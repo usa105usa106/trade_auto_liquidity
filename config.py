@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = os.getenv("BOT_VERSION", "0034 ADAPTIVE REGIME WIRED")
+VERSION = os.getenv("BOT_VERSION", "0035 CHAT API SETTINGS")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -53,5 +53,5 @@ class Defaults:
 DEFAULTS = Defaults()
 DB_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_ALLOWED_USER_ID = os.getenv("TELEGRAM_ALLOWED_USER_ID", "")
+ADMIN_IDS = os.getenv("ADMIN_IDS", "")
 DEFAULT_EXCHANGE = os.getenv("DEFAULT_EXCHANGE", "mexc").lower()

@@ -4,9 +4,9 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import psutil
 
-from config import TELEGRAM_TOKEN, TELEGRAM_ALLOWED_USER_ID, VERSION, DEFAULT_EXCHANGE
+from config import TELEGRAM_TOKEN, ADMIN_IDS, VERSION, DEFAULT_EXCHANGE
 from storage import Storage
-from keyboard import MAIN_MENU, settings_menu, choices_menu
+from keyboard import MAIN_MENU, settings_menu, choices_menu, api_menu
 from adaptive_engine import AdaptiveEngine
 from mirror_engine import MirrorEngine
 from session_engine import SessionEngine
@@ -33,20 +33,52 @@ ws_supervisor = None
 trading_task = None
 
 def allowed(update: Update) -> bool:
-    if not TELEGRAM_ALLOWED_USER_ID:
-        return True
+    # Fail closed: if ADMIN_IDS is not configured, nobody can control
+    # the bot from Telegram. This prevents accidental public access on Railway/VPS.
+    if not ADMIN_IDS:
+        return False
     uid = update.effective_user.id if update.effective_user else None
-    return str(uid) == str(TELEGRAM_ALLOWED_USER_ID)
+    return str(uid) == str(ADMIN_IDS)
+
+def _api_creds(settings: dict) -> tuple[str, str]:
+    # Telegram-saved credentials have priority. Environment variables remain a fallback
+    # for server-side deployment. Secrets are never printed back to chat.
+    api_key = str(settings.get("mexc_api_key") or os.getenv("MEXC_API_KEY", "") or "").strip()
+    api_secret = str(settings.get("mexc_api_secret") or os.getenv("MEXC_API_SECRET", "") or "").strip()
+    return api_key, api_secret
+
+def mask_secret(value: str) -> str:
+    value = str(value or "")
+    if not value:
+        return "missing"
+    if len(value) <= 8:
+        return "saved"
+    return f"{value[:4]}...{value[-4:]}"
+
+async def reset_exchange() -> None:
+    global exchange_client, ws_supervisor
+    if exchange_client:
+        try:
+            await exchange_client.close()
+        except Exception:
+            pass
+    exchange_client = None
 
 async def get_exchange(settings: dict):
     global exchange_client
-    if exchange_client:
-        return exchange_client
+    api_key, api_secret = _api_creds(settings)
     proxy_enabled = bool(settings.get("proxy_enabled", False))
     proxy_url = str(settings.get("proxy_url", ""))
-    api_key = os.getenv("MEXC_API_KEY", "")
-    api_secret = os.getenv("MEXC_API_SECRET", "")
+    desired_signature = (DEFAULT_EXCHANGE, proxy_url, proxy_enabled, api_key, bool(api_secret))
+    if exchange_client and getattr(exchange_client, "_bot_signature", None) == desired_signature:
+        return exchange_client
+    if exchange_client:
+        try:
+            await exchange_client.close()
+        except Exception:
+            pass
     exchange_client = await ExchangeClient(DEFAULT_EXCHANGE, proxy_url, proxy_enabled).init(api_key, api_secret)
+    exchange_client._bot_signature = desired_signature
     return exchange_client
 
 async def get_ws(settings: dict):
@@ -91,6 +123,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /stats - статистика сделок
 /sync - синхронизация позиций/ордеров
 /proxy on|off|test|set URL
+/api status|set KEY SECRET|clear|test - API биржи через чат
 /set key value - ручная настройка
 
 Ключевые настройки:
@@ -269,7 +302,59 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     s = await storage.all_settings()
     rev = int(s.get("settings_revision", 1))
-    await reply(update, "⚙️ Settings", reply_markup=settings_menu(rev))
+    await reply(update, "⚙️ Settings", reply_markup=settings_menu(rev, s))
+
+async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    if not context.args or context.args[0].lower() in {"status", "show"}:
+        api_key, api_secret = _api_creds(s)
+        source = "Telegram settings" if s.get("mexc_api_key") and s.get("mexc_api_secret") else "Railway/env fallback" if api_key and api_secret else "not configured"
+        await reply(update, (
+            "🔐 API status\n"
+            f"Exchange: {DEFAULT_EXCHANGE.upper()} futures\n"
+            f"Source: {source}\n"
+            f"Key: {mask_secret(api_key)}\n"
+            f"Secret: {mask_secret(api_secret)}\n\n"
+            "Команды:\n"
+            "/api set API_KEY API_SECRET — сохранить ключи в боте\n"
+            "/api test — проверить подключение к бирже\n"
+            "/api clear — удалить ключи из SQLite"
+        ), reply_markup=MAIN_MENU)
+        return
+    cmd = context.args[0].lower()
+    if cmd == "set":
+        if len(context.args) < 3:
+            await reply(update, "Usage: /api set API_KEY API_SECRET", reply_markup=MAIN_MENU)
+            return
+        await storage.set("mexc_api_key", context.args[1])
+        await storage.set("mexc_api_secret", context.args[2])
+        await reset_exchange()
+        await reply(update, f"✅ API saved\nKey: {mask_secret(context.args[1])}\nSecret: {mask_secret(context.args[2])}\n\nТеперь можно /api test", reply_markup=MAIN_MENU)
+        return
+    if cmd == "clear":
+        await storage.set("mexc_api_key", "")
+        await storage.set("mexc_api_secret", "")
+        await reset_exchange()
+        await reply(update, "🗑 API keys cleared from bot storage", reply_markup=MAIN_MENU)
+        return
+    if cmd == "test":
+        s = await storage.all_settings()
+        api_key, api_secret = _api_creds(s)
+        if not api_key or not api_secret:
+            await reply(update, "❌ API missing. Use /api set API_KEY API_SECRET", reply_markup=MAIN_MENU)
+            return
+        try:
+            ex = await get_exchange(s)
+            bal = await ex.fetch_balance()
+            usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
+            free = usdt.get("free", "n/a") if isinstance(usdt, dict) else "n/a"
+            total = usdt.get("total", "n/a") if isinstance(usdt, dict) else "n/a"
+            await reply(update, f"✅ API test OK\nUSDT free: {free}\nUSDT total: {total}", reply_markup=MAIN_MENU)
+        except Exception as e:
+            await reply(update, f"❌ API test failed: {e}", reply_markup=MAIN_MENU)
+        return
+    await reply(update, "Unknown API command. Use /api status|set|clear|test", reply_markup=MAIN_MENU)
 
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -282,6 +367,8 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: parsed = float(value) if "." in value else int(value)
         except Exception: parsed = value
     await storage.set(key, parsed)
+    if key in {"mexc_api_key", "mexc_api_secret", "proxy_url", "proxy_enabled"}:
+        await reset_exchange()
     await reply(update, f"✅ Saved\n{key} = {parsed}", reply_markup=MAIN_MENU)
 
 async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -323,7 +410,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mapping = {
         "▶️ Run": run_cmd, "⏹ Stop": stop_cmd, "📊 Status": status_cmd, "🚨 Panic": panic_cmd,
         "📈 Positions": positions_cmd, "📉 Stats": stats_cmd, "💰 Balance": balance_cmd,
-        "🏓 Ping": ping_cmd, "⚙️ Settings": settings_cmd,
+        "🏓 Ping": ping_cmd, "⚙️ Settings": settings_cmd, "🔐 API": api_cmd,
     }
     fn = mapping.get(text)
     if fn: await fn(update, context)
@@ -352,7 +439,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await storage.set(key, new_value)
         new_settings = await storage.all_settings()
         new_rev = int(new_settings.get("settings_revision", current_rev + 1))
-        await q.edit_message_text(f"✅ {key} = {new_value}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev))
+        await q.edit_message_text(f"✅ {key} = {new_value}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
     elif data[0] == "set":
         key, value = data[1], data[2]
         parsed = value
@@ -363,26 +450,71 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await storage.set(key, parsed)
         new_settings = await storage.all_settings()
         new_rev = int(new_settings.get("settings_revision", current_rev + 1))
-        await q.edit_message_text(f"✅ {key} = {parsed}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev))
+        # Stay inside the same submenu so the selected value is immediately visible with ✅.
+        if key == "universe_mode":
+            await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], new_rev, new_settings.get("universe_mode")))
+        elif key == "strategy_mode":
+            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Hybrid","hybrid")], new_rev, new_settings.get("strategy_mode")))
+        elif key == "scan_interval_sec":
+            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("1s","1"),("2s","2"),("3s","3"),("5s","5"),("10s","10")], new_rev, new_settings.get("scan_interval_sec")))
+        elif key == "symbol_refresh_sec":
+            await q.edit_message_text("🔄 Refresh", reply_markup=choices_menu("symbol_refresh_sec", [("60s","60"),("180s","180"),("300s","300"),("600s","600"),("1200s","1200")], new_rev, new_settings.get("symbol_refresh_sec")))
+        elif key == "risk_pct":
+            await q.edit_message_text("📊 Risk", reply_markup=choices_menu("risk_pct", [("0.25%","0.0025"),("0.50%","0.005"),("1%","0.01"),("3%","0.03"),("5%","0.05")], new_rev, new_settings.get("risk_pct")))
+        elif key == "max_open_positions":
+            await q.edit_message_text("🔥 Max positions", reply_markup=choices_menu("max_open_positions", [("1","1"),("2","2"),("3","3"),("5","5"),("10","10"),("15","15"),("20","20")], new_rev, new_settings.get("max_open_positions")))
+        elif key == "mirror_mode":
+            await q.edit_message_text("🪞 Mirror", reply_markup=choices_menu("mirror_mode", [("OFF","off"),("ON","on"),("AUTO","auto")], new_rev, new_settings.get("mirror_mode")))
+        else:
+            await q.edit_message_text(f"✅ {key} = {parsed}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
+    elif data[0] == "api":
+        action = data[1] if len(data) > 1 else "status"
+        if action == "clear":
+            await storage.set("mexc_api_key", "")
+            await storage.set("mexc_api_secret", "")
+            await reset_exchange()
+            new_settings = await storage.all_settings()
+            new_rev = int(new_settings.get("settings_revision", current_rev + 1))
+            await q.edit_message_text("🗑 API keys cleared from bot storage", reply_markup=api_menu(new_rev, new_settings))
+        elif action == "test":
+            api_key, api_secret = _api_creds(s)
+            if not api_key or not api_secret:
+                await q.edit_message_text("❌ API missing. Use /api set API_KEY API_SECRET", reply_markup=api_menu(current_rev, s))
+            else:
+                try:
+                    ex = await get_exchange(s)
+                    bal = await ex.fetch_balance()
+                    usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
+                    free = usdt.get("free", "n/a") if isinstance(usdt, dict) else "n/a"
+                    total = usdt.get("total", "n/a") if isinstance(usdt, dict) else "n/a"
+                    await q.edit_message_text(f"✅ API test OK\nUSDT free: {free}\nUSDT total: {total}", reply_markup=api_menu(current_rev, s))
+                except Exception as e:
+                    await q.edit_message_text(f"❌ API test failed: {e}", reply_markup=api_menu(current_rev, s))
+        else:
+            await q.edit_message_text("🔐 API menu\nUse /api set API_KEY API_SECRET to save keys.", reply_markup=api_menu(current_rev, s))
+    elif data[0] == "noop":
+        await q.answer("Use /api set API_KEY API_SECRET", show_alert=True)
     elif data[0] == "menu":
         name = data[1]
         rev = current_rev
         if name == "settings":
-            await q.edit_message_text("⚙️ Settings", reply_markup=settings_menu(rev))
+            await q.edit_message_text("⚙️ Settings", reply_markup=settings_menu(rev, s))
         elif name == "universe":
-            await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], rev))
+            await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], rev, s.get("universe_mode")))
         elif name == "strategy":
-            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Hybrid","hybrid")], rev))
+            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Hybrid","hybrid")], rev, s.get("strategy_mode")))
         elif name == "scan":
-            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("1s","1"),("2s","2"),("3s","3"),("5s","5"),("10s","10")], rev))
+            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("1s","1"),("2s","2"),("3s","3"),("5s","5"),("10s","10")], rev, s.get("scan_interval_sec")))
         elif name == "refresh":
-            await q.edit_message_text("🔄 Refresh", reply_markup=choices_menu("symbol_refresh_sec", [("60s","60"),("180s","180"),("300s","300"),("600s","600"),("1200s","1200")], rev))
+            await q.edit_message_text("🔄 Refresh", reply_markup=choices_menu("symbol_refresh_sec", [("60s","60"),("180s","180"),("300s","300"),("600s","600"),("1200s","1200")], rev, s.get("symbol_refresh_sec")))
         elif name == "risk":
-            await q.edit_message_text("📊 Risk", reply_markup=choices_menu("risk_pct", [("0.25%","0.0025"),("0.50%","0.005"),("1%","0.01"),("3%","0.03"),("5%","0.05")], rev))
+            await q.edit_message_text("📊 Risk", reply_markup=choices_menu("risk_pct", [("0.25%","0.0025"),("0.50%","0.005"),("1%","0.01"),("3%","0.03"),("5%","0.05")], rev, s.get("risk_pct")))
         elif name == "maxpos":
-            await q.edit_message_text("🔥 Max positions", reply_markup=choices_menu("max_open_positions", [("1","1"),("2","2"),("3","3"),("5","5"),("10","10"),("15","15"),("20","20")], rev))
+            await q.edit_message_text("🔥 Max positions", reply_markup=choices_menu("max_open_positions", [("1","1"),("2","2"),("3","3"),("5","5"),("10","10"),("15","15"),("20","20")], rev, s.get("max_open_positions")))
         elif name == "mirror":
-            await q.edit_message_text("🪞 Mirror", reply_markup=choices_menu("mirror_mode", [("OFF","off"),("ON","on"),("AUTO","auto")], rev))
+            await q.edit_message_text("🪞 Mirror", reply_markup=choices_menu("mirror_mode", [("OFF","off"),("ON","on"),("AUTO","auto")], rev, s.get("mirror_mode")))
+        elif name == "api":
+            await q.edit_message_text("🔐 API menu\nUse /api set API_KEY API_SECRET to save keys.", reply_markup=api_menu(rev, s))
 
 
 async def get_last_price(ex, symbol: str) -> float:
@@ -437,7 +569,7 @@ async def trading_loop(app):
 
                 # 1) Position management ALWAYS runs first and is never blocked by entry gates.
                 events = await pos_manager.manage(lambda symbol: get_last_price(ex, symbol), live)
-                chat_id = os.getenv("TELEGRAM_ALLOWED_USER_ID")
+                chat_id = os.getenv("ADMIN_IDS")
                 for ev in events:
                     if chat_id and ev.get("type") not in {"pending_sync_warning", "price_error"}:
                         try:
@@ -465,7 +597,8 @@ async def trading_loop(app):
                 # 4) Infrastructure gate for NEW entries only.
                 ws_enabled = bool(settings.get("ws_enabled", True))
                 ws_healthy = (not ws_enabled) or ws.healthy()
-                api_ready = bool(os.getenv("MEXC_API_KEY") and os.getenv("MEXC_API_SECRET")) if live else True
+                api_key, api_secret = _api_creds(settings)
+                api_ready = bool(api_key and api_secret) if live else True
                 sync_ok = True
                 if live:
                     try:
@@ -562,6 +695,7 @@ def build_app():
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("set", set_cmd))
     app.add_handler(CommandHandler("proxy", proxy_cmd))
+    app.add_handler(CommandHandler("api", api_cmd))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     return app

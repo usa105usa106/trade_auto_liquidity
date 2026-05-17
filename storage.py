@@ -29,6 +29,8 @@ DEFAULT_SETTINGS = {
     "limit_timeout_sec": DEFAULTS.limit_timeout_sec,
     "proxy_enabled": DEFAULTS.proxy_enabled,
     "proxy_url": DEFAULTS.proxy_url,
+    "mexc_api_key": "",
+    "mexc_api_secret": "",
     "websocket_enabled": True,
     "production_gate_enabled": True,
 
