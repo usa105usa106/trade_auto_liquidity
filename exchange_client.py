@@ -19,6 +19,9 @@ class ExchangeClient:
         }
         if self.proxy_enabled and self.proxy_url:
             config["proxies"] = {"http": self.proxy_url, "https": self.proxy_url}
+            # ccxt async_support uses aiohttp internally; aiohttp_proxy makes
+            # HTTP/SOCKS proxy usage explicit for async requests.
+            config["aiohttp_proxy"] = self.proxy_url
         self.exchange = klass(config)
         # Load markets once so user-facing symbols can be mapped to the exact
         # swap symbol used by the selected ccxt venue. A failure here is fatal
@@ -50,6 +53,24 @@ class ExchangeClient:
             if m.get("base") == base and m.get("quote") == "USDT" and (m.get("swap") or m.get("future") or m.get("type") in {"swap", "future"}):
                 return m["symbol"]
         raise ValueError(f"no compatible swap market for symbol {symbol}")
+
+
+    def futures_market_symbols(self) -> list[str]:
+        """Return all known USDT swap/futures symbols from loaded exchange markets."""
+        markets = getattr(self.exchange, "markets", None) or {}
+        out = []
+        for m in markets.values():
+            try:
+                if m.get("quote") != "USDT":
+                    continue
+                if not (m.get("swap") or m.get("future") or m.get("type") in {"swap", "future"}):
+                    continue
+                sym = m.get("symbol")
+                if sym and sym not in out:
+                    out.append(sym)
+            except Exception:
+                continue
+        return out
 
     async def close(self):
         if self.exchange:

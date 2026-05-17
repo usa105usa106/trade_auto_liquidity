@@ -1,6 +1,7 @@
 python-telegram-bot==22.3
 ccxt==4.4.95
 aiohttp==3.12.14
+aiohttp-socks==0.10.1
 aiosqlite==0.21.0
 python-dotenv==1.1.1
 psutil==7.0.0

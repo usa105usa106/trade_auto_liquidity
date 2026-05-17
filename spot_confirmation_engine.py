@@ -17,10 +17,13 @@ class SpotConfirmationEngine:
         c = dict(candidate)
         if not self.enabled:
             c["spot_confirmation"] = "OFF"
+            c["spot_confirmed"] = True
+            c["spot_reason"] = "Spot confirmation disabled"
             return c
         if not spot_data:
             c["confidence"] = float(c.get("confidence",0)) - 8
             c["spot_confirmation"] = "WEAK"
+            c["spot_confirmed"] = False
             c["spot_reason"] = "Spot data unavailable"
             return c
 
@@ -34,6 +37,7 @@ class SpotConfirmationEngine:
         if futures_price <= 0 or spot_price <= 0:
             c["confidence"] -= 10
             c["spot_confirmation"] = "WEAK"
+            c["spot_confirmed"] = False
             c["spot_reason"] = "Invalid spot data"
             return c
 
@@ -49,13 +53,16 @@ class SpotConfirmationEngine:
         if divergence > self.max_divergence_pct:
             c["confidence"] -= 12
             c["spot_confirmation"] = "DIVERGENCE"
+            c["spot_confirmed"] = False
             c["spot_reason"] = "Futures/spot divergence too high"
         elif direction_ok and volume_ok:
             c["confidence"] += 8
             c["spot_confirmation"] = "CONFIRMED"
+            c["spot_confirmed"] = True
             c["spot_reason"] = "Spot confirms futures signal"
         else:
             c["confidence"] -= 6
             c["spot_confirmation"] = "WEAK"
+            c["spot_confirmed"] = False
             c["spot_reason"] = "Spot confirmation weak"
         return c

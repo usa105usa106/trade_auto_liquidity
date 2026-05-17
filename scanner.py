@@ -1,6 +1,7 @@
 import time
 import os
 import logging
+import asyncio
 from signal_engine import SignalEngine
 from regime_engine import RegimeEngine
 
@@ -24,6 +25,18 @@ class Scanner:
         self.last_regime = {"regime": "LOW_VOLATILITY", "source": "init"}
         self.last_scan_source = "init"
         self.last_refresh_error = ""
+        self.last_total_markets = 0
+        self.last_filtered_markets = 0
+        self.last_requested_symbols = 0
+        self.last_selected_symbols = 0
+        self.last_available_markets = 0
+        self.last_signal_summary = "-"
+        self.last_reject_reason = "-"
+        self.last_concurrency = int(os.getenv("SCANNER_CONCURRENCY", "5"))
+        self.last_cycle_errors = 0
+        self.last_cycle_scanned = 0
+        self.last_slowdown_sec = 0
+        self.error_streak = 0
         self.engine = SignalEngine(
             min_confidence=float(os.getenv("SIGNAL_MIN_CONFIDENCE", "70")),
             volume_spike_mult=float(os.getenv("SIGNAL_VOLUME_SPIKE_MULT", "1.8")),
@@ -54,9 +67,16 @@ class Scanner:
 
         return max(10, min(n, 300, max(10, market_items_count)))
 
-    async def _fetch_binance_futures_tickers(self) -> dict:
+    async def _fetch_binance_futures_tickers(self, settings: dict | None = None) -> dict:
         import ccxt.async_support as ccxt
-        exchange = ccxt.binanceusdm({"enableRateLimit": True, "options": {"defaultType": "future"}})
+        settings = settings or {}
+        cfg = {"enableRateLimit": True, "options": {"defaultType": "future"}}
+        proxy_enabled = bool(settings.get("proxy_enabled", False))
+        proxy_url = str(settings.get("proxy_url", "") or "")
+        if proxy_enabled and proxy_url:
+            cfg["proxies"] = {"http": proxy_url, "https": proxy_url}
+            cfg["aiohttp_proxy"] = proxy_url
+        exchange = ccxt.binanceusdm(cfg)
         try:
             await exchange.load_markets()
             return await exchange.fetch_tickers()
@@ -78,18 +98,25 @@ class Scanner:
         mode = str(settings.get("scan_market_source", "mexc_binance") or "mexc_binance").lower()
         futures_source = "binance" if mode.startswith("binance") else "mexc"
 
-        if futures_source == "binance":
-            ws_error = ""
-            if ws_supervisor and ws_supervisor.healthy():
-                try:
-                    tickers = await ws_supervisor.tickers(max_age_sec=30)
-                    if tickers:
-                        return tickers, "binance_futures_ws"
-                    ws_error = "Binance futures websocket returned empty ticker cache"
-                except Exception as e:
-                    ws_error = f"Binance futures websocket failed: {e}"
+        ws_error = ""
+        ws_status = getattr(ws_supervisor, "status", None) if ws_supervisor else None
+        ws_enabled = bool(getattr(ws_status, "enabled", True)) if ws_status is not None else bool(ws_supervisor)
+        ws_venue = getattr(ws_status, "venue", futures_source) if ws_status is not None else futures_source
+        if ws_supervisor and ws_enabled and ws_venue == futures_source:
             try:
-                tickers = await self._fetch_binance_futures_tickers()
+                if ws_supervisor.healthy():
+                    tickers = await ws_supervisor.tickers(max_age_sec=max(30, int(settings.get("scan_interval_sec", 3)) * 10))
+                    if tickers:
+                        return tickers, f"{futures_source}_futures_ws"
+                    ws_error = f"{futures_source.title()} futures websocket returned empty ticker cache"
+                else:
+                    ws_error = f"{futures_source.title()} futures websocket unhealthy: {getattr(ws_status, 'last_error', '') or 'no fresh messages'}"
+            except Exception as e:
+                ws_error = f"{futures_source.title()} futures websocket failed: {e}"
+
+        if futures_source == "binance":
+            try:
+                tickers = await self._fetch_binance_futures_tickers(settings)
                 if tickers:
                     if ws_error:
                         self.last_refresh_error = ws_error
@@ -101,50 +128,117 @@ class Scanner:
                     msg = f"{ws_error}; {msg}"
                 raise RuntimeError(msg)
 
-        tickers = await exchange_client.fetch_tickers()
-        if tickers:
-            return tickers, "mexc_futures_rest"
-        raise RuntimeError("MEXC futures scan returned empty ticker set")
+        try:
+            tickers = await exchange_client.fetch_tickers()
+            if tickers:
+                if ws_error:
+                    self.last_refresh_error = ws_error
+                return tickers, "mexc_futures_rest"
+            raise RuntimeError("MEXC futures REST returned empty ticker set")
+        except Exception as e:
+            msg = f"MEXC futures scan failed: {e}"
+            if ws_error:
+                msg = f"{ws_error}; {msg}"
+            raise RuntimeError(msg)
+
+    def _universe_target_count(self, settings: dict, regime_info: dict, market_items_count: int) -> int:
+        mode = str(settings.get("universe_mode", "adaptive"))
+        if mode.startswith("top-"):
+            try:
+                return int(mode.replace("top-", ""))
+            except Exception:
+                return 100
+        return self._adaptive_symbol_count(settings, regime_info, market_items_count)
+
+    def _all_futures_symbols(self, exchange_client) -> list[str]:
+        try:
+            symbols = exchange_client.futures_market_symbols()
+            return list(dict.fromkeys(symbols))
+        except Exception:
+            return []
+
+    def _concurrency_limit(self, settings: dict) -> int:
+        try:
+            val = settings.get("scanner_concurrency", os.getenv("SCANNER_CONCURRENCY", "5"))
+            raw = int(float(val))
+        except Exception:
+            raw = 5
+        # Railway-safe guardrails: 1 avoids bursts, 12 keeps API/container load bounded.
+        return max(1, min(raw, 12))
+
+    def _record_cycle_health(self, scanned: int, errors: int, settings: dict) -> None:
+        self.last_cycle_scanned = int(scanned)
+        self.last_cycle_errors = int(errors)
+        threshold = int(settings.get("scanner_error_slowdown_threshold", os.getenv("SCANNER_ERROR_SLOWDOWN_THRESHOLD", "5")) or 5)
+        max_slowdown = int(settings.get("scanner_slowdown_max_sec", os.getenv("SCANNER_SLOWDOWN_MAX_SEC", "15")) or 15)
+        if errors >= max(1, threshold):
+            self.error_streak += 1
+            self.last_slowdown_sec = min(max_slowdown, 2 * self.error_streak)
+        else:
+            self.error_streak = 0
+            self.last_slowdown_sec = 0
 
     async def refresh_symbols(self, exchange_client, settings: dict, ws_supervisor=None):
         self.last_refresh = time.time()
         self.last_refresh_error = ""
+        self.last_reject_reason = "-"
         min_quote_volume = float(os.getenv("SIGNAL_MIN_24H_QUOTE_VOLUME", "5000000"))
         try:
             tickers, source = await self._fetch_scan_tickers(exchange_client, settings, ws_supervisor)
             self.last_scan_source = source
+            self.last_total_markets = len(tickers or {})
             regime_info = RegimeEngine().detect_from_tickers(tickers) if bool(settings.get("regime_adaptation", True)) else {"regime": "LOW_VOLATILITY", "source": "disabled"}
             regime_info["source"] = f"tickers:{source}"
             self.last_regime = regime_info
 
             items = []
-            for sym, t in tickers.items():
-                if "USDT" not in sym:
+            seen = set()
+            for sym, t in (tickers or {}).items():
+                if "USDT" not in str(sym):
                     continue
                 quote_volume = float(t.get("quoteVolume") or t.get("quoteVolume24h") or t.get("baseVolume") or 0)
                 if quote_volume < min_quote_volume:
                     continue
                 pct_change = abs(float(t.get("percentage") or t.get("change") or 0))
                 try:
-                    sym = exchange_client.normalize_symbol(sym)
+                    norm = exchange_client.normalize_symbol(sym)
                 except Exception:
                     continue
-                # Adaptive score: liquidity first, but hot movers receive priority. In choppy
-                # markets we cap the volatility bonus so random pumps do not dominate the list.
                 vol_bonus = min(pct_change, 30) / 100
                 if regime_info.get("regime") == "CHOPPY":
                     vol_bonus = min(pct_change, 12) / 100
                 score = quote_volume * (1 + vol_bonus)
-                items.append((score, sym))
+                if norm not in seen:
+                    seen.add(norm)
+                    items.append((score, norm))
+
             items.sort(reverse=True)
-            mode = str(settings.get("universe_mode", "adaptive"))
-            if mode.startswith("top-"):
-                n = int(mode.replace("top-", ""))
-            else:
-                n = self._adaptive_symbol_count(settings, regime_info, len(items))
-            self.hot_symbols = [s for _, s in items[:max(10, min(n, 300))]] or self.hot_symbols
+            self.last_filtered_markets = len(items)
+
+            all_symbols = self._all_futures_symbols(exchange_client)
+            self.last_available_markets = max(len(all_symbols), self.last_total_markets)
+            target = self._universe_target_count(settings, regime_info, max(len(items), len(all_symbols), self.last_total_markets))
+            target = max(10, min(int(target), 300))
+            self.last_requested_symbols = target
+
+            # If the ticker endpoint returns only a small set, supplement from loaded
+            # exchange markets so top-100/top-200/adaptive actually change the scan
+            # universe instead of always stopping at the ticker count. These extra
+            # markets get lower priority but still can be scanned via OHLCV/orderbook.
+            if len(items) < target:
+                for sym in all_symbols:
+                    if sym not in seen:
+                        seen.add(sym)
+                        items.append((0.0, sym))
+                    if len(items) >= target:
+                        break
+
+            selected = [s for _, s in items[:target]]
+            if selected:
+                self.hot_symbols = selected
+            self.last_selected_symbols = len(self.hot_symbols)
         except Exception as e:
-            self.last_refresh_error = str(e)[:240]
+            self.last_refresh_error = str(e)[:500]
             log.warning("symbol refresh failed: %s", e)
 
     async def detect_regime(self, exchange_client, settings: dict) -> dict:
@@ -180,34 +274,54 @@ class Scanner:
         else:
             max_candidates = base_max
 
-        out = []
-        for symbol in list(self.hot_symbols):
-            try:
-                candles = await exchange_client.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-                if not candles:
-                    continue
-                try:
-                    orderbook = await exchange_client.fetch_order_book(symbol, limit=20)
-                except Exception as e:
-                    log.debug("orderbook unavailable for %s: %s", symbol, e)
-                    continue
-                candidate = self.engine.analyze_symbol(
-                    symbol=symbol,
-                    candles=candles,
-                    ticker=None,
-                    orderbook=orderbook,
-                    preferred_strategy=preferred_strategy,
-                )
-                if candidate:
-                    candidate["market_regime"] = regime
-                    candidate["effective_strategy_mode"] = preferred_strategy
-                    out.append(candidate)
-            except Exception as e:
-                log.debug("candidate scan failed for %s: %s", symbol, e)
-                continue
+        self.last_concurrency = self._concurrency_limit(settings)
+        sem = asyncio.Semaphore(self.last_concurrency)
+        errors = 0
+        scanned = 0
 
+        async def scan_one(symbol: str) -> dict | None:
+            nonlocal errors, scanned
+            async with sem:
+                try:
+                    scanned += 1
+                    candles = await exchange_client.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+                    if not candles:
+                        return None
+                    try:
+                        orderbook = await exchange_client.fetch_order_book(symbol, limit=20)
+                    except Exception as e:
+                        errors += 1
+                        log.debug("orderbook unavailable for %s: %s", symbol, e)
+                        return None
+                    candidate = self.engine.analyze_symbol(
+                        symbol=symbol,
+                        candles=candles,
+                        ticker=None,
+                        orderbook=orderbook,
+                        preferred_strategy=preferred_strategy,
+                    )
+                    if candidate:
+                        candidate["market_regime"] = regime
+                        candidate["effective_strategy_mode"] = preferred_strategy
+                    return candidate
+                except Exception as e:
+                    errors += 1
+                    log.debug("candidate scan failed for %s: %s", symbol, e)
+                    return None
+
+        # Scan concurrently, but bounded. We stop scheduling in chunks once enough
+        # candidates are found, so top-200 does not always hammer every symbol.
+        out: list[dict] = []
+        symbols = list(self.hot_symbols)
+        batch_size = max(self.last_concurrency * 2, self.last_concurrency)
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i:i + batch_size]
+            results = await asyncio.gather(*(scan_one(sym) for sym in batch), return_exceptions=False)
+            out.extend([r for r in results if r])
             if len(out) >= max_candidates:
                 break
 
+        self._record_cycle_health(scanned, errors, settings)
         out.sort(key=lambda c: float(c.get("confidence", 0)), reverse=True)
         return out[:max_candidates]
+

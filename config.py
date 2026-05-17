@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = os.getenv("BOT_VERSION", "0037 MANUAL SCAN SOURCES")
+VERSION = os.getenv("BOT_VERSION", "0044 WS SPOT AUDIT FIXED")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -31,6 +31,13 @@ class Defaults:
     scan_market_source: str = os.getenv("SCAN_MARKET_SOURCE", "mexc_binance")
     max_symbols: int = env_int("MAX_SYMBOLS", 100)
     scan_interval_sec: int = env_int("SCAN_INTERVAL_SEC", 3)
+    scanner_concurrency: int = env_int("SCANNER_CONCURRENCY", 5)
+    scanner_error_slowdown_threshold: int = env_int("SCANNER_ERROR_SLOWDOWN_THRESHOLD", 5)
+    scanner_slowdown_max_sec: int = env_int("SCANNER_SLOWDOWN_MAX_SEC", 15)
+    ws_update_throttle_ms: int = env_int("WS_UPDATE_THROTTLE_MS", 500)
+    ws_max_updates_per_batch: int = env_int("WS_MAX_UPDATES_PER_BATCH", 250)
+    ws_queue_limit: int = env_int("WS_QUEUE_LIMIT", 2000)
+    ws_adaptive_slowdown_threshold: int = env_int("WS_ADAPTIVE_SLOWDOWN_THRESHOLD", 1000)
     symbol_refresh_sec: int = env_int("SYMBOL_REFRESH_SEC", 300)
     max_open_positions: int = env_int("MAX_OPEN_POSITIONS", 5)
     risk_pct: float = env_float("RISK_PCT", 0.005)
