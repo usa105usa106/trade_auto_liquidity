@@ -161,11 +161,29 @@ class WebSocketSupervisor:
     async def _subscribe(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         if self.venue == "mexc":
             # MEXC futures all-ticker stream. The server replies with push.tickers.
-            await ws.send_json({"method": "sub.tickers", "param": {}})
+            # gzip=false keeps payloads plain JSON and avoids client/proxy issues if
+            # the exchange enables compressed pushes by default for a channel.
+            await ws.send_json({"method": "sub.tickers", "param": {}, "gzip": False})
             # Mark the connection as alive immediately after a successful subscribe send.
             # The ticker cache becomes usable only after push.tickers arrives, but this
             # avoids a misleading "no messages yet" state during the first seconds.
             self.status.last_message_ts = time.time()
+
+    async def _mexc_json_ping_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Send MEXC application-level JSON pings.
+
+        MEXC futures docs require {"method":"ping"} every 10-20 seconds.
+        aiohttp's websocket heartbeat sends protocol ping frames, which are not
+        the same as MEXC's documented JSON ping command. If ticker traffic is
+        steady, the receive timeout path may never run, so the old code could go
+        a full minute without a JSON ping and then be disconnected by MEXC.
+        """
+        interval = max(10, min(20, int(self.ping_interval or 15)))
+        while not self._stop.is_set() and not ws.closed:
+            await asyncio.sleep(interval)
+            if self._stop.is_set() or ws.closed:
+                break
+            await ws.send_json({"method": "ping"})
 
     async def _run(self) -> None:
         backoff = self.reconnect_base
@@ -180,21 +198,34 @@ class WebSocketSupervisor:
                         self.status.last_error = ""
                         backoff = self.reconnect_base
                         await self._subscribe(ws)
-                        last_client_ping_ts = 0.0
-                        while not self._stop.is_set():
-                            try:
-                                msg = await ws.receive(timeout=max(5, min(self.status.stale_sec, self.ping_interval)))
-                            except asyncio.TimeoutError:
-                                # MEXC can go quiet between pushes on some connections. Send an
-                                # application-level ping before declaring the socket dead.
-                                now = time.time()
-                                if self.venue == "mexc" and now - last_client_ping_ts >= self.ping_interval:
-                                    await ws.send_json({"method": "ping"})
-                                    last_client_ping_ts = now
+                        ping_task = None
+                        if self.venue == "mexc":
+                            ping_task = asyncio.create_task(self._mexc_json_ping_loop(ws), name="mexc_json_ping")
+                        try:
+                            while not self._stop.is_set():
+                                try:
+                                    msg = await ws.receive(timeout=max(5, min(self.status.stale_sec, self.ping_interval)))
+                                except asyncio.TimeoutError:
+                                    now = time.time()
+                                    if now - self.status.last_message_ts >= self.status.stale_sec:
+                                        raise RuntimeError(f"{self.venue} websocket stale: no messages for {self.status.stale_sec}s")
                                     continue
-                                if now - self.status.last_message_ts >= self.status.stale_sec:
-                                    raise RuntimeError(f"{self.venue} websocket stale: no messages for {self.status.stale_sec}s")
-                                continue
+                                if msg.type == aiohttp.WSMsgType.TEXT:
+                                    self.status.last_message_ts = time.time()
+                                    updated = await self._handle_message(msg.data)
+                                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                                    raise RuntimeError(f"websocket closed/error: {msg.type}")
+                                elif msg.type == aiohttp.WSMsgType.CLOSING:
+                                    raise RuntimeError("websocket closing")
+                                elif msg.type == aiohttp.WSMsgType.PING:
+                                    await ws.pong()
+                        finally:
+                            if ping_task:
+                                ping_task.cancel()
+                                try:
+                                    await ping_task
+                                except asyncio.CancelledError:
+                                    pass
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 self.status.last_message_ts = time.time()
                                 updated = await self._handle_message(msg.data)
@@ -327,7 +358,7 @@ class WebSocketSupervisor:
             if not symbol:
                 continue
             last = self._to_float(item.get("lastPrice") or item.get("last") or item.get("p") or item.get("c"))
-            quote_volume = self._to_float(item.get("amount24") or item.get("quoteVolume") or item.get("q"))
+            quote_volume = self._to_float(item.get("amount24") or item.get("quoteVolume") or item.get("volume24") or item.get("q"))
             open_price = self._to_float(item.get("open") or item.get("o"))
             pct = self._to_float(item.get("riseFallRate") or item.get("percentage") or item.get("P"))
             if not pct and open_price:

@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = os.getenv("BOT_VERSION", "0047 RUN STATUS AT BOTTOM")
+VERSION = os.getenv("BOT_VERSION", "0048 ADAPTIVE UNIVERSE FIX")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)

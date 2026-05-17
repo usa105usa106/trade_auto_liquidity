@@ -112,6 +112,18 @@ class Storage:
             if await self.get(k) is None:
                 await self.set(k, v, bump_revision=False)
 
+        # One-time safety migration for older deployments where these values
+        # may already exist in the DB and therefore are not replaced by defaults.
+        # MEXC push.tickers sends the full futures universe, so batch=250 makes
+        # the cache incomplete and looks like a broken websocket.
+        try:
+            if int(await self.get("ws_max_updates_per_batch", 1000) or 1000) < 1000:
+                await self.set("ws_max_updates_per_batch", 1000, bump_revision=False)
+            if int(await self.get("ws_stale_sec", 20) or 20) < 20:
+                await self.set("ws_stale_sec", 20, bump_revision=False)
+        except Exception:
+            pass
+
     async def get(self, key: str, default: Any = None) -> Any:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))

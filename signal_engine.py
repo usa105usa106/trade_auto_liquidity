@@ -105,11 +105,11 @@ class SignalEngine:
         imbalance = orderbook_metrics["imbalance"]
 
         candidates = []
-        if preferred_strategy in {"hybrid", "momentum"}:
+        if preferred_strategy in {"hybrid", "all", "momentum"}:
             candidates += self._momentum(symbol, close, move_1m, move_5m, vol_ratio, breakout_up, breakout_down, trend_up, trend_down, atrp, spread_pct, depth_usdt, imbalance)
-        if preferred_strategy in {"hybrid", "pullback"}:
+        if preferred_strategy in {"hybrid", "all", "pullback"}:
             candidates += self._pullback(symbol, close, candles, trend_up, trend_down, vol_ratio, atrp, spread_pct, depth_usdt, imbalance)
-        if preferred_strategy in {"hybrid", "reversal"}:
+        if preferred_strategy in {"hybrid", "all", "reversal"}:
             candidates += self._reversal(symbol, close, candles, prior_high, prior_low, vol_ratio, atrp, spread_pct, depth_usdt, imbalance)
 
         candidates = [c for c in candidates if c["confidence"] >= self.min_confidence]

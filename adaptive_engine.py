@@ -1,6 +1,6 @@
 from collections import defaultdict
 
-STRATEGIES = ["momentum", "pullback", "reversal", "hybrid"]
+STRATEGIES = ["momentum", "pullback", "reversal", "hybrid", "all"]
 
 def safe_div(a, b, default=0.0):
     return a / b if b else default
@@ -40,6 +40,10 @@ class AdaptiveEngine:
         base_mode = (base_mode or "hybrid").lower()
         if base_mode not in STRATEGIES:
             base_mode = "hybrid"
+        # "all" is an explicit mode: scan every strategy every cycle.
+        # "hybrid" is adaptive: choose one effective strategy by market regime/stats.
+        if base_mode == "all":
+            return "all"
         if not enabled:
             return base_mode
         if base_mode != "hybrid":

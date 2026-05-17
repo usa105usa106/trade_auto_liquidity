@@ -30,8 +30,11 @@ class Scanner:
         self.last_requested_symbols = 0
         self.last_selected_symbols = 0
         self.last_available_markets = 0
+        self.last_universe_target_reason = "-"
         self.last_signal_summary = "-"
         self.last_reject_reason = "-"
+        self.last_effective_strategy = "-"
+        self.last_strategy_reason = "-"
         self.last_concurrency = int(os.getenv("SCANNER_CONCURRENCY", "5"))
         self.last_cycle_errors = 0
         self.last_cycle_scanned = 0
@@ -45,27 +48,78 @@ class Scanner:
             max_candidates_per_cycle=int(os.getenv("SIGNAL_MAX_CANDIDATES_PER_CYCLE", "8")),
         )
 
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        try:
+            if value is None or value == "":
+                return default
+            return float(value)
+        except Exception:
+            return default
+
+    def _ticker_quote_volume(self, ticker: dict) -> float:
+        """Return 24h quote volume across CCXT REST and MEXC WS shapes.
+
+        MEXC/CCXT payloads are inconsistent: some rows have quoteVolume, some
+        only baseVolume + last/close, and websocket snapshots may keep the raw
+        values inside info. The old adaptive universe treated missing
+        quoteVolume as zero, so many valid markets were filtered out and
+        adaptive mode looked broken.
+        """
+        info = ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
+        direct = (
+            ticker.get("quoteVolume") or ticker.get("quoteVolume24h") or
+            ticker.get("quote_volume") or ticker.get("amount24") or
+            info.get("quoteVolume") or info.get("quoteVolume24h") or
+            info.get("amount24") or info.get("turnover24")
+        )
+        quote = self._safe_float(direct, 0.0)
+        if quote > 0:
+            return quote
+        base = self._safe_float(ticker.get("baseVolume") or ticker.get("volume") or info.get("volume24") or info.get("vol24"), 0.0)
+        last = self._safe_float(ticker.get("last") or ticker.get("close") or info.get("lastPrice") or info.get("last") or info.get("fairPrice"), 0.0)
+        return base * last if base > 0 and last > 0 else 0.0
+
+    def _ticker_pct_change(self, ticker: dict) -> float:
+        info = ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
+        raw = (ticker.get("percentage") or ticker.get("change") or ticker.get("change24h") or
+               info.get("riseFallRate") or info.get("changeRate") or info.get("change24h"))
+        val = self._safe_float(raw, 0.0)
+        # MEXC often sends 0.0123 for 1.23%; CCXT percentage is already 1.23.
+        if abs(val) <= 1.0:
+            val *= 100.0
+        return abs(val)
+
     def _adaptive_symbol_count(self, settings: dict, regime_info: dict, market_items_count: int) -> int:
         base = int(settings.get("max_symbols", 100) or 100)
         regime = str(regime_info.get("regime", "LOW_VOLATILITY"))
         volatility = float(regime_info.get("volatility", 0.0) or 0.0)
         breadth = int(regime_info.get("breadth_count", market_items_count) or market_items_count)
 
+        factor = 1.0
+        reason = f"base={base}"
         if regime == "HIGH_VOLATILITY":
-            n = int(base * 0.60)  # trade fewer names when everything is moving wildly
+            factor *= 0.55
+            reason += ", high-vol: narrower"
         elif regime == "TRENDING":
-            n = int(base * 0.80)  # focus on leaders
+            factor *= 0.80
+            reason += ", trending: leaders"
         elif regime == "CHOPPY":
-            n = int(base * 1.20)  # scan wider for clean sweeps/reversions
+            factor *= 1.25
+            reason += ", choppy: wider"
         else:
-            n = base
+            reason += f", regime={regime}"
 
         if volatility >= 2.0:
-            n = int(n * 0.75)
+            factor *= 0.80
+            reason += ", volatility>=2: reduce"
         elif breadth >= 150 and regime in {"CHOPPY", "LOW_VOLATILITY"}:
-            n = int(n * 1.10)
+            factor *= 1.10
+            reason += ", broad market: widen"
 
-        return max(10, min(n, 300, max(10, market_items_count)))
+        n = int(base * factor)
+        n = max(10, min(n, 300, max(10, market_items_count)))
+        self.last_universe_target_reason = f"adaptive -> {n} ({reason})"
+        return n
 
     async def _fetch_binance_futures_tickers(self, settings: dict | None = None) -> dict:
         import ccxt.async_support as ccxt
@@ -145,9 +199,11 @@ class Scanner:
         mode = str(settings.get("universe_mode", "adaptive"))
         if mode.startswith("top-"):
             try:
-                return int(mode.replace("top-", ""))
+                n = int(mode.replace("top-", ""))
             except Exception:
-                return 100
+                n = 100
+            self.last_universe_target_reason = f"fixed {mode} -> {n}"
+            return n
         return self._adaptive_symbol_count(settings, regime_info, market_items_count)
 
     def _all_futures_symbols(self, exchange_client) -> list[str]:
@@ -196,10 +252,10 @@ class Scanner:
             for sym, t in (tickers or {}).items():
                 if "USDT" not in str(sym):
                     continue
-                quote_volume = float(t.get("quoteVolume") or t.get("quoteVolume24h") or t.get("baseVolume") or 0)
+                quote_volume = self._ticker_quote_volume(t)
                 if quote_volume < min_quote_volume:
                     continue
-                pct_change = abs(float(t.get("percentage") or t.get("change") or 0))
+                pct_change = self._ticker_pct_change(t)
                 try:
                     norm = exchange_client.normalize_symbol(sym)
                 except Exception:

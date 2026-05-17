@@ -103,6 +103,8 @@ def _scan_status_text(settings: dict, status: str = "scanning", last_signal: str
         f" | dropped={getattr(getattr(ws_supervisor, 'status', None), 'dropped_updates', 0)}\n"
         f"Execution data: {('fresh' if scanner_market_data_fresh() else 'stale')}\n"
         f"Regime: {scanner.last_regime.get('regime')}\n"
+        f"Mode: {settings.get('strategy_mode', 'hybrid')} | Effective strategy: {scanner.last_effective_strategy}\n"
+        f"Reason: {scanner.last_strategy_reason}\n"
         f"Last signal: {last_signal}\n"
         f"Last decision: {last_decision}\n"
         f"Error: {scanner.last_refresh_error or '-'}\n"
@@ -433,6 +435,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Running: {running}
 Live: {s.get('live_trading')}
 Strategy: {s.get('strategy_mode')}
+Effective strategy: {scanner.last_effective_strategy}
+Strategy reason: {scanner.last_strategy_reason}
 Universe: {s.get('universe_mode')}
 Risk: {float(s.get('risk_pct',0))*100:.2f}%
 Max positions: {s.get('max_open_positions')}
@@ -713,13 +717,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await storage.set(key, parsed)
         if key in {"scan_market_source", "ws_enabled", "proxy_url", "proxy_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold"}:
             await reset_market_runtime()
+        if key in {"universe_mode", "max_symbols", "scan_market_source"}:
+            scanner.last_refresh = 0
+            scanner.last_reject_reason = "universe settings changed; refresh queued"
         new_settings = await storage.all_settings()
         new_rev = int(new_settings.get("settings_revision", current_rev + 1))
         # Stay inside the same submenu so the selected value is immediately visible with ✅.
         if key == "universe_mode":
             await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], new_rev, new_settings.get("universe_mode")))
         elif key == "strategy_mode":
-            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Hybrid","hybrid")], new_rev, new_settings.get("strategy_mode")))
+            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Hybrid adaptive","hybrid"),("All strategies","all")], new_rev, new_settings.get("strategy_mode")))
         elif key == "scan_market_source":
             await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], new_rev, new_settings.get("scan_market_source", "mexc_binance")))
         elif key == "scan_interval_sec":
@@ -773,7 +780,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif name == "universe":
             await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], rev, s.get("universe_mode")))
         elif name == "strategy":
-            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Hybrid","hybrid")], rev, s.get("strategy_mode")))
+            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Hybrid adaptive","hybrid"),("All strategies","all")], rev, s.get("strategy_mode")))
         elif name == "marketsource":
             await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], rev, s.get("scan_market_source", "mexc_binance")))
         elif name == "scan":
@@ -955,12 +962,20 @@ async def trading_loop(app):
                 adaptive = AdaptiveEngine()
                 adaptive_stats = adaptive.calc_stats(trades)
                 regime_info = await scanner.detect_regime(ex, settings)
+                base_strategy_mode = str(settings.get("strategy_mode", "hybrid")).lower()
                 effective_strategy = adaptive.choose_strategy(
-                    base_mode=str(settings.get("strategy_mode", "hybrid")),
+                    base_mode=base_strategy_mode,
                     trades=trades,
                     regime=str(regime_info.get("regime", "LOW_VOLATILITY")),
                     enabled=bool(settings.get("auto_strategy_adaptation", True)),
                 )
+                scanner.last_effective_strategy = effective_strategy
+                if base_strategy_mode == "all":
+                    scanner.last_strategy_reason = "mode=ALL: scanning momentum+pullback+reversal"
+                elif base_strategy_mode == "hybrid":
+                    scanner.last_strategy_reason = f"mode=HYBRID, regime={regime_info.get('regime', 'LOW_VOLATILITY')}"
+                else:
+                    scanner.last_strategy_reason = f"manual mode={base_strategy_mode}"
                 effective_settings = dict(settings)
                 effective_settings["market_regime"] = regime_info.get("regime", "LOW_VOLATILITY")
                 effective_settings["market_regime_info"] = regime_info
@@ -972,7 +987,7 @@ async def trading_loop(app):
                     await asyncio.sleep(scanner.last_slowdown_sec)
                 if candidates:
                     top = candidates[0]
-                    scanner.last_signal_summary = f"{top.get('symbol')} {top.get('side')} conf={top.get('confidence')} strategy={effective_strategy} count={len(candidates)}"
+                    scanner.last_signal_summary = f"{top.get('symbol')} {top.get('side')} conf={top.get('confidence')} strategy={top.get('strategy', effective_strategy)} mode={effective_strategy} count={len(candidates)}"
                 else:
                     scanner.last_signal_summary = "none"
                     scanner.last_reject_reason = "no candidates passed signal engine"
