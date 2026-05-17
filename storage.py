@@ -43,7 +43,7 @@ DEFAULT_SETTINGS = {
     "production_gate_enabled": True,
 
     "ws_enabled": True,
-    "ws_require_healthy_for_entries": True,
+    "ws_require_healthy_for_entries": False,
     "ws_stale_sec": 10,
     "settings_revision": 1,
 }
@@ -145,6 +145,11 @@ class Storage:
         for k, v in rows:
             try: out[k] = json.loads(v)
             except Exception: out[k] = v
+        # v0046 safety migration: WS health is advisory only. Older Railway DBs
+        # may contain ws_require_healthy_for_entries=true from previous builds;
+        # forcing it false prevents stale websocket warnings from stopping scans
+        # or blocking entries when REST/scanner data is usable.
+        out["ws_require_healthy_for_entries"] = False
         return out
 
     async def upsert_position(self, pos: dict) -> None:

@@ -12,8 +12,10 @@ class ProductionGate:
             return False, "live_trading is OFF"
         if not api_ready:
             return False, "exchange API is not ready"
-        if self._ws_enabled(settings) and bool(settings.get("ws_require_healthy_for_entries", True)) and not ws_healthy:
-            return False, "websocket is unhealthy/stale"
+        # WebSocket is an acceleration/cache source only. It must never block
+        # new entries by itself because scanner can continue through REST/fresh
+        # cached market data. A stale WS is reported in status, not used as a
+        # hard production gate.
         if not sync_ok:
             return False, "exchange sync is not OK"
         if float(settings.get("risk_pct", 0.0)) <= 0:
@@ -24,8 +26,10 @@ class ProductionGate:
 
     def validate_for_paper(self, settings: dict, ws_healthy: bool = True) -> tuple[bool, str]:
         # Paper mode may run even without private exchange API.
-        if self._ws_enabled(settings) and bool(settings.get("ws_require_healthy_for_entries", True)) and not ws_healthy:
-            return False, "websocket is unhealthy/stale"
+        # WebSocket is an acceleration/cache source only. It must never block
+        # new entries by itself because scanner can continue through REST/fresh
+        # cached market data. A stale WS is reported in status, not used as a
+        # hard production gate.
         if float(settings.get("risk_pct", 0.0)) <= 0:
             return False, "risk_pct must be > 0"
         if int(settings.get("max_open_positions", 0)) <= 0:

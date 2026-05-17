@@ -48,6 +48,29 @@ def allowed(update: Update) -> bool:
     uid = update.effective_user.id if update.effective_user else None
     return str(uid) in ids
 
+def scanner_market_data_fresh(max_age_sec: int = 900) -> bool:
+    """Return True when the scanner has a usable recent universe/cycle.
+
+    WebSocket is an acceleration source, not a hard execution dependency.
+    If WS briefly disconnects but the scanner has recently loaded symbols and
+    completed a scan cycle without a large error burst, entries may continue
+    through REST/fallback market data instead of being blocked by stale WS state.
+    """
+    try:
+        age = time.time() - float(getattr(scanner, "last_refresh", 0) or 0)
+        loaded = len(getattr(scanner, "hot_symbols", []) or [])
+        scanned = int(getattr(scanner, "last_cycle_scanned", 0) or 0)
+        errors = int(getattr(scanner, "last_cycle_errors", 0) or 0)
+        source = str(getattr(scanner, "last_scan_source", "") or "")
+        return (
+            loaded > 0
+            and source not in {"", "init"}
+            and age <= max_age_sec
+            and (scanned == 0 or errors <= max(3, int(scanned * 0.35)))
+        )
+    except Exception:
+        return False
+
 async def notify_admin(app, text: str, min_interval_sec: int = 0, key: str = "notify") -> None:
     chat_id = first_admin_id()
     if not chat_id:
@@ -78,6 +101,7 @@ def _scan_status_text(settings: dict, status: str = "scanning", last_signal: str
         f"WS: {('OFF' if not settings.get('ws_enabled', True) else ('healthy' if (ws_supervisor and ws_supervisor.healthy()) else 'REST fallback'))}"
         f" | pending={getattr(getattr(ws_supervisor, 'status', None), 'pending_updates', 0)}"
         f" | dropped={getattr(getattr(ws_supervisor, 'status', None), 'dropped_updates', 0)}\n"
+        f"Execution data: {('fresh' if scanner_market_data_fresh() else 'stale')}\n"
         f"Regime: {scanner.last_regime.get('regime')}\n"
         f"Last signal: {last_signal}\n"
         f"Last decision: {last_decision}\n"
@@ -111,6 +135,24 @@ async def update_scanner_status(app, settings: dict, status: str = "scanning", l
             app.bot_data["scanner_status_last_edit"] = now
         except Exception as e2:
             log.warning("scanner status send failed: %s", e2)
+
+async def create_fresh_scanner_status(app, settings: dict, status: str = "waiting next scan") -> None:
+    """Create a new scanner live-status message at the bottom of the chat.
+
+    Telegram edits do not move an old message down. When the user presses Run,
+    we intentionally create a fresh message and then all scanner updates edit
+    this newest message id.
+    """
+    chat_id = first_admin_id()
+    if not chat_id:
+        return
+    text = _scan_status_text(settings, status)
+    try:
+        msg = await app.bot.send_message(chat_id=chat_id, text=text)
+        app.bot_data["scanner_status_message_id"] = msg.message_id
+        app.bot_data["scanner_status_last_edit"] = time.time()
+    except Exception as e:
+        log.warning("fresh scanner status send failed: %s", e)
 
 def _api_creds(settings: dict) -> tuple[str, str]:
     # Telegram-saved credentials have priority. Environment variables remain a fallback
@@ -286,14 +328,28 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if lock is None:
         lock = asyncio.Lock()
         context.application.bot_data["trading_start_lock"] = lock
+    already_running = False
     async with lock:
         if trading_task and not trading_task.done():
             running = True
-            await reply(update, "🟢 Bot already running\nExisting scanner/execution loop is active. New settings will apply on the next scan cycle.", reply_markup=MAIN_MENU)
-            return
-        running = True
-        trading_task = context.application.create_task(trading_loop(context.application))
-    await reply(update, "🟢 Bot started\nScanner/execution loop enabled.", reply_markup=MAIN_MENU)
+            already_running = True
+        else:
+            running = True
+            trading_task = context.application.create_task(trading_loop(context.application))
+
+    if already_running:
+        await reply(update, "🟢 Bot already running\nExisting scanner/execution loop is active. New settings will apply on the next scan cycle.", reply_markup=MAIN_MENU)
+    else:
+        await reply(update, "🟢 Bot started\nScanner/execution loop enabled.", reply_markup=MAIN_MENU)
+
+    # Put a new live scanner status at the bottom after the Run response.
+    # Future scanner updates will edit this new message instead of an old one above.
+    settings = await storage.all_settings()
+    await create_fresh_scanner_status(
+        context.application,
+        settings,
+        status=("already running; waiting next scan" if already_running else "started; waiting next scan"),
+    )
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running
@@ -552,7 +608,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "session_filter_enabled", "america_short_bias_enabled", "max_spread_pct", "max_slippage_pct",
         "min_depth_usdt", "max_daily_loss_pct", "max_consecutive_losses", "cooldown_after_close_sec",
         "limit_timeout_sec", "proxy_enabled", "proxy_url", "mexc_api_key", "mexc_api_secret",
-        "ws_enabled", "ws_require_healthy_for_entries", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold",
+        "ws_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold",
     }
     if key not in allowed_keys:
         await reply(update, f"❌ Setting is not allowed through /set: {key}", reply_markup=MAIN_MENU)
@@ -861,9 +917,14 @@ async def trading_loop(app):
 
                 # 4) Infrastructure gate for NEW entries only.
                 ws_enabled = bool(settings.get("ws_enabled", True))
-                # Binance WS is optional market radar. If it is stale but scanner
-                # successfully refreshed symbols from MEXC REST, market data is still usable.
-                ws_healthy = (not ws_enabled) or ws.healthy() or str(scanner.last_scan_source).endswith("_rest")
+                # WS is an acceleration source, not a hard entry dependency.
+                # If WS is temporarily stale but scanner market data is fresh or REST fallback
+                # has been used recently, entries must not be blocked by WS health alone.
+                market_data_ok = scanner_market_data_fresh(max_age_sec=max(900, int(settings.get("symbol_refresh_sec", 300)) * 3))
+                # WS health is advisory only. Even if the websocket reconnects, the
+                # scanner must keep cycling and entries may proceed when REST/cache
+                # scanner data is fresh. Never pass a false WS gate downstream.
+                ws_healthy = True
                 api_key, api_secret = _api_creds(settings)
                 api_ready = bool(api_key and api_secret) if live else True
                 sync_ok = True
@@ -881,7 +942,8 @@ async def trading_loop(app):
                 if not gate_ok:
                     scanner.last_reject_reason = f"gate blocked: {gate_reason}"
                     await update_scanner_status(app, settings, status="entries blocked", force=True)
-                    await notify_admin(app, f"⚠️ Входы заблокированы: {gate_reason}", min_interval_sec=300, key="gate_blocked")
+                    if "websocket" not in str(gate_reason).lower():
+                        await notify_admin(app, f"⚠️ Входы заблокированы: {gate_reason}", min_interval_sec=300, key="gate_blocked")
                     await asyncio.sleep(int(settings.get("scan_interval_sec", 3)))
                     continue
 
