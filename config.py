@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = os.getenv("BOT_VERSION", "0035 CHAT API SETTINGS")
+VERSION = os.getenv("BOT_VERSION", "0037 MANUAL SCAN SOURCES")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -28,6 +28,7 @@ def env_int(name: str, default: int) -> int:
 class Defaults:
     live_trading: bool = env_bool("LIVE_TRADING", False)
     universe_mode: str = os.getenv("UNIVERSE_MODE", "adaptive")
+    scan_market_source: str = os.getenv("SCAN_MARKET_SOURCE", "mexc_binance")
     max_symbols: int = env_int("MAX_SYMBOLS", 100)
     scan_interval_sec: int = env_int("SCAN_INTERVAL_SEC", 3)
     symbol_refresh_sec: int = env_int("SYMBOL_REFRESH_SEC", 300)

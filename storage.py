@@ -18,6 +18,7 @@ DEFAULT_SETTINGS = {
     "regime_adaptation": DEFAULTS.regime_adaptation,
     "mirror_mode": DEFAULTS.mirror_mode,
     "spot_confirmation_enabled": DEFAULTS.spot_confirmation_enabled,
+    "scan_market_source": DEFAULTS.scan_market_source,
     "session_filter_enabled": DEFAULTS.session_filter_enabled,
     "america_short_bias_enabled": DEFAULTS.america_short_bias_enabled,
     "max_spread_pct": DEFAULTS.max_spread_pct,

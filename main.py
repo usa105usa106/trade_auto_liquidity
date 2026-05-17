@@ -32,13 +32,37 @@ exchange_client = None
 ws_supervisor = None
 trading_task = None
 
+def admin_id_list() -> list[str]:
+    return [x.strip() for x in str(ADMIN_IDS or os.getenv("ADMIN_IDS", "")).split(",") if x.strip()]
+
+def first_admin_id() -> str:
+    ids = admin_id_list()
+    return ids[0] if ids else ""
+
 def allowed(update: Update) -> bool:
     # Fail closed: if ADMIN_IDS is not configured, nobody can control
     # the bot from Telegram. This prevents accidental public access on Railway/VPS.
-    if not ADMIN_IDS:
+    ids = set(admin_id_list())
+    if not ids:
         return False
     uid = update.effective_user.id if update.effective_user else None
-    return str(uid) == str(ADMIN_IDS)
+    return str(uid) in ids
+
+async def notify_admin(app, text: str, min_interval_sec: int = 0, key: str = "notify") -> None:
+    chat_id = first_admin_id()
+    if not chat_id:
+        return
+    now = time.time()
+    if min_interval_sec:
+        last_key = f"last_{key}"
+        last = float(app.bot_data.get(last_key, 0) or 0)
+        if now - last < min_interval_sec:
+            return
+        app.bot_data[last_key] = now
+    try:
+        await app.bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        log.warning("telegram notification failed: %s", e)
 
 def _api_creds(settings: dict) -> tuple[str, str]:
     # Telegram-saved credentials have priority. Environment variables remain a fallback
@@ -129,7 +153,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Ключевые настройки:
 live_trading, risk_pct, max_open_positions, scan_interval_sec,
 symbol_refresh_sec, universe_mode, strategy_mode, mirror_mode,
-spot_confirmation_enabled, session_filter_enabled, america_short_bias_enabled, ws_enabled.
+spot_confirmation_enabled, session_filter_enabled, america_short_bias_enabled, ws_enabled,
+scan_market_source = binance_binance | mexc_mexc | mexc_binance.
+
+По умолчанию: mexc_binance = MEXC фьючи скан + Binance spot подтверждение.
 """.strip(), reply_markup=MAIN_MENU)
 
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -230,10 +257,14 @@ Scan: {s.get('scan_interval_sec')}s
 Refresh: {s.get('symbol_refresh_sec')}s
 Mirror: {s.get('mirror_mode')}
 Spot confirmation: {s.get('spot_confirmation_enabled')}
+Фьючи/Спот source: {s.get('scan_market_source', 'mexc_binance')}
 Session filter: {s.get('session_filter_enabled')}
 America short bias: {s.get('america_short_bias_enabled')}
 Open positions: {len(positions)}
 Revision: {s.get('settings_revision')}
+Scan source: {scanner.last_scan_source}
+Symbols loaded: {len(scanner.hot_symbols)}
+Scanner error: {scanner.last_refresh_error or '-'}
 
 {ws_text}
 """.strip()
@@ -455,6 +486,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], new_rev, new_settings.get("universe_mode")))
         elif key == "strategy_mode":
             await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Hybrid","hybrid")], new_rev, new_settings.get("strategy_mode")))
+        elif key == "scan_market_source":
+            await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], new_rev, new_settings.get("scan_market_source", "mexc_binance")))
         elif key == "scan_interval_sec":
             await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("1s","1"),("2s","2"),("3s","3"),("5s","5"),("10s","10")], new_rev, new_settings.get("scan_interval_sec")))
         elif key == "symbol_refresh_sec":
@@ -503,6 +536,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], rev, s.get("universe_mode")))
         elif name == "strategy":
             await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Hybrid","hybrid")], rev, s.get("strategy_mode")))
+        elif name == "marketsource":
+            await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], rev, s.get("scan_market_source", "mexc_binance")))
         elif name == "scan":
             await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("1s","1"),("2s","2"),("3s","3"),("5s","5"),("10s","10")], rev, s.get("scan_interval_sec")))
         elif name == "refresh":
@@ -526,19 +561,48 @@ async def get_last_price(ex, symbol: str) -> float:
     ticker = await ex.fetch_ticker(symbol)
     return float(ticker.get("last") or ticker.get("close") or ticker.get("bid") or ticker.get("ask") or 0)
 
-async def fetch_spot_data_for_candidate(ex, candidate: dict) -> dict | None:
+async def fetch_spot_data_for_candidate(ex, candidate: dict, settings: dict | None = None) -> dict | None:
     symbol = candidate.get("symbol")
-    try:
-        spot_symbol = symbol.split(":", 1)[0]
-        candles = await ex.exchange.fetch_ohlcv(spot_symbol, timeframe="1m", limit=25, params={"type": "spot"})
-        ticker = await ex.exchange.fetch_ticker(spot_symbol, params={"type": "spot"})
-        if not candles or len(candles) < 5: return None
-        vols=[float(c[5]) for c in candles]; closes=[float(c[4]) for c in candles]
-        avg=sum(vols[:-1])/max(1,len(vols[:-1])); move=(closes[-1]-closes[-2])/closes[-2]*100 if closes[-2] else 0
-        return {"spot_price":float(ticker.get("last") or closes[-1]),"spot_volume_now":vols[-1],"spot_volume_avg":avg,"spot_price_change_pct":move}
-    except Exception as e:
-        log.debug("spot confirmation data failed for %s: %s", symbol, e)
+    settings = settings or {}
+    mode = str(settings.get("scan_market_source", "mexc_binance") or "mexc_binance").lower()
+    spot_source = "binance" if mode.endswith("binance") else "mexc"
+    spot_symbol = str(symbol or "").split(":", 1)[0]
+    if not spot_symbol:
         return None
+
+    client = None
+    try:
+        import ccxt.async_support as ccxt
+        if spot_source == "binance":
+            client = ccxt.binance({"enableRateLimit": True})
+        else:
+            client = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+        await client.load_markets()
+        candles = await client.fetch_ohlcv(spot_symbol, timeframe="1m", limit=25)
+        ticker = await client.fetch_ticker(spot_symbol)
+
+        if not candles or len(candles) < 5:
+            return None
+        vols = [float(c[5]) for c in candles]
+        closes = [float(c[4]) for c in candles]
+        avg = sum(vols[:-1]) / max(1, len(vols[:-1]))
+        move = (closes[-1] - closes[-2]) / closes[-2] * 100 if closes[-2] else 0
+        return {
+            "spot_source": spot_source,
+            "spot_price": float(ticker.get("last") or closes[-1]),
+            "spot_volume_now": vols[-1],
+            "spot_volume_avg": avg,
+            "spot_price_change_pct": move,
+        }
+    except Exception as e:
+        log.debug("%s spot confirmation data failed for %s: %s", spot_source, symbol, e)
+        return None
+    finally:
+        if client:
+            try:
+                await client.close()
+            except Exception:
+                pass
 
 async def account_equity_usdt(ex, default: float = 1000.0) -> float:
     try:
@@ -569,34 +633,43 @@ async def trading_loop(app):
 
                 # 1) Position management ALWAYS runs first and is never blocked by entry gates.
                 events = await pos_manager.manage(lambda symbol: get_last_price(ex, symbol), live)
-                chat_id = os.getenv("ADMIN_IDS")
                 for ev in events:
-                    if chat_id and ev.get("type") not in {"pending_sync_warning", "price_error"}:
-                        try:
-                            await app.bot.send_message(chat_id=chat_id, text=f"📌 {ev['type']} {ev['symbol']}")
-                        except Exception as e:
-                            log.warning("telegram notification failed: %s", e)
+                    if ev.get("type") not in {"pending_sync_warning", "price_error"}:
+                        await notify_admin(app, f"📌 {ev['type']} {ev['symbol']}", key="position_event")
 
                 # 2) Refresh symbol universe.
                 if time.time() - scanner.last_refresh > int(settings.get("symbol_refresh_sec", 300)):
+                    await notify_admin(app, "🔎 Начал обновление сканера и списка фьючерсов...", min_interval_sec=240, key="scan_refresh_start")
                     await scanner.refresh_symbols(ex, settings, ws_supervisor=ws)
+                    if scanner.last_refresh_error:
+                        await notify_admin(
+                            app,
+                            f"⚠️ Ошибка скана фьючерсов: {scanner.last_refresh_error}\nИспользуется прошлый список монет: {len(scanner.hot_symbols)}",
+                            min_interval_sec=120,
+                            key="scan_refresh_error",
+                        )
+                    else:
+                        await notify_admin(
+                            app,
+                            f"✅ Сканер готов: {len(scanner.hot_symbols)} монет, source={scanner.last_scan_source}, regime={scanner.last_regime.get('regime')}",
+                            min_interval_sec=240,
+                            key="scan_refresh_done",
+                        )
 
                 # 3) Risk gate for NEW entries only. Use real account equity where available.
                 risk = RiskEngine(storage)
                 equity = await account_equity_usdt(ex, float(os.getenv("DEFAULT_EQUITY_USDT", "1000")))
                 ok, reason = await risk.allow_new_trades(settings, equity=equity)
                 if not ok:
-                    if chat_id:
-                        try:
-                            await app.bot.send_message(chat_id=chat_id, text=f"🛑 New entries paused: {reason}")
-                        except Exception as e:
-                            log.warning("telegram notification failed: %s", e)
+                    await notify_admin(app, f"🛑 Новые входы на паузе: {reason}", min_interval_sec=300, key="risk_paused")
                     await asyncio.sleep(int(settings.get("scan_interval_sec", 3)))
                     continue
 
                 # 4) Infrastructure gate for NEW entries only.
                 ws_enabled = bool(settings.get("ws_enabled", True))
-                ws_healthy = (not ws_enabled) or ws.healthy()
+                # Binance WS is optional market radar. If it is stale but scanner
+                # successfully refreshed symbols from MEXC REST, market data is still usable.
+                ws_healthy = (not ws_enabled) or ws.healthy() or str(scanner.last_scan_source).endswith("_rest")
                 api_key, api_secret = _api_creds(settings)
                 api_ready = bool(api_key and api_secret) if live else True
                 sync_ok = True
@@ -612,6 +685,7 @@ async def trading_loop(app):
                 else:
                     gate_ok, gate_reason = ProductionGate().validate_for_paper(settings, ws_healthy=ws_healthy)
                 if not gate_ok:
+                    await notify_admin(app, f"⚠️ Входы заблокированы: {gate_reason}", min_interval_sec=300, key="gate_blocked")
                     await asyncio.sleep(int(settings.get("scan_interval_sec", 3)))
                     continue
 
@@ -632,6 +706,14 @@ async def trading_loop(app):
                 effective_settings["market_regime_info"] = regime_info
                 effective_settings["effective_strategy_mode"] = effective_strategy
                 candidates = await scanner.candidates(ex, effective_settings)
+                if candidates:
+                    top = candidates[0]
+                    await notify_admin(
+                        app,
+                        f"🎯 Найдены сигналы: {len(candidates)} | top={top.get('symbol')} {top.get('side')} conf={top.get('confidence')} strategy={effective_strategy}",
+                        min_interval_sec=120,
+                        key="candidates_found",
+                    )
 
                 for cand in candidates:
                     cand = MirrorEngine(str(settings.get("mirror_mode", "off"))).apply(cand, adaptive_stats)
@@ -641,7 +723,7 @@ async def trading_loop(app):
                         window_minutes=240,
                     ).apply(cand, settings)
 
-                    spot_data = await fetch_spot_data_for_candidate(ex, cand) if bool(settings.get("spot_confirmation_enabled", True)) else None
+                    spot_data = await fetch_spot_data_for_candidate(ex, cand, settings) if bool(settings.get("spot_confirmation_enabled", True)) else None
                     cand = SpotConfirmationEngine(enabled=bool(settings.get("spot_confirmation_enabled", True))).apply(cand, spot_data)
 
                     if not cand.get("allowed_by_session", True):
@@ -655,19 +737,17 @@ async def trading_loop(app):
                         continue
 
                     placed = await exec_engine.place_entry(plan, live)
-                    if placed.get("ok") and chat_id:
-                        try:
-                            await app.bot.send_message(
-                                chat_id=chat_id,
-                                text=(
-                                    f"🟢 Position opened\n{plan.symbol} {plan.side}\n"
-                                    f"Strategy: {plan.strategy}\nEntry: {plan.entry_price:.8f}\n"
-                                    f"SL: {plan.stop_price:.8f}\nTP: {plan.take_price:.8f}\n"
-                                    f"Qty: {plan.qty:.6f}\nLive: {live}"
-                                ),
-                            )
-                        except Exception as e:
-                            log.warning("telegram notification failed: %s", e)
+                    if placed.get("ok"):
+                        await notify_admin(
+                            app,
+                            (
+                                f"🟢 Position opened\n{plan.symbol} {plan.side}\n"
+                                f"Strategy: {plan.strategy}\nEntry: {plan.entry_price:.8f}\n"
+                                f"SL: {plan.stop_price:.8f}\nTP: {plan.take_price:.8f}\n"
+                                f"Qty: {plan.qty:.6f}\nLive: {live}"
+                            ),
+                            key="position_opened",
+                        )
 
                 await asyncio.sleep(int(settings.get("scan_interval_sec", 3)))
             except Exception as e:

@@ -22,6 +22,8 @@ class Scanner:
         self.last_refresh = 0
         self.hot_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT", "XRP/USDT"]
         self.last_regime = {"regime": "LOW_VOLATILITY", "source": "init"}
+        self.last_scan_source = "init"
+        self.last_refresh_error = ""
         self.engine = SignalEngine(
             min_confidence=float(os.getenv("SIGNAL_MIN_CONFIDENCE", "70")),
             volume_spike_mult=float(os.getenv("SIGNAL_VOLUME_SPIKE_MULT", "1.8")),
@@ -52,23 +54,77 @@ class Scanner:
 
         return max(10, min(n, 300, max(10, market_items_count)))
 
+    async def _fetch_binance_futures_tickers(self) -> dict:
+        import ccxt.async_support as ccxt
+        exchange = ccxt.binanceusdm({"enableRateLimit": True, "options": {"defaultType": "future"}})
+        try:
+            await exchange.load_markets()
+            return await exchange.fetch_tickers()
+        finally:
+            await exchange.close()
+
+    async def _fetch_scan_tickers(self, exchange_client, settings: dict, ws_supervisor=None) -> tuple[dict, str]:
+        """Return futures tickers for universe scanning using the user-selected source.
+
+        scan_market_source values:
+        - binance_binance: Binance futures scan + Binance spot confirmation
+        - mexc_mexc: MEXC futures scan + MEXC spot confirmation
+        - mexc_binance: MEXC futures scan + Binance spot confirmation (default)
+
+        There is intentionally NO automatic Binance->MEXC fallback here: if the
+        user selected Binance futures and it fails/stales, the bot reports the
+        error and keeps the previous universe instead of silently changing venue.
+        """
+        mode = str(settings.get("scan_market_source", "mexc_binance") or "mexc_binance").lower()
+        futures_source = "binance" if mode.startswith("binance") else "mexc"
+
+        if futures_source == "binance":
+            ws_error = ""
+            if ws_supervisor and ws_supervisor.healthy():
+                try:
+                    tickers = await ws_supervisor.tickers(max_age_sec=30)
+                    if tickers:
+                        return tickers, "binance_futures_ws"
+                    ws_error = "Binance futures websocket returned empty ticker cache"
+                except Exception as e:
+                    ws_error = f"Binance futures websocket failed: {e}"
+            try:
+                tickers = await self._fetch_binance_futures_tickers()
+                if tickers:
+                    if ws_error:
+                        self.last_refresh_error = ws_error
+                    return tickers, "binance_futures_rest"
+                raise RuntimeError("Binance futures REST returned empty ticker set")
+            except Exception as e:
+                msg = f"Binance futures scan failed: {e}"
+                if ws_error:
+                    msg = f"{ws_error}; {msg}"
+                raise RuntimeError(msg)
+
+        tickers = await exchange_client.fetch_tickers()
+        if tickers:
+            return tickers, "mexc_futures_rest"
+        raise RuntimeError("MEXC futures scan returned empty ticker set")
+
     async def refresh_symbols(self, exchange_client, settings: dict, ws_supervisor=None):
         self.last_refresh = time.time()
+        self.last_refresh_error = ""
         min_quote_volume = float(os.getenv("SIGNAL_MIN_24H_QUOTE_VOLUME", "5000000"))
         try:
-            tickers = await ws_supervisor.tickers(max_age_sec=30) if ws_supervisor and ws_supervisor.healthy() else await exchange_client.fetch_tickers()
+            tickers, source = await self._fetch_scan_tickers(exchange_client, settings, ws_supervisor)
+            self.last_scan_source = source
             regime_info = RegimeEngine().detect_from_tickers(tickers) if bool(settings.get("regime_adaptation", True)) else {"regime": "LOW_VOLATILITY", "source": "disabled"}
-            regime_info["source"] = "tickers"
+            regime_info["source"] = f"tickers:{source}"
             self.last_regime = regime_info
 
             items = []
             for sym, t in tickers.items():
                 if "USDT" not in sym:
                     continue
-                quote_volume = float(t.get("quoteVolume") or 0)
+                quote_volume = float(t.get("quoteVolume") or t.get("quoteVolume24h") or t.get("baseVolume") or 0)
                 if quote_volume < min_quote_volume:
                     continue
-                pct_change = abs(float(t.get("percentage") or 0))
+                pct_change = abs(float(t.get("percentage") or t.get("change") or 0))
                 try:
                     sym = exchange_client.normalize_symbol(sym)
                 except Exception:
@@ -88,6 +144,7 @@ class Scanner:
                 n = self._adaptive_symbol_count(settings, regime_info, len(items))
             self.hot_symbols = [s for _, s in items[:max(10, min(n, 300))]] or self.hot_symbols
         except Exception as e:
+            self.last_refresh_error = str(e)[:240]
             log.warning("symbol refresh failed: %s", e)
 
     async def detect_regime(self, exchange_client, settings: dict) -> dict:

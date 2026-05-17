@@ -23,15 +23,16 @@ class WSStatus:
     subscribed: str = "binance_futures_miniticker"
     stale_sec: int = 10
 
-    def age(self) -> float:
+    def age(self) -> float | None:
         if not self.last_message_ts:
-            return 10**9
+            return None
         return max(0.0, time.time() - self.last_message_ts)
 
     def healthy(self) -> bool:
         if not self.enabled:
             return True
-        return self.running and self.connected and self.age() <= self.stale_sec
+        age = self.age()
+        return self.running and self.connected and age is not None and age <= self.stale_sec
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -40,7 +41,7 @@ class WSStatus:
             "connected": self.connected,
             "healthy": self.healthy(),
             "reconnects": self.reconnects,
-            "last_message_age_sec": round(self.age(), 2),
+            "last_message_age_sec": None if self.age() is None else round(self.age(), 2),
             "last_error": self.last_error,
             "subscribed": self.subscribed,
         }
@@ -106,16 +107,23 @@ class WebSocketSupervisor:
                         self.status.connected = True
                         self.status.running = True
                         self.status.last_connect_ts = time.time()
+                        self.status.last_message_ts = 0.0
                         self.status.last_error = ""
                         backoff = self.reconnect_base
-                        async for msg in ws:
-                            if self._stop.is_set():
-                                break
+                        # Do not wait forever on a half-open connection. If Binance stops
+                        # sending miniTicker updates, mark WS unhealthy and reconnect so the
+                        # scanner can use MEXC REST fallback immediately.
+                        while not self._stop.is_set():
+                            msg = await ws.receive(timeout=max(5, self.status.stale_sec))
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 self.status.last_message_ts = time.time()
                                 await self._handle_message(msg.data)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                                 raise RuntimeError(f"websocket closed/error: {msg.type}")
+                            elif msg.type == aiohttp.WSMsgType.CLOSING:
+                                raise RuntimeError("websocket closing")
+                            elif msg.type == aiohttp.WSMsgType.PING:
+                                await ws.pong()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -193,7 +201,7 @@ class WebSocketSupervisor:
             f"WS running: {st['running']}\n"
             f"WS connected: {st['connected']}\n"
             f"WS healthy: {st['healthy']}\n"
-            f"WS last msg age: {st['last_message_age_sec']}s\n"
+            f"WS last msg age: {st['last_message_age_sec'] if st['last_message_age_sec'] is not None else 'no messages yet'}s\n"
             f"WS reconnects: {st['reconnects']}\n"
             f"WS last error: {st['last_error'] or '-'}"
         )

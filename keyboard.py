@@ -21,6 +21,7 @@ def settings_menu(revision: int, settings: dict | None = None):
     api_label = "✅ API saved" if api_ready else "○ API missing"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🌐 Universe: {_value(settings, 'universe_mode', 'adaptive')}", callback_data=f"menu:universe:{r}")],
+        [InlineKeyboardButton(f"📡 Фьючи|Спот: {_value(settings, 'scan_market_source', 'mexc_binance')}", callback_data=f"menu:marketsource:{r}")],
         [InlineKeyboardButton(f"📈 Strategy: {_value(settings, 'strategy_mode', 'hybrid')}", callback_data=f"menu:strategy:{r}")],
         [InlineKeyboardButton(f"⏱ Scan: {_value(settings, 'scan_interval_sec', '3')}s", callback_data=f"menu:scan:{r}"), InlineKeyboardButton(f"🔄 Refresh: {_value(settings, 'symbol_refresh_sec', '300')}s", callback_data=f"menu:refresh:{r}")],
         [InlineKeyboardButton(f"📊 Risk: {float((settings or {}).get('risk_pct', 0.005))*100:.2f}%", callback_data=f"menu:risk:{r}"), InlineKeyboardButton(f"🔥 Max Pos: {_value(settings, 'max_open_positions', '5')}", callback_data=f"menu:maxpos:{r}")],
