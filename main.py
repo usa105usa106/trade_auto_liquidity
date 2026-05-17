@@ -258,10 +258,11 @@ async def get_ws(settings: dict):
     proxy_enabled = bool(settings.get("proxy_enabled", False))
     proxy_url = str(settings.get("proxy_url", ""))
     ws_update_throttle_ms = int(settings.get("ws_update_throttle_ms", os.getenv("WS_UPDATE_THROTTLE_MS", "500")) or 500)
-    ws_max_updates_per_batch = int(settings.get("ws_max_updates_per_batch", os.getenv("WS_MAX_UPDATES_PER_BATCH", "250")) or 250)
+    ws_max_updates_per_batch = int(settings.get("ws_max_updates_per_batch", os.getenv("WS_MAX_UPDATES_PER_BATCH", "1000")) or 1000)
     ws_queue_limit = int(settings.get("ws_queue_limit", os.getenv("WS_QUEUE_LIMIT", "2000")) or 2000)
     ws_adaptive_slowdown_threshold = int(settings.get("ws_adaptive_slowdown_threshold", os.getenv("WS_ADAPTIVE_SLOWDOWN_THRESHOLD", "1000")) or 1000)
-    desired_signature = (enabled, venue, proxy_enabled, proxy_url, ws_update_throttle_ms, ws_max_updates_per_batch, ws_queue_limit, ws_adaptive_slowdown_threshold)
+    ws_stale_sec = int(settings.get("ws_stale_sec", os.getenv("WS_STALE_SEC", "20")) or 20)
+    desired_signature = (enabled, venue, proxy_enabled, proxy_url, ws_update_throttle_ms, ws_max_updates_per_batch, ws_queue_limit, ws_adaptive_slowdown_threshold, ws_stale_sec)
     current_signature = getattr(ws_supervisor, "_bot_signature", None) if ws_supervisor else None
     if ws_supervisor and current_signature == desired_signature:
         return ws_supervisor
@@ -276,6 +277,7 @@ async def get_ws(settings: dict):
         max_updates_per_batch=ws_max_updates_per_batch,
         queue_limit=ws_queue_limit,
         adaptive_slowdown_threshold=ws_adaptive_slowdown_threshold,
+        stale_sec=ws_stale_sec,
     )
     ws_supervisor._bot_signature = desired_signature
     return ws_supervisor

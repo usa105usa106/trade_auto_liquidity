@@ -44,7 +44,7 @@ DEFAULT_SETTINGS = {
 
     "ws_enabled": True,
     "ws_require_healthy_for_entries": False,
-    "ws_stale_sec": 10,
+    "ws_stale_sec": 20,
     "settings_revision": 1,
 }
 

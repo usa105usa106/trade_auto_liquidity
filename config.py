@@ -35,7 +35,7 @@ class Defaults:
     scanner_error_slowdown_threshold: int = env_int("SCANNER_ERROR_SLOWDOWN_THRESHOLD", 5)
     scanner_slowdown_max_sec: int = env_int("SCANNER_SLOWDOWN_MAX_SEC", 15)
     ws_update_throttle_ms: int = env_int("WS_UPDATE_THROTTLE_MS", 500)
-    ws_max_updates_per_batch: int = env_int("WS_MAX_UPDATES_PER_BATCH", 250)
+    ws_max_updates_per_batch: int = env_int("WS_MAX_UPDATES_PER_BATCH", 1000)
     ws_queue_limit: int = env_int("WS_QUEUE_LIMIT", 2000)
     ws_adaptive_slowdown_threshold: int = env_int("WS_ADAPTIVE_SLOWDOWN_THRESHOLD", 1000)
     symbol_refresh_sec: int = env_int("SYMBOL_REFRESH_SEC", 300)

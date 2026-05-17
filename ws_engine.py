@@ -87,17 +87,17 @@ class WebSocketSupervisor:
     earlier "Expected HTTP" error when proxy_url starts with socks5://.
     """
 
-    def __init__(self, proxy_url: str = "", proxy_enabled: bool = False, enabled: bool = True, venue: str = "mexc", update_throttle_ms: int = 500, max_updates_per_batch: int = 250, queue_limit: int = 2000, adaptive_slowdown_threshold: int = 1000):
+    def __init__(self, proxy_url: str = "", proxy_enabled: bool = False, enabled: bool = True, venue: str = "mexc", update_throttle_ms: int = 500, max_updates_per_batch: int = 1000, queue_limit: int = 2000, adaptive_slowdown_threshold: int = 1000, stale_sec: int | None = None):
         self.venue = futures_source_from_mode(venue)
         self.url = self._url_for_venue(self.venue)
         self.proxy_url = proxy_url if proxy_enabled else ""
         self.status = WSStatus(
             enabled=enabled,
-            stale_sec=int(os.getenv("WS_STALE_SEC", "20")),
+            stale_sec=int(stale_sec if stale_sec is not None else os.getenv("WS_STALE_SEC", "20")),
             venue=self.venue,
             subscribed=self._subscription_name(self.venue),
             update_throttle_ms=max(100, int(update_throttle_ms or 500)),
-            max_updates_per_batch=max(25, int(max_updates_per_batch or 250)),
+            max_updates_per_batch=max(25, int(max_updates_per_batch or 1000)),
             queue_limit=max(100, int(queue_limit or 2000)),
         )
         self.ping_interval = int(os.getenv("WS_PING_INTERVAL_SEC", "15"))
@@ -162,6 +162,10 @@ class WebSocketSupervisor:
         if self.venue == "mexc":
             # MEXC futures all-ticker stream. The server replies with push.tickers.
             await ws.send_json({"method": "sub.tickers", "param": {}})
+            # Mark the connection as alive immediately after a successful subscribe send.
+            # The ticker cache becomes usable only after push.tickers arrives, but this
+            # avoids a misleading "no messages yet" state during the first seconds.
+            self.status.last_message_ts = time.time()
 
     async def _run(self) -> None:
         backoff = self.reconnect_base
@@ -172,19 +176,28 @@ class WebSocketSupervisor:
                         self.status.connected = True
                         self.status.running = True
                         self.status.last_connect_ts = time.time()
-                        self.status.last_message_ts = 0.0
+                        self.status.last_message_ts = time.time()
                         self.status.last_error = ""
                         backoff = self.reconnect_base
                         await self._subscribe(ws)
+                        last_client_ping_ts = 0.0
                         while not self._stop.is_set():
                             try:
-                                msg = await ws.receive(timeout=max(5, self.status.stale_sec))
+                                msg = await ws.receive(timeout=max(5, min(self.status.stale_sec, self.ping_interval)))
                             except asyncio.TimeoutError:
-                                raise RuntimeError(f"{self.venue} websocket stale: no messages for {self.status.stale_sec}s")
+                                # MEXC can go quiet between pushes on some connections. Send an
+                                # application-level ping before declaring the socket dead.
+                                now = time.time()
+                                if self.venue == "mexc" and now - last_client_ping_ts >= self.ping_interval:
+                                    await ws.send_json({"method": "ping"})
+                                    last_client_ping_ts = now
+                                    continue
+                                if now - self.status.last_message_ts >= self.status.stale_sec:
+                                    raise RuntimeError(f"{self.venue} websocket stale: no messages for {self.status.stale_sec}s")
+                                continue
                             if msg.type == aiohttp.WSMsgType.TEXT:
+                                self.status.last_message_ts = time.time()
                                 updated = await self._handle_message(msg.data)
-                                if updated:
-                                    self.status.last_message_ts = time.time()
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                                 raise RuntimeError(f"websocket closed/error: {msg.type}")
                             elif msg.type == aiohttp.WSMsgType.CLOSING:
@@ -227,9 +240,9 @@ class WebSocketSupervisor:
         max_batch = self.status.max_updates_per_batch
         now = time.time()
         async with self._lock:
-            if len(rows) > max_batch:
-                self.status.dropped_updates += len(rows) - max_batch
-                rows = rows[:max_batch]
+            # Do not truncate one full-exchange ticker snapshot. MEXC push.tickers can
+            # contain 800+ contracts; cutting it to 250 makes the WS cache incomplete
+            # and produces false "dropped" growth. queue_limit still protects memory.
             for row in rows:
                 symbol = row.get("symbol")
                 if not symbol:
