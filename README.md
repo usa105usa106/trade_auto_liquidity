@@ -1,0 +1,230 @@
+# Liquidity Telegram Bot v0030 AUTOPILOT FIXED
+
+Signal-engine build for Railway with real futures-first candidate generation.
+
+## Что включено
+
+- Telegram bot с обычным главным меню 2 столбика.
+- Inline-настройки только внутри Settings.
+- Сохранение настроек в SQLite.
+- Защита от старых inline callback events через revision.
+- Paper/Live mode. По умолчанию Live OFF.
+- MEXC/BingX-ready через CCXT. Основной execution venue: MEXC futures.
+- Futures-first architecture.
+- Spot confirmation только после futures-сигнала.
+- Adaptive Strategy Adaptation.
+- Market Regime Adaptation.
+- Mirror Mode OFF/ON/AUTO.
+- Asia/America session engine по МСК.
+- Asia: 03:00–07:00 МСК.
+- America: 16:30–20:30 МСК.
+- America Short Bias: SHORT не режется по риску, LONG режется и требует сильнее сигнал.
+- Risk filters: spread, slippage, weak depth.
+- Trade journal SQLite.
+- /stats: PF, winrate, expectancy.
+- /sync: позиции и ордера.
+- Proxy settings.
+- Railway files: Procfile, railway.json.
+
+## Главное меню
+
+Run / Stop  
+Status / Panic  
+Positions / Stats  
+Balance / Ping  
+Settings
+
+## Команды
+
+/start  
+/help  
+/run  
+/stop  
+/panic  
+/status  
+/ping  
+/balance  
+/positions  
+/stats  
+/sync  
+/proxy on|off|set URL|test  
+/set key value
+
+## Важное
+
+Live trading требует:
+1. TELEGRAM_TOKEN
+2. API ключи биржи
+3. LIVE_TRADING=true через Settings или env
+4. Проверку на маленьком депозите
+
+Даже с production-safe архитектурой бот не гарантирует прибыль.
+
+
+## v0025 SIGNAL
+
+Добавлен реальный signal engine.
+
+Теперь scanner не пустой:
+- берёт hot futures symbols
+- получает OHLCV 1m
+- получает orderbook
+- ищет реальные кандидаты:
+  - Momentum breakout
+  - Pullback reclaim
+  - Reversal / liquidity sweep
+- считает confidence
+- отдаёт только кандидатов выше threshold
+
+Пайплайн:
+Futures market data
+→ SignalEngine
+→ Mirror
+→ Session engine
+→ Spot confirmation
+→ Risk filters
+→ Execution layer
+
+Важно:
+Это не гарантия прибыли. Это реальный генератор сигналов, который всё равно надо paper-forward тестировать.
+
+
+## v0026 EXECUTION FIX
+
+Исправлено главное:
+- signal engine больше не заканчивается no-op
+- candidate теперь превращается в TradePlan
+- считается qty через risk sizing
+- рассчитываются SL/TP через ATR%
+- сделка реально отправляется в ExecutionEngine
+- paper mode создаёт позицию в SQLite
+- live mode отправляет order через CCXT
+- PositionManager сопровождает TP/SL/time-stop/breakeven
+- spot confirmation запрашивается только после futures candidate
+
+
+
+## v0027 WS HARDENING
+
+Добавлено:
+- WebSocketSupervisor
+- Binance Futures miniTicker realtime stream
+- auto reconnect с exponential backoff
+- heartbeat / ping-pong
+- stale-data protection
+- resubscribe через reconnect
+- shared ticker cache для price/status
+- fail-safe: если WS stale/unhealthy, новые входы блокируются
+- positions management продолжает работать через REST fallback
+- /status и /ping показывают состояние WS
+- Settings: 🔌 WebSocket ON/OFF
+
+Новые настройки:
+- ws_enabled
+- ws_require_healthy_for_entries
+- ws_stale_sec
+
+Важно:
+WebSocket hardening снижает риск торговли по старым данным, но не гарантирует прибыль.
+
+
+## v0028 PRODUCTION REVIEW
+
+Добавлено:
+- ProductionGate
+- блокировка live-входов без API-ключей
+- блокировка новых входов при unhealthy/stale WebSocket
+- блокировка новых входов при sync failure
+- тесты production gate
+- полный audit.py
+
+Важно:
+Этот билд технически проверен, но live-edge-cases MEXC/BingX всё равно проверяются только реальными API:
+partial fills, reduceOnly, trigger TP/SL, private WS fills.
+
+Потенциальные подозрительные маркеры, найденные статическим поиском:
+[]
+
+## v0029 AUTOPILOT HARDENED
+
+Исправлены блокеры полного автопилота:
+
+- position management теперь выполняется первым и не блокируется production gate;
+- новые входы блокируются отдельно от сопровождения уже открытых позиций;
+- paper mode больше не зависит от private exchange endpoints;
+- live mode блокирует вход, если не удалось проверить open orders на бирже;
+- добавлен per-symbol async lock против дублей при одновременных сигналах;
+- open + pending + closing позиции считаются занятыми слотами;
+- pending limit получает lifecycle;
+- ProductionGate использует реальные настройки ws_enabled/ws_require_healthy_for_entries;
+- добавлены тесты autopilot hardening.
+
+## v0030 AUTOPILOT FIXED
+
+Исправлены 7 пунктов ревью:
+
+- pytest теперь запускает async-тесты через `pytest-asyncio`, добавлен `pytest.ini`;
+- orderbook больше не подменяется искусственно хорошими значениями: без реального стакана сигнал не создаётся;
+- `fetch_positions` больше не возвращает пустой список при отсутствии поддержки биржи, а явно сообщает ошибку;
+- live limit-entry больше не считается исполненным только потому, что исчез из open orders: статус подтверждается через `fetch_order`;
+- live TP/SL protection теперь обязательна по умолчанию через `REQUIRE_EXCHANGE_PROTECTION=true`; если protection не поставлена, позиция закрывается fail-safe;
+- `/run` больше не создаёт параллельные trading loops;
+- символы нормализуются через `load_markets()` под swap/futures формат выбранной ccxt-биржи;
+- скрытые `except/pass` в торговом контуре заменены на логирование или явное сохранение ошибки.
+
+Проверки текущего архива:
+
+```text
+python -m pytest -q
+20 passed
+```
+
+## v0033 AUTOPILOT HARDENED
+
+Исправлены повторно найденные live/autopilot edge cases:
+
+- `/panic` закрывает локальные позиции и в paper mode, и в live mode;
+- ошибка `cancel_all_orders()` больше не прерывает закрытие позиций в `/panic`;
+- `/sync` при импорте внешней позиции рассчитывает SL/TP и пытается сразу поставить exchange-side protection orders;
+- market entry теперь использует фактическую fill/average цену из ответа биржи и пересчитывает SL/TP от неё;
+- Settings callback-кнопки после toggle/set возвращают обновлённое меню, а не тупик “saved”;
+- `VERSION` обновлён до `0033 AUTOPILOT HARDENED`;
+- старые misleading-комментарии в runtime-коде заменены на актуальные описания.
+
+Проверки текущего архива:
+
+```text
+python -m pytest -q
+30 passed
+
+python audit.py
+AUDIT PASSED
+
+python -m compileall -q .
+OK
+```
+
+
+## v0034 ADAPTIVE REGIME WIRED
+
+Исправлено после ревью:
+
+- `VERSION` обновлён до `0034 ADAPTIVE REGIME WIRED`;
+- regression-тест версии обновлён и больше не ожидает `0033`;
+- `adaptive` universe mode реально меняет число символов по market regime, volatility и ticker breadth вместо простого `max_symbols`;
+- `regime_adaptation` определяет market regime по BTC/USDT OHLCV и breadth тикеров;
+- `auto_strategy_adaptation` выбирает effective strategy для скана по regime и статистике закрытых сделок;
+- Scanner candidates включают `market_regime` и `effective_strategy_mode` metadata.
+
+Проверки текущего архива:
+
+```text
+python -m pytest -q
+35 passed
+
+python audit.py
+AUDIT PASSED
+
+python -m compileall -q .
+OK
+```
