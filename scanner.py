@@ -69,14 +69,26 @@ class Scanner:
         direct = (
             ticker.get("quoteVolume") or ticker.get("quoteVolume24h") or
             ticker.get("quote_volume") or ticker.get("amount24") or
+            ticker.get("turnover") or ticker.get("turnover24") or
             info.get("quoteVolume") or info.get("quoteVolume24h") or
-            info.get("amount24") or info.get("turnover24")
+            info.get("amount24") or info.get("turnover24") or
+            info.get("turnover") or info.get("amount")
         )
         quote = self._safe_float(direct, 0.0)
         if quote > 0:
             return quote
-        base = self._safe_float(ticker.get("baseVolume") or ticker.get("volume") or info.get("volume24") or info.get("vol24"), 0.0)
-        last = self._safe_float(ticker.get("last") or ticker.get("close") or info.get("lastPrice") or info.get("last") or info.get("fairPrice"), 0.0)
+        base = self._safe_float(
+            ticker.get("baseVolume") or ticker.get("baseVolume24h") or ticker.get("volume") or
+            ticker.get("volume24") or ticker.get("vol24") or info.get("volume24") or
+            info.get("vol24") or info.get("volume") or info.get("baseVolume"),
+            0.0,
+        )
+        last = self._safe_float(
+            ticker.get("last") or ticker.get("close") or ticker.get("mark") or ticker.get("indexPrice") or
+            info.get("lastPrice") or info.get("last") or info.get("fairPrice") or
+            info.get("indexPrice") or info.get("bid1") or info.get("ask1"),
+            0.0,
+        )
         return base * last if base > 0 and last > 0 else 0.0
 
     def _ticker_pct_change(self, ticker: dict) -> float:
@@ -196,7 +208,7 @@ class Scanner:
             raise RuntimeError(msg)
 
     def _universe_target_count(self, settings: dict, regime_info: dict, market_items_count: int) -> int:
-        mode = str(settings.get("universe_mode", "adaptive"))
+        mode = str(settings.get("universe_mode", "adaptive") or "adaptive").strip().lower()
         if mode.startswith("top-"):
             try:
                 n = int(mode.replace("top-", ""))
@@ -270,6 +282,33 @@ class Scanner:
 
             items.sort(reverse=True)
             self.last_filtered_markets = len(items)
+
+            # Adaptive must not silently keep an old/default universe when the
+            # exchange payload has weak/missing quote-volume fields. If the hard
+            # volume filter removes everything, rebuild from all normalized USDT
+            # tickers with a softer score so adaptive still selects real markets.
+            if not items and tickers:
+                fallback = []
+                fallback_seen = set()
+                for sym, t in (tickers or {}).items():
+                    if "USDT" not in str(sym):
+                        continue
+                    try:
+                        norm = exchange_client.normalize_symbol(sym)
+                    except Exception:
+                        continue
+                    qv = self._ticker_quote_volume(t)
+                    pct_change = self._ticker_pct_change(t)
+                    score = qv if qv > 0 else pct_change
+                    if norm not in fallback_seen:
+                        fallback_seen.add(norm)
+                        fallback.append((score, norm))
+                fallback.sort(reverse=True)
+                if fallback:
+                    items = fallback
+                    seen = fallback_seen
+                    self.last_filtered_markets = len(items)
+                    self.last_refresh_error = "adaptive fallback: volume filter returned empty universe"
 
             all_symbols = self._all_futures_symbols(exchange_client)
             self.last_available_markets = max(len(all_symbols), self.last_total_markets)

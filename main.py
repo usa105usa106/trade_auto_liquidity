@@ -987,7 +987,11 @@ async def trading_loop(app):
                     await asyncio.sleep(scanner.last_slowdown_sec)
                 if candidates:
                     top = candidates[0]
-                    scanner.last_signal_summary = f"{top.get('symbol')} {top.get('side')} conf={top.get('confidence')} strategy={top.get('strategy', effective_strategy)} mode={effective_strategy} count={len(candidates)}"
+                    scanner.last_signal_summary = (
+                        f"futures candidate pending spot: {top.get('symbol')} {top.get('side')} "
+                        f"conf={top.get('confidence')} strategy={top.get('strategy', effective_strategy)} "
+                        f"mode={effective_strategy} count={len(candidates)}"
+                    )
                 else:
                     scanner.last_signal_summary = "none"
                     scanner.last_reject_reason = "no candidates passed signal engine"
@@ -1003,15 +1007,26 @@ async def trading_loop(app):
                         window_minutes=240,
                     ).apply(cand, settings)
 
-                    spot_data = await fetch_spot_data_for_candidate(ex, cand, settings) if bool(settings.get("spot_confirmation_enabled", True)) else None
-                    cand = SpotConfirmationEngine(enabled=bool(settings.get("spot_confirmation_enabled", True))).apply(cand, spot_data)
+                    spot_enabled = bool(settings.get("spot_confirmation_enabled", True))
+                    spot_data = await fetch_spot_data_for_candidate(ex, cand, settings) if spot_enabled else None
+                    cand = SpotConfirmationEngine(enabled=spot_enabled).apply(cand, spot_data)
+                    cand["strategy_mode"] = base_strategy_mode
+                    cand["effective_strategy_mode"] = effective_strategy
 
                     if not cand.get("allowed_by_session", True):
                         scanner.last_reject_reason = f"{original_symbol}: session filter blocked"
                         continue
-                    if bool(settings.get("spot_confirmation_enabled", True)) and not cand.get("spot_confirmed", True):
-                        scanner.last_reject_reason = f"{original_symbol}: spot confirmation failed"
+                    if spot_enabled and not cand.get("spot_confirmed", True):
+                        scanner.last_reject_reason = (
+                            f"{original_symbol}: spot confirmation failed "
+                            f"({cand.get('spot_confirmation', 'WEAK')}: {cand.get('spot_reason', '-')})"
+                        )
                         continue
+                    scanner.last_signal_summary = (
+                        f"{cand.get('symbol')} {cand.get('side')} conf={cand.get('confidence')} "
+                        f"strategy={cand.get('strategy', effective_strategy)} mode={effective_strategy} "
+                        f"spot={cand.get('spot_confirmation', 'OFF')}"
+                    )
                     mf_ok, mf_reason = risk.market_filters(cand, settings)
                     if not mf_ok:
                         scanner.last_reject_reason = f"{original_symbol}: market filter blocked: {mf_reason}"
