@@ -1,4 +1,4 @@
-# Liquidity Telegram Bot v0061 MEXC POSITION SYNC
+# Liquidity Telegram Bot v0062 MEXC RAW STATE SYNC
 
 Signal-engine build for Railway with real futures-first candidate generation.
 
@@ -256,3 +256,11 @@ OK
 - Position list now shows notional, leverage, and estimated margin.
 - Position lifecycle events now include PnL for TP/SL/time-stop closes when available.
 - Strategy logic, scanner, and WebSocket logic were not changed.
+
+
+## v0062 MEXC RAW STATE SYNC
+- Raw MEXC futures state sync is now exchange-first.
+- `/positions` reads native MEXC open positions and does not rely on ccxt position parsing.
+- Open orders include normal orders plus plan/stop/TP-SL order scans when available.
+- `/cancel_all`, `/close_all`, and Panic attempt raw exchange cleanup even if local bot state is empty.
+- Balance output includes used/position/frozen margin diagnostics when MEXC returns them.

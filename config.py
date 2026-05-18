@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = os.getenv("BOT_VERSION", "0061 MEXC POSITION SYNC")
+VERSION = os.getenv("BOT_VERSION", "0062 MEXC RAW STATE SYNC")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)

@@ -494,6 +494,7 @@ async def panic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failures.append(f"local {p.get('symbol')}: {res.get('reason')}")
 
     # Live-only: also close positions that exist on the exchange but are missing locally.
+    native_close_res = None
     if live and ex:
         try:
             exchange_positions = await ex.fetch_positions()
@@ -509,12 +510,20 @@ async def panic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     failures.append(f"exchange {symbol}: {res.get('reason')}")
         except Exception as e:
             failures.append(f"fetch/close exchange positions: {e}")
+        # Final emergency fallback: native MEXC close_all, because some MEXC
+        # accounts can have position margin while open_positions returns empty.
+        if hasattr(ex, "mexc_close_all_positions_native"):
+            try:
+                native_close_res = await ex.mexc_close_all_positions_native()
+            except Exception as e:
+                failures.append(f"native_close_all: {e}")
 
     text = (
         "🚨 PANIC MODE\n"
         "Trading disabled. Close workflow executed.\n"
         f"Tracked positions closed: {closed_local}\n"
-        f"Exchange-only positions closed: {closed_external}"
+        f"Exchange-only positions closed: {closed_external}\n"
+        f"Native close_all: {str(native_close_res)[:180] if native_close_res is not None else '-'}"
     )
     if failures:
         text += "\n⚠️ Failures:\n" + "\n".join(failures[:10])
@@ -585,8 +594,13 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
         free = usdt.get("free", "n/a") if isinstance(usdt, dict) else "n/a"
         total = usdt.get("total", "n/a") if isinstance(usdt, dict) else "n/a"
+        used = usdt.get("used", "n/a") if isinstance(usdt, dict) else "n/a"
+        position_margin = usdt.get("positionMargin", "n/a") if isinstance(usdt, dict) else "n/a"
+        frozen_balance = usdt.get("frozenBalance", "n/a") if isinstance(usdt, dict) else "n/a"
+        unrealized = usdt.get("unrealized", "n/a") if isinstance(usdt, dict) else "n/a"
     except Exception as e:
         balance_error = str(e)[:240]
+        used = position_margin = frozen_balance = unrealized = "n/a"
 
     proxy_line = f"{proxy_ip.get('ip')}" if proxy_ip.get("ok") else f"{proxy_ip.get('ip')} ({proxy_ip.get('error')})"
     direct_line = f"{direct_ip.get('ip')}" if direct_ip.get("ok") else f"{direct_ip.get('ip')} ({direct_ip.get('error')})"
@@ -594,6 +608,10 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💰 Futures Balance\n"
         f"USDT free: {free}\n"
         f"USDT total: {total}\n"
+        f"USDT used: {used}\n"
+        f"Position margin: {position_margin}\n"
+        f"Frozen balance: {frozen_balance}\n"
+        f"Unrealized PnL: {unrealized}\n"
         f"Balance error: {balance_error or '-'}\n\n"
         "🌍 IP diagnostics\n"
         f"Direct IP: {direct_line}\n"
@@ -744,8 +762,6 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ex = await get_exchange(s)
         exec_engine = ExecutionEngine(storage, ex)
         positions = [p for p in (await ex.fetch_positions() or []) if exec_engine.exchange_position_qty(p) > 0]
-        if not positions:
-            await reply(update, "🧯 Close all: no real exchange positions", reply_markup=MAIN_MENU); return
         failures = []
         closed = 0
         for p in positions:
@@ -754,7 +770,15 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 closed += 1
             else:
                 failures.append(f"{p.get('symbol')}: {res.get('reason')}")
-        await reply(update, f"🧯 Close all sent\nClosed requests: {closed}\nFailures: {failures[:5] if failures else '-'}", reply_markup=MAIN_MENU)
+        native_res = None
+        # Extra safety: MEXC native close_all closes exchange-side positions even
+        # when position listing is stale/empty.
+        if hasattr(ex, "mexc_close_all_positions_native"):
+            try:
+                native_res = await ex.mexc_close_all_positions_native()
+            except Exception as e:
+                failures.append(f"native_close_all: {e}")
+        await reply(update, f"🧯 Close all sent\nListed positions closed: {closed}\nNative close_all: {str(native_res)[:300] if native_res is not None else '-'}\nFailures: {failures[:5] if failures else '-'}", reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"🧯 Close all failed: {e}", reply_markup=MAIN_MENU)
 
