@@ -399,7 +399,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /ping - отклик, RAM, uptime
 /balance - futures balance + IP/proxy
 /positions - локальные + реальные позиции MEXC + protection mode
-/open_orders - открытые ордера на MEXC
+/open_orders - обычные + plan/stop/TP-SL ордера MEXC
 /cancel_all - отменить все открытые ордера MEXC
 /close_all - закрыть все реальные позиции MEXC native close-all
 /stats - статистика сделок
@@ -407,7 +407,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /sync_positions - подтянуть реальные позиции MEXC в бота
 /mexc_debug_state [SYMBOL] - raw debug MEXC positions/orders/symbol variants
 
-Note: /positions now checks MEXC even when the scanner is stopped/live_trading is off.
+Note: /positions checks MEXC exchange-first; /open_orders scans normal + plan + stop + TP/SL endpoints. If exchange TP/SL is missing, local monitor protects positions kept in bot cache.
 /proxy on|off|test|set URL
 /api status|set KEY SECRET|clear|test - API биржи через чат
 /mexc_settings - показать MEXC параметры ордера
@@ -806,11 +806,21 @@ async def open_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         ex = await get_exchange(s)
         orders = await ex.fetch_open_orders()
+        positions = []
+        try:
+            exec_engine = ExecutionEngine(storage, ex)
+            positions = [p for p in (await ex.fetch_positions() or []) if exec_engine.exchange_position_qty(p) > 0]
+        except Exception:
+            positions = []
         if not orders:
-            await reply(update, "📋 Open orders: none", reply_markup=MAIN_MENU); return
-        lines = [f"📋 Open orders: {len(orders)}"]
+            msg = "📋 Open orders: none"
+            if positions:
+                msg += "\n⚠️ Есть реальные позиции, но exchange TP/SL/open orders не найдены. Бот будет вести TP/SL локальным мониторингом, если позиция есть в local cache. Для аварийного выхода: /close_all или Panic."
+            await reply(update, msg, reply_markup=MAIN_MENU); return
+        lines = [f"📋 Open orders/protection: {len(orders)}"]
         for o in orders[:30]:
-            lines.append(f"{o.get('symbol')} {o.get('side')} id={o.get('id')} price={o.get('price')} amount={o.get('amount')} client={o.get('clientOrderId') or '-'}")
+            src = ((o.get('info') or {}).get('_source_endpoint') if isinstance(o.get('info'), dict) else '') or '-'
+            lines.append(f"{o.get('symbol')} {o.get('side')} {o.get('type')} id={o.get('id')} price={o.get('price')} amount={o.get('amount')} src={src} client={o.get('clientOrderId') or '-'}")
         await reply(update, "\n".join(lines), reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"📋 Open orders failed: {e}", reply_markup=MAIN_MENU)

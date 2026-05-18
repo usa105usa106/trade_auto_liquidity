@@ -319,6 +319,17 @@ class ExecutionEngine:
         return {"symbol": symbol, "qty": qty, "side": side}
 
     async def close_exchange_position(self, pos: dict, reason: str = "external_close") -> dict:
+        # Prefer the native MEXC close-by-position row, because exchange-only
+        # positions from /position/open_positions contain exact holdVol and
+        # positionType. This is more reliable than ccxt reduceOnly for MEXC.
+        try:
+            if hasattr(self.exchange_client, "mexc_close_position_market_native"):
+                res = await self.exchange_client.mexc_close_position_market_native(pos)
+                return {"ok": True, "order": res, "native_mexc_close": True}
+        except Exception as native_error:
+            native_reason = str(native_error)
+        else:
+            native_reason = ""
         order = self._exchange_position_to_close_order(pos)
         if order.get("skip"):
             return {"ok": True, "skipped": True, "reason": order.get("reason")}
@@ -327,9 +338,9 @@ class ExecutionEngine:
                 order["symbol"], "market", order["side"], order["qty"], None,
                 {"reduceOnly": True, "clientOrderId": f"bot_{reason}_{int(time.time()*1000)}"}, attempts=2
             )
-            return {"ok": True, "order": res}
+            return {"ok": True, "order": res, "native_mexc_error": native_reason}
         except Exception as e:
-            return {"ok": False, "reason": str(e)}
+            return {"ok": False, "reason": str(e), "native_mexc_error": native_reason}
 
     async def _create_stop_market_order(self, symbol: str, side: str, qty: float, stop_price: float) -> dict:
         errors = []

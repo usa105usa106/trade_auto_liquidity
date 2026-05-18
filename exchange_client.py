@@ -450,7 +450,7 @@ class ExchangeClient:
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            for key in ("list", "result", "data", "rows", "items"):
+            for key in ("list", "result", "resultList", "data", "rows", "items"):
                 value = data.get(key)
                 if isinstance(value, list):
                     return value
@@ -664,15 +664,23 @@ class ExchangeClient:
                 ("/api/v1/private/order/list/open_orders/" + msym, {}),
                 ("/api/v1/private/order/list/open_orders", {"symbol": msym}),
                 ("/api/v1/private/planorder/list/orders", {"symbol": msym, "states": "1"}),
+                ("/api/v1/private/planorder/list/orders", {"symbol": msym, "isFinished": 0}),
                 ("/api/v1/private/stoporder/list/orders", {"symbol": msym, "states": "1"}),
                 ("/api/v1/private/stoporder/list/orders", {"symbol": msym, "isFinished": 0}),
+                ("/api/v1/private/tpsl/list/orders", {"symbol": msym, "states": "1"}),
+                ("/api/v1/private/tpsl/list/orders", {"symbol": msym, "isFinished": 0}),
+                ("/api/v1/private/position/stop_orders", {"symbol": msym}),
             ])
         else:
             candidates.extend([
                 ("/api/v1/private/order/list/open_orders", {}),
                 ("/api/v1/private/planorder/list/orders", {"states": "1"}),
+                ("/api/v1/private/planorder/list/orders", {"isFinished": 0}),
                 ("/api/v1/private/stoporder/list/orders", {"states": "1"}),
                 ("/api/v1/private/stoporder/list/orders", {"isFinished": 0}),
+                ("/api/v1/private/tpsl/list/orders", {"states": "1"}),
+                ("/api/v1/private/tpsl/list/orders", {"isFinished": 0}),
+                ("/api/v1/private/position/stop_orders", {}),
             ])
         orders = []
         errors = []
@@ -740,6 +748,45 @@ class ExchangeClient:
                 errors.append({"symbol": "all", "error": str(e)})
         return {"ok": len(errors) == 0, "cancelled_symbols": len(results), "results": results, "errors": errors}
 
+
+    async def mexc_close_position_market_native(self, pos: dict) -> dict:
+        """Close one MEXC futures position using native order/create.
+
+        This avoids ccxt reduceOnly routing issues and uses the exact MEXC
+        side codes from the raw open_positions row:
+        positionType 1 = long => side 4 close long; positionType 2 = short => side 2 close short.
+        """
+        info = pos.get("info", {}) if isinstance(pos.get("info"), dict) else {}
+        symbol = info.get("symbol") or pos.get("mexc_symbol") or pos.get("symbol")
+        msym = self._mexc_normalize_contract_id(symbol)
+        if not msym or "_" not in msym:
+            msym = self._mexc_symbol(pos.get("symbol") or symbol)
+        vol = info.get("holdVol") or info.get("vol") or pos.get("contracts")
+        try:
+            vol = int(float(vol or 0))
+        except Exception:
+            vol = 0
+        if vol <= 0:
+            raise RuntimeError("cannot close MEXC position: empty holdVol")
+        pt = str(info.get("positionType") or info.get("holdSide") or pos.get("side") or "").lower()
+        # MEXC side: 2 closes short, 4 closes long.
+        if pt in {"1", "long", "buy"} or str(pos.get("side", "")).lower() == "long":
+            close_side = 4
+        elif pt in {"2", "short", "sell"} or str(pos.get("side", "")).lower() == "short":
+            close_side = 2
+        else:
+            raise RuntimeError(f"cannot infer MEXC close side from positionType={pt!r}")
+        body = {
+            "symbol": msym,
+            "price": 0,
+            "vol": vol,
+            "side": close_side,
+            "type": 5,
+            "openType": int(info.get("openType") or os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or "1"),
+            "leverage": int(info.get("leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or "5"),
+        }
+        out = await self._mexc_private("POST", "/api/v1/private/order/create", body=body)
+        return {"ok": True, "symbol": self._mexc_id_to_symbol(msym), "mexc_symbol": msym, "vol": vol, "side": close_side, "result": out}
 
     async def mexc_close_all_positions_native(self):
         """Emergency exchange-side close all positions endpoint."""
