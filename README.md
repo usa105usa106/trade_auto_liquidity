@@ -1,4 +1,4 @@
-# Liquidity Telegram Bot v0056 MEXC RAW ORDER FIRST
+# Liquidity Telegram Bot v0058 MEXC API HOST + RATE LIMIT
 
 Signal-engine build for Railway with real futures-first candidate generation.
 
@@ -230,7 +230,13 @@ OK
 ```
 
 
-## v0056 MEXC RAW ORDER FIRST
+## v0058 MEXC API HOST + RATE LIMIT
 
 - Updated displayed bot version.
 - Includes MEXC 403 order fallback, Telegram MEXC settings, recvWindow defaults, isolated mode, and time-difference adjustment.
+
+
+## v0058 notes
+- Futures private REST base defaults to `https://api.mexc.com` per MEXC support recommendation.
+- Private MEXC requests are limited to 4 requests per 2 seconds.
+- Raw order endpoint remains `/api/v1/private/order/create`; `contract.mexc.com` is no longer used for private REST by default.

@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import json
 import asyncio
+from collections import deque
 from urllib.parse import urlencode
 
 import aiohttp
@@ -24,6 +25,8 @@ class ExchangeClient:
         self.api_key = ""
         self.api_secret = ""
         self.time_difference_ms = 0
+        self._mexc_private_request_times = deque()
+        self._mexc_private_lock = asyncio.Lock()
 
     async def init(self, api_key: str = "", api_secret: str = ""):
         self.api_key = api_key or ""
@@ -52,9 +55,9 @@ class ExchangeClient:
                 diff = await self.exchange.load_time_difference()
                 self.time_difference_ms = int(diff or 0)
         except Exception:
-            # Do not block startup; raw MEXC fallback also syncs from contract server time.
+            # Do not block startup; raw MEXC fallback also syncs from MEXC server time.
             pass
-        await self._sync_mexc_contract_time(silent=True)
+        await self._sync_mexc_time(silent=True)
         return self
 
     def normalize_symbol(self, symbol: str) -> str:
@@ -87,7 +90,7 @@ class ExchangeClient:
         norm = self.normalize_symbol(symbol)
         return (getattr(self.exchange, "markets", {}) or {}).get(norm, {"symbol": norm})
 
-    def _mexc_contract_symbol(self, symbol: str) -> str:
+    def _mexc_symbol(self, symbol: str) -> str:
         m = self._market(symbol)
         mid = str(m.get("id") or "")
         if mid:
@@ -97,7 +100,7 @@ class ExchangeClient:
         return f"{base}_USDT"
 
     def _amount_to_mexc_vol(self, symbol: str, amount: float) -> int:
-        """MEXC contract API expects integer contract volume, not base coin amount."""
+        """MEXC futures API expects integer contract volume, not base coin amount."""
         m = self._market(symbol)
         amount = float(amount or 0)
         contract_size = float(m.get("contractSize") or m.get("contract_size") or 0)
@@ -131,18 +134,11 @@ class ExchangeClient:
             await self.exchange.close()
 
     async def fetch_balance(self):
-        # For MEXC futures use native contract API first.
-        # ccxt.fetch_balance({"type": "swap"}) may still touch the spot-private
-        # /api/v3/capital/config/getall endpoint, which is exactly what causes
-        # 403 via proxy. Do not call ccxt balance for MEXC unless raw fallback fails.
+        # For MEXC futures use ONLY native futures API.
+        # Do not fallback to ccxt.fetch_balance(): ccxt can call the spot-private
+        # /api/v3/capital/config/getall endpoint, which causes the old proxy 403.
         if self.exchange_id == "mexc":
-            try:
-                return await self._mexc_contract_fetch_balance()
-            except Exception as raw_error:
-                try:
-                    return await self.exchange.fetch_balance({"type": "swap"})
-                except Exception as ccxt_error:
-                    raise RuntimeError(f"raw MEXC contract balance failed: {raw_error}; ccxt balance failed: {ccxt_error}")
+            return await self._mexc_fetch_balance()
         return await self.exchange.fetch_balance({"type": "swap"})
 
     async def fetch_tickers(self):
@@ -175,32 +171,15 @@ class ExchangeClient:
         params = params or {}
         norm = self.normalize_symbol(symbol)
 
-        # For MEXC futures, use the native contract endpoint FIRST.
-        # ccxt currently routes create_order to /api/v1/private/order/submit,
-        # which is the exact endpoint that returns Akamai/EdgeSuite 403 for this bot.
-        # Do not call ccxt first unless explicitly disabled with MEXC_RAW_ORDERS_FIRST=false.
-        if self.exchange_id == "mexc" and os.getenv("MEXC_RAW_ORDERS_FIRST", "true").lower() in {"1", "true", "yes", "on"}:
-            try:
-                return await self._mexc_contract_create_order(symbol, type_, side, amount, price, params, previous_error="")
-            except Exception as raw_error:
-                # If the native endpoint itself is 403 Access Denied, that is an IP/proxy/WAF block.
-                # Falling back to ccxt will only hit /order/submit and produce a noisier duplicate error,
-                # so keep the clean raw error.
-                raw_msg = str(raw_error)
-                if "403" in raw_msg or "Access Denied" in raw_msg or "Forbidden" in raw_msg:
-                    raise RuntimeError(f"MEXC native order/create blocked: {raw_msg}")
-                # Non-403 errors may be parameter-related; try ccxt as secondary fallback.
+        # MEXC futures orders are sent through the support-recommended host
+        # https://api.mexc.com and native endpoint /api/v1/private/order/create.
+        # Do not fallback to ccxt for MEXC, because ccxt can route to
+        # /api/v1/private/order/submit on contract.mexc.com, which was the
+        # endpoint producing CDN 403.
+        if self.exchange_id == "mexc":
+            return await self._mexc_create_order(symbol, type_, side, amount, price, params, previous_error="")
 
-        try:
-            return await self.exchange.create_order(norm, type_, side, amount, price, params)
-        except Exception as e:
-            msg = str(e)
-            if self.exchange_id == "mexc":
-                try:
-                    return await self._mexc_contract_create_order(symbol, type_, side, amount, price, params, previous_error=msg)
-                except Exception as e2:
-                    raise RuntimeError(f"ccxt create_order failed: {msg}; raw MEXC contract fallback failed: {e2}")
-            raise
+        return await self.exchange.create_order(norm, type_, side, amount, price, params)
 
     async def cancel_order(self, order_id, symbol):
         return await self.exchange.cancel_order(order_id, self.normalize_symbol(symbol))
@@ -218,17 +197,68 @@ class ExchangeClient:
                 out.append({"id": o.get("id"), "symbol": o.get("symbol"), "error": str(e)})
         return out
 
-    async def _http_session(self):
-        if self.proxy_enabled and self.proxy_url and ProxyConnector:
-            return aiohttp.ClientSession(connector=ProxyConnector.from_url(self.proxy_url))
-        return aiohttp.ClientSession()
 
-    async def _sync_mexc_contract_time(self, silent: bool = False):
+    def _mexc_rest_base(self) -> str:
+        """Base URL for MEXC futures REST.
+
+        MEXC support recommended using https://api.mexc.com instead of
+        https://contract.mexc.com for futures private requests when CDN 403
+        appears on the contract host. Keep it configurable, but default to the
+        support-recommended host.
+        """
+        return os.getenv("MEXC_FUTURES_REST_BASE", "https://api.mexc.com").rstrip("/")
+
+    async def _mexc_private_rate_limit(self):
+        """Limit private MEXC requests to <=4 per 2 seconds.
+
+        This matches the support recommendation and prevents duplicate order
+        attempts from looking like private endpoint spam.
+        """
+        limit = int(os.getenv("MEXC_PRIVATE_RATE_LIMIT", "4") or "4")
+        window = float(os.getenv("MEXC_PRIVATE_RATE_WINDOW", "2") or "2")
+        if limit <= 0:
+            return
+        async with self._mexc_private_lock:
+            now = time.monotonic()
+            while self._mexc_private_request_times and now - self._mexc_private_request_times[0] >= window:
+                self._mexc_private_request_times.popleft()
+            if len(self._mexc_private_request_times) >= limit:
+                sleep_for = window - (now - self._mexc_private_request_times[0]) + 0.05
+                await asyncio.sleep(max(0.05, sleep_for))
+                now = time.monotonic()
+                while self._mexc_private_request_times and now - self._mexc_private_request_times[0] >= window:
+                    self._mexc_private_request_times.popleft()
+            self._mexc_private_request_times.append(time.monotonic())
+
+    def _proxy_connector_and_arg(self):
+        """Return (connector, proxy_arg) for aiohttp requests.
+
+        aiohttp needs a ProxyConnector for SOCKS proxies, but HTTP/HTTPS proxies
+        must be passed as the per-request `proxy=` argument. The previous raw
+        MEXC code only handled SOCKS; this keeps both paths explicit and makes
+        `/proxy test` and signed MEXC REST use the same proxy route.
+        """
+        if not (self.proxy_enabled and self.proxy_url):
+            return None, None
+        from urllib.parse import urlparse
+        scheme = urlparse(self.proxy_url).scheme.lower()
+        if scheme.startswith("socks"):
+            if not ProxyConnector:
+                raise RuntimeError("SOCKS proxy requires aiohttp-socks")
+            return ProxyConnector.from_url(self.proxy_url), None
+        return None, self.proxy_url
+
+    async def _http_session(self):
+        connector, _ = self._proxy_connector_and_arg()
+        return aiohttp.ClientSession(connector=connector)
+
+    async def _sync_mexc_time(self, silent: bool = False):
         if self.exchange_id != "mexc":
             return 0
         try:
-            async with await self._http_session() as session:
-                async with session.get("https://contract.mexc.com/api/v1/contract/ping", timeout=10) as r:
+            connector, proxy_arg = self._proxy_connector_and_arg()
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(f"{self._mexc_rest_base()}/api/v1/contract/ping", proxy=proxy_arg, timeout=10) as r:
                     data = await r.json(content_type=None)
             server = int(data.get("data") or data.get("timestamp") or 0)
             if server > 0:
@@ -263,19 +293,20 @@ class ExchangeClient:
         raw = f"{self.api_key}{req_time}{payload}"
         return hmac.new(self.api_secret.encode(), raw.encode(), hashlib.sha256).hexdigest()
 
-    async def _mexc_contract_private(self, method: str, path: str, body: dict | None = None, query: dict | None = None):
+    async def _mexc_private(self, method: str, path: str, body: dict | None = None, query: dict | None = None):
         if not self.api_key or not self.api_secret:
             raise RuntimeError("MEXC API key/secret is missing")
+        await self._mexc_private_rate_limit()
         body = body or {}
         query = query or {}
         method = method.upper()
         if method == "GET":
             payload = urlencode(sorted((k, v) for k, v in query.items() if v is not None))
-            url = f"https://contract.mexc.com{path}" + (f"?{payload}" if payload else "")
+            url = f"{self._mexc_rest_base()}{path}" + (f"?{payload}" if payload else "")
             data = None
         else:
             payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-            url = f"https://contract.mexc.com{path}"
+            url = f"{self._mexc_rest_base()}{path}"
             data = payload
         req_time = self._mexc_request_time()
         headers = {
@@ -286,20 +317,21 @@ class ExchangeClient:
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0",
         }
-        async with await self._http_session() as session:
-            async with session.request(method, url, data=data, headers=headers, timeout=15) as r:
+        connector, proxy_arg = self._proxy_connector_and_arg()
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.request(method, url, data=data, headers=headers, proxy=proxy_arg, timeout=15) as r:
                 text = await r.text()
                 try:
                     out = json.loads(text)
                 except Exception:
                     out = {"raw": text}
                 if r.status == 401 or r.status == 403 or str(out.get("code")) in {"401", "403", "602", "603"}:
-                    # One retry after syncing contract server time.
-                    await self._sync_mexc_contract_time(silent=True)
+                    # One retry after syncing MEXC server time.
+                    await self._sync_mexc_time(silent=True)
                     req_time = self._mexc_request_time()
                     headers["Request-Time"] = req_time
                     headers["Signature"] = self._mexc_signature(req_time, payload)
-                    async with session.request(method, url, data=data, headers=headers, timeout=15) as r2:
+                    async with session.request(method, url, data=data, headers=headers, proxy=proxy_arg, timeout=15) as r2:
                         text = await r2.text()
                         try:
                             out = json.loads(text)
@@ -312,8 +344,8 @@ class ExchangeClient:
                     raise RuntimeError(f"HTTP {r.status}: {out}")
                 return out
 
-    async def _mexc_contract_fetch_balance(self):
-        out = await self._mexc_contract_private("GET", "/api/v1/private/account/assets")
+    async def _mexc_fetch_balance(self):
+        out = await self._mexc_private("GET", "/api/v1/private/account/assets")
         assets = out.get("data") or []
         free = total = used = 0.0
         by_currency = {}
@@ -327,7 +359,7 @@ class ExchangeClient:
             by_currency[ccy] = {"free": free, "used": used, "total": total}
         return {"free": {"USDT": free}, "used": {"USDT": used}, "total": {"USDT": total}, "USDT": by_currency.get("USDT", {"free": free, "used": used, "total": total}), "info": out}
 
-    async def _mexc_contract_create_order(self, symbol, type_, side, amount, price=None, params=None, previous_error: str = ""):
+    async def _mexc_create_order(self, symbol, type_, side, amount, price=None, params=None, previous_error: str = ""):
         params = params or {}
         reduce_only = bool(params.get("reduceOnly") or params.get("reduce_only"))
         is_buy = str(side).lower() == "buy"
@@ -344,7 +376,7 @@ class ExchangeClient:
             # Native plan order. Used for SL/TP fallback only if ccxt fails.
             trigger_price = float(params.get("triggerPrice") or params.get("stopPrice") or params.get("stopLossPrice"))
             body = {
-                "symbol": self._mexc_contract_symbol(symbol),
+                "symbol": self._mexc_symbol(symbol),
                 "vol": self._amount_to_mexc_vol(symbol, amount),
                 "side": mexc_side,
                 "openType": int(os.getenv("MEXC_ORDER_OPEN_TYPE", "1")),
@@ -356,7 +388,7 @@ class ExchangeClient:
             }
             if params.get("clientOrderId"):
                 body["externalOid"] = str(params.get("clientOrderId"))[:32]
-            out = await self._mexc_contract_private("POST", "/api/v1/private/planorder/place", body=body)
+            out = await self._mexc_private("POST", "/api/v1/private/planorder/place", body=body)
             return {"id": str((out.get("data") or {}).get("orderId") or (out.get("data") or {}).get("id") or ""), "symbol": self.normalize_symbol(symbol), "type": type_, "side": side, "amount": amount, "price": price, "info": {"raw_fallback": True, "previous_error": previous_error, **out}}
         else:
             mexc_type = 1  # limit
@@ -364,7 +396,7 @@ class ExchangeClient:
             if order_price <= 0:
                 raise RuntimeError("limit order requires price")
         body = {
-            "symbol": self._mexc_contract_symbol(symbol),
+            "symbol": self._mexc_symbol(symbol),
             "price": order_price,
             "vol": self._amount_to_mexc_vol(symbol, amount),
             "side": mexc_side,
@@ -374,7 +406,7 @@ class ExchangeClient:
         }
         if params.get("clientOrderId"):
             body["externalOid"] = str(params.get("clientOrderId"))[:32]
-        out = await self._mexc_contract_private("POST", "/api/v1/private/order/create", body=body)
+        out = await self._mexc_private("POST", "/api/v1/private/order/create", body=body)
         data = out.get("data")
         oid = data.get("orderId") if isinstance(data, dict) else data
         return {"id": str(oid or ""), "symbol": self.normalize_symbol(symbol), "type": type_, "side": side, "amount": amount, "price": price, "average": None, "filled": 0, "info": {"raw_fallback": True, "previous_error": previous_error, **out}}
