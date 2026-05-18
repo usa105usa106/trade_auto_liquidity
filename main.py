@@ -396,9 +396,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /status - статус
 /ping - отклик, RAM, uptime
 /balance - futures balance + IP/proxy
-/positions - открытые позиции
+/positions - локальные + реальные позиции MEXC
+/open_orders - открытые ордера на MEXC
+/cancel_all - отменить все открытые ордера MEXC
+/close_all - закрыть все реальные позиции MEXC market reduce-only
 /stats - статистика сделок
 /sync - синхронизация позиций/ордеров
+/sync_positions - подтянуть реальные позиции MEXC в бота
 /proxy on|off|test|set URL
 /api status|set KEY SECRET|clear|test - API биржи через чат
 /mexc_settings - показать MEXC параметры ордера
@@ -598,21 +602,75 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await reply(update, text, reply_markup=MAIN_MENU)
 
+def _exchange_position_text(p: dict) -> str:
+    info = p.get("info", {}) if isinstance(p.get("info"), dict) else {}
+    symbol = p.get("symbol") or info.get("symbol") or "-"
+    side = str(p.get("side") or info.get("side") or "-").upper()
+    qty = 0.0
+    for key in ("amount", "qty", "size", "contracts"):
+        try:
+            value = p.get(key)
+            if value not in (None, ""):
+                qty = abs(float(value)); break
+        except Exception:
+            pass
+    entry = 0.0
+    for key in ("entryPrice", "entry_price", "average"):
+        try:
+            value = p.get(key)
+            if value not in (None, "") and float(value) > 0:
+                entry = float(value); break
+        except Exception:
+            pass
+    if entry <= 0:
+        for key in ("holdAvgPrice", "openAvgPrice", "entryPrice"):
+            try:
+                value = info.get(key)
+                if value not in (None, "") and float(value) > 0:
+                    entry = float(value); break
+            except Exception:
+                pass
+    notional = abs(qty * entry) if qty and entry else 0.0
+    coin = str(symbol).split('/')[0]
+    return f"{symbol} {side} exchange\nQty={qty:.6f} {coin} / {notional:.2f} USDT | entry={entry:.8f}"
+
 async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
-    ps = await storage.positions()
-    if not ps:
-        await reply(update, "📈 Positions: none", reply_markup=MAIN_MENU); return
+    s = await storage.all_settings()
+    local = await storage.positions()
+    exchange_positions = []
+    exchange_error = ""
+    if bool(s.get("live_trading", False)):
+        try:
+            ex = await get_exchange(s)
+            exchange_positions = [p for p in (await ex.fetch_positions() or []) if ExecutionEngine(storage, ex).exchange_position_qty(p) > 0]
+        except Exception as e:
+            exchange_error = str(e)[:220]
+    if not local and not exchange_positions:
+        text = "📈 Positions: none"
+        if exchange_error:
+            text += f"\nExchange sync error: {exchange_error}"
+        await reply(update, text, reply_markup=MAIN_MENU); return
     lines = ["📈 Positions"]
-    for p in ps:
-        notional, margin, leverage, margin_type = _position_money_fields(p)
-        coin = str(p.get('symbol', '')).split('/')[0]
-        lines.append(
-            f"{p.get('symbol')} {p.get('side')} {p.get('status')} "
-            f"entry={p.get('entry_price')} SL={p.get('stop_price')} TP={p.get('take_price')}\n"
-            f"Qty={float(p.get('qty') or 0):.6f} {coin} / {notional:.2f} USDT | "
-            f"Lev={leverage}x | Margin={margin_type} ~{margin:.2f} USDT"
-        )
+    if local:
+        lines.append("\nLocal bot state:")
+        for p in local:
+            notional, margin, leverage, margin_type = _position_money_fields(p)
+            coin = str(p.get('symbol', '')).split('/')[0]
+            lines.append(
+                f"{p.get('symbol')} {p.get('side')} {p.get('status')} "
+                f"entry={p.get('entry_price')} SL={p.get('stop_price')} TP={p.get('take_price')}\n"
+                f"Qty={float(p.get('qty') or 0):.6f} {coin} / {notional:.2f} USDT | "
+                f"Lev={leverage}x | Margin={margin_type} ~{margin:.2f} USDT"
+            )
+    if exchange_positions:
+        local_symbols = {p.get("symbol") for p in local}
+        lines.append("\nExchange real positions:")
+        for p in exchange_positions:
+            prefix = "✅ synced" if p.get("symbol") in local_symbols else "⚠️ exchange-only"
+            lines.append(prefix + " " + _exchange_position_text(p))
+    if exchange_error:
+        lines.append(f"\nExchange sync error: {exchange_error}")
     await reply(update, "\n".join(lines), reply_markup=MAIN_MENU)
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -639,10 +697,66 @@ async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = await storage.all_settings()
     try:
         ex = await get_exchange(s)
-        report = await SyncEngine(storage, ex).sync()
+        report = await SyncEngine(storage, ex).sync(protect=True)
         await reply(update, "🔄 Sync\n" + "\n".join(f"{k}: {v}" for k,v in report.items()), reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"🔄 Sync failed: {e}", reply_markup=MAIN_MENU)
+
+async def sync_positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    try:
+        ex = await get_exchange(s)
+        report = await SyncEngine(storage, ex).sync(protect=True)
+        await reply(update, "🔄 Sync positions done\n" + "\n".join(f"{k}: {v}" for k,v in report.items()), reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"🔄 Sync positions failed: {e}", reply_markup=MAIN_MENU)
+
+async def open_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    try:
+        ex = await get_exchange(s)
+        orders = await ex.fetch_open_orders()
+        if not orders:
+            await reply(update, "📋 Open orders: none", reply_markup=MAIN_MENU); return
+        lines = [f"📋 Open orders: {len(orders)}"]
+        for o in orders[:30]:
+            lines.append(f"{o.get('symbol')} {o.get('side')} id={o.get('id')} price={o.get('price')} amount={o.get('amount')} client={o.get('clientOrderId') or '-'}")
+        await reply(update, "\n".join(lines), reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"📋 Open orders failed: {e}", reply_markup=MAIN_MENU)
+
+async def cancel_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    try:
+        ex = await get_exchange(s)
+        res = await ex.cancel_all_orders()
+        await reply(update, f"🧹 Cancel all orders sent\n{str(res)[:1200]}", reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"🧹 Cancel all failed: {e}", reply_markup=MAIN_MENU)
+
+async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    try:
+        ex = await get_exchange(s)
+        exec_engine = ExecutionEngine(storage, ex)
+        positions = [p for p in (await ex.fetch_positions() or []) if exec_engine.exchange_position_qty(p) > 0]
+        if not positions:
+            await reply(update, "🧯 Close all: no real exchange positions", reply_markup=MAIN_MENU); return
+        failures = []
+        closed = 0
+        for p in positions:
+            res = await exec_engine.close_exchange_position(p, "manual_close_all")
+            if res.get("ok"):
+                closed += 1
+            else:
+                failures.append(f"{p.get('symbol')}: {res.get('reason')}")
+        await reply(update, f"🧯 Close all sent\nClosed requests: {closed}\nFailures: {failures[:5] if failures else '-'}", reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"🧯 Close all failed: {e}", reply_markup=MAIN_MENU)
 
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -1240,8 +1354,12 @@ def build_app():
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("positions", positions_cmd))
+    app.add_handler(CommandHandler("open_orders", open_orders_cmd))
+    app.add_handler(CommandHandler("cancel_all", cancel_all_cmd))
+    app.add_handler(CommandHandler("close_all", close_all_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("sync", sync_cmd))
+    app.add_handler(CommandHandler("sync_positions", sync_positions_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("mexc_settings", mexc_settings_cmd))
     app.add_handler(CommandHandler("leverage", leverage_cmd))

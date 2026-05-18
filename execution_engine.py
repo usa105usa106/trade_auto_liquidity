@@ -181,8 +181,9 @@ class ExecutionEngine:
                     return {"ok": False, "reason": "mexc opening restricted / reduce-only symbol (code 8950)"}
                 raise
 
-            # For market orders, we treat position as open immediately.
-            # For limit orders, track as pending until PositionManager sees fill/cancel/timeout.
+            # For market orders, sync the real exchange position immediately.
+            # This prevents the bot from losing state when MEXC accepted the order
+            # but the raw order response does not include a filled quantity/price.
             pos = plan.__dict__.copy()
             pos["status"] = "pending" if order_type == "limit" else "open"
             pos["order_id"] = order.get("id")
@@ -192,6 +193,35 @@ class ExecutionEngine:
             if pos["status"] == "open":
                 fill_price = self._order_fill_price(order, plan.entry_price)
                 pos = self._rebase_protection_to_fill(pos, fill_price)
+                try:
+                    await asyncio.sleep(float(os.getenv("POST_ORDER_POSITION_SYNC_DELAY_SEC", "0.5")))
+                    exchange_positions = await self.exchange_client.fetch_positions([plan.symbol])
+                    active = [p for p in (exchange_positions or []) if self.exchange_position_qty(p) > 0]
+                    if active:
+                        ep = active[0]
+                        ep_info = ep.get("info", {}) if isinstance(ep.get("info"), dict) else {}
+                        pos["qty"] = self.exchange_position_qty(ep) or pos.get("qty")
+                        pos["exchange_contracts"] = ep.get("contracts")
+                        pos["raw_exchange_position"] = ep
+                        for key in ("entryPrice", "entry_price", "average"):
+                            try:
+                                val = ep.get(key)
+                                if val and float(val) > 0:
+                                    pos["entry_price"] = float(val); break
+                            except Exception:
+                                pass
+                        if not float(pos.get("entry_price") or 0):
+                            for key in ("holdAvgPrice", "openAvgPrice", "entryPrice"):
+                                try:
+                                    val = ep_info.get(key)
+                                    if val and float(val) > 0:
+                                        pos["entry_price"] = float(val); break
+                                except Exception:
+                                    pass
+                        pos["exchange_synced"] = True
+                        pos["updated_at"] = time.time()
+                except Exception as e:
+                    pos["exchange_sync_warning"] = str(e)
             pos = self._decorate_position_metrics(pos)
             await self.storage.upsert_position(pos)
 
@@ -206,12 +236,31 @@ class ExecutionEngine:
 
 
     def exchange_position_qty(self, pos: dict) -> float:
+        """Return base-coin amount suitable for create_order(amount=...).
+
+        Native MEXC position sync exposes both `contracts` and `amount`; MEXC
+        close orders in this bot accept base amount and convert it back to
+        contract volume. Prefer `amount`; otherwise convert contracts by
+        contractSize when available.
+        """
         info = pos.get("info", {}) if isinstance(pos.get("info"), dict) else {}
-        raw = pos.get("contracts", pos.get("contractSize", pos.get("amount", pos.get("size"))))
-        if raw is None:
-            raw = info.get("positionAmt") or info.get("holdVol") or info.get("vol")
+        for key in ("amount", "qty", "size"):
+            try:
+                value = pos.get(key)
+                if value not in (None, ""):
+                    return abs(float(value))
+            except Exception:
+                pass
+        contracts = pos.get("contracts")
+        if contracts is None:
+            contracts = info.get("positionAmt") or info.get("holdVol") or info.get("vol")
         try:
-            return abs(float(raw or 0))
+            contracts_f = abs(float(contracts or 0))
+            cs = pos.get("contractSize")
+            if cs is None:
+                cs = info.get("contractSize") or info.get("contract_size")
+            cs_f = float(cs or 0)
+            return contracts_f * cs_f if cs_f > 0 else contracts_f
         except Exception:
             return 0.0
 

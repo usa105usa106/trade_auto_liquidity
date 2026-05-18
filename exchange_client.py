@@ -159,9 +159,21 @@ class ExchangeClient:
         return await self.exchange.fetch_order(order_id, self.normalize_symbol(symbol))
 
     async def fetch_open_orders(self, symbol=None):
+        if self.exchange_id == "mexc":
+            try:
+                return await self._mexc_fetch_open_orders(symbol)
+            except Exception:
+                # ccxt fallback is still useful for read-only order listing.
+                pass
         return await self.exchange.fetch_open_orders(self.normalize_symbol(symbol) if symbol else None)
 
     async def fetch_positions(self, symbols=None):
+        if self.exchange_id == "mexc":
+            try:
+                return await self._mexc_fetch_positions(symbols)
+            except Exception:
+                # Keep ccxt as a read fallback, but native MEXC is preferred for sync.
+                pass
         if not hasattr(self.exchange, "fetch_positions"):
             raise NotImplementedError(f"{self.exchange_id} does not support fetch_positions")
         norm_symbols = [self.normalize_symbol(s) for s in symbols] if symbols else None
@@ -185,6 +197,8 @@ class ExchangeClient:
         return await self.exchange.cancel_order(order_id, self.normalize_symbol(symbol))
 
     async def cancel_all_orders(self, symbol=None):
+        if self.exchange_id == "mexc":
+            return await self._mexc_cancel_all_orders(symbol)
         norm_symbol = self.normalize_symbol(symbol) if symbol else None
         if hasattr(self.exchange, "cancel_all_orders"):
             return await self.exchange.cancel_all_orders(norm_symbol)
@@ -358,6 +372,192 @@ class ExchangeClient:
             used = max(0.0, total - free)
             by_currency[ccy] = {"free": free, "used": used, "total": total}
         return {"free": {"USDT": free}, "used": {"USDT": used}, "total": {"USDT": total}, "USDT": by_currency.get("USDT", {"free": free, "used": used, "total": total}), "info": out}
+
+    def _mexc_id_to_symbol(self, mexc_symbol: str) -> str:
+        raw = str(mexc_symbol or "").strip()
+        if not raw:
+            return raw
+        markets = getattr(self.exchange, "markets", {}) or {}
+        for m in markets.values():
+            if str(m.get("id") or "") == raw:
+                return str(m.get("symbol") or raw)
+        if "_" in raw:
+            base, quote = raw.split("_", 1)
+            candidate = f"{base}/{quote}:USDT"
+            if candidate in markets:
+                return candidate
+            candidate2 = f"{base}/{quote}"
+            if candidate2 in markets:
+                return candidate2
+            return candidate
+        return raw
+
+    def _mexc_contracts_to_amount(self, symbol: str, contracts: float) -> float:
+        try:
+            m = self._market(symbol)
+            contract_size = float(m.get("contractSize") or m.get("contract_size") or 0)
+            if contract_size > 0:
+                return abs(float(contracts or 0)) * contract_size
+        except Exception:
+            pass
+        return abs(float(contracts or 0))
+
+    def _mexc_position_qty_contracts(self, row: dict) -> float:
+        for key in ("holdVol", "vol", "positionVol", "positionAmt", "amount", "contracts"):
+            try:
+                value = row.get(key)
+                if value not in (None, ""):
+                    return abs(float(value))
+            except Exception:
+                pass
+        return 0.0
+
+    def _mexc_position_side(self, row: dict) -> str:
+        side = str(row.get("positionType") or row.get("holdSide") or row.get("side") or "").lower()
+        if side in {"2", "short", "sell"} or "short" in side:
+            return "short"
+        return "long"
+
+    def _mexc_parse_position(self, row: dict) -> dict:
+        mexc_symbol = str(row.get("symbol") or row.get("contract") or "")
+        symbol = self._mexc_id_to_symbol(mexc_symbol)
+        contracts = self._mexc_position_qty_contracts(row)
+        amount = self._mexc_contracts_to_amount(symbol, contracts)
+        entry = 0.0
+        for key in ("holdAvgPrice", "openAvgPrice", "entryPrice", "avgPrice"):
+            try:
+                if row.get(key) not in (None, ""):
+                    entry = float(row.get(key)); break
+            except Exception:
+                pass
+        mark = 0.0
+        for key in ("markPrice", "fairPrice", "lastPrice"):
+            try:
+                if row.get(key) not in (None, ""):
+                    mark = float(row.get(key)); break
+            except Exception:
+                pass
+        side = self._mexc_position_side(row)
+        return {
+            "symbol": symbol,
+            "side": side,
+            "contracts": contracts,
+            "contractSize": (amount / contracts if contracts else None),
+            "amount": amount,
+            "entryPrice": entry,
+            "markPrice": mark,
+            "unrealizedPnl": float(row.get("unrealised") or row.get("unrealizedPnl") or row.get("profit") or 0),
+            "info": row,
+        }
+
+    async def _mexc_fetch_positions(self, symbols=None):
+        query = {}
+        one_symbol = None
+        if symbols:
+            one_symbol = list(symbols)[0]
+            query["symbol"] = self._mexc_symbol(one_symbol)
+        # Native endpoint is required for reliable Telegram sync.
+        out = await self._mexc_private("GET", "/api/v1/private/position/open_positions", query=query)
+        data = out.get("data") or []
+        if isinstance(data, dict):
+            # Some responses wrap rows under a list key.
+            data = data.get("list") or data.get("result") or data.get("data") or []
+        rows = data if isinstance(data, list) else []
+        parsed = [self._mexc_parse_position(r) for r in rows if isinstance(r, dict)]
+        if symbols:
+            wanted = {self.normalize_symbol(x) for x in symbols}
+            parsed = [p for p in parsed if p.get("symbol") in wanted]
+        return parsed
+
+    def _mexc_parse_order(self, row: dict) -> dict:
+        symbol = self._mexc_id_to_symbol(str(row.get("symbol") or ""))
+        oid = str(row.get("orderId") or row.get("id") or row.get("externalOid") or "")
+        side_raw = str(row.get("side") or "")
+        side = "buy" if side_raw in {"1", "2"} else "sell"
+        return {
+            "id": oid,
+            "symbol": symbol,
+            "side": side,
+            "type": row.get("type") or row.get("orderType"),
+            "price": float(row.get("price") or row.get("executePrice") or 0),
+            "amount": self._mexc_contracts_to_amount(symbol, float(row.get("vol") or row.get("remainVol") or 0)),
+            "remaining": self._mexc_contracts_to_amount(symbol, float(row.get("remainVol") or 0)),
+            "status": "open",
+            "clientOrderId": row.get("externalOid"),
+            "info": row,
+        }
+
+    async def _mexc_fetch_open_orders(self, symbol=None):
+        paths = []
+        if symbol:
+            paths.append(f"/api/v1/private/order/list/open_orders/{self._mexc_symbol(symbol)}")
+            paths.append("/api/v1/private/order/list/open_orders")
+        else:
+            paths.append("/api/v1/private/order/list/open_orders")
+        last_error = None
+        for path in paths:
+            try:
+                query = {}
+                if symbol and path.endswith("open_orders"):
+                    query["symbol"] = self._mexc_symbol(symbol)
+                out = await self._mexc_private("GET", path, query=query)
+                data = out.get("data") or []
+                if isinstance(data, dict):
+                    data = data.get("list") or data.get("result") or data.get("data") or []
+                rows = data if isinstance(data, list) else []
+                parsed = [self._mexc_parse_order(r) for r in rows if isinstance(r, dict)]
+                if symbol:
+                    norm = self.normalize_symbol(symbol)
+                    parsed = [o for o in parsed if o.get("symbol") == norm]
+                return parsed
+            except Exception as e:
+                last_error = e
+        if last_error:
+            raise last_error
+        return []
+
+    async def _mexc_cancel_all_orders(self, symbol=None):
+        symbols = []
+        if symbol:
+            symbols = [symbol]
+        else:
+            # Try to discover symbols with open orders and positions first.
+            try:
+                symbols.extend([o.get("symbol") for o in await self._mexc_fetch_open_orders() if o.get("symbol")])
+            except Exception:
+                pass
+            try:
+                symbols.extend([p.get("symbol") for p in await self._mexc_fetch_positions() if p.get("symbol")])
+            except Exception:
+                pass
+        seen = []
+        for sym in symbols:
+            if sym and sym not in seen:
+                seen.append(sym)
+        results = []
+        errors = []
+        for sym in seen:
+            try:
+                out = await self._mexc_private("POST", "/api/v1/private/order/cancel_all", body={"symbol": self._mexc_symbol(sym)})
+                results.append({"symbol": self.normalize_symbol(sym), "result": out})
+            except Exception as e:
+                errors.append({"symbol": sym, "error": str(e)})
+                # Fallback: cancel individual orders if listing works.
+                try:
+                    for o in await self.fetch_open_orders(sym):
+                        try:
+                            results.append(await self.cancel_order(o.get("id"), o.get("symbol") or sym))
+                        except Exception as e2:
+                            errors.append({"symbol": sym, "order_id": o.get("id"), "error": str(e2)})
+                except Exception as e3:
+                    errors.append({"symbol": sym, "error": f"list fallback failed: {e3}"})
+        if not seen and not symbol:
+            # As a final fallback, ask ccxt. This is read/cancel only.
+            try:
+                return await self.exchange.cancel_all_orders(None)
+            except Exception as e:
+                errors.append({"symbol": "all", "error": str(e)})
+        return {"ok": len(errors) == 0, "cancelled_symbols": len(results), "results": results, "errors": errors}
 
     async def _mexc_create_order(self, symbol, type_, side, amount, price=None, params=None, previous_error: str = ""):
         params = params or {}

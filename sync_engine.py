@@ -9,12 +9,24 @@ class SyncEngine:
         self.exchange_client = exchange_client
 
     def _position_qty(self, p: dict) -> float:
-        raw = p.get("contracts", p.get("amount", p.get("size")))
+        # Return base-coin amount, not raw contract count. Native MEXC sync
+        # supplies `amount` already converted from contracts via contractSize.
+        for key in ("amount", "qty", "size"):
+            try:
+                value = p.get(key)
+                if value not in (None, ""):
+                    return abs(float(value))
+            except Exception:
+                pass
+        info = p.get("info", {}) if isinstance(p.get("info"), dict) else {}
+        raw = p.get("contracts")
         if raw is None:
-            info = p.get("info", {}) if isinstance(p.get("info"), dict) else {}
             raw = info.get("positionAmt") or info.get("holdVol") or info.get("vol")
         try:
-            return abs(float(raw or 0))
+            contracts = abs(float(raw or 0))
+            cs = p.get("contractSize") or info.get("contractSize") or info.get("contract_size")
+            cs_f = float(cs or 0)
+            return contracts * cs_f if cs_f > 0 else contracts
         except Exception:
             return 0.0
 
@@ -60,7 +72,7 @@ class SyncEngine:
             return entry * (1 + sl_pct), entry * (1 - tp_pct)
         return entry * (1 - sl_pct), entry * (1 + tp_pct)
 
-    async def sync(self) -> dict:
+    async def sync(self, protect: bool = True) -> dict:
         report = {"positions": 0, "orders": 0, "entry": 0, "tp": 0, "sl": 0, "imported_positions": 0, "protected_positions": 0, "warnings": []}
         local_symbols = {p.get("symbol") for p in await self.storage.positions()}
         try:
@@ -96,7 +108,7 @@ class SyncEngine:
                 }
                 await self.storage.upsert_position(imported)
                 report["imported_positions"] += 1
-                if stop_price > 0 and take_price > 0:
+                if protect and stop_price > 0 and take_price > 0:
                     protection = await ExecutionEngine(self.storage, self.exchange_client).place_protection_orders(imported, live=True)
                     imported.update(protection)
                     await self.storage.upsert_position(imported)

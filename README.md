@@ -1,4 +1,4 @@
-# Liquidity Telegram Bot v0060 UX + 5X LEVERAGE
+# Liquidity Telegram Bot v0061 MEXC POSITION SYNC
 
 Signal-engine build for Railway with real futures-first candidate generation.
 
@@ -243,13 +243,13 @@ OK
 
 
 ## v0059 notes
-- `VERSION` updated to `0060 UX + 5X LEVERAGE`.
+- `VERSION` updated to `0061 MEXC POSITION SYNC`.
 - `LIMIT_TIMEOUT_SEC` default increased from 30 to 300 seconds.
 - MEXC code `8950` / closing-only symbols are treated as non-retryable: no position slot is occupied, and the symbol is locked for `MEXC_RESTRICTED_SYMBOL_LOCK_SEC` seconds.
 - MEXC private futures REST remains on `https://api.mexc.com`; WebSocket still uses `wss://contract.mexc.com/edge`.
 
 
-## v0060 UX + 5X LEVERAGE
+## v0061 MEXC POSITION SYNC
 - Default MEXC leverage is now 5x isolated.
 - Default risk is now 1% per trade.
 - Telegram open-position messages now show coin qty, USDT notional, leverage, margin mode, and estimated margin.
