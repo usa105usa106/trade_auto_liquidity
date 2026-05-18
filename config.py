@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = os.getenv("BOT_VERSION", "0065 HIDDEN MARGIN DETECTOR")
+VERSION = os.getenv("BOT_VERSION", "0066 LOCAL PROTECTION + POSITION STATE")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -61,6 +61,8 @@ class Defaults:
     mexc_order_open_type: int = env_int("MEXC_ORDER_OPEN_TYPE", 1)
     mexc_recv_window: int = env_int("MEXC_RECV_WINDOW", 20000)
     margin_allocation_enabled: bool = env_bool("MARGIN_ALLOCATION_ENABLED", True)
+    require_exchange_protection: bool = env_bool("REQUIRE_EXCHANGE_PROTECTION", True)
+    auto_close_on_protection_failed: bool = env_bool("AUTO_CLOSE_ON_PROTECTION_FAILED", False)
 
 DEFAULTS = Defaults()
 DB_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")

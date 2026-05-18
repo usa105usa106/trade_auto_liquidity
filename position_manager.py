@@ -64,8 +64,17 @@ class PositionManager:
                 pos.update(protection)
                 await self.storage.upsert_position(pos)
                 if not protection.get("ok"):
-                    close_res = await self.execution_engine.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
-                    return {"type": "protection_failed", "symbol": symbol, "result": close_res, "protection": protection}
+                    # v0066: keep the local position and let PositionManager
+                    # enforce TP/SL/time-stop from ticker prices. Auto-closing
+                    # can be enabled explicitly, but default is safer state sync.
+                    pos["protection_mode"] = "local_monitoring"
+                    pos["protection_warning"] = "exchange protection failed; local TP/SL monitor active"
+                    pos.update(protection)
+                    await self.storage.upsert_position(pos)
+                    if os.getenv("AUTO_CLOSE_ON_PROTECTION_FAILED", "false").lower() in {"1", "true", "yes", "on"}:
+                        close_res = await self.execution_engine.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
+                        return {"type": "protection_failed", "symbol": symbol, "result": close_res, "protection": protection}
+                    return {"type": "protection_local", "symbol": symbol, "protection": protection}
                 return {"type": "limit_filled", "symbol": symbol}
             if status in {"canceled", "cancelled", "rejected", "expired"}:
                 await self.storage.remove_position(symbol)

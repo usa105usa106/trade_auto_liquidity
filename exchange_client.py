@@ -506,15 +506,21 @@ class ExchangeClient:
         all_rows = []
         raw_meta = []
         errors = []
-        # Query all positions first, then symbol-specific variants. This catches
-        # MEXC cases where one variant returns empty while the other has data.
+        # Query all known current-position variants. MEXC accounts can return
+        # empty rows from one endpoint while account/assets shows positionMargin.
+        endpoints = [
+            "/api/v1/private/position/open_positions",
+            "/api/v1/private/position/list/open_positions",
+            "/api/v1/private/position/holding",
+        ]
         for query in queries:
-            try:
-                out = await self._mexc_private_read_any_base("/api/v1/private/position/open_positions", query=query)
-                raw_meta.append({"base": out.get("_base_url"), "query": query})
-                all_rows.extend([r for r in self._mexc_rows(out.get("data")) if isinstance(r, dict)])
-            except Exception as e:
-                errors.append(str(e))
+            for endpoint in endpoints:
+                try:
+                    out = await self._mexc_private_read_any_base(endpoint, query=query)
+                    raw_meta.append({"base": out.get("_base_url"), "query": query, "endpoint": endpoint})
+                    all_rows.extend([r for r in self._mexc_rows(out.get("data")) if isinstance(r, dict)])
+                except Exception as e:
+                    errors.append(f"{endpoint}: {e}")
         # De-duplicate by positionId/symbol/side.
         unique = []
         seen = set()
@@ -651,6 +657,47 @@ class ExchangeClient:
         if self.exchange_id != "mexc":
             raise NotImplementedError("native close_all is MEXC only")
         return await self._mexc_private("POST", "/api/v1/private/position/close_all", body={})
+
+    async def mexc_place_stop_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, client_order_id: str = "") -> dict:
+        """Place a native MEXC futures stop-market close order.
+
+        Used for SL protection. `close_side` is the side needed to close the
+        current position: sell closes long, buy closes short. MEXC uses side
+        code 4 to close long and 2 to close short. The trend value is selected
+        from the trigger direction: a buy stop normally triggers upward, a sell
+        stop normally triggers downward.
+        """
+        msym = self._mexc_symbol(symbol)
+        side_l = str(close_side).lower()
+        mexc_side = 2 if side_l == "buy" else 4
+        # trend: 1 = trigger upward, 2 = trigger downward on common MEXC variants.
+        trend = 1 if side_l == "buy" else 2
+        body = {
+            "symbol": msym,
+            "vol": self._amount_to_mexc_vol(symbol, amount),
+            "side": mexc_side,
+            "openType": int(os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or "1"),
+            "leverage": int(os.getenv("MEXC_ORDER_LEVERAGE", "5") or "5"),
+            "triggerPrice": float(trigger_price),
+            "executePrice": 0,
+            "orderType": 5,
+            "triggerType": 1,
+            "trend": trend,
+        }
+        if client_order_id:
+            body["externalOid"] = str(client_order_id)[:32]
+        out = await self._mexc_private("POST", "/api/v1/private/planorder/place", body=body)
+        data = out.get("data") if isinstance(out, dict) else {}
+        oid = data.get("orderId") if isinstance(data, dict) else data
+        return {
+            "id": str(oid or ""),
+            "symbol": self.normalize_symbol(symbol),
+            "type": "stop_market",
+            "side": close_side,
+            "amount": amount,
+            "price": None,
+            "info": {"native_mexc_stop": True, **(out if isinstance(out, dict) else {"raw": out})},
+        }
 
     async def mexc_account_state(self):
         """Return raw account state used by diagnostics commands."""

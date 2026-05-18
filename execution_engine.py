@@ -245,8 +245,17 @@ class ExecutionEngine:
                 pos.update(protection)
                 await self.storage.upsert_position(pos)
                 if not protection.get("ok"):
-                    close_res = await self.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
-                    return {"ok": False, "reason": "protection orders failed", "protection": protection, "close_result": close_res}
+                    # v0066: do NOT delete local state when MEXC fails to place
+                    # exchange-side TP/SL. The position is already live; losing
+                    # local state is worse than running local TP/SL monitoring.
+                    pos["protection_mode"] = "local_monitoring"
+                    pos["protection_warning"] = "exchange protection failed; local TP/SL monitor active"
+                    pos["updated_at"] = time.time()
+                    await self.storage.upsert_position(pos)
+                    if os.getenv("AUTO_CLOSE_ON_PROTECTION_FAILED", "false").lower() in {"1", "true", "yes", "on"}:
+                        close_res = await self.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
+                        return {"ok": False, "reason": "protection orders failed; auto-close enabled", "protection": protection, "close_result": close_res}
+                    return {"ok": True, "order": order, "position": pos, "warning": "exchange protection failed; local TP/SL monitor active"}
             return {"ok": True, "order": order, "position": pos}
 
 
@@ -313,12 +322,22 @@ class ExecutionEngine:
             return {"ok": False, "reason": str(e)}
 
     async def _create_stop_market_order(self, symbol: str, side: str, qty: float, stop_price: float) -> dict:
+        errors = []
+        # Prefer native MEXC plan order when available. It avoids ccxt routing
+        # differences and lets ExchangeClient choose the correct close side.
+        try:
+            if hasattr(self.exchange_client, "mexc_place_stop_market"):
+                return await self.exchange_client.mexc_place_stop_market(
+                    symbol=symbol, close_side=side, amount=qty, trigger_price=stop_price,
+                    client_order_id=f"bot_sl_{int(time.time()*1000)}",
+                )
+        except Exception as e:
+            errors.append(f"native_plan: {e}")
         attempts = [
             ("market", None, {"reduceOnly": True, "stopPrice": stop_price, "triggerPrice": stop_price, "clientOrderId": f"bot_sl_{int(time.time()*1000)}"}),
             ("market", None, {"reduceOnly": True, "stopLossPrice": stop_price, "clientOrderId": f"bot_sl_{int(time.time()*1000)}"}),
             ("stop_market", None, {"reduceOnly": True, "stopPrice": stop_price, "triggerPrice": stop_price, "clientOrderId": f"bot_sl_{int(time.time()*1000)}"}),
         ]
-        errors = []
         for type_, price, params in attempts:
             try:
                 return await self.exchange_client.create_order(symbol, type_, side, qty, price, params)

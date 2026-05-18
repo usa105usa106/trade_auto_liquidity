@@ -237,6 +237,7 @@ def format_position_event(ev: dict) -> str:
         "limit_expired": "limit expired",
         "breakeven": "breakeven moved",
         "protection_failed": "protection failed",
+        "protection_local": "exchange protection failed; local monitor active",
     }
     label = reason_map.get(str(typ), str(typ))
     lines = [f"📌 Position event", f"{symbol}: {label}"]
@@ -397,11 +398,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /status - статус
 /ping - отклик, RAM, uptime
 /balance - futures balance + IP/proxy
-/positions - локальные + реальные позиции MEXC
+/positions - локальные + реальные позиции MEXC + protection mode
 /open_orders - открытые ордера на MEXC
 /cancel_all - отменить все открытые ордера MEXC
 /close_all - закрыть все реальные позиции MEXC native close-all
-/positions - показывает локальные позиции + предупреждение о hidden margin
 /stats - статистика сделок
 /sync - синхронизация позиций/ордеров
 /sync_positions - подтянуть реальные позиции MEXC в бота
@@ -412,6 +412,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /open_type 1 - 1 isolated, 2 cross
 /recv_window 20000 - окно timestamp для MEXC
 /set margin_allocation_enabled true|false - делить баланс по слотам
+/set auto_close_on_protection_failed true|false - авто-закрытие если TP/SL не встал
+/set require_exchange_protection true|false - требовать exchange TP/SL
 /set key value - ручная настройка
 
 Ключевые настройки:
@@ -419,7 +421,7 @@ live_trading, risk_pct, max_open_positions, scan_interval_sec, scanner_concurren
 ws_update_throttle_ms, ws_max_updates_per_batch, ws_queue_limit,
 symbol_refresh_sec, universe_mode, strategy_mode, mirror_mode,
 spot_confirmation_enabled, session_filter_enabled, america_short_bias_enabled, ws_enabled,
-mexc_order_leverage, mexc_order_open_type, mexc_recv_window, margin_allocation_enabled,
+mexc_order_leverage, mexc_order_open_type, mexc_recv_window, margin_allocation_enabled, require_exchange_protection, auto_close_on_protection_failed,
 scan_market_source = binance_binance | mexc_mexc | mexc_binance.
 
 По умолчанию: mexc_binance = MEXC фьючи скан + Binance spot подтверждение.
@@ -703,11 +705,16 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for p in local:
             notional, margin, leverage, margin_type = _position_money_fields(p)
             coin = str(p.get('symbol', '')).split('/')[0]
+            warn = ""
+            if p.get("protection_mode") == "local_monitoring" or p.get("protection_warning"):
+                warn = "\n⚠️ Protection: LOCAL monitoring only; exchange TP/SL not confirmed"
+                if p.get("tp_error") or p.get("sl_error"):
+                    warn += f"\nTP err: {str(p.get('tp_error') or '-')[:120]}\nSL err: {str(p.get('sl_error') or '-')[:120]}"
             lines.append(
                 f"{p.get('symbol')} {p.get('side')} {p.get('status')} "
                 f"entry={p.get('entry_price')} SL={p.get('stop_price')} TP={p.get('take_price')}\n"
                 f"Qty={float(p.get('qty') or 0):.6f} {coin} / {notional:.2f} USDT | "
-                f"Lev={leverage}x | Margin={margin_type} ~{margin:.2f} USDT"
+                f"Lev={leverage}x | Margin={margin_type} ~{margin:.2f} USDT" + warn
             )
     if exchange_positions:
         local_symbols = {p.get("symbol") for p in local}
@@ -799,6 +806,11 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 failures.append(f"{p.get('symbol')}: {res.get('reason')}")
         native_res = None
+        cancel_res = None
+        try:
+            cancel_res = await ex.cancel_all_orders()
+        except Exception as e:
+            failures.append(f"cancel_all: {e}")
         # Extra safety: MEXC native close_all closes exchange-side positions even
         # when position listing is stale/empty.
         if hasattr(ex, "mexc_close_all_positions_native"):
@@ -806,7 +818,14 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 native_res = await ex.mexc_close_all_positions_native()
             except Exception as e:
                 failures.append(f"native_close_all: {e}")
-        await reply(update, f"🧯 Close all sent\nListed positions closed: {closed}\nNative close_all: {str(native_res)[:300] if native_res is not None else '-'}\nFailures: {failures[:5] if failures else '-'}", reply_markup=MAIN_MENU)
+        # Clear local cache after an explicit emergency/manual close-all command.
+        # The user can /sync_positions after if something is still live.
+        for lp in await storage.positions():
+            try:
+                await storage.remove_position(lp.get("symbol"))
+            except Exception:
+                pass
+        await reply(update, f"🧯 Close all sent\nListed positions closed: {closed}\nCancel all: {str(cancel_res)[:220] if cancel_res is not None else '-'}\nNative close_all: {str(native_res)[:300] if native_res is not None else '-'}\nLocal cache cleared: yes\nFailures: {failures[:5] if failures else '-'}", reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"🧯 Close all failed: {e}", reply_markup=MAIN_MENU)
 
@@ -937,6 +956,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "limit_timeout_sec", "proxy_enabled", "proxy_url", "mexc_api_key", "mexc_api_secret",
         "ws_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold",
         "mexc_order_leverage", "mexc_order_open_type", "mexc_recv_window",
+        "margin_allocation_enabled", "require_exchange_protection", "auto_close_on_protection_failed",
     }
     if key not in allowed_keys:
         await reply(update, f"❌ Setting is not allowed through /set: {key}", reply_markup=MAIN_MENU)
@@ -947,7 +967,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: parsed = float(value) if "." in value else int(value)
         except Exception: parsed = value
     await storage.set(key, parsed)
-    if key in {"mexc_api_key", "mexc_api_secret", "proxy_url", "proxy_enabled", "mexc_order_leverage", "mexc_order_open_type", "mexc_recv_window"}:
+    if key in {"mexc_api_key", "mexc_api_secret", "proxy_url", "proxy_enabled", "mexc_order_leverage", "mexc_order_open_type", "mexc_recv_window", "margin_allocation_enabled", "require_exchange_protection", "auto_close_on_protection_failed"}:
         new_settings = await storage.all_settings()
         apply_mexc_runtime_env(new_settings)
         await reset_exchange()
