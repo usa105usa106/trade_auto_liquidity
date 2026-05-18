@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = os.getenv("BOT_VERSION", "0068 MEXC SYMBOL MAPPER + RAW DEBUG")
+VERSION = os.getenv("BOT_VERSION", "0069 MEXC EXCHANGE-FIRST POSITIONS")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)

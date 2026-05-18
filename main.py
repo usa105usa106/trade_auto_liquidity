@@ -406,6 +406,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /sync - синхронизация позиций/ордеров
 /sync_positions - подтянуть реальные позиции MEXC в бота
 /mexc_debug_state [SYMBOL] - raw debug MEXC positions/orders/symbol variants
+
+Note: /positions now checks MEXC even when the scanner is stopped/live_trading is off.
 /proxy on|off|test|set URL
 /api status|set KEY SECRET|clear|test - API биржи через чат
 /mexc_settings - показать MEXC параметры ордера
@@ -665,10 +667,15 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     local = await storage.positions()
     exchange_positions = []
     exchange_error = ""
-    if bool(s.get("live_trading", False)):
+    # v0069: /positions must be exchange-first and must NOT depend on
+    # live_trading/Run. A user can have real MEXC positions while the bot is
+    # stopped or live_trading is off; hiding them is dangerous.
+    api_key, api_secret = _api_creds(s)
+    if api_key and api_secret:
         try:
             ex = await get_exchange(s)
-            exchange_positions = [p for p in (await ex.fetch_positions() or []) if ExecutionEngine(storage, ex).exchange_position_qty(p) > 0]
+            raw_positions = await ex.fetch_positions() or []
+            exchange_positions = [p for p in raw_positions if ExecutionEngine(storage, ex).exchange_position_qty(p) > 0]
         except Exception as e:
             exchange_error = str(e)[:220]
     if not local and not exchange_positions:
@@ -677,7 +684,8 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # assets still show positionMargin/used/unrealized PnL. Surface that
         # clearly instead of pretending the account is clean.
         try:
-            if bool(s.get("live_trading", False)):
+            api_key2, api_secret2 = _api_creds(s)
+            if api_key2 and api_secret2:
                 ex2 = await get_exchange(s)
                 bal = await ex2.fetch_balance()
                 usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
