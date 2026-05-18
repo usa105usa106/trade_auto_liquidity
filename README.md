@@ -1,4 +1,4 @@
-# Liquidity Telegram Bot v0066 LOCAL PROTECTION + POSITION STATE
+# Liquidity Telegram Bot v0067 SAFE LOCAL STATE + HIDDEN MARGIN
 
 Signal-engine build for Railway with real futures-first candidate generation.
 
@@ -258,7 +258,7 @@ OK
 - Strategy logic, scanner, and WebSocket logic were not changed.
 
 
-## v0066 LOCAL PROTECTION + POSITION STATE
+## v0067 SAFE LOCAL STATE + HIDDEN MARGIN
 - Raw MEXC futures state sync is now exchange-first.
 - `/positions` reads native MEXC open positions and does not rely on ccxt position parsing.
 - Open orders include normal orders plus plan/stop/TP-SL order scans when available.
@@ -269,7 +269,7 @@ OK
 MARGIN_ALLOCATION_ENABLED=true
 
 
-## v0066 LOCAL PROTECTION + POSITION STATE
+## v0067 SAFE LOCAL STATE + HIDDEN MARGIN
 - Если MEXC не отдаёт строку позиции, бот не удаляет локальную позицию после входа.
 - Если exchange TP/SL protection не поставился, бот оставляет позицию под локальным мониторингом TP/SL/time-stop вместо немедленного удаления состояния.
 - /positions показывает protection mode и warning.

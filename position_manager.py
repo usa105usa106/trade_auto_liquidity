@@ -71,7 +71,7 @@ class PositionManager:
                     pos["protection_warning"] = "exchange protection failed; local TP/SL monitor active"
                     pos.update(protection)
                     await self.storage.upsert_position(pos)
-                    if os.getenv("AUTO_CLOSE_ON_PROTECTION_FAILED", "false").lower() in {"1", "true", "yes", "on"}:
+                    if os.getenv("ALLOW_AUTO_CLOSE_ON_PROTECTION_FAILED", "false").lower() in {"1", "true", "yes", "on"}:
                         close_res = await self.execution_engine.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
                         return {"type": "protection_failed", "symbol": symbol, "result": close_res, "protection": protection}
                     return {"type": "protection_local", "symbol": symbol, "protection": protection}

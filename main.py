@@ -405,6 +405,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /stats - статистика сделок
 /sync - синхронизация позиций/ордеров
 /sync_positions - подтянуть реальные позиции MEXC в бота
+/mexc_debug_state [SYMBOL] - raw debug MEXC positions/orders/symbol variants
 /proxy on|off|test|set URL
 /api status|set KEY SECRET|clear|test - API биржи через чат
 /mexc_settings - показать MEXC параметры ордера
@@ -685,13 +686,14 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 frozen = float(usdt.get("frozenBalance") or 0)
                 upnl = float(usdt.get("unrealized") or 0)
                 if used > 0.5 or pm > 0.5 or abs(upnl) > 0.01:
-                    text += (
-                        "\n\n⚠️ Hidden MEXC margin detected"
+                    text = (
+                        "📈 Positions: ⚠️ hidden exchange margin\n⚠️ Hidden MEXC margin detected"
                         f"\nUsed: {used:.4f} USDT"
                         f"\nPosition margin: {pm:.4f} USDT"
                         f"\nFrozen: {frozen:.4f} USDT"
                         f"\nUnrealized PnL: {upnl:.4f} USDT"
-                        "\nMEXC did not return a position row, but account assets show margin/PnL."
+                        "\n\nMEXC did not return a position row, but account assets show live margin/PnL."
+                        "\nThis is NOT flat. Do not start new trading until it is closed."
                         "\nUse /close_all to send native MEXC close-all, then /balance."
                     )
         except Exception as e:
@@ -717,10 +719,35 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Lev={leverage}x | Margin={margin_type} ~{margin:.2f} USDT" + warn
             )
     if exchange_positions:
-        local_symbols = {p.get("symbol") for p in local}
+        local_keys = set()
+        try:
+            ex_for_variants = await get_exchange(s)
+            for lp in local:
+                for v in (lp.get("symbol_variants") or []):
+                    local_keys.add(ex_for_variants._mexc_normalize_contract_id(v))
+                if lp.get("symbol"):
+                    for v in ex_for_variants.mexc_symbol_variants(lp.get("symbol")):
+                        local_keys.add(ex_for_variants._mexc_normalize_contract_id(v))
+                if lp.get("mexc_symbol"):
+                    local_keys.add(ex_for_variants._mexc_normalize_contract_id(lp.get("mexc_symbol")))
+        except Exception:
+            local_keys = {p.get("symbol") for p in local}
         lines.append("\nExchange real positions:")
         for p in exchange_positions:
-            prefix = "✅ synced" if p.get("symbol") in local_symbols else "⚠️ exchange-only"
+            p_keys = set()
+            try:
+                ex_for_variants = await get_exchange(s)
+                for v in (p.get("symbol_variants") or []):
+                    p_keys.add(ex_for_variants._mexc_normalize_contract_id(v))
+                p_keys.add(ex_for_variants._mexc_normalize_contract_id(p.get("symbol")))
+                p_keys.add(ex_for_variants._mexc_normalize_contract_id(p.get("mexc_symbol")))
+                info = p.get("info") or {}
+                if isinstance(info, dict):
+                    p_keys.add(ex_for_variants._mexc_normalize_contract_id(info.get("symbol")))
+                    p_keys.add(ex_for_variants._mexc_normalize_contract_id(info.get("contract")))
+            except Exception:
+                p_keys = {p.get("symbol")}
+            prefix = "✅ synced" if (p_keys & local_keys) else "⚠️ exchange-only"
             lines.append(prefix + " " + _exchange_position_text(p))
     if exchange_error:
         lines.append(f"\nExchange sync error: {exchange_error}")
@@ -818,16 +845,58 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 native_res = await ex.mexc_close_all_positions_native()
             except Exception as e:
                 failures.append(f"native_close_all: {e}")
-        # Clear local cache after an explicit emergency/manual close-all command.
-        # The user can /sync_positions after if something is still live.
-        for lp in await storage.positions():
-            try:
-                await storage.remove_position(lp.get("symbol"))
-            except Exception:
-                pass
-        await reply(update, f"🧯 Close all sent\nListed positions closed: {closed}\nCancel all: {str(cancel_res)[:220] if cancel_res is not None else '-'}\nNative close_all: {str(native_res)[:300] if native_res is not None else '-'}\nLocal cache cleared: yes\nFailures: {failures[:5] if failures else '-'}", reply_markup=MAIN_MENU)
+        # v0067: clear local cache only after balance confirms there is no hidden
+        # position margin left. Previously the bot could erase local state while
+        # MEXC still showed used/positionMargin > 0.
+        local_cache_cleared = False
+        post_pm = post_used = None
+        try:
+            await asyncio.sleep(float(os.getenv("POST_CLOSE_BALANCE_CHECK_DELAY_SEC", "0.8")))
+            bal = await ex.fetch_balance()
+            usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
+            post_pm = float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
+            post_used = float(usdt.get("used") or ((bal or {}).get("used", {}) or {}).get("USDT") or 0)
+            if post_pm <= 0.5 and post_used <= 0.5:
+                for lp in await storage.positions():
+                    try:
+                        await storage.remove_position(lp.get("symbol"))
+                    except Exception:
+                        pass
+                local_cache_cleared = True
+            else:
+                failures.append(f"hidden margin still present: used={post_used:.4f}, positionMargin={post_pm:.4f}")
+        except Exception as e:
+            failures.append(f"post-close balance check: {e}")
+        await reply(update, f"🧯 Close all sent\nListed positions closed: {closed}\nCancel all: {str(cancel_res)[:220] if cancel_res is not None else '-'}\nNative close_all: {str(native_res)[:300] if native_res is not None else '-'}\nPost used: {post_used if post_used is not None else '-'}\nPost position margin: {post_pm if post_pm is not None else '-'}\nLocal cache cleared: {'yes' if local_cache_cleared else 'no'}\nFailures: {failures[:5] if failures else '-'}", reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"🧯 Close all failed: {e}", reply_markup=MAIN_MENU)
+
+async def mexc_debug_state_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    symbol = context.args[0] if context.args else None
+    try:
+        ex = await get_exchange(s)
+        if not hasattr(ex, "mexc_debug_state"):
+            await reply(update, "MEXC debug is not available for this exchange", reply_markup=MAIN_MENU); return
+        report = await ex.mexc_debug_state(symbol)
+        lines = ["🧪 MEXC raw state debug"]
+        if symbol:
+            lines.append(f"Symbol: {symbol}")
+            lines.append("Variants: " + ", ".join(report.get("variants") or [])[:500])
+        for item in (report.get("endpoints") or [])[:24]:
+            ep = item.get("endpoint")
+            q = item.get("query")
+            if item.get("error"):
+                lines.append(f"{ep} {q}: ERR {item.get('error')}")
+            else:
+                sample = str(item.get("sample"))
+                if len(sample) > 260:
+                    sample = sample[:260] + "..."
+                lines.append(f"{ep} {q}: rows={item.get('rows')} base={item.get('base')} sample={sample}")
+        await reply(update, "\n".join(lines)[:3900], reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"🧪 MEXC debug failed: {e}", reply_markup=MAIN_MENU)
 
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -1426,6 +1495,7 @@ def build_app():
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("positions", positions_cmd))
+    app.add_handler(CommandHandler("mexc_debug_state", mexc_debug_state_cmd))
     app.add_handler(CommandHandler("open_orders", open_orders_cmd))
     app.add_handler(CommandHandler("cancel_all", cancel_all_cmd))
     app.add_handler(CommandHandler("close_all", close_all_cmd))

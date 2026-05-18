@@ -190,6 +190,16 @@ class ExecutionEngine:
             pos["opened_at"] = time.time()
             pos["updated_at"] = time.time()
             pos["raw_order"] = order
+            # v0068: persist every known MEXC symbol spelling immediately.
+            # Railway redeploys/local DB resets can still lose cache, but while
+            # the bot is running this prevents symbol mismatch from hiding the
+            # position in /positions and close logic.
+            try:
+                if hasattr(self.exchange_client, "mexc_symbol_variants"):
+                    pos["symbol_variants"] = self.exchange_client.mexc_symbol_variants(plan.symbol)
+                    pos["mexc_symbol"] = self.exchange_client._mexc_symbol(plan.symbol)
+            except Exception as e:
+                pos["symbol_variant_warning"] = str(e)[:160]
             try:
                 info = order.get("info", {}) if isinstance(order, dict) else {}
                 mg = info.get("margin_guard") or {}
@@ -252,9 +262,9 @@ class ExecutionEngine:
                     pos["protection_warning"] = "exchange protection failed; local TP/SL monitor active"
                     pos["updated_at"] = time.time()
                     await self.storage.upsert_position(pos)
-                    if os.getenv("AUTO_CLOSE_ON_PROTECTION_FAILED", "false").lower() in {"1", "true", "yes", "on"}:
+                    if os.getenv("ALLOW_AUTO_CLOSE_ON_PROTECTION_FAILED", "false").lower() in {"1", "true", "yes", "on"}:
                         close_res = await self.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
-                        return {"ok": False, "reason": "protection orders failed; auto-close enabled", "protection": protection, "close_result": close_res}
+                        return {"ok": False, "reason": "protection orders failed; auto-close explicitly enabled", "protection": protection, "close_result": close_res}
                     return {"ok": True, "order": order, "position": pos, "warning": "exchange protection failed; local TP/SL monitor active"}
             return {"ok": True, "order": order, "position": pos}
 
@@ -422,6 +432,32 @@ class ExecutionEngine:
             "mirror_used": pos.get("mirror_used", False),
             "session": pos.get("session"),
         })
+        # v0067 safety: do not erase local state if MEXC still shows hidden
+        # position margin after a close attempt. Some accounts return empty
+        # position lists while account/assets still has positionMargin. In that
+        # case keeping local state is safer than pretending the account is flat.
+        confirmed_flat = True
+        if live and hasattr(self.exchange_client, "fetch_balance"):
+            try:
+                await asyncio.sleep(float(os.getenv("POST_CLOSE_BALANCE_CHECK_DELAY_SEC", "0.8")))
+                bal = await self.exchange_client.fetch_balance()
+                usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
+                pm = float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
+                used = float(usdt.get("used") or ((bal or {}).get("used", {}) or {}).get("USDT") or 0)
+                if pm > float(os.getenv("HIDDEN_MARGIN_WARN_USDT", "0.5")) and used > float(os.getenv("HIDDEN_MARGIN_WARN_USDT", "0.5")):
+                    confirmed_flat = False
+                    pos["status"] = "open"
+                    pos["close_warning"] = f"close order sent but account still shows hidden margin: {pm:.4f} USDT"
+                    pos["updated_at"] = time.time()
+                    await self.storage.upsert_position(pos)
+            except Exception as e:
+                confirmed_flat = False
+                pos["status"] = "open"
+                pos["close_warning"] = f"close verification failed: {e}"
+                pos["updated_at"] = time.time()
+                await self.storage.upsert_position(pos)
+        if not confirmed_flat:
+            return {"ok": False, "reason": pos.get("close_warning", "close not confirmed"), "pnl_usdt": pnl_usdt, "pnl_pct": pnl_pct}
         await self.storage.remove_position(symbol)
         await self.storage.set_lock(symbol, 120, f"closed: {reason}")
         return {"ok": True, "pnl_usdt": pnl_usdt, "pnl_pct": pnl_pct}

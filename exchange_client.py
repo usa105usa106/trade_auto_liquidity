@@ -97,7 +97,68 @@ class ExchangeClient:
             return mid
         norm = str(m.get("symbol") or self.normalize_symbol(symbol))
         base = norm.split("/", 1)[0]
-        return f"{base}_USDT"
+        quote = (norm.split("/", 1)[1].split(":", 1)[0] if "/" in norm else "USDT")
+        return f"{base}_{quote}"
+
+    def mexc_symbol_variants(self, symbol: str) -> list[str]:
+        """Return all symbol spellings MEXC may use for the same futures pair.
+
+        MEXC futures can use different symbols across endpoints: ccxt symbol
+        (SUI/USDT:USDT), contract id (SUI_USDT), compact (SUIUSDT), hyphen
+        (SUI-USDT), and sometimes plain SUI/USDT. Keeping these variants in
+        local state lets /positions match exchange rows even if one endpoint
+        returns a different spelling.
+        """
+        out = []
+        def add(x):
+            x = str(x or "").strip()
+            if x and x not in out:
+                out.append(x)
+        try:
+            norm = self.normalize_symbol(symbol)
+        except Exception:
+            norm = str(symbol or "")
+        add(symbol); add(norm)
+        base, quote = "", "USDT"
+        if "/" in norm:
+            base = norm.split("/", 1)[0]
+            quote = norm.split("/", 1)[1].split(":", 1)[0] or "USDT"
+        else:
+            raw = norm.replace("-", "_")
+            if "_" in raw:
+                base, quote = raw.split("_", 1)
+            elif raw.upper().endswith("USDT"):
+                base, quote = raw[:-4], "USDT"
+            else:
+                base, quote = raw, "USDT"
+        base = base.upper(); quote = quote.upper()
+        add(f"{base}/{quote}:USDT")
+        add(f"{base}/{quote}")
+        add(f"{base}_{quote}")
+        add(f"{base}-{quote}")
+        add(f"{base}{quote}")
+        try:
+            m = self._market(norm)
+            add(m.get("id")); add(m.get("symbol"))
+            info = m.get("info") or {}
+            if isinstance(info, dict):
+                for k in ("symbol", "contract", "contractName", "baseCoin", "settleCoin"):
+                    if k in info and k not in {"baseCoin", "settleCoin"}:
+                        add(info.get(k))
+        except Exception:
+            pass
+        return out
+
+    def _mexc_normalize_contract_id(self, raw: str) -> str:
+        raw = str(raw or "").strip().upper().replace("-", "_").replace("/", "_")
+        if raw.endswith(":USDT"):
+            raw = raw[:-5]
+        if "_" not in raw and raw.endswith("USDT"):
+            raw = raw[:-4] + "_USDT"
+        return raw
+
+    def _mexc_variants_match(self, a: str, b: str) -> bool:
+        return self._mexc_normalize_contract_id(a) == self._mexc_normalize_contract_id(b)
 
     def _amount_to_mexc_vol(self, symbol: str, amount: float) -> int:
         """MEXC futures API expects integer contract volume, not base coin amount."""
@@ -426,18 +487,25 @@ class ExchangeClient:
         if not raw:
             return raw
         markets = getattr(self.exchange, "markets", {}) or {}
+        norm_raw = self._mexc_normalize_contract_id(raw)
         for m in markets.values():
-            if str(m.get("id") or "") == raw:
+            ids = {
+                self._mexc_normalize_contract_id(m.get("id")),
+                self._mexc_normalize_contract_id(m.get("symbol")),
+            }
+            info = m.get("info") or {}
+            if isinstance(info, dict):
+                ids.add(self._mexc_normalize_contract_id(info.get("symbol")))
+                ids.add(self._mexc_normalize_contract_id(info.get("contract")))
+                ids.add(self._mexc_normalize_contract_id(info.get("contractName")))
+            if norm_raw in ids:
                 return str(m.get("symbol") or raw)
-        if "_" in raw:
-            base, quote = raw.split("_", 1)
-            candidate = f"{base}/{quote}:USDT"
-            if candidate in markets:
-                return candidate
-            candidate2 = f"{base}/{quote}"
-            if candidate2 in markets:
-                return candidate2
-            return candidate
+        if "_" in norm_raw:
+            base, quote = norm_raw.split("_", 1)
+            for candidate in (f"{base}/{quote}:USDT", f"{base}/{quote}"):
+                if candidate in markets:
+                    return candidate
+            return f"{base}/{quote}:USDT"
         return raw
 
     def _mexc_contracts_to_amount(self, symbol: str, contracts: float) -> float:
@@ -486,8 +554,13 @@ class ExchangeClient:
             except Exception:
                 pass
         side = self._mexc_position_side(row)
+        variants = self.mexc_symbol_variants(symbol)
+        if mexc_symbol and mexc_symbol not in variants:
+            variants.append(mexc_symbol)
         return {
             "symbol": symbol,
+            "mexc_symbol": self._mexc_normalize_contract_id(mexc_symbol),
+            "symbol_variants": variants,
             "side": side,
             "contracts": contracts,
             "contractSize": (amount / contracts if contracts else None),
@@ -500,9 +573,15 @@ class ExchangeClient:
 
     async def _mexc_fetch_positions(self, symbols=None):
         queries = [{}]
+        wanted_variants = set()
         if symbols:
             for sym in list(symbols):
-                queries.append({"symbol": self._mexc_symbol(sym)})
+                for v in self.mexc_symbol_variants(sym):
+                    wanted_variants.add(self._mexc_normalize_contract_id(v))
+                    # Query each MEXC-style contract id variant; unsupported
+                    # variants are ignored by the endpoint loop below.
+                    if "_" in self._mexc_normalize_contract_id(v):
+                        queries.append({"symbol": self._mexc_normalize_contract_id(v)})
         all_rows = []
         raw_meta = []
         errors = []
@@ -533,8 +612,18 @@ class ExchangeClient:
         parsed = [self._mexc_parse_position(r) for r in unique]
         parsed = [p for p in parsed if self._mexc_position_qty_contracts(p.get("info", {})) > 0 or float(p.get("contracts") or 0) > 0 or float(p.get("amount") or 0) > 0]
         if symbols:
-            wanted = {self.normalize_symbol(x) for x in symbols}
-            parsed = [p for p in parsed if p.get("symbol") in wanted]
+            def matches_requested(p):
+                vals = set()
+                vals.add(self._mexc_normalize_contract_id(p.get("symbol")))
+                vals.add(self._mexc_normalize_contract_id(p.get("mexc_symbol")))
+                for v in p.get("symbol_variants") or []:
+                    vals.add(self._mexc_normalize_contract_id(v))
+                info = p.get("info") or {}
+                if isinstance(info, dict):
+                    vals.add(self._mexc_normalize_contract_id(info.get("symbol")))
+                    vals.add(self._mexc_normalize_contract_id(info.get("contract")))
+                return bool(vals & wanted_variants)
+            parsed = [p for p in parsed if matches_requested(p)]
         for p in parsed:
             p.setdefault("sync_meta", raw_meta[:3])
         if not parsed and errors:
@@ -698,6 +787,44 @@ class ExchangeClient:
             "price": None,
             "info": {"native_mexc_stop": True, **(out if isinstance(out, dict) else {"raw": out})},
         }
+
+    async def mexc_debug_state(self, symbol: str | None = None) -> dict:
+        """Compact raw diagnostics for MEXC state without exposing credentials."""
+        endpoints = [
+            "/api/v1/private/account/assets",
+            "/api/v1/private/position/open_positions",
+            "/api/v1/private/position/list/open_positions",
+            "/api/v1/private/position/holding",
+            "/api/v1/private/order/list/open_orders",
+            "/api/v1/private/planorder/list/orders",
+            "/api/v1/private/stoporder/list/orders",
+        ]
+        queries = [{}]
+        if symbol:
+            queries = []
+            for v in self.mexc_symbol_variants(symbol):
+                ms = self._mexc_normalize_contract_id(v)
+                if "_" in ms:
+                    queries.append({"symbol": ms})
+            queries.append({})
+        report = {"symbol": symbol, "variants": self.mexc_symbol_variants(symbol) if symbol else [], "endpoints": []}
+        for ep in endpoints:
+            for q in queries[:6]:
+                try:
+                    out = await self._mexc_private_read_any_base(ep, query=q)
+                    data = out.get("data") if isinstance(out, dict) else None
+                    rows = self._mexc_rows(data)
+                    sample = rows[:2] if rows else (data if isinstance(data, dict) else data)
+                    report["endpoints"].append({
+                        "endpoint": ep,
+                        "query": q,
+                        "base": out.get("_base_url") if isinstance(out, dict) else "",
+                        "rows": len(rows) if isinstance(rows, list) else 0,
+                        "sample": sample,
+                    })
+                except Exception as e:
+                    report["endpoints"].append({"endpoint": ep, "query": q, "error": str(e)[:220]})
+        return report
 
     async def mexc_account_state(self):
         """Return raw account state used by diagnostics commands."""
