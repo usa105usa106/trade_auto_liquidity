@@ -131,15 +131,19 @@ class ExchangeClient:
             await self.exchange.close()
 
     async def fetch_balance(self):
-        try:
-            return await self.exchange.fetch_balance({"type": "swap"})
-        except Exception as e:
-            if self.exchange_id == "mexc":
+        # For MEXC futures use native contract API first.
+        # ccxt.fetch_balance({"type": "swap"}) may still touch the spot-private
+        # /api/v3/capital/config/getall endpoint, which is exactly what causes
+        # 403 via proxy. Do not call ccxt balance for MEXC unless raw fallback fails.
+        if self.exchange_id == "mexc":
+            try:
+                return await self._mexc_contract_fetch_balance()
+            except Exception as raw_error:
                 try:
-                    return await self._mexc_contract_fetch_balance()
-                except Exception as e2:
-                    raise RuntimeError(f"ccxt balance failed: {e}; raw contract balance failed: {e2}")
-            raise
+                    return await self.exchange.fetch_balance({"type": "swap"})
+                except Exception as ccxt_error:
+                    raise RuntimeError(f"raw MEXC contract balance failed: {raw_error}; ccxt balance failed: {ccxt_error}")
+        return await self.exchange.fetch_balance({"type": "swap"})
 
     async def fetch_tickers(self):
         return await self.exchange.fetch_tickers()
@@ -170,13 +174,28 @@ class ExchangeClient:
     async def create_order(self, symbol, type_, side, amount, price=None, params=None):
         params = params or {}
         norm = self.normalize_symbol(symbol)
+
+        # For MEXC futures, use the native contract endpoint FIRST.
+        # ccxt currently routes create_order to /api/v1/private/order/submit,
+        # which is the exact endpoint that returns Akamai/EdgeSuite 403 for this bot.
+        # Do not call ccxt first unless explicitly disabled with MEXC_RAW_ORDERS_FIRST=false.
+        if self.exchange_id == "mexc" and os.getenv("MEXC_RAW_ORDERS_FIRST", "true").lower() in {"1", "true", "yes", "on"}:
+            try:
+                return await self._mexc_contract_create_order(symbol, type_, side, amount, price, params, previous_error="")
+            except Exception as raw_error:
+                # If the native endpoint itself is 403 Access Denied, that is an IP/proxy/WAF block.
+                # Falling back to ccxt will only hit /order/submit and produce a noisier duplicate error,
+                # so keep the clean raw error.
+                raw_msg = str(raw_error)
+                if "403" in raw_msg or "Access Denied" in raw_msg or "Forbidden" in raw_msg:
+                    raise RuntimeError(f"MEXC native order/create blocked: {raw_msg}")
+                # Non-403 errors may be parameter-related; try ccxt as secondary fallback.
+
         try:
             return await self.exchange.create_order(norm, type_, side, amount, price, params)
         except Exception as e:
             msg = str(e)
-            # MEXC often returns bare 403 on unified ccxt order placement. Fall back to
-            # native contract API so entry orders are not blocked by ccxt's spot/swap routing.
-            if self.exchange_id == "mexc" and ("403" in msg or "Forbidden" in msg or os.getenv("MEXC_FORCE_RAW_ORDERS", "false").lower() in {"1", "true", "yes", "on"}):
+            if self.exchange_id == "mexc":
                 try:
                     return await self._mexc_contract_create_order(symbol, type_, side, amount, price, params, previous_error=msg)
                 except Exception as e2:

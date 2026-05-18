@@ -1,4 +1,4 @@
-# Liquidity Telegram Bot v0030 AUTOPILOT FIXED
+# Liquidity Telegram Bot v0056 MEXC RAW ORDER FIRST
 
 Signal-engine build for Railway with real futures-first candidate generation.
 
@@ -228,3 +228,9 @@ AUDIT PASSED
 python -m compileall -q .
 OK
 ```
+
+
+## v0056 MEXC RAW ORDER FIRST
+
+- Updated displayed bot version.
+- Includes MEXC 403 order fallback, Telegram MEXC settings, recvWindow defaults, isolated mode, and time-difference adjustment.
