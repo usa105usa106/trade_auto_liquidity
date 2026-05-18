@@ -164,6 +164,33 @@ def _api_creds(settings: dict) -> tuple[str, str]:
     return api_key, api_secret
 
 
+def apply_mexc_runtime_env(settings: dict) -> None:
+    """Apply Telegram/DB MEXC order settings to this Railway process.
+
+    Railway environment variables cannot be changed from inside the bot, so these
+    values are stored in SQLite and mirrored into os.environ. ExchangeClient reads
+    them at order time, which allows changing them from Telegram without editing
+    Railway Variables.
+    """
+    os.environ["MEXC_ORDER_LEVERAGE"] = str(settings.get("mexc_order_leverage", os.getenv("MEXC_ORDER_LEVERAGE", "1")) or "1")
+    os.environ["MEXC_ORDER_OPEN_TYPE"] = str(settings.get("mexc_order_open_type", os.getenv("MEXC_ORDER_OPEN_TYPE", "1")) or "1")
+    os.environ["MEXC_RECV_WINDOW"] = str(settings.get("mexc_recv_window", os.getenv("MEXC_RECV_WINDOW", "20000")) or "20000")
+
+
+def mexc_order_settings_text(settings: dict) -> str:
+    return (
+        "⚙️ MEXC order settings\n"
+        f"Leverage: {settings.get('mexc_order_leverage', os.getenv('MEXC_ORDER_LEVERAGE', '1'))}x\n"
+        f"Open type: {settings.get('mexc_order_open_type', os.getenv('MEXC_ORDER_OPEN_TYPE', '1'))} "
+        "(1 isolated, 2 cross)\n"
+        f"recvWindow: {settings.get('mexc_recv_window', os.getenv('MEXC_RECV_WINDOW', '20000'))} ms\n\n"
+        "Commands:\n"
+        "/leverage 1\n"
+        "/open_type 1\n"
+        "/recv_window 20000"
+    )
+
+
 async def fetch_public_ip(use_proxy: bool = False, proxy_url: str = "", timeout_sec: int = 10) -> dict:
     """Return public IP info for direct or proxied HTTP path.
 
@@ -313,6 +340,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /sync - синхронизация позиций/ордеров
 /proxy on|off|test|set URL
 /api status|set KEY SECRET|clear|test - API биржи через чат
+/mexc_settings - показать MEXC параметры ордера
+/leverage 1 - плечо MEXC futures
+/open_type 1 - 1 isolated, 2 cross
+/recv_window 20000 - окно timestamp для MEXC
 /set key value - ручная настройка
 
 Ключевые настройки:
@@ -320,6 +351,7 @@ live_trading, risk_pct, max_open_positions, scan_interval_sec, scanner_concurren
 ws_update_throttle_ms, ws_max_updates_per_batch, ws_queue_limit,
 symbol_refresh_sec, universe_mode, strategy_mode, mirror_mode,
 spot_confirmation_enabled, session_filter_enabled, america_short_bias_enabled, ws_enabled,
+mexc_order_leverage, mexc_order_open_type, mexc_recv_window,
 scan_market_source = binance_binance | mexc_mexc | mexc_binance.
 
 По умолчанию: mexc_binance = MEXC фьючи скан + Binance spot подтверждение.
@@ -550,6 +582,61 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rev = int(s.get("settings_revision", 1))
     await reply(update, "⚙️ Settings", reply_markup=settings_menu(rev, s))
 
+async def mexc_settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    apply_mexc_runtime_env(s)
+    await reply(update, mexc_order_settings_text(s), reply_markup=MAIN_MENU)
+
+
+async def leverage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    if not context.args:
+        await reply(update, "Usage: /leverage 1", reply_markup=MAIN_MENU); return
+    try:
+        value = int(float(context.args[0]))
+        if value < 1 or value > 200:
+            raise ValueError("leverage must be 1..200")
+        await storage.set("mexc_order_leverage", value)
+        os.environ["MEXC_ORDER_LEVERAGE"] = str(value)
+        await reset_exchange()
+        await reply(update, f"✅ MEXC leverage saved: {value}x", reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"❌ /leverage error: {e}", reply_markup=MAIN_MENU)
+
+
+async def open_type_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    if not context.args:
+        await reply(update, "Usage: /open_type 1  (1 isolated, 2 cross)", reply_markup=MAIN_MENU); return
+    try:
+        value = int(float(context.args[0]))
+        if value not in {1, 2}:
+            raise ValueError("use 1 for isolated or 2 for cross")
+        await storage.set("mexc_order_open_type", value)
+        os.environ["MEXC_ORDER_OPEN_TYPE"] = str(value)
+        await reset_exchange()
+        label = "isolated" if value == 1 else "cross"
+        await reply(update, f"✅ MEXC open type saved: {value} ({label})", reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"❌ /open_type error: {e}", reply_markup=MAIN_MENU)
+
+
+async def recv_window_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    if not context.args:
+        await reply(update, "Usage: /recv_window 20000", reply_markup=MAIN_MENU); return
+    try:
+        value = int(float(context.args[0]))
+        if value < 5000 or value > 60000:
+            raise ValueError("recv_window must be 5000..60000 ms")
+        await storage.set("mexc_recv_window", value)
+        os.environ["MEXC_RECV_WINDOW"] = str(value)
+        await reset_exchange()
+        await reply(update, f"✅ MEXC recvWindow saved: {value} ms", reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"❌ /recv_window error: {e}", reply_markup=MAIN_MENU)
+
 async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     s = await storage.all_settings()
@@ -615,6 +702,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "min_depth_usdt", "max_daily_loss_pct", "max_consecutive_losses", "cooldown_after_close_sec",
         "limit_timeout_sec", "proxy_enabled", "proxy_url", "mexc_api_key", "mexc_api_secret",
         "ws_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold",
+        "mexc_order_leverage", "mexc_order_open_type", "mexc_recv_window",
     }
     if key not in allowed_keys:
         await reply(update, f"❌ Setting is not allowed through /set: {key}", reply_markup=MAIN_MENU)
@@ -625,7 +713,9 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: parsed = float(value) if "." in value else int(value)
         except Exception: parsed = value
     await storage.set(key, parsed)
-    if key in {"mexc_api_key", "mexc_api_secret", "proxy_url", "proxy_enabled"}:
+    if key in {"mexc_api_key", "mexc_api_secret", "proxy_url", "proxy_enabled", "mexc_order_leverage", "mexc_order_open_type", "mexc_recv_window"}:
+        new_settings = await storage.all_settings()
+        apply_mexc_runtime_env(new_settings)
         await reset_exchange()
     if key in {"proxy_url", "proxy_enabled", "scan_market_source", "ws_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold"}:
         await reset_market_runtime()
@@ -675,7 +765,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mapping = {
         "▶️ Run": run_cmd, "⏹ Stop": stop_cmd, "📊 Status": status_cmd, "🚨 Panic": panic_cmd,
         "📈 Positions": positions_cmd, "📉 Stats": stats_cmd, "💰 Balance": balance_cmd,
-        "🏓 Ping": ping_cmd, "⚙️ Settings": settings_cmd, "🔐 API": api_cmd,
+        "🏓 Ping": ping_cmd, "⚙️ Settings": settings_cmd, "🔐 API": api_cmd, "⚙️ MEXC": mexc_settings_cmd,
     }
     fn = mapping.get(text)
     if fn: await fn(update, context)
@@ -1073,6 +1163,7 @@ async def trading_loop(app):
 
 async def on_startup(app):
     await storage.init()
+    apply_mexc_runtime_env(await storage.all_settings())
     app.bot_data.setdefault("trading_start_lock", asyncio.Lock())
 
 def build_app():
@@ -1089,6 +1180,10 @@ def build_app():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("sync", sync_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
+    app.add_handler(CommandHandler("mexc_settings", mexc_settings_cmd))
+    app.add_handler(CommandHandler("leverage", leverage_cmd))
+    app.add_handler(CommandHandler("open_type", open_type_cmd))
+    app.add_handler(CommandHandler("recv_window", recv_window_cmd))
     app.add_handler(CommandHandler("set", set_cmd))
     app.add_handler(CommandHandler("proxy", proxy_cmd))
     app.add_handler(CommandHandler("api", api_cmd))

@@ -6,6 +6,7 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["📈 Positions", "📉 Stats"],
     ["💰 Balance", "🏓 Ping"],
     ["⚙️ Settings", "🔐 API"],
+    ["⚙️ MEXC"],
 ], resize_keyboard=True)
 
 def _onoff(settings: dict | None, key: str) -> str:
@@ -32,6 +33,7 @@ def settings_menu(revision: int, settings: dict | None = None):
         [InlineKeyboardButton(f"🪞 Mirror: {_value(settings, 'mirror_mode', 'off')}", callback_data=f"menu:mirror:{r}"), InlineKeyboardButton(f"🔎 Spot: {_onoff(settings, 'spot_confirmation_enabled')}", callback_data=f"toggle:spot_confirmation_enabled:{r}")],
         [InlineKeyboardButton(f"🌍 Session: {_onoff(settings, 'session_filter_enabled')}", callback_data=f"toggle:session_filter_enabled:{r}"), InlineKeyboardButton(f"🇺🇸 Bias: {_onoff(settings, 'america_short_bias_enabled')}", callback_data=f"toggle:america_short_bias_enabled:{r}")],
         [InlineKeyboardButton(f"🔌 WebSocket: {_onoff(settings, 'ws_enabled')}", callback_data=f"toggle:ws_enabled:{r}"), InlineKeyboardButton(f"🌊 WS: {_value(settings, 'ws_update_throttle_ms', '500')}ms", callback_data=f"menu:wsthrottle:{r}")],
+        [InlineKeyboardButton(f"⚙️ MEXC lev {_value(settings, 'mexc_order_leverage', '1')}x | open {_value(settings, 'mexc_order_open_type', '1')} | rw {_value(settings, 'mexc_recv_window', '20000')}", callback_data=f"noop:mexc:{r}")],
     ])
 
 def choices_menu(name: str, choices: list[tuple[str, str]], revision: int, current=None):

@@ -57,6 +57,9 @@ class Defaults:
     limit_timeout_sec: int = env_int("LIMIT_TIMEOUT_SEC", 30)
     proxy_enabled: bool = env_bool("PROXY_ENABLED", False)
     proxy_url: str = os.getenv("PROXY_URL", "")
+    mexc_order_leverage: int = env_int("MEXC_ORDER_LEVERAGE", 1)
+    mexc_order_open_type: int = env_int("MEXC_ORDER_OPEN_TYPE", 1)
+    mexc_recv_window: int = env_int("MEXC_RECV_WINDOW", 20000)
 
 DEFAULTS = Defaults()
 DB_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")
