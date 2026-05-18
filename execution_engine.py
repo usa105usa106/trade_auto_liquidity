@@ -139,13 +139,13 @@ class ExecutionEngine:
         try:
             entry = float(pos.get("entry_price") or 0)
             qty = float(pos.get("qty") or 0)
-            leverage = int(float(os.getenv("MEXC_ORDER_LEVERAGE", "5") or 5))
+            leverage = int(float(pos.get("leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or 5))
             open_type = int(float(os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or 1))
-            notional = abs(entry * qty) if entry > 0 and qty > 0 else 0.0
+            notional = float(pos.get("planned_notional_usdt") or 0) or (abs(entry * qty) if entry > 0 and qty > 0 else 0.0)
             pos["notional_usdt"] = notional
             pos["leverage"] = leverage
             pos["margin_type"] = "isolated" if open_type == 1 else "cross"
-            pos["estimated_margin_usdt"] = notional / leverage if leverage > 0 else notional
+            pos["estimated_margin_usdt"] = float(pos.get("expected_margin_usdt") or 0) or (notional / leverage if leverage > 0 else notional)
         except Exception:
             pass
         return pos
@@ -190,6 +190,21 @@ class ExecutionEngine:
             pos["opened_at"] = time.time()
             pos["updated_at"] = time.time()
             pos["raw_order"] = order
+            try:
+                info = order.get("info", {}) if isinstance(order, dict) else {}
+                mg = info.get("margin_guard") or {}
+                mp = info.get("margin_precheck") or {}
+                lev = info.get("leverage_setup") or {}
+                if mp:
+                    pos["precheck_notional_usdt"] = mp.get("notional")
+                    pos["expected_margin_usdt"] = mp.get("expected_margin")
+                if mg:
+                    pos["actual_used_margin_delta_usdt"] = mg.get("used_delta")
+                    pos["margin_guard_threshold_usdt"] = mg.get("threshold")
+                if lev:
+                    pos["leverage_setup_ok"] = lev.get("ok")
+            except Exception:
+                pass
             if pos["status"] == "open":
                 fill_price = self._order_fill_price(order, plan.entry_price)
                 pos = self._rebase_protection_to_fill(pos, fill_price)

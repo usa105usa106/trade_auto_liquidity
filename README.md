@@ -1,4 +1,4 @@
-# Liquidity Telegram Bot v0062 MEXC RAW STATE SYNC
+# Liquidity Telegram Bot v0064 FIXED MARGIN ALLOCATION
 
 Signal-engine build for Railway with real futures-first candidate generation.
 
@@ -258,9 +258,12 @@ OK
 - Strategy logic, scanner, and WebSocket logic were not changed.
 
 
-## v0062 MEXC RAW STATE SYNC
+## v0064 FIXED MARGIN ALLOCATION
 - Raw MEXC futures state sync is now exchange-first.
 - `/positions` reads native MEXC open positions and does not rely on ccxt position parsing.
 - Open orders include normal orders plus plan/stop/TP-SL order scans when available.
 - `/cancel_all`, `/close_all`, and Panic attempt raw exchange cleanup even if local bot state is empty.
 - Balance output includes used/position/frozen margin diagnostics when MEXC returns them.
+
+# v0064: cap margin per position as total_balance / max_open_positions
+MARGIN_ALLOCATION_ENABLED=true

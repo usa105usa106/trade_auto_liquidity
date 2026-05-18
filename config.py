@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = os.getenv("BOT_VERSION", "0062 MEXC RAW STATE SYNC")
+VERSION = os.getenv("BOT_VERSION", "0064 FIXED MARGIN ALLOCATION")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -60,6 +60,7 @@ class Defaults:
     mexc_order_leverage: int = env_int("MEXC_ORDER_LEVERAGE", 5)
     mexc_order_open_type: int = env_int("MEXC_ORDER_OPEN_TYPE", 1)
     mexc_recv_window: int = env_int("MEXC_RECV_WINDOW", 20000)
+    margin_allocation_enabled: bool = env_bool("MARGIN_ALLOCATION_ENABLED", True)
 
 DEFAULTS = Defaults()
 DB_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")

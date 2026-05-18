@@ -659,9 +659,146 @@ class ExchangeClient:
         orders = await self._mexc_fetch_open_orders()
         return {"balance": bal, "positions": pos, "open_orders": orders}
 
+    def _mexc_usdt_metrics_from_balance(self, balance: dict) -> dict:
+        """Extract free/used/margin/unrealized numbers from native MEXC balance."""
+        usdt = balance.get("USDT", {}) if isinstance(balance, dict) else {}
+        try:
+            free = float(usdt.get("free") or (balance.get("free", {}) or {}).get("USDT") or 0)
+        except Exception:
+            free = 0.0
+        try:
+            total = float(usdt.get("total") or (balance.get("total", {}) or {}).get("USDT") or 0)
+        except Exception:
+            total = 0.0
+        try:
+            used = float(usdt.get("used") or (balance.get("used", {}) or {}).get("USDT") or max(0.0, total - free))
+        except Exception:
+            used = max(0.0, total - free)
+        def f(key, default=0.0):
+            try:
+                return float(usdt.get(key) or default)
+            except Exception:
+                return default
+        return {
+            "free": free,
+            "total": total,
+            "used": used,
+            "position_margin": f("positionMargin"),
+            "frozen_balance": f("frozenBalance"),
+            "unrealized": f("unrealized"),
+        }
+
+    async def _mexc_last_price(self, symbol: str, fallback: float | None = None) -> float:
+        try:
+            if fallback and float(fallback) > 0:
+                return float(fallback)
+        except Exception:
+            pass
+        try:
+            t = await self.fetch_ticker(symbol)
+            for k in ("last", "close", "bid", "ask"):
+                v = t.get(k)
+                if v and float(v) > 0:
+                    return float(v)
+        except Exception:
+            pass
+        return float(fallback or 0)
+
+    async def _mexc_set_leverage_for_symbol(self, symbol: str, leverage: int, open_type: int) -> dict:
+        """Best-effort native leverage setter.
+
+        MEXC accepts leverage in the order body, but some accounts keep the
+        previous contract leverage. To avoid accidental 1x positions, set both
+        long and short positionType before opening. The endpoint payload is kept
+        compatible with common MEXC futures variants.
+        """
+        leverage = int(leverage or 1)
+        if leverage <= 0:
+            leverage = 1
+        msym = self._mexc_symbol(symbol)
+        results, errors = [], []
+        endpoint = os.getenv("MEXC_SET_LEVERAGE_ENDPOINT", "/api/v1/private/position/change_leverage")
+        # positionType: 1 long, 2 short on MEXC futures. Some accounts accept a
+        # symbol-level request without it, so try that too.
+        payloads = [
+            {"symbol": msym, "leverage": leverage, "openType": int(open_type or 1), "positionType": 1},
+            {"symbol": msym, "leverage": leverage, "openType": int(open_type or 1), "positionType": 2},
+            {"symbol": msym, "leverage": leverage, "openType": int(open_type or 1)},
+        ]
+        ok_any = False
+        for body in payloads:
+            try:
+                out = await self._mexc_private("POST", endpoint, body=body)
+                results.append(out)
+                ok_any = True
+            except Exception as e:
+                errors.append(str(e)[:240])
+        if not ok_any and os.getenv("MEXC_STRICT_LEVERAGE", "true").lower() in {"1", "true", "yes", "on"}:
+            raise RuntimeError("MEXC leverage setup failed before order: " + " | ".join(errors[:2]))
+        return {"ok": ok_any, "results": results, "errors": errors, "leverage": leverage, "openType": open_type}
+
+    async def _mexc_open_margin_precheck(self, symbol: str, amount: float, price: float | None, leverage: int) -> dict:
+        """Return expected margin and balance snapshot before an opening order."""
+        last_price = await self._mexc_last_price(symbol, price)
+        amount = float(amount or 0)
+        leverage = max(1, int(leverage or 1))
+        notional = abs(amount * last_price) if amount > 0 and last_price > 0 else 0.0
+        expected_margin = notional / leverage if leverage > 0 else notional
+        bal = await self._mexc_fetch_balance()
+        metrics = self._mexc_usdt_metrics_from_balance(bal)
+        return {"price": last_price, "notional": notional, "expected_margin": expected_margin, "balance": metrics}
+
+    async def _mexc_margin_guard_after_open(self, symbol: str, before: dict, expected_margin: float) -> dict:
+        """Verify that the new order did not consume far more margin than expected.
+
+        This catches the dangerous case we observed: settings say 5x but MEXC
+        effectively opens close to 1x and consumes most account margin.
+        """
+        await asyncio.sleep(float(os.getenv("MEXC_MARGIN_GUARD_DELAY_SEC", "0.8") or "0.8"))
+        bal_after = await self._mexc_fetch_balance()
+        after = self._mexc_usdt_metrics_from_balance(bal_after)
+        before_used = float((before or {}).get("used") or 0)
+        used_delta = max(0.0, float(after.get("used") or 0) - before_used)
+        multiplier = float(os.getenv("MEXC_MARGIN_GUARD_MULTIPLIER", "2.5") or "2.5")
+        absolute_buffer = float(os.getenv("MEXC_MARGIN_GUARD_ABS_BUFFER_USDT", "2.0") or "2.0")
+        threshold = max(float(expected_margin or 0) * multiplier, float(expected_margin or 0) + absolute_buffer)
+        ok = True
+        action = "none"
+        if expected_margin > 0 and used_delta > threshold and os.getenv("MEXC_MARGIN_GUARD_ENABLED", "true").lower() in {"1", "true", "yes", "on"}:
+            ok = False
+            action = "emergency_close_all"
+            # First remove potential child orders, then native close all. This is
+            # intentionally defensive because position listing can be stale/empty.
+            try:
+                await self._mexc_cancel_all_orders(symbol)
+            except Exception:
+                pass
+            try:
+                await self.mexc_close_all_positions_native()
+            except Exception:
+                pass
+        return {
+            "ok": ok,
+            "action": action,
+            "expected_margin": expected_margin,
+            "used_delta": used_delta,
+            "threshold": threshold,
+            "before": before,
+            "after": after,
+        }
+
     async def _mexc_create_order(self, symbol, type_, side, amount, price=None, params=None, previous_error: str = ""):
         params = params or {}
         reduce_only = bool(params.get("reduceOnly") or params.get("reduce_only"))
+        is_opening = not reduce_only
+        target_leverage = int(os.getenv("MEXC_ORDER_LEVERAGE", "5") or "5")
+        target_open_type = int(os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or "1")
+        leverage_setup = {"ok": None}
+        margin_pre = None
+        if is_opening:
+            if os.getenv("MEXC_SET_LEVERAGE_BEFORE_ORDER", "true").lower() in {"1", "true", "yes", "on"}:
+                leverage_setup = await self._mexc_set_leverage_for_symbol(symbol, target_leverage, target_open_type)
+            margin_pre = await self._mexc_open_margin_precheck(symbol, amount, price, target_leverage)
         is_buy = str(side).lower() == "buy"
         # MEXC side codes: 1 open long, 2 close short, 3 open short, 4 close long.
         if reduce_only:
@@ -679,7 +816,8 @@ class ExchangeClient:
                 "symbol": self._mexc_symbol(symbol),
                 "vol": self._amount_to_mexc_vol(symbol, amount),
                 "side": mexc_side,
-                "openType": int(os.getenv("MEXC_ORDER_OPEN_TYPE", "1")),
+                "openType": target_open_type,
+                "leverage": target_leverage,
                 "triggerPrice": trigger_price,
                 "executePrice": 0,
                 "orderType": 5,
@@ -701,12 +839,28 @@ class ExchangeClient:
             "vol": self._amount_to_mexc_vol(symbol, amount),
             "side": mexc_side,
             "type": mexc_type,
-            "openType": int(os.getenv("MEXC_ORDER_OPEN_TYPE", "1")),
-            "leverage": int(os.getenv("MEXC_ORDER_LEVERAGE", "5")),
+            "openType": target_open_type,
+            "leverage": target_leverage,
         }
         if params.get("clientOrderId"):
             body["externalOid"] = str(params.get("clientOrderId"))[:32]
         out = await self._mexc_private("POST", "/api/v1/private/order/create", body=body)
         data = out.get("data")
         oid = data.get("orderId") if isinstance(data, dict) else data
-        return {"id": str(oid or ""), "symbol": self.normalize_symbol(symbol), "type": type_, "side": side, "amount": amount, "price": price, "average": None, "filled": 0, "info": {"raw_fallback": True, "previous_error": previous_error, **out}}
+        margin_guard = None
+        if is_opening:
+            margin_guard = await self._mexc_margin_guard_after_open(
+                symbol,
+                (margin_pre or {}).get("balance") or {},
+                float((margin_pre or {}).get("expected_margin") or 0),
+            )
+            if not margin_guard.get("ok", True):
+                raise RuntimeError(
+                    "MEXC margin guard blocked unsafe position: "
+                    f"expected_margin={margin_guard.get('expected_margin'):.4f} USDT, "
+                    f"used_delta={margin_guard.get('used_delta'):.4f} USDT, "
+                    f"threshold={margin_guard.get('threshold'):.4f} USDT. "
+                    "Emergency close_all was sent."
+                )
+        info = {"raw_fallback": True, "previous_error": previous_error, "leverage_setup": leverage_setup, "margin_precheck": margin_pre, "margin_guard": margin_guard, **out}
+        return {"id": str(oid or ""), "symbol": self.normalize_symbol(symbol), "type": type_, "side": side, "amount": amount, "price": price, "average": None, "filled": 0, "info": info}

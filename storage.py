@@ -41,6 +41,7 @@ DEFAULT_SETTINGS = {
     "mexc_order_leverage": DEFAULTS.mexc_order_leverage,
     "mexc_order_open_type": DEFAULTS.mexc_order_open_type,
     "mexc_recv_window": DEFAULTS.mexc_recv_window,
+    "margin_allocation_enabled": DEFAULTS.margin_allocation_enabled,
     "mexc_api_key": "",
     "mexc_api_secret": "",
     "websocket_enabled": True,

@@ -196,7 +196,7 @@ def _position_money_fields(pos: dict) -> tuple[float, float, int, str]:
     notional = float(pos.get("notional_usdt") or (abs(entry * qty) if entry and qty else 0))
     leverage = int(float(pos.get("leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or 5))
     margin_type = str(pos.get("margin_type") or ("isolated" if int(float(os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or 1)) == 1 else "cross"))
-    margin = float(pos.get("estimated_margin_usdt") or (notional / leverage if leverage > 0 else notional))
+    margin = float(pos.get("estimated_margin_usdt") or pos.get("expected_margin_usdt") or (notional / leverage if leverage > 0 else notional))
     return notional, margin, leverage, margin_type
 
 
@@ -216,6 +216,7 @@ def format_position_opened(plan, placed: dict, live: bool) -> str:
         f"Qty: {qty:.6f} {coin} / {notional:.2f} USDT\n"
         f"Leverage: {leverage}x\n"
         f"Margin: {margin_type} / ~{margin:.2f} USDT\n"
+        f"Slot cap: ~{float(pos.get('max_margin_per_position_usdt') or margin):.2f} USDT margin\n"
         f"Live: {live}"
     )
 
@@ -409,6 +410,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /leverage 5 - плечо MEXC futures
 /open_type 1 - 1 isolated, 2 cross
 /recv_window 20000 - окно timestamp для MEXC
+/set margin_allocation_enabled true|false - делить баланс по слотам
 /set key value - ручная настройка
 
 Ключевые настройки:
@@ -416,7 +418,7 @@ live_trading, risk_pct, max_open_positions, scan_interval_sec, scanner_concurren
 ws_update_throttle_ms, ws_max_updates_per_batch, ws_queue_limit,
 symbol_refresh_sec, universe_mode, strategy_mode, mirror_mode,
 spot_confirmation_enabled, session_filter_enabled, america_short_bias_enabled, ws_enabled,
-mexc_order_leverage, mexc_order_open_type, mexc_recv_window,
+mexc_order_leverage, mexc_order_open_type, mexc_recv_window, margin_allocation_enabled,
 scan_market_source = binance_binance | mexc_mexc | mexc_binance.
 
 По умолчанию: mexc_binance = MEXC фьючи скан + Binance spot подтверждение.
@@ -546,6 +548,7 @@ Strategy reason: {scanner.last_strategy_reason}
 Universe: {s.get('universe_mode')}
 Risk: {float(s.get('risk_pct',0))*100:.2f}%
 Max positions: {s.get('max_open_positions')}
+Margin allocation: {s.get('margin_allocation_enabled', True)}
 Scan: {s.get('scan_interval_sec')}s
 Concurrency: {s.get('scanner_concurrency', 5)} | last scanned={scanner.last_cycle_scanned} | errors={scanner.last_cycle_errors} | slowdown={scanner.last_slowdown_sec}s
 Refresh: {s.get('symbol_refresh_sec')}s

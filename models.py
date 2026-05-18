@@ -27,4 +27,8 @@ class TradePlan:
     mirror_used: bool = False
     session: str = "NORMAL"
     max_open_positions: int = 999
+    planned_notional_usdt: float = 0.0
+    expected_margin_usdt: float = 0.0
+    max_margin_per_position_usdt: float = 0.0
+    leverage: int = 0
     created_at: float = field(default_factory=time.time)
