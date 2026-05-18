@@ -1,4 +1,4 @@
-# Liquidity Telegram Bot v0064 FIXED MARGIN ALLOCATION
+# Liquidity Telegram Bot v0065 HIDDEN MARGIN DETECTOR
 
 Signal-engine build for Railway with real futures-first candidate generation.
 
@@ -258,7 +258,7 @@ OK
 - Strategy logic, scanner, and WebSocket logic were not changed.
 
 
-## v0064 FIXED MARGIN ALLOCATION
+## v0065 HIDDEN MARGIN DETECTOR
 - Raw MEXC futures state sync is now exchange-first.
 - `/positions` reads native MEXC open positions and does not rely on ccxt position parsing.
 - Open orders include normal orders plus plan/stop/TP-SL order scans when available.

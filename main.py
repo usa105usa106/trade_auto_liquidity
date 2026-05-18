@@ -400,7 +400,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /positions - локальные + реальные позиции MEXC
 /open_orders - открытые ордера на MEXC
 /cancel_all - отменить все открытые ордера MEXC
-/close_all - закрыть все реальные позиции MEXC market reduce-only
+/close_all - закрыть все реальные позиции MEXC native close-all
+/positions - показывает локальные позиции + предупреждение о hidden margin
 /stats - статистика сделок
 /sync - синхронизация позиций/ордеров
 /sync_positions - подтянуть реальные позиции MEXC в бота
@@ -669,6 +670,30 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             exchange_error = str(e)[:220]
     if not local and not exchange_positions:
         text = "📈 Positions: none"
+        # MEXC can occasionally return an empty positions list while account
+        # assets still show positionMargin/used/unrealized PnL. Surface that
+        # clearly instead of pretending the account is clean.
+        try:
+            if bool(s.get("live_trading", False)):
+                ex2 = await get_exchange(s)
+                bal = await ex2.fetch_balance()
+                usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
+                used = float(usdt.get("used") or ((bal or {}).get("used", {}) or {}).get("USDT") or 0)
+                pm = float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
+                frozen = float(usdt.get("frozenBalance") or 0)
+                upnl = float(usdt.get("unrealized") or 0)
+                if used > 0.5 or pm > 0.5 or abs(upnl) > 0.01:
+                    text += (
+                        "\n\n⚠️ Hidden MEXC margin detected"
+                        f"\nUsed: {used:.4f} USDT"
+                        f"\nPosition margin: {pm:.4f} USDT"
+                        f"\nFrozen: {frozen:.4f} USDT"
+                        f"\nUnrealized PnL: {upnl:.4f} USDT"
+                        "\nMEXC did not return a position row, but account assets show margin/PnL."
+                        "\nUse /close_all to send native MEXC close-all, then /balance."
+                    )
+        except Exception as e:
+            text += f"\nHidden-margin check failed: {str(e)[:160]}"
         if exchange_error:
             text += f"\nExchange sync error: {exchange_error}"
         await reply(update, text, reply_markup=MAIN_MENU); return

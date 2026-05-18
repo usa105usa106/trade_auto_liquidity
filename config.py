@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = os.getenv("BOT_VERSION", "0064 FIXED MARGIN ALLOCATION")
+VERSION = os.getenv("BOT_VERSION", "0065 HIDDEN MARGIN DETECTOR")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
