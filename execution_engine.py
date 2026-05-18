@@ -49,6 +49,25 @@ class ExecutionEngine:
                 return False, f"cannot verify open orders: {e}"
         return True, "ok"
 
+
+    def _is_mexc_opening_restricted_error(self, exc: Exception) -> bool:
+        """Return True for MEXC reduce-only / region-risk symbols.
+
+        MEXC can return HTTP 200 with code 8950 when a contract is restricted
+        to closing-only. This is not a retryable execution error and should not
+        occupy a position slot; the symbol is temporarily locked instead.
+        """
+        text = str(exc).lower()
+        restricted_markers = (
+            "code': 8950",
+            'code": 8950',
+            "code: 8950",
+            "opening positions for this trading pair is unavailable",
+            "you may only close existing positions",
+            "only close existing positions",
+        )
+        return any(marker in text for marker in restricted_markers)
+
     async def _create_order_retry(self, *args, attempts: int = 2, **kwargs):
         last = None
         for i in range(max(1, attempts)):
@@ -114,6 +133,23 @@ class ExecutionEngine:
         pos["fill_price_source"] = "exchange_order"
         return pos
 
+
+    def _decorate_position_metrics(self, pos: dict) -> dict:
+        """Attach human-readable money/margin fields used by Telegram notifications."""
+        try:
+            entry = float(pos.get("entry_price") or 0)
+            qty = float(pos.get("qty") or 0)
+            leverage = int(float(os.getenv("MEXC_ORDER_LEVERAGE", "5") or 5))
+            open_type = int(float(os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or 1))
+            notional = abs(entry * qty) if entry > 0 and qty > 0 else 0.0
+            pos["notional_usdt"] = notional
+            pos["leverage"] = leverage
+            pos["margin_type"] = "isolated" if open_type == 1 else "cross"
+            pos["estimated_margin_usdt"] = notional / leverage if leverage > 0 else notional
+        except Exception:
+            pass
+        return pos
+
     async def place_entry(self, plan: TradePlan, live: bool):
         async with self._lock_for(plan.symbol):
             ok, reason = await self.can_enter(plan.symbol, int(getattr(plan, "max_open_positions", 999)), live=live)
@@ -129,6 +165,7 @@ class ExecutionEngine:
                 pos["opened_at"] = time.time()
                 pos["updated_at"] = time.time()
                 pos["paper"] = True
+                pos = self._decorate_position_metrics(pos)
                 await self.storage.upsert_position(pos)
                 return {"ok": True, "paper": True, "position": pos}
 
@@ -136,7 +173,13 @@ class ExecutionEngine:
             order_type = plan.order_type.lower()
             price = plan.entry_price if order_type == "limit" else None
             params = {"clientOrderId": f"bot_entry_{int(time.time()*1000)}"}
-            order = await self._create_order_retry(plan.symbol, order_type, side, plan.qty, price, params, attempts=2)
+            try:
+                order = await self._create_order_retry(plan.symbol, order_type, side, plan.qty, price, params, attempts=2)
+            except Exception as e:
+                if self._is_mexc_opening_restricted_error(e):
+                    await self.storage.set_lock(plan.symbol, int(os.getenv("MEXC_RESTRICTED_SYMBOL_LOCK_SEC", "86400")), "mexc_opening_restricted_8950")
+                    return {"ok": False, "reason": "mexc opening restricted / reduce-only symbol (code 8950)"}
+                raise
 
             # For market orders, we treat position as open immediately.
             # For limit orders, track as pending until PositionManager sees fill/cancel/timeout.
@@ -149,6 +192,7 @@ class ExecutionEngine:
             if pos["status"] == "open":
                 fill_price = self._order_fill_price(order, plan.entry_price)
                 pos = self._rebase_protection_to_fill(pos, fill_price)
+            pos = self._decorate_position_metrics(pos)
             await self.storage.upsert_position(pos)
 
             if pos["status"] == "open":

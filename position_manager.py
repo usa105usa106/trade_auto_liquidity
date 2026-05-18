@@ -16,7 +16,7 @@ class PositionManager:
         self.storage = storage
         self.execution_engine = execution_engine
         self.time_stop_sec = int(os.getenv("TIME_STOP_SEC", "300"))
-        self.limit_timeout_sec = int(os.getenv("LIMIT_TIMEOUT_SEC", "30"))
+        self.limit_timeout_sec = int(os.getenv("LIMIT_TIMEOUT_SEC", "300"))
         self.breakeven_trigger_pct = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.30"))
 
     def pnl_pct(self, pos, price):
@@ -35,6 +35,7 @@ class PositionManager:
             # lifecycle is still visible in storage after placement.
             pos["status"] = "open"
             pos["updated_at"] = now
+            pos = self.execution_engine._decorate_position_metrics(pos)
             await self.storage.upsert_position(pos)
             return {"type": "paper_limit_filled", "symbol": symbol}
 
@@ -58,6 +59,7 @@ class PositionManager:
                 pos["status"] = "open"
                 pos["entry_price"] = avg or pos.get("entry_price")
                 pos["updated_at"] = now
+                pos = self.execution_engine._decorate_position_metrics(pos)
                 protection = await self.execution_engine.place_protection_orders(pos, live=True)
                 pos.update(protection)
                 await self.storage.upsert_position(pos)

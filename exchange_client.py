@@ -402,7 +402,7 @@ class ExchangeClient:
             "side": mexc_side,
             "type": mexc_type,
             "openType": int(os.getenv("MEXC_ORDER_OPEN_TYPE", "1")),
-            "leverage": int(os.getenv("MEXC_ORDER_LEVERAGE", "1")),
+            "leverage": int(os.getenv("MEXC_ORDER_LEVERAGE", "5")),
         }
         if params.get("clientOrderId"):
             body["externalOid"] = str(params.get("clientOrderId"))[:32]

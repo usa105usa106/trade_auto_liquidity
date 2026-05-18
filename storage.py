@@ -1,6 +1,7 @@
 from __future__ import annotations
 import time
 import json
+import os
 import aiosqlite
 from typing import Any, Optional
 from config import DB_PATH, DEFAULTS
@@ -124,6 +125,20 @@ class Storage:
                 await self.set("ws_max_updates_per_batch", 1000, bump_revision=False)
             if int(await self.get("ws_stale_sec", 20) or 20) < 20:
                 await self.set("ws_stale_sec", 20, bump_revision=False)
+        except Exception:
+            pass
+
+        # v0060 default migration: previous builds stored leverage=1 in SQLite,
+        # so changing only DEFAULTS would not affect an existing Railway DB.
+        # If the user did not set a Railway env override, move the old default
+        # to the new requested default 5x once. Telegram /leverage can still
+        # change it any time after startup.
+        try:
+            if await self.get("v0060_leverage_default_migrated") is None:
+                current_lev = int(await self.get("mexc_order_leverage", DEFAULTS.mexc_order_leverage) or DEFAULTS.mexc_order_leverage)
+                if current_lev == 1 and os.getenv("MEXC_ORDER_LEVERAGE") is None:
+                    await self.set("mexc_order_leverage", 5, bump_revision=False)
+                await self.set("v0060_leverage_default_migrated", True, bump_revision=False)
         except Exception:
             pass
 

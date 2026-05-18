@@ -172,7 +172,7 @@ def apply_mexc_runtime_env(settings: dict) -> None:
     them at order time, which allows changing them from Telegram without editing
     Railway Variables.
     """
-    os.environ["MEXC_ORDER_LEVERAGE"] = str(settings.get("mexc_order_leverage", os.getenv("MEXC_ORDER_LEVERAGE", "1")) or "1")
+    os.environ["MEXC_ORDER_LEVERAGE"] = str(settings.get("mexc_order_leverage", os.getenv("MEXC_ORDER_LEVERAGE", "5")) or "5")
     os.environ["MEXC_ORDER_OPEN_TYPE"] = str(settings.get("mexc_order_open_type", os.getenv("MEXC_ORDER_OPEN_TYPE", "1")) or "1")
     os.environ["MEXC_RECV_WINDOW"] = str(settings.get("mexc_recv_window", os.getenv("MEXC_RECV_WINDOW", "20000")) or "20000")
 
@@ -180,15 +180,76 @@ def apply_mexc_runtime_env(settings: dict) -> None:
 def mexc_order_settings_text(settings: dict) -> str:
     return (
         "⚙️ MEXC order settings\n"
-        f"Leverage: {settings.get('mexc_order_leverage', os.getenv('MEXC_ORDER_LEVERAGE', '1'))}x\n"
+        f"Leverage: {settings.get('mexc_order_leverage', os.getenv('MEXC_ORDER_LEVERAGE', '5'))}x\n"
         f"Open type: {settings.get('mexc_order_open_type', os.getenv('MEXC_ORDER_OPEN_TYPE', '1'))} "
         "(1 isolated, 2 cross)\n"
         f"recvWindow: {settings.get('mexc_recv_window', os.getenv('MEXC_RECV_WINDOW', '20000'))} ms\n\n"
         "Commands:\n"
-        "/leverage 1\n"
+        "/leverage 5\n"
         "/open_type 1\n"
         "/recv_window 20000"
     )
+
+def _position_money_fields(pos: dict) -> tuple[float, float, int, str]:
+    entry = float(pos.get("entry_price") or 0)
+    qty = float(pos.get("qty") or 0)
+    notional = float(pos.get("notional_usdt") or (abs(entry * qty) if entry and qty else 0))
+    leverage = int(float(pos.get("leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or 5))
+    margin_type = str(pos.get("margin_type") or ("isolated" if int(float(os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or 1)) == 1 else "cross"))
+    margin = float(pos.get("estimated_margin_usdt") or (notional / leverage if leverage > 0 else notional))
+    return notional, margin, leverage, margin_type
+
+
+def format_position_opened(plan, placed: dict, live: bool) -> str:
+    pos = placed.get("position") if isinstance(placed, dict) else None
+    pos = pos if isinstance(pos, dict) else plan.__dict__
+    entry = float(pos.get("entry_price") or plan.entry_price)
+    qty = float(pos.get("qty") or plan.qty)
+    notional, margin, leverage, margin_type = _position_money_fields(pos)
+    coin = str(plan.symbol).split("/")[0]
+    return (
+        f"🟢 Position opened\n{plan.symbol} {plan.side}\n"
+        f"Strategy: {plan.strategy}\n"
+        f"Entry: {entry:.8f}\n"
+        f"SL: {float(pos.get('stop_price') or plan.stop_price):.8f}\n"
+        f"TP: {float(pos.get('take_price') or plan.take_price):.8f}\n"
+        f"Qty: {qty:.6f} {coin} / {notional:.2f} USDT\n"
+        f"Leverage: {leverage}x\n"
+        f"Margin: {margin_type} / ~{margin:.2f} USDT\n"
+        f"Live: {live}"
+    )
+
+
+def format_position_event(ev: dict) -> str:
+    symbol = ev.get("symbol", "-")
+    typ = ev.get("type", "event")
+    result = ev.get("result") if isinstance(ev.get("result"), dict) else {}
+    reason_map = {
+        "tp": "take profit",
+        "sl": "stop loss",
+        "time_stop": "time stop",
+        "limit_timeout": "limit timeout",
+        "limit_filled": "limit filled",
+        "limit_canceled": "limit canceled",
+        "limit_cancelled": "limit canceled",
+        "limit_rejected": "limit rejected",
+        "limit_expired": "limit expired",
+        "breakeven": "breakeven moved",
+        "protection_failed": "protection failed",
+    }
+    label = reason_map.get(str(typ), str(typ))
+    lines = [f"📌 Position event", f"{symbol}: {label}"]
+    if "pnl_usdt" in result or "pnl_pct" in result:
+        try:
+            pnl_usdt = float(result.get("pnl_usdt") or 0)
+            pnl_pct = float(result.get("pnl_pct") or 0)
+            sign = "+" if pnl_usdt >= 0 else ""
+            lines.append(f"PnL: {sign}{pnl_usdt:.4f} USDT ({sign}{pnl_pct:.2f}%)")
+        except Exception:
+            pass
+    if result.get("reason"):
+        lines.append(f"Reason: {result.get('reason')}")
+    return "\n".join(lines)
 
 
 async def fetch_public_ip(use_proxy: bool = False, proxy_url: str = "", timeout_sec: int = 10) -> dict:
@@ -341,7 +402,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /proxy on|off|test|set URL
 /api status|set KEY SECRET|clear|test - API биржи через чат
 /mexc_settings - показать MEXC параметры ордера
-/leverage 1 - плечо MEXC futures
+/leverage 5 - плечо MEXC futures
 /open_type 1 - 1 isolated, 2 cross
 /recv_window 20000 - окно timestamp для MEXC
 /set key value - ручная настройка
@@ -544,7 +605,14 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update, "📈 Positions: none", reply_markup=MAIN_MENU); return
     lines = ["📈 Positions"]
     for p in ps:
-        lines.append(f"{p.get('symbol')} {p.get('side')} {p.get('status')} entry={p.get('entry_price')} SL={p.get('stop_price')} TP={p.get('take_price')}")
+        notional, margin, leverage, margin_type = _position_money_fields(p)
+        coin = str(p.get('symbol', '')).split('/')[0]
+        lines.append(
+            f"{p.get('symbol')} {p.get('side')} {p.get('status')} "
+            f"entry={p.get('entry_price')} SL={p.get('stop_price')} TP={p.get('take_price')}\n"
+            f"Qty={float(p.get('qty') or 0):.6f} {coin} / {notional:.2f} USDT | "
+            f"Lev={leverage}x | Margin={margin_type} ~{margin:.2f} USDT"
+        )
     await reply(update, "\n".join(lines), reply_markup=MAIN_MENU)
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -592,7 +660,7 @@ async def mexc_settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def leverage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     if not context.args:
-        await reply(update, "Usage: /leverage 1", reply_markup=MAIN_MENU); return
+        await reply(update, "Usage: /leverage 5", reply_markup=MAIN_MENU); return
     try:
         value = int(float(context.args[0]))
         if value < 1 or value > 200:
@@ -983,7 +1051,7 @@ async def trading_loop(app):
                 events = await pos_manager.manage(lambda symbol: get_last_price(ex, symbol), live)
                 for ev in events:
                     if ev.get("type") not in {"pending_sync_warning", "price_error"}:
-                        await notify_admin(app, f"📌 {ev['type']} {ev['symbol']}", key="position_event")
+                        await notify_admin(app, format_position_event(ev), key="position_event")
 
                 # 2) Refresh symbol universe. Normal scanner progress is kept in one
                 # editable live-status message to avoid chat spam.
@@ -1138,12 +1206,7 @@ async def trading_loop(app):
                         await update_scanner_status(app, settings, status="position opened", force=True)
                         await notify_admin(
                             app,
-                            (
-                                f"🟢 Position opened\n{plan.symbol} {plan.side}\n"
-                                f"Strategy: {plan.strategy}\nEntry: {plan.entry_price:.8f}\n"
-                                f"SL: {plan.stop_price:.8f}\nTP: {plan.take_price:.8f}\n"
-                                f"Qty: {plan.qty:.6f}\nLive: {live}"
-                            ),
+                            format_position_opened(plan, placed, live),
                             key="position_opened",
                         )
                     else:

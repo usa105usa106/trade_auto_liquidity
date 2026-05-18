@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = os.getenv("BOT_VERSION", "0058 MEXC API HOST + RATE LIMIT")
+VERSION = os.getenv("BOT_VERSION", "0060 UX + 5X LEVERAGE")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -40,7 +40,7 @@ class Defaults:
     ws_adaptive_slowdown_threshold: int = env_int("WS_ADAPTIVE_SLOWDOWN_THRESHOLD", 1000)
     symbol_refresh_sec: int = env_int("SYMBOL_REFRESH_SEC", 300)
     max_open_positions: int = env_int("MAX_OPEN_POSITIONS", 5)
-    risk_pct: float = env_float("RISK_PCT", 0.005)
+    risk_pct: float = env_float("RISK_PCT", 0.01)
     strategy_mode: str = os.getenv("STRATEGY_MODE", "hybrid")
     auto_strategy_adaptation: bool = env_bool("AUTO_STRATEGY_ADAPTATION", True)
     regime_adaptation: bool = env_bool("REGIME_ADAPTATION", True)
@@ -54,10 +54,10 @@ class Defaults:
     max_daily_loss_pct: float = env_float("MAX_DAILY_LOSS_PCT", 3.0)
     max_consecutive_losses: int = env_int("MAX_CONSECUTIVE_LOSSES", 4)
     cooldown_after_close_sec: int = env_int("COOLDOWN_AFTER_CLOSE_SEC", 120)
-    limit_timeout_sec: int = env_int("LIMIT_TIMEOUT_SEC", 30)
+    limit_timeout_sec: int = env_int("LIMIT_TIMEOUT_SEC", 300)
     proxy_enabled: bool = env_bool("PROXY_ENABLED", False)
     proxy_url: str = os.getenv("PROXY_URL", "")
-    mexc_order_leverage: int = env_int("MEXC_ORDER_LEVERAGE", 1)
+    mexc_order_leverage: int = env_int("MEXC_ORDER_LEVERAGE", 5)
     mexc_order_open_type: int = env_int("MEXC_ORDER_OPEN_TYPE", 1)
     mexc_recv_window: int = env_int("MEXC_RECV_WINDOW", 20000)
 
