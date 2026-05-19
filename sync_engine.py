@@ -75,14 +75,30 @@ class SyncEngine:
 
     async def sync(self, protect: bool = True) -> dict:
         report = {"positions": 0, "orders": 0, "entry": 0, "tp": 0, "sl": 0, "imported_positions": 0, "protected_positions": 0, "warnings": []}
-        local_symbols = {p.get("symbol") for p in await self.storage.positions()}
+        local_positions_initial = await self.storage.positions()
+        local_symbols = {p.get("symbol") for p in local_positions_initial}
+        local_identity_keys = set()
+        try:
+            for lp in local_positions_initial:
+                for v in [lp.get("symbol"), lp.get("mexc_symbol"), *list(lp.get("symbol_variants") or [])]:
+                    if v and hasattr(self.exchange_client, "_mexc_normalize_contract_id"):
+                        local_identity_keys.add(self.exchange_client._mexc_normalize_contract_id(v))
+        except Exception:
+            pass
         try:
             positions = await self.exchange_client.fetch_positions()
             active = [p for p in (positions or []) if self._position_qty(p) > 0]
             report["positions"] = len(active)
             for p in active:
                 symbol = p.get("symbol") or (p.get("info", {}) if isinstance(p.get("info"), dict) else {}).get("symbol")
-                if not symbol or symbol in local_symbols:
+                ep_keys = set()
+                try:
+                    for v in [symbol, p.get("mexc_symbol"), *list(p.get("symbol_variants") or [])]:
+                        if v and hasattr(self.exchange_client, "_mexc_normalize_contract_id"):
+                            ep_keys.add(self.exchange_client._mexc_normalize_contract_id(v))
+                except Exception:
+                    pass
+                if not symbol or symbol in local_symbols or (ep_keys and (ep_keys & local_identity_keys)):
                     continue
                 side = self._position_side(p)
                 entry = await self._last_price(symbol, self._entry_price(p))
@@ -107,11 +123,19 @@ class SyncEngine:
                     "external_sync": True,
                     "raw_exchange_position": p,
                 }
+                try:
+                    imported = ExecutionEngine(self.storage, self.exchange_client)._sanitize_position_for_exchange(imported)
+                except Exception:
+                    pass
                 await self.storage.upsert_position(imported)
                 report["imported_positions"] += 1
                 if protect and stop_price > 0 and take_price > 0:
                     protection = await ExecutionEngine(self.storage, self.exchange_client).place_protection_orders(imported, live=True)
                     imported.update(protection)
+                    try:
+                        imported = ExecutionEngine(self.storage, self.exchange_client)._sanitize_position_for_exchange(imported)
+                    except Exception:
+                        pass
                     await self.storage.upsert_position(imported)
                     if protection.get("ok"):
                         report["protected_positions"] = report.get("protected_positions", 0) + 1
@@ -134,7 +158,7 @@ class SyncEngine:
                     report["protected_positions"] = report.get("protected_positions", 0) + 1
                     lp.pop("protection_warning", None)
                 else:
-                    lp["protection_warning"] = "exchange TP/SL not fully confirmed; local TP/SL monitor active"
+                    lp["protection_warning"] = "exchange TP/SL not confirmed; bot monitors TP/SL locally"
                     report["warnings"].append(f"{lp.get('symbol')}: protection status {state.get('protection_status')}")
                 await self.storage.upsert_position(lp)
         except Exception as e:

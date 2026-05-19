@@ -272,7 +272,7 @@ class ExecutionEngine:
                         pos["updated_at"] = time.time()
                 except Exception as e:
                     pos["exchange_sync_warning"] = str(e)
-            pos = self._decorate_position_metrics(pos)
+            pos = self._sanitize_position_for_exchange(self._decorate_position_metrics(pos))
             await self.storage.upsert_position(pos)
 
             if pos["status"] == "open":
@@ -284,15 +284,33 @@ class ExecutionEngine:
                     # exchange-side TP/SL. The position is already live; losing
                     # local state is worse than running local TP/SL monitoring.
                     pos["protection_mode"] = "local_monitoring"
-                    pos["protection_warning"] = "exchange protection failed; local TP/SL monitor active"
+                    pos["protection_warning"] = "exchange protection failed; bot monitors TP/SL locally"
                     pos["updated_at"] = time.time()
                     await self.storage.upsert_position(pos)
                     auto_close = await self._setting_bool("auto_close_on_protection_failed", "ALLOW_AUTO_CLOSE_ON_PROTECTION_FAILED", False)
                     if auto_close:
                         close_res = await self.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
                         return {"ok": False, "reason": "protection orders failed; auto-close explicitly enabled", "protection": protection, "close_result": close_res}
-                    return {"ok": True, "order": order, "position": pos, "warning": "exchange protection failed; local TP/SL monitor active"}
+                    return {"ok": True, "order": order, "position": pos, "warning": "exchange protection failed; bot monitors TP/SL locally"}
             return {"ok": True, "order": order, "position": pos}
+
+
+    def _sanitize_position_for_exchange(self, pos: dict) -> dict:
+        """Round qty/TP/SL once and keep local display equal to what MEXC receives."""
+        try:
+            if hasattr(self.exchange_client, "sanitize_protection_values"):
+                vals = self.exchange_client.sanitize_protection_values(
+                    pos.get("symbol"),
+                    float(pos.get("qty") or 0),
+                    pos.get("stop_price"),
+                    pos.get("take_price"),
+                )
+                for k, v in vals.items():
+                    if v not in (None, ""):
+                        pos[k] = v
+        except Exception as e:
+            pos["precision_warning"] = str(e)[:160]
+        return pos
 
 
     def exchange_position_qty(self, pos: dict) -> float:
@@ -395,6 +413,7 @@ class ExecutionEngine:
     async def place_protection_orders(self, pos: dict, live: bool) -> dict:
         if not live:
             return {}
+        pos = self._sanitize_position_for_exchange(dict(pos))
         symbol = pos["symbol"]
         qty = float(pos.get("qty") or 0)
         if qty <= 0:
@@ -421,10 +440,10 @@ class ExecutionEngine:
             out["sl_error"] = str(e)
         if require_exchange_protection and (not out.get("tp_order_id") or not out.get("sl_order_id")):
             out["ok"] = False
-        out["protection_status"] = "EXCHANGE PROTECTED" if out.get("tp_order_id") and out.get("sl_order_id") else "LOCAL FALLBACK"
+        out["protection_status"] = "EXCHANGE PROTECTED" if out.get("tp_order_id") and out.get("sl_order_id") else "LOCAL BOT PROTECTED"
         out["protection_mode"] = "exchange" if out["protection_status"] == "EXCHANGE PROTECTED" else "local_monitoring"
         if out["protection_status"] != "EXCHANGE PROTECTED":
-            out["protection_warning"] = "exchange TP/SL not fully confirmed; local monitor fallback active"
+            out["protection_warning"] = "exchange TP/SL not fully confirmed; bot monitors locally"
         else:
             out.pop("protection_warning", None)
         return out
@@ -447,13 +466,21 @@ class ExecutionEngine:
         qty = float(pos.get("qty") or 0)
         pos["status"] = "closing"
         await self.storage.upsert_position(pos)
+        already_closed = False
         if live and qty > 0:
             try:
                 await self._create_order_retry(symbol, "market", side, qty, None, {"reduceOnly": True, "clientOrderId": f"bot_close_{int(time.time()*1000)}"}, attempts=2)
             except Exception as e:
-                pos["status"] = "open"
-                await self.storage.upsert_position(pos)
-                return {"ok": False, "reason": f"close failed: {e}"}
+                err = str(e)
+                # MEXC code 2009 means the position is already gone. This is a
+                # normal race after TP/SL/time-stop/native-close, not a trading
+                # failure, so keep closing idempotent and silent for Telegram.
+                if "2009" in err or "nonexistent or closed" in err.lower():
+                    already_closed = True
+                else:
+                    pos["status"] = "open"
+                    await self.storage.upsert_position(pos)
+                    return {"ok": False, "reason": f"close failed: {e}"}
         entry = float(pos.get("entry_price") or 0)
         exit_price = float(exit_price or entry)
         pnl_pct = ((exit_price-entry)/entry*100) if str(pos.get("side")).upper()=="LONG" and entry else ((entry-exit_price)/entry*100 if entry else 0)
@@ -475,30 +502,35 @@ class ExecutionEngine:
             "mirror_used": pos.get("mirror_used", False),
             "session": pos.get("session"),
         })
-        # v0067 safety: do not erase local state if MEXC still shows hidden
-        # position margin after a close attempt. Some accounts return empty
-        # position lists while account/assets still has positionMargin. In that
-        # case keeping local state is safer than pretending the account is flat.
+        # v0078 close confirmation: verify the concrete symbol position after
+        # a small grace period. Do not use account/assets hidden margin as a
+        # failure signal: MEXC can keep margin fields stale for a few seconds
+        # after the position is already closed, which caused duplicate close
+        # attempts and noisy 2009 Telegram events.
         confirmed_flat = True
-        if live and hasattr(self.exchange_client, "fetch_balance"):
+        if live and hasattr(self.exchange_client, "fetch_positions") and not already_closed:
             try:
-                await asyncio.sleep(float(os.getenv("POST_CLOSE_BALANCE_CHECK_DELAY_SEC", "0.8")))
-                bal = await self.exchange_client.fetch_balance()
-                usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
-                pm = float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
-                used = float(usdt.get("used") or ((bal or {}).get("used", {}) or {}).get("USDT") or 0)
-                if pm > float(os.getenv("HIDDEN_MARGIN_WARN_USDT", "0.5")) and used > float(os.getenv("HIDDEN_MARGIN_WARN_USDT", "0.5")):
-                    confirmed_flat = False
+                await asyncio.sleep(float(os.getenv("POST_CLOSE_POSITION_RECHECK_DELAY_SEC", os.getenv("POST_CLOSE_BALANCE_CHECK_DELAY_SEC", "2.0"))))
+                rows = await self.exchange_client.fetch_positions([symbol])
+                for r in rows or []:
+                    try:
+                        sym = str(r.get("symbol") or ((r.get("info") or {}).get("symbol")) or "")
+                        contracts = float(r.get("contracts") or r.get("contractSize") or r.get("qty") or r.get("amount") or ((r.get("info") or {}).get("holdVol")) or 0)
+                        if contracts > 0 and (sym == symbol or self.exchange_client._mexc_variants_match(sym, symbol)):
+                            confirmed_flat = False
+                            break
+                    except Exception:
+                        continue
+                if not confirmed_flat:
                     pos["status"] = "open"
-                    pos["close_warning"] = f"close order sent but account still shows hidden margin: {pm:.4f} USDT"
+                    pos["close_warning"] = "close order sent; exchange position still open after grace recheck"
                     pos["updated_at"] = time.time()
                     await self.storage.upsert_position(pos)
             except Exception as e:
-                confirmed_flat = False
-                pos["status"] = "open"
-                pos["close_warning"] = f"close verification failed: {e}"
-                pos["updated_at"] = time.time()
-                await self.storage.upsert_position(pos)
+                # Verification outages should not create double-close loops. Keep
+                # local cleanup and let the next /positions or sync restore state
+                # if the exchange still has a real position.
+                pos["close_verify_warning"] = str(e)[:220]
         if not confirmed_flat:
             return {"ok": False, "reason": pos.get("close_warning", "close not confirmed"), "pnl_usdt": pnl_usdt, "pnl_pct": pnl_pct}
         await self.storage.remove_position(symbol)

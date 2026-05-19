@@ -150,6 +150,10 @@ class RecoveryEngine:
                 "exchange_recovered": True,
                 "raw_exchange_position": ep,
             })
+            try:
+                pos = self.execution_engine._sanitize_position_for_exchange(pos)
+            except Exception:
+                pass
             state = await ProtectionEngine(self.exchange_client, self.execution_engine).reconcile(pos, live=True, reattach=reattach)
             pos.update(state)
             if state.get("protection_status") == "EXCHANGE PROTECTED":
@@ -161,13 +165,22 @@ class RecoveryEngine:
                     report["reattach_ok"] += 1
             else:
                 pos["protection_mode"] = "local_monitoring"
-                pos["protection_warning"] = "exchange TP/SL not fully confirmed; local TP/SL monitor active"
+                pos["protection_warning"] = "exchange TP/SL not confirmed; bot monitors TP/SL locally"
                 report["local_monitoring"] += 1
                 if reattach:
                     report["reattach_attempted"] += 1
                     if state.get("reattach_error") or state.get("tp_error") or state.get("sl_error"):
                         report["errors"].append(f"reattach {symbol}: {state.get('reattach_error') or state.get('tp_error') or state.get('sl_error')}")
             pos = self.execution_engine._decorate_position_metrics(pos)
+            try:
+                if old and old.get("symbol") and old.get("symbol") != pos.get("symbol"):
+                    await self.storage.remove_position(old.get("symbol"))
+                # Remove duplicate local aliases for the same exchange contract.
+                for lp2 in await self.storage.positions():
+                    if lp2.get("symbol") != pos.get("symbol") and (self._keys(lp2) & keys):
+                        await self.storage.remove_position(lp2.get("symbol"))
+            except Exception:
+                pass
             await self.storage.upsert_position(pos)
             if old:
                 report["updated"] += 1

@@ -13,10 +13,62 @@ class TradePlanner:
         self.max_order_usdt = float(os.getenv("MAX_ORDER_USDT", "100"))
         self.tp_atr_mult = float(os.getenv("TP_ATR_MULT", "2.2"))
         self.sl_atr_mult = float(os.getenv("SL_ATR_MULT", "1.2"))
-        self.min_tp_pct = float(os.getenv("MIN_TP_PCT", "0.25"))
-        self.max_tp_pct = float(os.getenv("MAX_TP_PCT", "1.20"))
-        self.min_sl_pct = float(os.getenv("MIN_SL_PCT", "0.15"))
-        self.max_sl_pct = float(os.getenv("MAX_SL_PCT", "0.60"))
+        # v0078: default risk model is a scalp profile, not swing.
+        # Values are in raw price %, before leverage.
+        self.min_tp_pct = float(os.getenv("MIN_TP_PCT", "0.12"))
+        self.max_tp_pct = float(os.getenv("MAX_TP_PCT", "0.30"))
+        self.min_sl_pct = float(os.getenv("MIN_SL_PCT", "0.20"))
+        self.max_sl_pct = float(os.getenv("MAX_SL_PCT", "0.45"))
+        # Fee-aware entry filter. Defaults are conservative % estimates for a
+        # market-in/market-out scalp: taker fee each side + spread/slippage
+        # buffer + minimal net profit. If the configured TP cannot clear this,
+        # the plan is skipped instead of opening a mathematically bad scalp.
+        self.taker_fee_pct = float(os.getenv("TAKER_FEE_PCT", "0.04"))
+        self.spread_buffer_pct = float(os.getenv("SCALP_SPREAD_BUFFER_PCT", "0.03"))
+        self.min_net_profit_pct = float(os.getenv("MIN_NET_PROFIT_PCT", "0.04"))
+        # v0079: strategy risk profiles. Momentum remains the original scalp
+        # profile. Pullback/reversal use slightly different bands instead of
+        # silently reusing exactly the same TP/SL as momentum. All values are
+        # raw price %, before leverage, and can be overridden from ENV.
+        self.strategy_profiles = {
+            "momentum": {
+                "min_tp": float(os.getenv("MOMENTUM_MIN_TP_PCT", os.getenv("MIN_TP_PCT", "0.12"))),
+                "max_tp": float(os.getenv("MOMENTUM_MAX_TP_PCT", os.getenv("MAX_TP_PCT", "0.30"))),
+                "min_sl": float(os.getenv("MOMENTUM_MIN_SL_PCT", os.getenv("MIN_SL_PCT", "0.20"))),
+                "max_sl": float(os.getenv("MOMENTUM_MAX_SL_PCT", os.getenv("MAX_SL_PCT", "0.45"))),
+                "tp_mult": float(os.getenv("MOMENTUM_TP_ATR_MULT", os.getenv("TP_ATR_MULT", "2.2"))),
+                "sl_mult": float(os.getenv("MOMENTUM_SL_ATR_MULT", os.getenv("SL_ATR_MULT", "1.2"))),
+            },
+            "pullback": {
+                "min_tp": float(os.getenv("PULLBACK_MIN_TP_PCT", "0.16")),
+                "max_tp": float(os.getenv("PULLBACK_MAX_TP_PCT", "0.38")),
+                "min_sl": float(os.getenv("PULLBACK_MIN_SL_PCT", "0.22")),
+                "max_sl": float(os.getenv("PULLBACK_MAX_SL_PCT", "0.50")),
+                "tp_mult": float(os.getenv("PULLBACK_TP_ATR_MULT", "2.0")),
+                "sl_mult": float(os.getenv("PULLBACK_SL_ATR_MULT", "1.3")),
+            },
+            "reversal": {
+                "min_tp": float(os.getenv("REVERSAL_MIN_TP_PCT", "0.18")),
+                "max_tp": float(os.getenv("REVERSAL_MAX_TP_PCT", "0.45")),
+                "min_sl": float(os.getenv("REVERSAL_MIN_SL_PCT", "0.25")),
+                "max_sl": float(os.getenv("REVERSAL_MAX_SL_PCT", "0.60")),
+                "tp_mult": float(os.getenv("REVERSAL_TP_ATR_MULT", "1.8")),
+                "sl_mult": float(os.getenv("REVERSAL_SL_ATR_MULT", "1.4")),
+            },
+            "liquidity_retest": {
+                # v0082: not a scalp profile. SL comes from the liquidity zone/wick,
+                # TP is adaptive RR (2R/3R/4R). These bands are safety clamps only.
+                "min_tp": float(os.getenv("LIQUIDITY_RETEST_MIN_TP_PCT", "0.35")),
+                "max_tp": float(os.getenv("LIQUIDITY_RETEST_MAX_TP_PCT", "5.00")),
+                "min_sl": float(os.getenv("LIQUIDITY_RETEST_MIN_SL_PCT", "0.15")),
+                "max_sl": float(os.getenv("LIQUIDITY_RETEST_MAX_SL_PCT", "1.20")),
+                "tp_mult": float(os.getenv("LIQUIDITY_RETEST_DEFAULT_RR", "3.0")),
+                "sl_mult": float(os.getenv("LIQUIDITY_RETEST_SL_ATR_MULT", "1.0")),
+            },
+        }
+
+    def _profile_for(self, strategy: str) -> dict:
+        return self.strategy_profiles.get(str(strategy or "momentum").lower(), self.strategy_profiles["momentum"])
 
     @staticmethod
     def _bool_setting(settings: dict, key: str, default: bool = True) -> bool:
@@ -34,8 +86,55 @@ class TradePlanner:
         equity = float(equity_usdt or self.default_equity)
         risk_pct = float(candidate.get("risk_pct", settings.get("risk_pct", 0.005)))
         atr_pct = float(candidate.get("atr_pct") or 0.25)
-        sl_pct = clamp(atr_pct * self.sl_atr_mult, self.min_sl_pct, self.max_sl_pct)
-        tp_pct = clamp(atr_pct * self.tp_atr_mult, self.min_tp_pct, self.max_tp_pct)
+        strategy = str(candidate.get("strategy", "momentum")).lower()
+        profile = self._profile_for(strategy)
+        details = candidate.get("score_details") or {}
+        if strategy == "liquidity_retest":
+            # v0082: SL is placed behind the detected demand/supply zone. TP is
+            # adaptive RR: 2R for weak/okay retests, 3R normal, 4R strong setups.
+            zone_low = float(details.get("zone_low") or 0)
+            zone_high = float(details.get("zone_high") or 0)
+            buffer_pct = float(settings.get("liquidity_retest_sl_buffer_pct", os.getenv("LIQUIDITY_RETEST_SL_BUFFER_PCT", "0.04")) or 0.04)
+            rr = float(details.get("adaptive_rr") or settings.get("liquidity_retest_default_rr", os.getenv("LIQUIDITY_RETEST_DEFAULT_RR", "3.0")) or 3.0)
+            rr = clamp(rr, 2.0, 4.0)
+            if side == "LONG" and zone_low > 0:
+                stop_from_zone = zone_low * (1 - buffer_pct / 100.0)
+                sl_pct = max(0.0001, (price - stop_from_zone) / price * 100.0)
+            elif side == "SHORT" and zone_high > 0:
+                stop_from_zone = zone_high * (1 + buffer_pct / 100.0)
+                sl_pct = max(0.0001, (stop_from_zone - price) / price * 100.0)
+            else:
+                sl_pct = clamp(atr_pct * float(profile["sl_mult"]), float(profile["min_sl"]), float(profile["max_sl"]))
+            sl_pct = clamp(sl_pct, float(profile["min_sl"]), float(profile["max_sl"]))
+            tp_pct = clamp(sl_pct * rr, float(profile["min_tp"]), float(profile["max_tp"]))
+            # v0083: when the SMC detector found a real nearby liquidity target,
+            # use it if it is inside the safe adaptive RR band. Otherwise keep
+            # the adaptive 2R/3R/4R target so the trade stays structured.
+            liquidity_target = float(details.get("liquidity_target") or 0) if isinstance(details, dict) else 0.0
+            if liquidity_target > 0:
+                if side == "LONG" and liquidity_target > price:
+                    target_pct = (liquidity_target - price) / price * 100.0
+                    target_rr = target_pct / sl_pct if sl_pct > 0 else 0.0
+                    if 2.0 <= target_rr <= 4.25:
+                        tp_pct = clamp(target_pct, float(profile["min_tp"]), float(profile["max_tp"]))
+                        rr = clamp(target_rr, 2.0, 4.0)
+                elif side == "SHORT" and liquidity_target < price:
+                    target_pct = (price - liquidity_target) / price * 100.0
+                    target_rr = target_pct / sl_pct if sl_pct > 0 else 0.0
+                    if 2.0 <= target_rr <= 4.25:
+                        tp_pct = clamp(target_pct, float(profile["min_tp"]), float(profile["max_tp"]))
+                        rr = clamp(target_rr, 2.0, 4.0)
+            candidate["liquidity_retest_rr"] = rr
+        else:
+            sl_pct = clamp(atr_pct * float(profile["sl_mult"]), float(profile["min_sl"]), float(profile["max_sl"]))
+            tp_pct = clamp(atr_pct * float(profile["tp_mult"]), float(profile["min_tp"]), float(profile["max_tp"]))
+            min_fee_aware_tp = max(float(profile["min_tp"]), self.taker_fee_pct * 2 + self.spread_buffer_pct + self.min_net_profit_pct)
+            if tp_pct < min_fee_aware_tp:
+                tp_pct = min_fee_aware_tp
+            if tp_pct > float(profile["max_tp"]):
+                # TP would be too small after fees/spread for the configured strategy
+                # band. Do not open; better no trade than a negative-expectancy setup.
+                return None
         max_positions = max(1, int(candidate.get("max_open_positions", settings.get("max_open_positions", 5)) or 5))
         leverage = max(1, int(float(settings.get("mexc_order_leverage", os.getenv("MEXC_ORDER_LEVERAGE", "5")) or 5)))
 
@@ -73,8 +172,11 @@ class TradePlanner:
             stop = price * (1 + sl_pct / 100.0)
             take = price * (1 - tp_pct / 100.0)
 
-        strategy = str(candidate.get("strategy", "momentum")).lower()
         order_type = "market" if strategy == "momentum" else "limit"
+        lr_rr = float(candidate.get("liquidity_retest_rr") or (details.get("adaptive_rr") if isinstance(details, dict) else 0) or 0)
+        lr_zone_low = float(details.get("zone_low") or 0) if isinstance(details, dict) else 0.0
+        lr_zone_high = float(details.get("zone_high") or 0) if isinstance(details, dict) else 0.0
+        lr_reason = str(details.get("rr_reason") or details.get("setup") or "") if isinstance(details, dict) else ""
         return TradePlan(
             symbol=candidate["symbol"],
             side=side,
@@ -93,4 +195,8 @@ class TradePlanner:
             expected_margin_usdt=expected_margin,
             max_margin_per_position_usdt=max_margin_per_position,
             leverage=leverage,
+            liquidity_retest_rr=lr_rr,
+            liquidity_retest_zone_low=lr_zone_low,
+            liquidity_retest_zone_high=lr_zone_high,
+            liquidity_retest_reason=lr_reason,
         )

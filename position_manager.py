@@ -1,5 +1,6 @@
 import time
 import os
+from scalp_exit_engine import ScalpExitPolicy
 
 class PositionManager:
     """
@@ -17,7 +18,8 @@ class PositionManager:
         self.execution_engine = execution_engine
         self.time_stop_sec = int(os.getenv("TIME_STOP_SEC", "300"))
         self.limit_timeout_sec = int(os.getenv("LIMIT_TIMEOUT_SEC", "300"))
-        self.breakeven_trigger_pct = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.30"))
+        self.breakeven_trigger_pct = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.12"))
+        self.scalp_exit_policy = ScalpExitPolicy()
 
     @staticmethod
     def _truthy(value, default: bool = False) -> bool:
@@ -42,6 +44,54 @@ class PositionManager:
         limit_timeout = int(await self._setting("limit_timeout_sec", self.limit_timeout_sec) or self.limit_timeout_sec)
         breakeven = float(await self._setting("breakeven_trigger_pct", self.breakeven_trigger_pct) or self.breakeven_trigger_pct)
         return time_stop, limit_timeout, breakeven
+
+    async def _refresh_scalp_policy(self) -> ScalpExitPolicy:
+        policy = ScalpExitPolicy()
+        policy.enabled = self._truthy(await self._setting("scalp_exit_enabled", policy.enabled), policy.enabled)
+        policy.breakeven_trigger_pct = float(await self._setting("breakeven_trigger_pct", policy.breakeven_trigger_pct) or policy.breakeven_trigger_pct)
+        policy.breakeven_offset_pct = float(await self._setting("breakeven_offset_pct", policy.breakeven_offset_pct) or policy.breakeven_offset_pct)
+        policy.trailing_enabled = self._truthy(await self._setting("scalp_trailing_enabled", policy.trailing_enabled), policy.trailing_enabled)
+        policy.trailing_start_pct = float(await self._setting("scalp_trailing_start_pct", policy.trailing_start_pct) or policy.trailing_start_pct)
+        policy.trailing_giveback_pct = float(await self._setting("scalp_trailing_giveback_pct", policy.trailing_giveback_pct) or policy.trailing_giveback_pct)
+        policy.time_min_sec = int(await self._setting("smart_time_stop_min_sec", policy.time_min_sec) or policy.time_min_sec)
+        policy.stale_pnl_abs_pct = float(await self._setting("smart_time_stop_stale_abs_pct", policy.stale_pnl_abs_pct) or policy.stale_pnl_abs_pct)
+        policy.time_extend_profit_pct = float(await self._setting("smart_time_stop_extend_profit_pct", policy.time_extend_profit_pct) or policy.time_extend_profit_pct)
+        policy.time_max_extend_sec = int(await self._setting("smart_time_stop_max_extend_sec", policy.time_max_extend_sec) or policy.time_max_extend_sec)
+        self.scalp_exit_policy = policy
+        return policy
+
+
+    async def _is_terminal_closed(self, symbol: str) -> bool:
+        """Return True when a recent close lock makes local callbacks stale.
+
+        MEXC can report stale margin/order state for a few seconds after flat.
+        Once ExecutionEngine closes a symbol, CLOSED is terminal for local TP/SL,
+        breakeven and time-stop callbacks until the cooldown lock expires.
+        """
+        try:
+            locked, reason = await self.storage.is_locked(symbol)
+            return bool(locked and str(reason or "").startswith("closed:"))
+        except Exception:
+            return False
+
+    async def _close_and_event(self, pos: dict, event_type: str, reason: str, live: bool, price: float) -> dict | None:
+        symbol = pos["symbol"]
+        if await self._is_terminal_closed(symbol):
+            try:
+                await self.storage.remove_position(symbol)
+            except Exception:
+                pass
+            return None
+        res = await self.execution_engine.close_position(pos, reason, live, price)
+        if isinstance(res, dict) and res.get("ok"):
+            # Close is terminal locally. Remove any stale local row again and rely
+            # on /positions or sync to restore it only if exchange still has a
+            # real position after settlement.
+            try:
+                await self.storage.remove_position(symbol)
+            except Exception:
+                pass
+        return {"type": event_type, "symbol": symbol, "result": res}
 
     async def _auto_close_on_protection_failed(self) -> bool:
         value = await self._setting("auto_close_on_protection_failed", os.getenv("ALLOW_AUTO_CLOSE_ON_PROTECTION_FAILED", "false"))
@@ -97,7 +147,7 @@ class PositionManager:
                     # enforce TP/SL/time-stop from ticker prices. Auto-closing
                     # can be enabled explicitly, but default is safer state sync.
                     pos["protection_mode"] = "local_monitoring"
-                    pos["protection_warning"] = "exchange protection failed; local TP/SL monitor active"
+                    pos["protection_warning"] = "exchange protection failed; bot monitors TP/SL locally"
                     pos.update(protection)
                     await self.storage.upsert_position(pos)
                     if await self._auto_close_on_protection_failed():
@@ -127,6 +177,14 @@ class PositionManager:
             if status not in {"open"}:
                 continue
             symbol=pos["symbol"]
+            if await self._is_terminal_closed(symbol):
+                # Ignore stale post-close callbacks such as breakeven moved after
+                # SL/TP/time-stop. CLOSED is terminal.
+                try:
+                    await self.storage.remove_position(symbol)
+                except Exception:
+                    pass
+                continue
             try:
                 price=await price_provider(symbol)
             except Exception as e:
@@ -135,20 +193,78 @@ class PositionManager:
             if not price:
                 continue
             side=str(pos.get("side")).upper(); stop=float(pos.get("stop_price") or 0); take=float(pos.get("take_price") or 0); entry=float(pos.get("entry_price") or 0); opened=float(pos.get("opened_at") or now); pnl=self.pnl_pct(pos, price)
-            if pnl>=breakeven_trigger_pct and entry>0:
-                if (side=="LONG" and stop<entry) or (side=="SHORT" and stop>entry):
-                    pos["stop_price"]=entry; await self.storage.upsert_position(pos); events.append({"type":"breakeven","symbol":symbol})
-                    stop = entry
+            strategy = str(pos.get("strategy") or "").lower()
+            is_liquidity_retest = strategy == "liquidity_retest"
+            policy = await self._refresh_scalp_policy()
+            policy.update_best_pnl(pos, pnl)
+            if is_liquidity_retest:
+                # v0082: no aggressive scalp BE. Move to BE only after price has
+                # travelled roughly 1R, because this strategy targets 2R-4R.
+                risk_pct = 0.0
+                if entry > 0 and stop > 0:
+                    risk_pct = abs(entry - stop) / entry * 100.0
+                be_trigger = max(float(await self._setting("liquidity_retest_be_r_pct", 1.0) or 1.0) * risk_pct, 0.20)
+                move_be, new_stop = False, 0.0
+                if pnl >= be_trigger and entry > 0:
+                    if (side == "LONG" and (not stop or stop < entry)) or (side == "SHORT" and (not stop or stop > entry)):
+                        move_be, new_stop = True, entry
+            else:
+                move_be, _pnl, new_stop = policy.should_move_breakeven(pos, price)
+                # Backward-compatible fallback for users who disable the new policy.
+                if not move_be and pnl>=breakeven_trigger_pct and entry>0:
+                    if (side=="LONG" and stop<entry) or (side=="SHORT" and stop>entry):
+                        move_be, new_stop = True, entry
+            if move_be and entry>0:
+                if await self._is_terminal_closed(symbol):
+                    try:
+                        await self.storage.remove_position(symbol)
+                    except Exception:
+                        pass
+                    continue
+                pos["stop_price"] = new_stop
+                pos["breakeven_moved"] = True
+                pos["updated_at"] = now
+                await self.storage.upsert_position(pos)
+                events.append({"type":"breakeven","symbol":symbol, "stop_price": new_stop})
+                stop = new_stop
             if side=="LONG":
                 if take and price>=take:
-                    events.append({"type":"tp","symbol":symbol,"result":await self.execution_engine.close_position(pos,"take_profit",live,price)}); continue
+                    ev = await self._close_and_event(pos, "tp", "take_profit", live, price)
+                    if ev: events.append(ev)
+                    continue
                 if stop and price<=stop:
-                    events.append({"type":"sl","symbol":symbol,"result":await self.execution_engine.close_position(pos,"stop_loss",live,price)}); continue
+                    ev = await self._close_and_event(pos, "sl", "stop_loss", live, price)
+                    if ev: events.append(ev)
+                    continue
             else:
                 if take and price<=take:
-                    events.append({"type":"tp","symbol":symbol,"result":await self.execution_engine.close_position(pos,"take_profit",live,price)}); continue
+                    ev = await self._close_and_event(pos, "tp", "take_profit", live, price)
+                    if ev: events.append(ev)
+                    continue
                 if stop and price>=stop:
-                    events.append({"type":"sl","symbol":symbol,"result":await self.execution_engine.close_position(pos,"stop_loss",live,price)}); continue
-            if now-opened>=time_stop_sec:
-                events.append({"type":"time_stop","symbol":symbol,"result":await self.execution_engine.close_position(pos,"time_stop",live,price)})
+                    ev = await self._close_and_event(pos, "sl", "stop_loss", live, price)
+                    if ev: events.append(ev)
+                    continue
+            if not is_liquidity_retest:
+                trailing_reason = policy.trailing_exit_reason(pos, pnl)
+                if trailing_reason:
+                    ev = await self._close_and_event(pos, "trailing_exit", trailing_reason, live, price)
+                    if ev: events.append(ev)
+                    continue
+                time_reason = policy.time_stop_reason(pos, pnl, now-opened, time_stop_sec)
+                if time_reason:
+                    ev = await self._close_and_event(pos, "time_stop", time_reason, live, price)
+                    if ev: events.append(ev)
+                    continue
+            else:
+                # v0082: liquidity_retest is not ultra-scalp. Keep only a long
+                # hard safety timeout so dead retests don't live forever.
+                lr_time_stop = int(await self._setting("liquidity_retest_time_stop_sec", os.getenv("LIQUIDITY_RETEST_TIME_STOP_SEC", "1800")) or 1800)
+                if lr_time_stop > 0 and now - opened >= lr_time_stop:
+                    ev = await self._close_and_event(pos, "time_stop", "liquidity_retest_time_stop", live, price)
+                    if ev: events.append(ev)
+                    continue
+            if pos.get("best_pnl_pct") is not None:
+                pos["updated_at"] = now
+                await self.storage.upsert_position(pos)
         return events

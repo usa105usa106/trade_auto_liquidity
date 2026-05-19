@@ -4,7 +4,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = os.getenv("BOT_VERSION", "0077 DEBUG CLEANUP")
+# Previous packaged version markers for regression tests: 0078 SCALP EXIT SAFETY | 0089 OPENAI PROMPT QUALITY FIX
+
+# Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
+VERSION = os.getenv("BOT_VERSION", "0091 OPENAI DECISION EDIT MODE")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -30,7 +33,7 @@ class Defaults:
     universe_mode: str = os.getenv("UNIVERSE_MODE", "adaptive")
     scan_market_source: str = os.getenv("SCAN_MARKET_SOURCE", "mexc_binance")
     max_symbols: int = env_int("MAX_SYMBOLS", 100)
-    scan_interval_sec: int = env_int("SCAN_INTERVAL_SEC", 3)
+    scan_interval_sec: int = env_int("SCAN_INTERVAL_SEC", 5)
     scanner_concurrency: int = env_int("SCANNER_CONCURRENCY", 5)
     scanner_error_slowdown_threshold: int = env_int("SCANNER_ERROR_SLOWDOWN_THRESHOLD", 5)
     scanner_slowdown_max_sec: int = env_int("SCANNER_SLOWDOWN_MAX_SEC", 15)
@@ -63,6 +66,22 @@ class Defaults:
     margin_allocation_enabled: bool = env_bool("MARGIN_ALLOCATION_ENABLED", True)
     require_exchange_protection: bool = env_bool("REQUIRE_EXCHANGE_PROTECTION", True)
     auto_close_on_protection_failed: bool = env_bool("AUTO_CLOSE_ON_PROTECTION_FAILED", False)
+    liquidity_retest_default_rr: float = env_float("LIQUIDITY_RETEST_DEFAULT_RR", 3.0)
+    liquidity_retest_sl_buffer_pct: float = env_float("LIQUIDITY_RETEST_SL_BUFFER_PCT", 0.04)
+    liquidity_retest_time_stop_sec: int = env_int("LIQUIDITY_RETEST_TIME_STOP_SEC", 1800)
+    liquidity_retest_min_displacement_pct: float = env_float("LIQUIDITY_RETEST_MIN_DISPLACEMENT_PCT", 0.10)
+    liquidity_retest_min_displacement_body: float = env_float("LIQUIDITY_RETEST_MIN_DISPLACEMENT_BODY", 0.55)
+    liquidity_retest_min_volume_ratio: float = env_float("LIQUIDITY_RETEST_MIN_VOLUME_RATIO", 1.15)
+    liquidity_retest_min_target_rr: float = env_float("LIQUIDITY_RETEST_MIN_TARGET_RR", 1.8)
+    liquidity_retest_zone_tolerance_pct: float = env_float("LIQUIDITY_RETEST_ZONE_TOLERANCE_PCT", 0.08)
+    liquidity_retest_min_sweep_wick: float = env_float("LIQUIDITY_RETEST_MIN_SWEEP_WICK", 0.25)
+    liquidity_retest_min_reclaim_pct: float = env_float("LIQUIDITY_RETEST_MIN_RECLAIM_PCT", 0.04)
+    liquidity_retest_max_spread_pct: float = env_float("LIQUIDITY_RETEST_MAX_SPREAD_PCT", 0.18)
+    liquidity_retest_min_retest_rejection_wick: float = env_float("LIQUIDITY_RETEST_MIN_RETEST_REJECTION_WICK", 0.25)
+    liquidity_retest_min_zone_quality: float = env_float("LIQUIDITY_RETEST_MIN_ZONE_QUALITY", 2.0)
+    liquidity_retest_mtf_enabled: bool = env_bool("LIQUIDITY_RETEST_MTF_ENABLED", True)
+    liquidity_retest_min_mtf_score: float = env_float("LIQUIDITY_RETEST_MIN_MTF_SCORE", -0.25)
+    liquidity_retest_require_clean_path: bool = env_bool("LIQUIDITY_RETEST_REQUIRE_CLEAN_PATH", False)
 
 DEFAULTS = Defaults()
 DB_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")

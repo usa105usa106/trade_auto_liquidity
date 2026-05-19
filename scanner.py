@@ -369,6 +369,7 @@ class Scanner:
         else:
             max_candidates = base_max
 
+        self.engine.configure_from_settings(settings)
         self.last_concurrency = self._concurrency_limit(settings)
         sem = asyncio.Semaphore(self.last_concurrency)
         errors = 0

@@ -60,6 +60,28 @@ class ExchangeClient:
         await self._sync_mexc_time(silent=True)
         return self
 
+    def _split_symbol_parts(self, symbol: str) -> tuple[str, str]:
+        """Return (BASE, QUOTE) from any bot/MEXC/ccxt futures spelling.
+
+        Examples: ONDO/USDT:USDT, ONDO_USDT, ONDO-USDT, ONDOUSDT.
+        Keeping this centralized prevents `Contract does not exist` caused by
+        sending display symbols to native MEXC endpoints.
+        """
+        raw = str(symbol or "").strip().upper()
+        if raw.endswith(":USDT"):
+            raw = raw[:-5]
+        raw = raw.replace("-", "_")
+        if "/" in raw:
+            base, quote = raw.split("/", 1)
+            quote = quote.split(":", 1)[0] or "USDT"
+        elif "_" in raw:
+            base, quote = raw.split("_", 1)
+        elif raw.endswith("USDT") and len(raw) > 4:
+            base, quote = raw[:-4], "USDT"
+        else:
+            base, quote = raw, "USDT"
+        return base.strip("_/:-"), (quote or "USDT").strip("_/:-")
+
     def normalize_symbol(self, symbol: str) -> str:
         """Return an exchange-compatible swap symbol, or raise if none exists."""
         if not self.exchange:
@@ -67,14 +89,13 @@ class ExchangeClient:
         markets = getattr(self.exchange, "markets", None) or {}
         if symbol in markets:
             return symbol
-        base, quote = (symbol.split("/", 1) + [""])[:2] if "/" in symbol else (symbol.replace("USDT", ""), "USDT")
-        quote = (quote.split(":", 1)[0] or "USDT").upper()
+        base, quote = self._split_symbol_parts(symbol)
         aliases = [
             symbol,
             f"{base}/{quote}:USDT",
             f"{base}/{quote}",
-            f"{base}/USDT:USDT",
-            f"{base}/USDT",
+            f"{base}_USDT",
+            f"{base}{quote}",
         ]
         for candidate in aliases:
             if candidate in markets:
@@ -82,7 +103,7 @@ class ExchangeClient:
                 if m.get("swap") or m.get("future") or m.get("type") in {"swap", "future"}:
                     return candidate
         for m in markets.values():
-            if m.get("base") == base and m.get("quote") == "USDT" and (m.get("swap") or m.get("future") or m.get("type") in {"swap", "future"}):
+            if str(m.get("base") or "").upper() == base and str(m.get("quote") or "").upper() == quote and (m.get("swap") or m.get("future") or m.get("type") in {"swap", "future"}):
                 return m["symbol"]
         raise ValueError(f"no compatible swap market for symbol {symbol}")
 
@@ -119,18 +140,7 @@ class ExchangeClient:
         except Exception:
             norm = str(symbol or "")
         add(symbol); add(norm)
-        base, quote = "", "USDT"
-        if "/" in norm:
-            base = norm.split("/", 1)[0]
-            quote = norm.split("/", 1)[1].split(":", 1)[0] or "USDT"
-        else:
-            raw = norm.replace("-", "_")
-            if "_" in raw:
-                base, quote = raw.split("_", 1)
-            elif raw.upper().endswith("USDT"):
-                base, quote = raw[:-4], "USDT"
-            else:
-                base, quote = raw, "USDT"
+        base, quote = self._split_symbol_parts(norm)
         base = base.upper(); quote = quote.upper()
         add(f"{base}/{quote}:USDT")
         add(f"{base}/{quote}")
@@ -159,6 +169,62 @@ class ExchangeClient:
 
     def _mexc_variants_match(self, a: str, b: str) -> bool:
         return self._mexc_normalize_contract_id(a) == self._mexc_normalize_contract_id(b)
+
+    def _precision_digits_from_market(self, symbol: str, kind: str, default: int) -> int:
+        try:
+            m = self._market(symbol)
+            prec = (m.get("precision") or {}).get(kind)
+            if prec is None:
+                info = m.get("info") or {}
+                keys = ("priceScale", "price_scale") if kind == "price" else ("volScale", "amountScale", "quantityScale")
+                for k in keys:
+                    if isinstance(info, dict) and info.get(k) not in (None, ""):
+                        prec = int(float(info.get(k))); break
+            if prec is not None:
+                # ccxt may provide tick-size decimals as float. Values <1 are
+                # a tick size; convert 0.0001 -> 4 digits. Integer values are
+                # already digit counts.
+                f = float(prec)
+                if 0 < f < 1:
+                    import math
+                    return max(0, min(12, int(round(-math.log10(f)))))
+                return max(0, min(12, int(f)))
+        except Exception:
+            pass
+        return default
+
+    def _mexc_price_to_precision(self, symbol: str, price: float) -> float:
+        price = float(price or 0)
+        if price <= 0:
+            return 0.0
+        try:
+            return float(self.exchange.price_to_precision(self.normalize_symbol(symbol), price))
+        except Exception:
+            digits = self._precision_digits_from_market(symbol, "price", 8)
+            return float(f"{price:.{digits}f}")
+
+    def _mexc_amount_to_precision(self, symbol: str, amount: float) -> float:
+        amount = float(amount or 0)
+        if amount <= 0:
+            return 0.0
+        try:
+            return float(self.exchange.amount_to_precision(self.normalize_symbol(symbol), amount))
+        except Exception:
+            digits = self._precision_digits_from_market(symbol, "amount", 6)
+            return float(f"{amount:.{digits}f}")
+
+    def sanitize_protection_values(self, symbol: str, qty: float, stop_price: float | None = None, take_price: float | None = None) -> dict:
+        """Sanitize qty/TP/SL before storage and native MEXC requests.
+
+        This removes Python float tails like 0.38182571428571427 and prevents
+        MEXC 2015 precision errors when placing protection orders.
+        """
+        out = {"qty": self._mexc_amount_to_precision(symbol, qty)}
+        if stop_price not in (None, ""):
+            out["stop_price"] = self._mexc_price_to_precision(symbol, float(stop_price or 0))
+        if take_price not in (None, ""):
+            out["take_price"] = self._mexc_price_to_precision(symbol, float(take_price or 0))
+        return out
 
     def _amount_to_mexc_vol(self, symbol: str, amount: float) -> int:
         """MEXC futures API expects integer contract volume, not base coin amount."""
@@ -855,7 +921,7 @@ class ExchangeClient:
             "side": mexc_side,
             "openType": int(os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or "1"),
             "leverage": int(os.getenv("MEXC_ORDER_LEVERAGE", "5") or "5"),
-            "triggerPrice": float(trigger_price),
+            "triggerPrice": self._mexc_price_to_precision(symbol, float(trigger_price)),
             "executePrice": 0,
             "orderType": 5,
             "triggerType": 1,
@@ -1079,7 +1145,7 @@ class ExchangeClient:
             order_price = 0
         elif any(k in params for k in ("stopPrice", "triggerPrice", "stopLossPrice")):
             # Native plan order. Used for SL/TP fallback only if ccxt fails.
-            trigger_price = float(params.get("triggerPrice") or params.get("stopPrice") or params.get("stopLossPrice"))
+            trigger_price = self._mexc_price_to_precision(symbol, float(params.get("triggerPrice") or params.get("stopPrice") or params.get("stopLossPrice")))
             body = {
                 "symbol": self._mexc_symbol(symbol),
                 "vol": self._amount_to_mexc_vol(symbol, amount),
@@ -1098,7 +1164,7 @@ class ExchangeClient:
             return {"id": str((out.get("data") or {}).get("orderId") or (out.get("data") or {}).get("id") or ""), "symbol": self.normalize_symbol(symbol), "type": type_, "side": side, "amount": amount, "price": price, "info": {"raw_fallback": True, "previous_error": previous_error, **out}}
         else:
             mexc_type = 1  # limit
-            order_price = float(price or 0)
+            order_price = self._mexc_price_to_precision(symbol, float(price or 0))
             if order_price <= 0:
                 raise RuntimeError("limit order requires price")
         body = {

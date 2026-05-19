@@ -80,7 +80,7 @@ class ProtectionEngine:
             if side_ok and sl_price > 0 and price > 0 and abs(price - sl_price) / sl_price < 0.002:
                 found_sl = True; matched_sl_id = oid or matched_sl_id
 
-        status = "EXCHANGE PROTECTED" if (found_tp and found_sl) else ("LOCAL FALLBACK" if (found_tp or found_sl) else "UNPROTECTED")
+        status = "EXCHANGE PROTECTED" if (found_tp and found_sl) else "LOCAL BOT PROTECTED"
         return {
             "tp_exists": found_tp,
             "sl_exists": found_sl,
@@ -94,12 +94,12 @@ class ProtectionEngine:
     async def check(self, pos: dict) -> dict:
         symbol = pos.get("symbol")
         if not symbol:
-            return {"protection_status": "UNPROTECTED", "protection_error": "missing symbol", "tp_exists": False, "sl_exists": False}
+            return {"protection_status": "LOCAL BOT PROTECTED", "protection_mode": "local_monitoring", "protection_error": "missing symbol", "tp_exists": False, "sl_exists": False}
         try:
             orders = await self.exchange_client.fetch_open_orders(symbol)
             return self.classify_orders(pos, orders or [])
         except Exception as e:
-            return {"protection_status": "LOCAL FALLBACK", "protection_mode": "local_monitoring", "protection_error": str(e)[:240], "tp_exists": False, "sl_exists": False}
+            return {"protection_status": "LOCAL BOT PROTECTED", "protection_mode": "local_monitoring", "protection_error": str(e)[:240], "tp_exists": False, "sl_exists": False}
 
     async def reconcile(self, pos: dict, live: bool = True, reattach: bool = True) -> dict:
         out = await self.check(pos)

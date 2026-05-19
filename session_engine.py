@@ -61,15 +61,26 @@ class SessionEngine:
         min_conf = float(c.get("min_confidence", 70))
         conf = float(c.get("confidence", 0))
 
+        strategy = str(c.get("strategy") or c.get("effective_strategy_mode") or "").lower()
+        liquidity_retest = strategy == "liquidity_retest"
         if side == "SHORT":
             c["risk_pct"] = risk * state.short_risk_multiplier
             c["confidence"] = conf + state.short_confidence_bonus
             c["max_open_positions"] = max_pos if state.short_bias_active else max(1, int(max_pos * state.max_positions_multiplier))
+            if liquidity_retest and state.short_bias_active:
+                # v0082: US open dump bias supports short retests after upward liquidity grabs.
+                c["confidence"] = float(c.get("confidence", conf)) + 4
+                c["liquidity_retest_bias"] = "US_OPEN_SHORT_PRIORITY"
         elif side == "LONG":
             c["risk_pct"] = risk * state.long_risk_multiplier
             c["confidence"] = conf - state.long_confidence_penalty
             c["max_open_positions"] = max(1, int(max_pos * (0.5 if state.short_bias_active else state.max_positions_multiplier)))
             min_conf += 10 if state.short_bias_active else 0
+            if liquidity_retest and state.short_bias_active:
+                # Keep America bias: during 16:30-20:30 MSK longs need stronger reclaim.
+                c["confidence"] = float(c.get("confidence", conf)) - 5
+                min_conf += 5
+                c["liquidity_retest_bias"] = "US_OPEN_LONG_STRICT"
         else:
             c["risk_pct"] = risk * state.risk_multiplier
             c["max_open_positions"] = max(1, int(max_pos * state.max_positions_multiplier))

@@ -6,7 +6,7 @@ import psutil
 
 from config import TELEGRAM_TOKEN, ADMIN_IDS, VERSION, DEFAULT_EXCHANGE
 from storage import Storage
-from keyboard import MAIN_MENU, settings_menu, choices_menu, api_menu
+from keyboard import MAIN_MENU, settings_menu, choices_menu, api_menu, openai_menu, format_duration_seconds
 from adaptive_engine import AdaptiveEngine
 from mirror_engine import MirrorEngine
 from session_engine import SessionEngine
@@ -21,6 +21,7 @@ from scanner import Scanner
 from production_gate import ProductionGate
 from ws_engine import WebSocketSupervisor, futures_source_from_mode
 from trade_planner import TradePlanner
+from openai_signal_engine import OpenAISignalEngine
 from position_manager import PositionManager
 
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +29,7 @@ log = logging.getLogger("bot")
 
 storage = Storage()
 scanner = Scanner()
+ai_signal_engine = OpenAISignalEngine()
 running = False
 started_at = time.time()
 exchange_client = None
@@ -88,6 +90,54 @@ async def notify_admin(app, text: str, min_interval_sec: int = 0, key: str = "no
         await app.bot.send_message(chat_id=chat_id, text=text)
     except Exception as e:
         log.warning("telegram notification failed: %s", e)
+
+async def send_or_edit_ai_decision(app, text: str, message_id: int | None = None) -> int | None:
+    """Send or edit one Telegram AI decision message.
+
+    Used only for UI visibility. It never performs another OpenAI request,
+    so it does not spend extra AI tokens.
+    """
+    chat_id = first_admin_id()
+    if not chat_id:
+        return message_id
+    try:
+        if message_id:
+            await app.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+            return message_id
+        msg = await app.bot.send_message(chat_id=chat_id, text=text)
+        return getattr(msg, "message_id", None)
+    except Exception as e:
+        log.warning("AI decision Telegram update failed: %s", e)
+        if message_id:
+            try:
+                msg = await app.bot.send_message(chat_id=chat_id, text=text)
+                return getattr(msg, "message_id", message_id)
+            except Exception as e2:
+                log.warning("AI decision Telegram resend failed: %s", e2)
+        return message_id
+
+def ai_verdict_is_important(verdict) -> bool:
+    """Minimal OFF visibility: show only AI operational problems, not normal rejects."""
+    if verdict is None:
+        return False
+    error = str(getattr(verdict, "error", "") or "").strip()
+    if error:
+        return True
+    return not bool(getattr(verdict, "ok", True))
+
+def format_ai_minimal_issue(plan, verdict) -> str:
+    symbol = getattr(plan, "symbol", "-")
+    side = getattr(plan, "side", "-")
+    strategy = getattr(plan, "strategy", "-")
+    reason = (getattr(verdict, "error", "") or getattr(verdict, "reason", "") or "AI check problem").strip()
+    if len(reason) > 180:
+        reason = reason[:177] + "..."
+    return (
+        "⚠️ AI check issue\n"
+        f"{symbol} {side} | {strategy}\n"
+        f"Model: {getattr(verdict, 'model', '-')} | Mode: {getattr(verdict, 'mode', '-')}\n"
+        f"Reason: {reason}"
+    )
 
 def _scan_status_text(settings: dict, status: str = "scanning", last_signal: str | None = None, last_decision: str | None = None) -> str:
     last_signal = last_signal or scanner.last_signal_summary or "-"
@@ -223,6 +273,46 @@ def format_position_opened(plan, placed: dict, live: bool) -> str:
     )
 
 
+
+
+def _bool_setting(settings: dict, key: str, default: bool = False) -> bool:
+    raw = settings.get(key, default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+def format_ai_decision(plan, verdict, stage: str = "done") -> str:
+    """Short Telegram-only AI decision message.
+
+    This does not create another OpenAI request and does not spend extra tokens;
+    it only formats the already requested verdict.
+    """
+    symbol = getattr(plan, "symbol", "-")
+    side = getattr(plan, "side", "-")
+    strategy = getattr(plan, "strategy", "-")
+    if stage == "start":
+        return (
+            "🤖 AI analysis started\n"
+            f"{symbol} {side}\n"
+            f"Strategy: {strategy}\n"
+            f"Model: {getattr(verdict, 'model', '-')} | Mode: {getattr(verdict, 'mode', '-')}"
+        )
+    approved = bool(getattr(verdict, "approved", False))
+    icon = "✅" if approved else "❌"
+    status = "approved" if approved else "rejected"
+    conf = float(getattr(verdict, "confidence", 0.0) or 0.0)
+    reason = (getattr(verdict, "reason", "") or getattr(verdict, "error", "") or "no reason").strip()
+    if len(reason) > 160:
+        reason = reason[:157] + "..."
+    return (
+        f"{icon} AI {status} setup\n"
+        f"{symbol} {side}\n"
+        f"Strategy: {strategy}\n"
+        f"Model: {getattr(verdict, 'model', '-')} | Mode: {getattr(verdict, 'mode', '-')}\n"
+        f"Confidence: {conf:.2f}\n"
+        f"Reason: {reason}"
+    )
+
 def format_position_event(ev: dict) -> str:
     symbol = ev.get("symbol", "-")
     typ = ev.get("type", "event")
@@ -231,6 +321,7 @@ def format_position_event(ev: dict) -> str:
         "tp": "take profit",
         "sl": "stop loss",
         "time_stop": "time stop",
+        "trailing_exit": "trailing scalp exit",
         "limit_timeout": "limit timeout",
         "limit_filled": "limit filled",
         "limit_canceled": "limit canceled",
@@ -239,7 +330,7 @@ def format_position_event(ev: dict) -> str:
         "limit_expired": "limit expired",
         "breakeven": "breakeven moved",
         "protection_failed": "protection failed",
-        "protection_local": "exchange protection failed; local monitor active",
+        "protection_local": "exchange protection failed; bot monitors TP/SL locally",
     }
     label = reason_map.get(str(typ), str(typ))
     lines = [f"📌 Position event", f"{symbol}: {label}"]
@@ -251,8 +342,15 @@ def format_position_event(ev: dict) -> str:
             lines.append(f"PnL: {sign}{pnl_usdt:.4f} USDT ({sign}{pnl_pct:.2f}%)")
         except Exception:
             pass
-    if result.get("reason"):
-        lines.append(f"Reason: {result.get('reason')}")
+    reason = str(result.get("reason") or "")
+    noisy = ("2009" in reason or "1001" in reason or "2015" in reason or "nonexistent or closed" in reason.lower() or "hidden margin" in reason.lower() or "contract does not exist" in reason.lower() or "precision error" in reason.lower() or "HTTP 200" in reason)
+    if reason and not noisy:
+        lines.append(f"Reason: {reason}")
+    elif reason and noisy:
+        # Legacy suppressed text marker for tests: exchange already flat / close confirmed
+        # v0079: keep Telegram clean. MEXC 2009/hidden-margin/HTTP details are
+        # normal post-close settlement noise and must not be shown to the user.
+        pass
     return "\n".join(lines)
 
 
@@ -378,9 +476,10 @@ async def get_ws(settings: dict):
 
 async def reply(update: Update, text: str, **kwargs):
     if update.message:
-        await update.message.reply_text(text, **kwargs)
+        return await update.message.reply_text(text, **kwargs)
     elif update.callback_query:
-        await update.callback_query.message.reply_text(text, **kwargs)
+        return await update.callback_query.message.reply_text(text, **kwargs)
+    return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -413,6 +512,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Note: /positions checks MEXC exchange-first; /open_orders scans normal + plan + stop + TP/SL endpoints. If exchange TP/SL is missing, local monitor protects positions kept in bot cache.
 /proxy on|off|test|set URL
 /api status|set KEY SECRET|clear|test - API биржи через чат
+/openai status|set KEY|clear|test - OpenAI ключ для ИИ проверки
 /mexc_settings - показать MEXC параметры ордера
 /leverage 5 - плечо MEXC futures
 /open_type 1 - 1 isolated, 2 cross
@@ -449,19 +549,17 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             running = True
             trading_task = context.application.create_task(trading_loop(context.application))
 
-    if already_running:
-        await reply(update, "🟢 Bot already running\nExisting scanner/execution loop is active. New settings will apply on the next scan cycle.", reply_markup=MAIN_MENU)
-    else:
-        await reply(update, "🟢 Bot started\nScanner/execution loop enabled.", reply_markup=MAIN_MENU)
-
-    # Put a new live scanner status at the bottom after the Run response.
-    # Future scanner updates will edit this new message instead of an old one above.
+    # v0079: one Run press must create exactly one Telegram message. Earlier
+    # versions replied "started" and then immediately sent a separate scanner
+    # status card, which looked like duplicate start. The reply itself becomes
+    # the editable scanner-status message.
     settings = await storage.all_settings()
-    await create_fresh_scanner_status(
-        context.application,
-        settings,
-        status=("already running; waiting next scan" if already_running else "started; waiting next scan"),
-    )
+    status = "already running; waiting next scan" if already_running else "started; waiting next scan"
+    header = "🟢 Bot already running" if already_running else "🟢 Bot started"
+    msg = await reply(update, f"{header}\n" + _scan_status_text(settings, status=status), reply_markup=MAIN_MENU)
+    if msg is not None:
+        context.application.bot_data["scanner_status_message_id"] = msg.message_id
+        context.application.bot_data["scanner_status_last_edit"] = time.time()
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running
@@ -562,7 +660,7 @@ Universe: {s.get('universe_mode')}
 Risk: {float(s.get('risk_pct',0))*100:.2f}%
 Max positions: {s.get('max_open_positions')}
 Margin allocation: {s.get('margin_allocation_enabled', True)}
-Scan: {s.get('scan_interval_sec')}s
+Scan: {format_duration_seconds(s.get('scan_interval_sec', 5))}
 Concurrency: {s.get('scanner_concurrency', 5)} | last scanned={scanner.last_cycle_scanned} | errors={scanner.last_cycle_errors} | slowdown={scanner.last_slowdown_sec}s
 Refresh: {s.get('symbol_refresh_sec')}s
 Mirror: {s.get('mirror_mode')}
@@ -826,20 +924,18 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             notional, margin, leverage, margin_type = _position_money_fields(p)
             coin = str(p.get('symbol', '')).split('/')[0]
             warn = ""
-            status = p.get("protection_status") or ("EXCHANGE PROTECTED" if p.get("protection_mode") == "exchange" else "LOCAL FALLBACK" if p.get("protection_mode") == "local_monitoring" else "UNKNOWN")
+            status = p.get("protection_status") or ("EXCHANGE PROTECTED" if p.get("protection_mode") == "exchange" else "LOCAL BOT PROTECTED" if p.get("protection_mode") == "local_monitoring" else "UNKNOWN")
             if status == "EXCHANGE PROTECTED":
                 warn = "\n🛡️ Protection: EXCHANGE PROTECTED (TP/SL confirmed on MEXC)"
-            elif status == "UNPROTECTED":
-                warn = "\n🚨 Protection: UNPROTECTED (no exchange TP/SL confirmed; local fallback may be unavailable)"
-            elif p.get("protection_mode") == "local_monitoring" or p.get("protection_warning"):
-                warn = "\n⚠️ Protection: LOCAL FALLBACK (exchange TP/SL not fully confirmed; bot monitors TP/SL locally)"
+            elif status == "LOCAL BOT PROTECTED" or p.get("protection_mode") == "local_monitoring" or p.get("protection_warning"):
+                warn = "\n🟡 Protection: LOCAL BOT PROTECTED (bot monitors TP/SL/time-stop locally)"
             else:
                 warn = f"\nℹ️ Protection: {status}"
             details = []
-            if p.get("tp_exists") is not None or p.get("sl_exists") is not None:
+            if status == "EXCHANGE PROTECTED" and (p.get("tp_exists") is not None or p.get("sl_exists") is not None):
                 details.append(f"TP={'yes' if p.get('tp_exists') else 'no'} SL={'yes' if p.get('sl_exists') else 'no'}")
-            if p.get("tp_error") or p.get("sl_error") or p.get("protection_error") or p.get("reattach_error"):
-                details.append(f"err={str(p.get('protection_error') or p.get('reattach_error') or p.get('tp_error') or p.get('sl_error'))[:160]}")
+            # Do not leak raw exchange HTTP/precision/contract messages into Telegram.
+            # They are stored in raw position data for diagnostics, while UI stays clean.
             if details:
                 warn += "\n" + " | ".join(details)
             lines.append(
@@ -1024,10 +1120,13 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
                 local_cache_cleared = True
             else:
-                failures.append(f"hidden margin still present: used={post_used:.4f}, positionMargin={post_pm:.4f}")
+                # MEXC may keep balance margin stale for a few seconds after flat.
+                # Do not show scary hidden-margin text; /positions exchange sync is
+                # the source of truth and will restore a real position if needed.
+                local_cache_cleared = False
         except Exception as e:
             failures.append(f"post-close balance check: {e}")
-        await reply(update, f"🧯 Close all sent\nListed positions closed: {closed}\nCancel all: {str(cancel_res)[:220] if cancel_res is not None else '-'}\nNative close_all: {str(native_res)[:300] if native_res is not None else '-'}\nPost used: {post_used if post_used is not None else '-'}\nPost position margin: {post_pm if post_pm is not None else '-'}\nLocal cache cleared: {'yes' if local_cache_cleared else 'no'}\nFailures: {failures[:5] if failures else '-'}", reply_markup=MAIN_MENU)
+        await reply(update, f"🧯 Close all sent\nListed positions closed: {closed}\nCancel all: {str(cancel_res)[:220] if cancel_res is not None else '-'}\nNative close_all: {str(native_res)[:300] if native_res is not None else '-'}\nPost used: {post_used if post_used is not None else '-'}\nPost position margin: {post_pm if post_pm is not None else '-'}\nLocal cache cleared: {'yes' if local_cache_cleared else 'no'}\nFailures: {[f for f in failures[:5] if 'hidden margin' not in str(f).lower()] if failures else '-'}", reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"🧯 Close all failed: {e}", reply_markup=MAIN_MENU)
 
@@ -1122,6 +1221,45 @@ async def recv_window_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await reply(update, f"❌ /recv_window error: {e}", reply_markup=MAIN_MENU)
 
+async def openai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    args = context.args or []
+    s = await storage.all_settings()
+    cmd = args[0].lower() if args else "status"
+    if cmd == "status":
+        key_saved = bool(s.get("openai_api_key"))
+        env_fb = bool(s.get("openai_env_fallback", True))
+        env_key = bool(os.getenv("OPENAI_API_KEY", "").strip())
+        await reply(update,
+            "🤖 OpenAI AI Analysis\n"
+            f"Enabled: {bool(s.get('openai_analysis_enabled', False))}\n"
+            f"Model: {s.get('openai_model', 'gpt-5.4-mini')}\n"
+            f"Strength: {s.get('openai_check_strength', 'medium')}\n"
+            f"Show decisions: {'detailed' if bool(s.get('openai_show_decisions', False)) else 'minimal issues only'}\n"
+            f"API key saved: {key_saved}\n"
+            f"ENV fallback: {env_fb} ({'present' if env_key else 'missing'})\n\n"
+            "Use /openai set OPENAI_API_KEY or the Settings → ИИ анализ menu.",
+            reply_markup=MAIN_MENU)
+        return
+    if cmd == "set" and len(args) >= 2:
+        key = " ".join(args[1:]).strip()
+        if not key.startswith("sk-") and len(key) < 20:
+            await reply(update, "❌ This does not look like an OpenAI API key.", reply_markup=MAIN_MENU)
+            return
+        await storage.set("openai_api_key", key)
+        await reply(update, "✅ OpenAI API key saved", reply_markup=MAIN_MENU)
+        return
+    if cmd == "clear":
+        await storage.set("openai_api_key", "")
+        await reply(update, "🗑 OpenAI API key cleared", reply_markup=MAIN_MENU)
+        return
+    if cmd == "test":
+        from openai_signal_engine import openai_key
+        key_ok = bool(openai_key(s))
+        await reply(update, "✅ OpenAI key available" if key_ok else "❌ OpenAI key missing", reply_markup=MAIN_MENU)
+        return
+    await reply(update, "Usage: /openai status|set KEY|clear|test", reply_markup=MAIN_MENU)
+
 async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     s = await storage.all_settings()
@@ -1189,6 +1327,13 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ws_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold",
         "mexc_order_leverage", "mexc_order_open_type", "mexc_recv_window",
         "margin_allocation_enabled", "require_exchange_protection", "auto_close_on_protection_failed",
+        "breakeven_trigger_pct", "breakeven_offset_pct", "scalp_exit_enabled", "scalp_trailing_enabled",
+        "scalp_trailing_start_pct", "scalp_trailing_giveback_pct", "smart_time_stop_min_sec",
+        "smart_time_stop_stale_abs_pct", "smart_time_stop_extend_profit_pct", "smart_time_stop_max_extend_sec",
+        "liquidity_retest_default_rr", "liquidity_retest_sl_buffer_pct", "liquidity_retest_time_stop_sec", "liquidity_retest_min_displacement_pct", "liquidity_retest_min_displacement_body", "liquidity_retest_min_volume_ratio", "liquidity_retest_min_target_rr", "liquidity_retest_zone_tolerance_pct", "liquidity_retest_min_sweep_wick", "liquidity_retest_min_reclaim_pct", "liquidity_retest_max_spread_pct", "liquidity_retest_min_retest_rejection_wick", "liquidity_retest_min_zone_quality", "liquidity_retest_mtf_enabled", "liquidity_retest_min_mtf_score", "liquidity_retest_require_clean_path",
+        "weak_momentum_filter_enabled", "momentum_min_5m_confirm_pct", "momentum_min_imbalance_abs", "momentum_max_spread_pct",
+        "openai_analysis_enabled", "openai_model", "openai_check_strength", "openai_api_key",
+        "openai_env_fallback", "openai_timeout_sec", "openai_fail_open", "openai_show_decisions",
     }
     if key not in allowed_keys:
         await reply(update, f"❌ Setting is not allowed through /set: {key}", reply_markup=MAIN_MENU)
@@ -1198,6 +1343,12 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         try: parsed = float(value) if "." in value else int(value)
         except Exception: parsed = value
+    if key == "openai_model" and str(parsed) not in {"gpt-5.4-mini", "gpt-4o-mini", "gpt-5.5", "gpt-5.5-pro", "gpt-4.1"}:
+        await reply(update, "❌ Unknown OpenAI model. Use the ИИ анализ menu.", reply_markup=MAIN_MENU)
+        return
+    if key == "openai_check_strength" and str(parsed).lower() not in {"weak", "medium", "strong"}:
+        await reply(update, "❌ OpenAI strength must be weak, medium, or strong.", reply_markup=MAIN_MENU)
+        return
     await storage.set(key, parsed)
     if key in {"mexc_api_key", "mexc_api_secret", "proxy_url", "proxy_enabled", "mexc_order_leverage", "mexc_order_open_type", "mexc_recv_window", "margin_allocation_enabled", "require_exchange_protection", "auto_close_on_protection_failed"}:
         new_settings = await storage.all_settings()
@@ -1205,7 +1356,8 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reset_exchange()
     if key in {"proxy_url", "proxy_enabled", "scan_market_source", "ws_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold"}:
         await reset_market_runtime()
-    await reply(update, f"✅ Saved\n{key} = {parsed}", reply_markup=MAIN_MENU)
+    shown = mask_secret(str(parsed)) if key in {"mexc_api_key", "mexc_api_secret", "openai_api_key", "proxy_url"} else parsed
+    await reply(update, f"✅ Saved\n{key} = {shown}", reply_markup=MAIN_MENU)
 
 async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -1302,11 +1454,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key == "universe_mode":
             await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], new_rev, new_settings.get("universe_mode")))
         elif key == "strategy_mode":
-            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Hybrid adaptive","hybrid"),("All strategies","all")], new_rev, new_settings.get("strategy_mode")))
+            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("Hybrid adaptive","hybrid"),("All strategies","all")], new_rev, new_settings.get("strategy_mode")))
         elif key == "scan_market_source":
             await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], new_rev, new_settings.get("scan_market_source", "mexc_binance")))
         elif key == "scan_interval_sec":
-            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("1s","1"),("2s","2"),("3s","3"),("5s","5"),("10s","10")], new_rev, new_settings.get("scan_interval_sec")))
+            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("3s","3"),("5s default","5"),("10s","10"),("30s","30"),("1m","60"),("5m","300"),("15m","900"),("30m","1800"),("1h","3600"),("4h","14400")], new_rev, new_settings.get("scan_interval_sec")))
         elif key == "scanner_concurrency":
             await q.edit_message_text("🧵 Scanner concurrency", reply_markup=choices_menu("scanner_concurrency", [("3 requests","3"),("5 requests","5"),("8 requests","8"),("12 requests","12")], new_rev, new_settings.get("scanner_concurrency", 5)))
         elif key == "ws_update_throttle_ms":
@@ -1319,6 +1471,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("🔥 Max positions", reply_markup=choices_menu("max_open_positions", [("1","1"),("2","2"),("3","3"),("5","5"),("10","10"),("15","15"),("20","20")], new_rev, new_settings.get("max_open_positions")))
         elif key == "mirror_mode":
             await q.edit_message_text("🪞 Mirror", reply_markup=choices_menu("mirror_mode", [("OFF","off"),("ON","on"),("AUTO","auto")], new_rev, new_settings.get("mirror_mode")))
+        elif key == "openai_model":
+            await q.edit_message_text("🧠 OpenAI model", reply_markup=choices_menu("openai_model", [("gpt-5.4-mini default","gpt-5.4-mini"),("gpt-4o-mini","gpt-4o-mini"),("gpt-5.5","gpt-5.5"),("gpt-5.5-pro","gpt-5.5-pro"),("gpt-4.1","gpt-4.1")], new_rev, new_settings.get("openai_model", "gpt-5.4-mini")))
+        elif key == "openai_check_strength":
+            await q.edit_message_text("🛡 OpenAI check strength", reply_markup=choices_menu("openai_check_strength", [("Weak","weak"),("Medium default","medium"),("Strong","strong")], new_rev, new_settings.get("openai_check_strength", "medium")))
         else:
             await q.edit_message_text(f"✅ {key} = {parsed}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
     elif data[0] == "api":
@@ -1346,6 +1502,15 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await q.edit_message_text(f"❌ API test failed: {e}", reply_markup=api_menu(current_rev, s))
         else:
             await q.edit_message_text("🔐 API menu\nUse /api set API_KEY API_SECRET to save keys.", reply_markup=api_menu(current_rev, s))
+    elif data[0] == "openai":
+        action = data[1] if len(data) > 1 else "status"
+        if action == "clear":
+            await storage.set("openai_api_key", "")
+            new_settings = await storage.all_settings()
+            new_rev = int(new_settings.get("settings_revision", current_rev + 1))
+            await q.edit_message_text("🗑 OpenAI API key cleared", reply_markup=openai_menu(new_rev, new_settings))
+        else:
+            await q.edit_message_text("🔑 OpenAI API key\nUse: /openai set YOUR_OPENAI_API_KEY", reply_markup=openai_menu(current_rev, s))
     elif data[0] == "noop":
         await q.answer("Use /api set API_KEY API_SECRET", show_alert=True)
     elif data[0] == "menu":
@@ -1356,11 +1521,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif name == "universe":
             await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], rev, s.get("universe_mode")))
         elif name == "strategy":
-            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Hybrid adaptive","hybrid"),("All strategies","all")], rev, s.get("strategy_mode")))
+            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("Hybrid adaptive","hybrid"),("All strategies","all")], rev, s.get("strategy_mode")))
         elif name == "marketsource":
             await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], rev, s.get("scan_market_source", "mexc_binance")))
         elif name == "scan":
-            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("1s","1"),("2s","2"),("3s","3"),("5s","5"),("10s","10")], rev, s.get("scan_interval_sec")))
+            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("3s","3"),("5s default","5"),("10s","10"),("30s","30"),("1m","60"),("5m","300"),("15m","900"),("30m","1800"),("1h","3600"),("4h","14400")], rev, s.get("scan_interval_sec")))
         elif name == "concurrency":
             await q.edit_message_text("🧵 Scanner concurrency", reply_markup=choices_menu("scanner_concurrency", [("3 requests","3"),("5 requests","5"),("8 requests","8"),("12 requests","12")], rev, s.get("scanner_concurrency", 5)))
         elif name == "wsthrottle":
@@ -1373,6 +1538,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("🔥 Max positions", reply_markup=choices_menu("max_open_positions", [("1","1"),("2","2"),("3","3"),("5","5"),("10","10"),("15","15"),("20","20")], rev, s.get("max_open_positions")))
         elif name == "mirror":
             await q.edit_message_text("🪞 Mirror", reply_markup=choices_menu("mirror_mode", [("OFF","off"),("ON","on"),("AUTO","auto")], rev, s.get("mirror_mode")))
+        elif name == "openai":
+            await q.edit_message_text("🤖 ИИ анализ OpenAI", reply_markup=openai_menu(rev, s))
+        elif name == "openai_model":
+            await q.edit_message_text("🧠 OpenAI model", reply_markup=choices_menu("openai_model", [("gpt-5.4-mini default","gpt-5.4-mini"),("gpt-4o-mini","gpt-4o-mini"),("gpt-5.5","gpt-5.5"),("gpt-5.5-pro","gpt-5.5-pro"),("gpt-4.1","gpt-4.1")], rev, s.get("openai_model", "gpt-5.4-mini")))
+        elif name == "openai_strength":
+            await q.edit_message_text("🛡 OpenAI check strength", reply_markup=choices_menu("openai_check_strength", [("Weak","weak"),("Medium default","medium"),("Strong","strong")], rev, s.get("openai_check_strength", "medium")))
         elif name == "api":
             await q.edit_message_text("🔐 API menu\nUse /api set API_KEY API_SECRET to save keys.", reply_markup=api_menu(rev, s))
 
@@ -1547,7 +1718,7 @@ async def trading_loop(app):
                 )
                 scanner.last_effective_strategy = effective_strategy
                 if base_strategy_mode == "all":
-                    scanner.last_strategy_reason = "mode=ALL: scanning momentum+pullback+reversal"
+                    scanner.last_strategy_reason = "mode=ALL: scanning momentum+pullback+reversal (liquidity_retest is manual-only)"
                 elif base_strategy_mode == "hybrid":
                     scanner.last_strategy_reason = f"mode=HYBRID, regime={regime_info.get('regime', 'LOW_VOLATILITY')}"
                 else:
@@ -1612,6 +1783,44 @@ async def trading_loop(app):
                     if not plan:
                         scanner.last_reject_reason = f"{original_symbol}: planner returned no trade"
                         continue
+
+                    ai_enabled = bool(settings.get("openai_analysis_enabled", False))
+                    ai_show = bool(settings.get("openai_show_decisions", False))
+                    ai_message_id = None
+                    if ai_enabled and ai_show:
+                        from openai_signal_engine import active_model, active_strength
+                        preview = type("AIPreview", (), {"model": active_model(settings), "mode": active_strength(settings)})()
+                        ai_message_id = await send_or_edit_ai_decision(
+                            app,
+                            format_ai_decision(plan, preview, stage="start"),
+                            message_id=None,
+                        )
+                    ai_verdict = await ai_signal_engine.validate(cand, plan, settings)
+                    if ai_enabled:
+                        if ai_show:
+                            ai_message_id = await send_or_edit_ai_decision(
+                                app,
+                                format_ai_decision(plan, ai_verdict, stage="done"),
+                                message_id=ai_message_id,
+                            )
+                        elif ai_verdict_is_important(ai_verdict):
+                            await notify_admin(
+                                app,
+                                format_ai_minimal_issue(plan, ai_verdict),
+                                min_interval_sec=30,
+                                key="ai_minimal_issue",
+                            )
+                        if not ai_verdict.approved:
+                            scanner.last_reject_reason = (
+                                f"{plan.symbol}: OpenAI rejected "
+                                f"model={ai_verdict.model} mode={ai_verdict.mode} "
+                                f"conf={ai_verdict.confidence:.2f} "
+                                f"reason={ai_verdict.reason or ai_verdict.error or 'no reason'}"
+                            )
+                            continue
+                        cand["openai_approved"] = True
+                        cand["openai_confidence"] = ai_verdict.confidence
+                        cand["openai_reason"] = ai_verdict.reason
 
                     try:
                         placed = await exec_engine.place_entry(plan, live)
@@ -1690,6 +1899,7 @@ def build_app():
     app.add_handler(CommandHandler("set", set_cmd))
     app.add_handler(CommandHandler("proxy", proxy_cmd))
     app.add_handler(CommandHandler("api", api_cmd))
+    app.add_handler(CommandHandler("openai", openai_cmd))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     return app
