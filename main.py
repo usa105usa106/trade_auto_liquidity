@@ -1189,6 +1189,22 @@ async def sync_positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         await reply(update, f"🔄 Sync positions failed: {e}", reply_markup=MAIN_MENU)
 
+def order_display_line(o: dict) -> str:
+    info = o.get('info') if isinstance(o.get('info'), dict) else {}
+    src = str(info.get('_source_endpoint') or '-').replace('/api/v1/private/', '')
+    kind = str(info.get('_protection_kind') or '').upper()
+    typ = str(o.get('type') or 'unknown')
+    label = kind or typ
+    trigger = o.get('price')
+    amount = o.get('amount')
+    remaining = o.get('remaining')
+    return (
+        f"{o.get('symbol')} {label} {o.get('side')} "
+        f"id={o.get('id') or '-'} trigger/price={trigger} "
+        f"amount={amount} remaining={remaining} src={src} "
+        f"client={o.get('clientOrderId') or '-'}"
+    )
+
 async def open_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     s = await storage.all_settings()
@@ -1208,8 +1224,7 @@ async def open_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply(update, msg, reply_markup=MAIN_MENU); return
         lines = [f"📋 Open orders/protection: {len(orders)}"]
         for o in orders[:30]:
-            src = ((o.get('info') or {}).get('_source_endpoint') if isinstance(o.get('info'), dict) else '') or '-'
-            lines.append(f"{o.get('symbol')} {o.get('side')} {o.get('type')} id={o.get('id')} price={o.get('price')} amount={o.get('amount')} src={src} client={o.get('clientOrderId') or '-'}")
+            lines.append(order_display_line(o))
         await reply(update, "\n".join(lines), reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"📋 Open orders failed: {e}", reply_markup=MAIN_MENU)

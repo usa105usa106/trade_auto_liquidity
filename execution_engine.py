@@ -370,6 +370,63 @@ class ExecutionEngine:
             side = "buy" if signed < 0 else "sell"
         return {"symbol": symbol, "qty": qty, "side": side}
 
+
+    def _position_symbol_matches(self, row: dict, symbol: str) -> bool:
+        """Return True when an exchange position row belongs to the local symbol."""
+        info = row.get("info", {}) if isinstance(row.get("info"), dict) else {}
+        row_symbol = str(row.get("symbol") or info.get("symbol") or "")
+        if not row_symbol or not symbol:
+            return False
+        if row_symbol == symbol:
+            return True
+        try:
+            return bool(self.exchange_client._mexc_variants_match(row_symbol, symbol))
+        except Exception:
+            return row_symbol.replace(":USDT", "").replace("_", "/") == symbol.replace(":USDT", "").replace("_", "/")
+
+    def _exchange_row_contracts(self, row: dict) -> float:
+        """Return real open contract/volume count from a position row.
+
+        Never use contractSize here: contractSize is instrument metadata, not an
+        open position amount. Using it made close confirmation think an already
+        closed MEXC position was still open.
+        """
+        info = row.get("info", {}) if isinstance(row.get("info"), dict) else {}
+        for key in ("contracts", "qty", "amount", "size"):
+            try:
+                value = row.get(key)
+                if value not in (None, ""):
+                    return abs(float(value))
+            except Exception:
+                pass
+        for key in ("holdVol", "vol", "positionAmt"):
+            try:
+                value = info.get(key)
+                if value not in (None, ""):
+                    return abs(float(value))
+            except Exception:
+                pass
+        return 0.0
+
+    async def _find_exchange_position_row(self, symbol: str) -> dict | None:
+        """Fetch the current real exchange position for symbol, if any."""
+        if not hasattr(self.exchange_client, "fetch_positions"):
+            return None
+        rows = []
+        try:
+            rows = await self.exchange_client.fetch_positions([symbol])
+        except TypeError:
+            try:
+                rows = await self.exchange_client.fetch_positions()
+            except Exception:
+                rows = []
+        except Exception:
+            rows = []
+        for row in rows or []:
+            if self._position_symbol_matches(row, symbol) and self._exchange_row_contracts(row) > 0:
+                return row
+        return None
+
     async def close_exchange_position(self, pos: dict, reason: str = "external_close") -> dict:
         # Prefer the native MEXC close-by-position row, because exchange-only
         # positions from /position/open_positions contain exact holdVol and
@@ -475,9 +532,23 @@ class ExecutionEngine:
         pos["status"] = "closing"
         await self.storage.upsert_position(pos)
         already_closed = False
-        if live and qty > 0:
+        if live:
             try:
-                await self._create_order_retry(symbol, "market", side, qty, None, {"reduceOnly": True, "clientOrderId": f"bot_close_{int(time.time()*1000)}"}, attempts=2)
+                # Close the exact exchange row/holdVol when available. Local qty
+                # can be stale after MEXC precision rounding or manual exchange
+                # changes (example: local 4.0 COPPER, exchange 4.1).
+                exchange_row = await self._find_exchange_position_row(symbol)
+                if exchange_row:
+                    pos["qty"] = self.exchange_position_qty(exchange_row) or qty
+                    pos["exchange_contracts"] = exchange_row.get("contracts") or (exchange_row.get("info") or {}).get("holdVol")
+                    pos["raw_exchange_position"] = exchange_row
+                    close_res = await self.close_exchange_position(exchange_row, reason=reason)
+                    if not close_res.get("ok"):
+                        raise RuntimeError(close_res.get("reason") or close_res)
+                elif qty > 0:
+                    await self._create_order_retry(symbol, "market", side, qty, None, {"reduceOnly": True, "clientOrderId": f"bot_close_{int(time.time()*1000)}"}, attempts=2)
+                else:
+                    already_closed = True
             except Exception as e:
                 err = str(e)
                 # MEXC code 2009 means the position is already gone. This is a
@@ -522,9 +593,7 @@ class ExecutionEngine:
                 rows = await self.exchange_client.fetch_positions([symbol])
                 for r in rows or []:
                     try:
-                        sym = str(r.get("symbol") or ((r.get("info") or {}).get("symbol")) or "")
-                        contracts = float(r.get("contracts") or r.get("contractSize") or r.get("qty") or r.get("amount") or ((r.get("info") or {}).get("holdVol")) or 0)
-                        if contracts > 0 and (sym == symbol or self.exchange_client._mexc_variants_match(sym, symbol)):
+                        if self._position_symbol_matches(r, symbol) and self._exchange_row_contracts(r) > 0:
                             confirmed_flat = False
                             break
                     except Exception:

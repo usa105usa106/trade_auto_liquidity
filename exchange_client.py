@@ -713,7 +713,10 @@ class ExchangeClient:
                 pass
         typ = row.get("type") or row.get("orderType") or row.get("category")
         src = str(row.get("_source_endpoint") or "")
-        if not typ and "stoporder" in src and (row.get("takeProfitPrice") or row.get("stopLossPrice")):
+        protection_kind = str(row.get("_protection_kind") or "").lower()
+        if protection_kind in {"tp", "sl"}:
+            typ = f"tpsl_{protection_kind}"
+        elif not typ and "stoporder" in src and (row.get("takeProfitPrice") or row.get("stopLossPrice")):
             typ = "tpsl"
         return {
             "id": oid,
@@ -801,16 +804,25 @@ class ExchangeClient:
                         orders.append(self._mexc_parse_order(expanded))
             except Exception as e:
                 errors.append(f"{path}: {e}")
-        # De-duplicate.
+        # De-duplicate across endpoints. MEXC often exposes the same TP/SL via
+        # stoporder/open_orders and position/stop_orders; /open_orders should not
+        # count the same protection twice. Keep TP and SL separate when a combined
+        # row was expanded.
         unique = []
         seen = set()
         for o in orders:
-            key = (o.get("id"), o.get("symbol"), o.get("type"), (o.get("info") or {}).get("_source_endpoint"))
+            if symbol and o.get("symbol") != self.normalize_symbol(symbol):
+                continue
+            info = o.get("info") if isinstance(o.get("info"), dict) else {}
+            kind = str(info.get("_protection_kind") or "").lower()
+            raw_id = str(o.get("id") or info.get("orderId") or info.get("planOrderId") or info.get("stopOrderId") or info.get("positionId") or "")
+            base_id = raw_id.split(":", 1)[0]
+            price_key = round(float(o.get("price") or info.get("triggerPrice") or info.get("takeProfitPrice") or info.get("stopLossPrice") or 0), 12)
+            amount_key = round(float(o.get("amount") or 0), 12)
+            key = (o.get("symbol"), base_id, kind, str(o.get("side") or ""), str(o.get("type") or ""), price_key, amount_key)
             if key in seen:
                 continue
             seen.add(key)
-            if symbol and o.get("symbol") != self.normalize_symbol(symbol):
-                continue
             unique.append(o)
         return unique
 

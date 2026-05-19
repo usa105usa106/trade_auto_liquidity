@@ -149,9 +149,30 @@ class SyncEngine:
             # even when the position was not newly imported.
             eng = ExecutionEngine(self.storage, self.exchange_client)
             pe = ProtectionEngine(self.exchange_client, eng)
+            # Keep existing local rows aligned with the real exchange amount.
+            # This prevents local partial closes when MEXC rounded/adjusted the
+            # opened volume (for example local 4.0 but exchange 4.1).
+            exchange_active_rows = []
+            try:
+                exchange_active_rows = [p for p in (await self.exchange_client.fetch_positions() or []) if self._position_qty(p) > 0]
+            except Exception as e:
+                report["warnings"].append(f"position qty refresh failed: {e}")
             for lp in await self.storage.positions():
                 if str(lp.get("status") or "").lower() != "open":
                     continue
+                try:
+                    for ep in exchange_active_rows:
+                        es = str(ep.get("symbol") or ((ep.get("info") or {}).get("symbol")) or "")
+                        if es == lp.get("symbol") or (hasattr(self.exchange_client, "_mexc_variants_match") and self.exchange_client._mexc_variants_match(es, lp.get("symbol"))):
+                            real_qty = self._position_qty(ep)
+                            if real_qty > 0:
+                                lp["qty"] = real_qty
+                                lp["exchange_contracts"] = ep.get("contracts") or ((ep.get("info") or {}).get("holdVol"))
+                                lp["raw_exchange_position"] = ep
+                                lp["exchange_synced"] = True
+                            break
+                except Exception as e:
+                    lp["exchange_sync_warning"] = str(e)[:180]
                 state = await pe.reconcile(lp, live=True, reattach=protect)
                 lp.update(state)
                 if state.get("protection_status") == "EXCHANGE PROTECTED":
