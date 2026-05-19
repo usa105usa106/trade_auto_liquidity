@@ -525,6 +525,38 @@ class ExecutionEngine:
         await self.storage.set_lock(symbol, 30, reason)
         return {"ok": True, "reason": reason}
 
+
+    async def _close_until_flat(self, symbol: str, reason: str, side: str, fallback_qty: float) -> tuple[bool, list]:
+        """Close a futures position and keep retrying small exchange tails.
+
+        MEXC can leave a residual contract after a market close because local
+        qty is base amount while native close requires integer holdVol. Every
+        retry fetches the real exchange row and closes its current holdVol, so
+        local rounding cannot create partial closes.
+        """
+        attempts = max(1, int(os.getenv("POST_CLOSE_MAX_ATTEMPTS", "4") or "4"))
+        delay = float(os.getenv("POST_CLOSE_POSITION_RECHECK_DELAY_SEC", os.getenv("POST_CLOSE_BALANCE_CHECK_DELAY_SEC", "1.5")))
+        results = []
+        for i in range(attempts):
+            exchange_row = await self._find_exchange_position_row(symbol)
+            if exchange_row:
+                res = await self.close_exchange_position(exchange_row, reason=reason)
+                results.append({"attempt": i + 1, "mode": "exchange_row", "result": res})
+                if not res.get("ok"):
+                    return False, results
+            elif i == 0 and fallback_qty > 0:
+                res = await self._create_order_retry(
+                    symbol, "market", side, fallback_qty, None,
+                    {"reduceOnly": True, "clientOrderId": f"bot_close_{int(time.time()*1000)}"}, attempts=2
+                )
+                results.append({"attempt": i + 1, "mode": "fallback_qty", "result": res})
+            else:
+                return True, results
+            await asyncio.sleep(delay)
+            if not await self._find_exchange_position_row(symbol):
+                return True, results
+        return (not await self._find_exchange_position_row(symbol)), results
+
     async def close_position(self, pos: dict, reason: str, live: bool, exit_price: float | None = None):
         symbol = pos["symbol"]
         side = "sell" if str(pos.get("side")).upper() == "LONG" else "buy"
@@ -532,23 +564,20 @@ class ExecutionEngine:
         pos["status"] = "closing"
         await self.storage.upsert_position(pos)
         already_closed = False
+        close_attempts = []
         if live:
             try:
-                # Close the exact exchange row/holdVol when available. Local qty
-                # can be stale after MEXC precision rounding or manual exchange
-                # changes (example: local 4.0 COPPER, exchange 4.1).
+                # Close the exact exchange row/holdVol when available and keep
+                # retrying residual exchange tails until the symbol is flat.
                 exchange_row = await self._find_exchange_position_row(symbol)
                 if exchange_row:
                     pos["qty"] = self.exchange_position_qty(exchange_row) or qty
                     pos["exchange_contracts"] = exchange_row.get("contracts") or (exchange_row.get("info") or {}).get("holdVol")
                     pos["raw_exchange_position"] = exchange_row
-                    close_res = await self.close_exchange_position(exchange_row, reason=reason)
-                    if not close_res.get("ok"):
-                        raise RuntimeError(close_res.get("reason") or close_res)
-                elif qty > 0:
-                    await self._create_order_retry(symbol, "market", side, qty, None, {"reduceOnly": True, "clientOrderId": f"bot_close_{int(time.time()*1000)}"}, attempts=2)
-                else:
-                    already_closed = True
+                flat, close_attempts = await self._close_until_flat(symbol, reason, side, qty)
+                already_closed = flat
+                if not flat:
+                    raise RuntimeError("exchange position still open after retry close loop")
             except Exception as e:
                 err = str(e)
                 # MEXC code 2009 means the position is already gone. This is a
@@ -558,8 +587,9 @@ class ExecutionEngine:
                     already_closed = True
                 else:
                     pos["status"] = "open"
+                    pos["close_attempts"] = close_attempts
                     await self.storage.upsert_position(pos)
-                    return {"ok": False, "reason": f"close failed: {e}"}
+                    return {"ok": False, "reason": f"close failed: {e}", "close_attempts": close_attempts}
         entry = float(pos.get("entry_price") or 0)
         exit_price = float(exit_price or entry)
         pnl_pct = ((exit_price-entry)/entry*100) if str(pos.get("side")).upper()=="LONG" and entry else ((entry-exit_price)/entry*100 if entry else 0)

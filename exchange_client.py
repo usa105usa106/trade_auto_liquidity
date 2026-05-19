@@ -880,13 +880,30 @@ class ExchangeClient:
         msym = self._mexc_normalize_contract_id(symbol)
         if not msym or "_" not in msym:
             msym = self._mexc_symbol(pos.get("symbol") or symbol)
-        vol = info.get("holdVol") or info.get("vol") or pos.get("contracts")
+        raw_vol = info.get("holdVol") or info.get("vol") or pos.get("contracts")
         try:
-            vol = int(float(vol or 0))
+            raw_f = abs(float(raw_vol or 0))
         except Exception:
-            vol = 0
+            raw_f = 0.0
+        # MEXC order/create expects integer contract volume. Native position rows
+        # usually expose holdVol as contracts (for SPACEX this can be 11 while
+        # base amount is 0.011). Some fallback rows expose only base amount; in
+        # that case convert amount -> contracts instead of int(0.011) == 0.
+        if raw_f >= 1:
+            vol = int(round(raw_f))
+        else:
+            amount_f = 0.0
+            for k in ("amount", "qty", "size"):
+                try:
+                    if pos.get(k) not in (None, ""):
+                        amount_f = abs(float(pos.get(k) or 0)); break
+                except Exception:
+                    pass
+            if amount_f <= 0 and raw_f > 0:
+                amount_f = raw_f
+            vol = self._amount_to_mexc_vol(self._mexc_id_to_symbol(msym), amount_f) if amount_f > 0 else 0
         if vol <= 0:
-            raise RuntimeError("cannot close MEXC position: empty holdVol")
+            raise RuntimeError(f"cannot close MEXC position: empty holdVol/rawVol={raw_vol!r}")
         pt = str(info.get("positionType") or info.get("holdSide") or pos.get("side") or "").lower()
         # MEXC side: 2 closes short, 4 closes long.
         if pt in {"1", "long", "buy"} or str(pos.get("side", "")).lower() == "long":

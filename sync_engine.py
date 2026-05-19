@@ -123,10 +123,15 @@ class SyncEngine:
                     "external_sync": True,
                     "raw_exchange_position": p,
                 }
+                real_qty = self._position_qty(p)
                 try:
                     imported = ExecutionEngine(self.storage, self.exchange_client)._sanitize_position_for_exchange(imported)
                 except Exception:
                     pass
+                # Do not let exchange metadata/ccxt amount precision round a real
+                # tiny futures amount (for example SPACEX 0.011) down to 0.
+                if real_qty > 0:
+                    imported["qty"] = real_qty
                 await self.storage.upsert_position(imported)
                 report["imported_positions"] += 1
                 if protect and stop_price > 0 and take_price > 0:
@@ -170,11 +175,19 @@ class SyncEngine:
                                 lp["exchange_contracts"] = ep.get("contracts") or ((ep.get("info") or {}).get("holdVol"))
                                 lp["raw_exchange_position"] = ep
                                 lp["exchange_synced"] = True
+                                lp["qty_precision_protected"] = True
                             break
                 except Exception as e:
                     lp["exchange_sync_warning"] = str(e)[:180]
                 state = await pe.reconcile(lp, live=True, reattach=protect)
                 lp.update(state)
+                try:
+                    ep = lp.get("raw_exchange_position") if isinstance(lp.get("raw_exchange_position"), dict) else None
+                    rq = self._position_qty(ep) if ep else 0
+                    if rq > 0:
+                        lp["qty"] = rq
+                except Exception:
+                    pass
                 if state.get("protection_status") == "EXCHANGE PROTECTED":
                     report["protected_positions"] = report.get("protected_positions", 0) + 1
                     lp.pop("protection_warning", None)
