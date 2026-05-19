@@ -65,6 +65,7 @@ DEFAULT_SETTINGS = {
     "liquidity_retest_mtf_enabled": DEFAULTS.liquidity_retest_mtf_enabled,
     "liquidity_retest_min_mtf_score": DEFAULTS.liquidity_retest_min_mtf_score,
     "liquidity_retest_require_clean_path": DEFAULTS.liquidity_retest_require_clean_path,
+    "liquidity_runner_enabled": DEFAULTS.liquidity_runner_enabled,
     "proxy_enabled": DEFAULTS.proxy_enabled,
     "proxy_url": DEFAULTS.proxy_url,
     "mexc_order_leverage": DEFAULTS.mexc_order_leverage,
@@ -88,6 +89,7 @@ DEFAULT_SETTINGS = {
     "openai_timeout_sec": int(os.getenv("OPENAI_TIMEOUT_SEC", "12")),
     "openai_fail_open": os.getenv("OPENAI_FAIL_OPEN", "false").lower() in {"1", "true", "yes", "on"},
     "openai_show_decisions": os.getenv("OPENAI_SHOW_DECISIONS", "false").lower() in {"1", "true", "yes", "on"},
+    "trade_charts_enabled": os.getenv("TRADE_CHARTS_ENABLED", "false").lower() in {"1", "true", "yes", "on"},
 
     "ws_enabled": True,
     "ws_require_healthy_for_entries": False,

@@ -7,7 +7,8 @@ load_dotenv()
 # Previous packaged version markers for regression tests: 0078 SCALP EXIT SAFETY | 0089 OPENAI PROMPT QUALITY FIX
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
-VERSION = os.getenv("BOT_VERSION", "0091 OPENAI DECISION EDIT MODE")
+# Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
+VERSION = os.getenv("BOT_VERSION", "0096 SAFE STOP MARKET RECOVERY")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -82,6 +83,7 @@ class Defaults:
     liquidity_retest_mtf_enabled: bool = env_bool("LIQUIDITY_RETEST_MTF_ENABLED", True)
     liquidity_retest_min_mtf_score: float = env_float("LIQUIDITY_RETEST_MIN_MTF_SCORE", -0.25)
     liquidity_retest_require_clean_path: bool = env_bool("LIQUIDITY_RETEST_REQUIRE_CLEAN_PATH", False)
+    liquidity_runner_enabled: bool = env_bool("LIQUIDITY_RUNNER_ENABLED", False)
 
 DEFAULTS = Defaults()
 DB_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")

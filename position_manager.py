@@ -61,6 +61,73 @@ class PositionManager:
         return policy
 
 
+
+    async def _liquidity_runner_enabled(self) -> bool:
+        value = await self._setting("liquidity_runner_enabled", os.getenv("LIQUIDITY_RUNNER_ENABLED", "false"))
+        return self._truthy(value, False)
+
+    async def _liquidity_runner_stop(self, pos: dict, price: float, current_stop: float) -> tuple[bool, float, int]:
+        """Progressively lock profit for liquidity_retest positions.
+
+        This is not scalp trailing. It moves the local stop by structure/R steps:
+        - 1R: existing breakeven logic protects entry.
+        - 2R: lock +1R.
+        - 3R: lock +2R.
+        - 4R+: lock +3R if TP/liquidity target is farther.
+
+        The feature is controlled by liquidity_runner_enabled and only applies
+        to strategy=liquidity_retest. It never loosens a stop and never moves
+        the stop past current price.
+        """
+        if not await self._liquidity_runner_enabled():
+            return False, 0.0, int(pos.get("liquidity_runner_stage") or 0)
+        side = str(pos.get("side") or "").upper()
+        entry = float(pos.get("entry_price") or 0)
+        initial_stop = float(pos.get("initial_stop_price") or pos.get("original_stop_price") or 0)
+        if entry <= 0 or price <= 0:
+            return False, 0.0, int(pos.get("liquidity_runner_stage") or 0)
+        if initial_stop <= 0:
+            initial_stop = float(pos.get("stop_price") or 0)
+        risk_abs = abs(entry - initial_stop)
+        if risk_abs <= 0:
+            return False, 0.0, int(pos.get("liquidity_runner_stage") or 0)
+        if side == "LONG":
+            r_now = (price - entry) / risk_abs
+        elif side == "SHORT":
+            r_now = (entry - price) / risk_abs
+        else:
+            return False, 0.0, int(pos.get("liquidity_runner_stage") or 0)
+
+        target_stage = 0
+        if r_now >= 4.0:
+            target_stage = 4
+        elif r_now >= 3.0:
+            target_stage = 3
+        elif r_now >= 2.0:
+            target_stage = 2
+        else:
+            return False, 0.0, int(pos.get("liquidity_runner_stage") or 0)
+
+        current_stage = int(pos.get("liquidity_runner_stage") or 0)
+        if target_stage <= current_stage:
+            return False, 0.0, current_stage
+
+        # Lock one R behind the reached stage: 2R -> +1R, 3R -> +2R, 4R -> +3R.
+        lock_r = max(1, target_stage - 1)
+        if side == "LONG":
+            new_stop = entry + lock_r * risk_abs
+            if current_stop and new_stop <= current_stop:
+                return False, 0.0, current_stage
+            if new_stop >= price:
+                return False, 0.0, current_stage
+        else:
+            new_stop = entry - lock_r * risk_abs
+            if current_stop and new_stop >= current_stop:
+                return False, 0.0, current_stage
+            if new_stop <= price:
+                return False, 0.0, current_stage
+        return True, float(new_stop), target_stage
+
     async def _is_terminal_closed(self, symbol: str) -> bool:
         """Return True when a recent close lock makes local callbacks stale.
 
@@ -221,12 +288,32 @@ class PositionManager:
                     except Exception:
                         pass
                     continue
+                pos.setdefault("initial_stop_price", stop)
+                pos.setdefault("initial_take_price", take)
                 pos["stop_price"] = new_stop
                 pos["breakeven_moved"] = True
                 pos["updated_at"] = now
                 await self.storage.upsert_position(pos)
                 events.append({"type":"breakeven","symbol":symbol, "stop_price": new_stop})
                 stop = new_stop
+            if is_liquidity_retest:
+                pos.setdefault("initial_stop_price", stop)
+                pos.setdefault("initial_take_price", take)
+                runner_move, runner_stop, runner_stage = await self._liquidity_runner_stop(pos, price, stop)
+                if runner_move:
+                    if await self._is_terminal_closed(symbol):
+                        try:
+                            await self.storage.remove_position(symbol)
+                        except Exception:
+                            pass
+                        continue
+                    pos["stop_price"] = runner_stop
+                    pos["liquidity_runner_stage"] = runner_stage
+                    pos["liquidity_runner_enabled"] = True
+                    pos["updated_at"] = now
+                    await self.storage.upsert_position(pos)
+                    events.append({"type":"liquidity_runner", "symbol": symbol, "stop_price": runner_stop, "stage_r": runner_stage})
+                    stop = runner_stop
             if side=="LONG":
                 if take and price>=take:
                     ev = await self._close_and_event(pos, "tp", "take_profit", live, price)

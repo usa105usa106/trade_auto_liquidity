@@ -187,6 +187,9 @@ class ExecutionEngine:
                 # entries start as pending and are later resolved by PositionManager.
                 pos = plan.__dict__.copy()
                 pos["status"] = "pending" if plan.order_type.lower() == "limit" else "open"
+                pos["initial_stop_price"] = plan.stop_price
+                pos["initial_take_price"] = plan.take_price
+                pos["liquidity_runner_stage"] = 0
                 pos["opened_at"] = time.time()
                 pos["updated_at"] = time.time()
                 pos["paper"] = True
@@ -211,6 +214,9 @@ class ExecutionEngine:
             # but the raw order response does not include a filled quantity/price.
             pos = plan.__dict__.copy()
             pos["status"] = "pending" if order_type == "limit" else "open"
+            pos["initial_stop_price"] = plan.stop_price
+            pos["initial_take_price"] = plan.take_price
+            pos["liquidity_runner_stage"] = 0
             pos["order_id"] = order.get("id")
             pos["opened_at"] = time.time()
             pos["updated_at"] = time.time()
@@ -243,6 +249,8 @@ class ExecutionEngine:
             if pos["status"] == "open":
                 fill_price = self._order_fill_price(order, plan.entry_price)
                 pos = self._rebase_protection_to_fill(pos, fill_price)
+                pos["initial_stop_price"] = pos.get("stop_price")
+                pos["initial_take_price"] = pos.get("take_price")
                 try:
                     await asyncio.sleep(float(os.getenv("POST_ORDER_POSITION_SYNC_DELAY_SEC", "0.5")))
                     exchange_positions = await self.exchange_client.fetch_positions([plan.symbol])

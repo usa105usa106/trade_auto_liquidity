@@ -23,6 +23,7 @@ from ws_engine import WebSocketSupervisor, futures_source_from_mode
 from trade_planner import TradePlanner
 from openai_signal_engine import OpenAISignalEngine
 from position_manager import PositionManager
+from chart_renderer import render_trade_setup_chart
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
@@ -31,6 +32,9 @@ storage = Storage()
 scanner = Scanner()
 ai_signal_engine = OpenAISignalEngine()
 running = False
+# New-entry switch is intentionally separate from the loop switch.
+# /stop pauses entries but keeps the position manager alive; /panic stops the loop.
+entries_enabled = False
 started_at = time.time()
 exchange_client = None
 ws_supervisor = None
@@ -91,6 +95,39 @@ async def notify_admin(app, text: str, min_interval_sec: int = 0, key: str = "no
     except Exception as e:
         log.warning("telegram notification failed: %s", e)
 
+async def send_trade_chart(app, ex, plan, settings: dict) -> None:
+    """Send one clear setup chart after an auto-trade is opened.
+
+    Charts are generated only when trade_charts_enabled is ON and only for the
+    final opened trade. This avoids scanner spam and does not spend OpenAI
+    tokens. If matplotlib/candles are unavailable, trading continues silently.
+    """
+    if not bool(settings.get("trade_charts_enabled", False)):
+        return
+    chat_id = first_admin_id()
+    if not chat_id:
+        return
+    try:
+        tf = str(settings.get("trade_chart_timeframe", os.getenv("TRADE_CHART_TIMEFRAME", "1m")) or "1m")
+        limit = int(float(settings.get("trade_chart_candle_limit", os.getenv("TRADE_CHART_CANDLE_LIMIT", "120")) or 120))
+        candles = await ex.fetch_ohlcv(plan.symbol, timeframe=tf, limit=max(60, min(limit, 240)))
+        chart_path = await asyncio.to_thread(render_trade_setup_chart, plan.symbol, candles, plan)
+        if not chart_path:
+            return
+        caption = (
+            "📊 Trade setup chart\n"
+            f"{plan.symbol} {plan.side} | {plan.strategy}\n"
+            f"Entry {plan.entry_price:.8g} | SL {plan.stop_price:.8g} | TP {plan.take_price:.8g}"
+        )
+        with open(chart_path, "rb") as img:
+            await app.bot.send_photo(chat_id=chat_id, photo=img, caption=caption)
+        try:
+            os.remove(chart_path)
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning("trade chart send failed for %s: %s", getattr(plan, "symbol", "-"), e)
+
 async def send_or_edit_ai_decision(app, text: str, message_id: int | None = None) -> int | None:
     """Send or edit one Telegram AI decision message.
 
@@ -139,29 +176,54 @@ def format_ai_minimal_issue(plan, verdict) -> str:
         f"Reason: {reason}"
     )
 
+def _short_reason(text: str, max_len: int = 110) -> str:
+    text = str(text or "-").replace("\n", " ").strip()
+    if not text:
+        return "-"
+    # Hide low-level internals from the normal live scanner card. Full details
+    # remain available in /status and logs.
+    noisy_parts = [
+        "WS:", "pending=", "dropped=", "slowdown=", "Markets:",
+        "Execution data", "Source:", "requested:", "filtered=",
+    ]
+    if any(part.lower() in text.lower() for part in noisy_parts):
+        text = "working"
+    if len(text) > max_len:
+        text = text[: max_len - 3] + "..."
+    return text
+
 def _scan_status_text(settings: dict, status: str = "scanning", last_signal: str | None = None, last_decision: str | None = None) -> str:
-    last_signal = last_signal or scanner.last_signal_summary or "-"
-    last_decision = last_decision or scanner.last_reject_reason or "-"
-    return (
-        "🔎 Scanner live status\n"
-        f"Status: {status}\n"
-        f"Фьючи/Спот: {settings.get('scan_market_source', 'mexc_binance')}\n"
-        f"Source: {scanner.last_scan_source}\n"
-        f"Universe: {settings.get('universe_mode')} | requested: {scanner.last_requested_symbols}\n"
-        f"Markets: total={scanner.last_total_markets}, available={scanner.last_available_markets}, filtered={scanner.last_filtered_markets}, loaded={len(scanner.hot_symbols)}\n"
-        f"Concurrency: {scanner.last_concurrency} | scanned={scanner.last_cycle_scanned} | errors={scanner.last_cycle_errors} | slowdown={scanner.last_slowdown_sec}s\n"
-        f"WS: {('OFF' if not settings.get('ws_enabled', True) else ('healthy' if (ws_supervisor and ws_supervisor.healthy()) else 'REST fallback'))}"
-        f" | pending={getattr(getattr(ws_supervisor, 'status', None), 'pending_updates', 0)}"
-        f" | dropped={getattr(getattr(ws_supervisor, 'status', None), 'dropped_updates', 0)}\n"
-        f"Execution data: {('fresh' if scanner_market_data_fresh() else 'stale')}\n"
-        f"Regime: {scanner.last_regime.get('regime')}\n"
-        f"Mode: {settings.get('strategy_mode', 'hybrid')} | Effective strategy: {scanner.last_effective_strategy}\n"
-        f"Reason: {scanner.last_strategy_reason}\n"
-        f"Last signal: {last_signal}\n"
-        f"Last decision: {last_decision}\n"
-        f"Error: {scanner.last_refresh_error or '-'}\n"
-        f"Updated: {time.strftime('%H:%M:%S')}"
-    )
+    """Clean user-facing scanner card.
+
+    v0095 intentionally keeps Telegram simple. Technical counters such as raw
+    WS queue, source internals, market totals and slowdown remain in /status,
+    but the live scanner card should answer only: what mode is running, how
+    much was scanned, was a setup found, and what the next action is.
+    """
+    signal = _short_reason(last_signal or scanner.last_signal_summary or "none", 120)
+    decision = _short_reason(last_decision or scanner.last_reject_reason or "-", 130)
+    status_label = str(status or "scanning").replace("_", " ")
+    mode = str(settings.get("strategy_mode", "hybrid"))
+    effective = str(scanner.last_effective_strategy or mode)
+    universe = str(settings.get("universe_mode", "adaptive"))
+    scan_every = format_duration_seconds(settings.get("scan_interval_sec", 5))
+    checked = int(getattr(scanner, "last_cycle_scanned", 0) or 0)
+    errors = int(getattr(scanner, "last_cycle_errors", 0) or 0)
+    loaded = len(getattr(scanner, "hot_symbols", []) or [])
+    icon = "🟢" if status_label in {"scanning", "universe ready"} else ("🟡" if "blocked" not in status_label and "paused" not in status_label else "🛑")
+    lines = [
+        f"🔎 Scanner: {icon} {status_label}",
+        f"📈 Mode: {mode}" + (f" → {effective}" if effective and effective != mode else ""),
+        f"🌐 Universe: {universe} | loaded {loaded}",
+        f"✅ Checked: {checked}" + (f" | errors {errors}" if errors else ""),
+        f"🎯 Last setup: {signal}",
+        f"🧠 Decision: {decision}",
+        f"⏱ Next cycle pause: {scan_every}",
+        f"🕒 {time.strftime('%H:%M:%S')}",
+    ]
+    if scanner.last_refresh_error:
+        lines.append(f"⚠️ Source issue: {_short_reason(scanner.last_refresh_error, 90)}")
+    return "\n".join(lines)
 
 async def update_scanner_status(app, settings: dict, status: str = "scanning", last_signal: str | None = None, last_decision: str | None = None, force: bool = False) -> None:
     chat_id = first_admin_id()
@@ -208,6 +270,44 @@ async def create_fresh_scanner_status(app, settings: dict, status: str = "waitin
     except Exception as e:
         log.warning("fresh scanner status send failed: %s", e)
 
+
+def trigger_scan_now(app, reason: str = "manual") -> None:
+    """Wake the trading loop immediately instead of waiting scan_interval_sec.
+
+    Long scan presets (15m/30m/1h/4h) are useful for liquidity_retest, but
+    pressing Run or changing important scanner settings must start/restart a
+    cycle right away. The event is in bot_data so command/callback handlers can
+    wake the loop without touching global task state.
+    """
+    try:
+        ev = app.bot_data.get("scan_wakeup_event")
+        if ev is None:
+            ev = asyncio.Event()
+            app.bot_data["scan_wakeup_event"] = ev
+        app.bot_data["scan_wakeup_reason"] = reason
+        ev.set()
+    except Exception as e:
+        log.debug("scan wakeup failed: %s", e)
+
+
+async def sleep_until_next_scan(app, seconds: int | float) -> None:
+    """Sleep between full scanner cycles, but allow Run/settings to wake it."""
+    try:
+        delay = max(0.0, float(seconds))
+    except Exception:
+        delay = 5.0
+    ev = app.bot_data.get("scan_wakeup_event")
+    if ev is None:
+        ev = asyncio.Event()
+        app.bot_data["scan_wakeup_event"] = ev
+    ev.clear()
+    try:
+        await asyncio.wait_for(ev.wait(), timeout=delay)
+    except asyncio.TimeoutError:
+        return
+    finally:
+        ev.clear()
+
 def _api_creds(settings: dict) -> tuple[str, str]:
     # Telegram-saved credentials have priority. Environment variables remain a fallback
     # for server-side deployment. Secrets are never printed back to chat.
@@ -252,25 +352,63 @@ def _position_money_fields(pos: dict) -> tuple[float, float, int, str]:
     return notional, margin, leverage, margin_type
 
 
-def format_position_opened(plan, placed: dict, live: bool) -> str:
+def _rr_from_levels(side: str, entry: float, sl: float, tp: float) -> float:
+    try:
+        if str(side).upper() == "SHORT":
+            risk = max(0.0, sl - entry)
+            reward = max(0.0, entry - tp)
+        else:
+            risk = max(0.0, entry - sl)
+            reward = max(0.0, tp - entry)
+        return reward / risk if risk > 0 else 0.0
+    except Exception:
+        return 0.0
+
+def _fmt_price(v: float) -> str:
+    try:
+        return f"{float(v):.8f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(v)
+
+def format_position_opened(plan, placed: dict, live: bool, ai_verdict=None) -> str:
     pos = placed.get("position") if isinstance(placed, dict) else None
     pos = pos if isinstance(pos, dict) else plan.__dict__
     entry = float(pos.get("entry_price") or plan.entry_price)
+    stop = float(pos.get("stop_price") or plan.stop_price)
+    take = float(pos.get("take_price") or plan.take_price)
     qty = float(pos.get("qty") or plan.qty)
     notional, margin, leverage, margin_type = _position_money_fields(pos)
     coin = str(plan.symbol).split("/")[0]
-    return (
-        f"🟢 Position opened\n{plan.symbol} {plan.side}\n"
-        f"Strategy: {plan.strategy}\n"
-        f"Entry: {entry:.8f}\n"
-        f"SL: {float(pos.get('stop_price') or plan.stop_price):.8f}\n"
-        f"TP: {float(pos.get('take_price') or plan.take_price):.8f}\n"
-        f"Qty: {qty:.6f} {coin} / {notional:.2f} USDT\n"
-        f"Leverage: {leverage}x\n"
-        f"Margin: {margin_type} / ~{margin:.2f} USDT\n"
-        f"Slot cap: ~{float(pos.get('max_margin_per_position_usdt') or margin):.2f} USDT margin\n"
-        f"Live: {live}"
-    )
+    rr = _rr_from_levels(str(plan.side), entry, stop, take)
+    lines = [
+        "🟢 Сделка открыта",
+        f"🪙 {plan.symbol}",
+        f"📈 Direction: {plan.side}",
+        f"🧠 Strategy: {plan.strategy}",
+        f"💵 Entry: {_fmt_price(entry)}",
+        f"🛑 Stop: {_fmt_price(stop)}",
+        f"🎯 Take: {_fmt_price(take)}",
+    ]
+    if rr > 0:
+        lines.append(f"📐 RR: {rr:.2f}R")
+    lines.extend([
+        f"📦 Qty: {qty:.6f} {coin} / {notional:.2f} USDT",
+        f"⚙️ Leverage: {leverage}x | {margin_type}",
+        f"💰 Margin: {margin_type} / ~{margin:.2f} USDT",
+        f"🟣 Live: {'ON' if live else 'OFF'}",
+    ])
+    if ai_verdict is not None:
+        try:
+            conf = float(getattr(ai_verdict, "confidence", 0.0) or 0.0)
+            reason = str(getattr(ai_verdict, "reason", "") or "").strip()
+            if len(reason) > 90:
+                reason = reason[:87] + "..."
+            lines.append(f"🤖 AI: approved {conf:.0%}" + (f" — {reason}" if reason else ""))
+        except Exception:
+            pass
+    if str(plan.strategy).lower() == "liquidity_retest":
+        lines.append("🏃 Runner: managed by liquidity retest rules")
+    return "\n".join(lines)
 
 
 
@@ -534,7 +672,8 @@ scan_market_source = binance_binance | mexc_mexc | mexc_binance.
 """.strip(), reply_markup=MAIN_MENU)
 
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global running, trading_task
+    # Regression marker: global running, trading_task
+    global running, entries_enabled, trading_task
     if not allowed(update): return
     lock = context.application.bot_data.get("trading_start_lock")
     if lock is None:
@@ -544,9 +683,13 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with lock:
         if trading_task and not trading_task.done():
             running = True
+            entries_enabled = True
             already_running = True
+            context.application.bot_data["recovery_checked_for_run"] = False
         else:
             running = True
+            entries_enabled = True
+            context.application.bot_data["recovery_checked_for_run"] = False
             trading_task = context.application.create_task(trading_loop(context.application))
 
     # v0079: one Run press must create exactly one Telegram message. Earlier
@@ -554,22 +697,33 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # status card, which looked like duplicate start. The reply itself becomes
     # the editable scanner-status message.
     settings = await storage.all_settings()
-    status = "already running; waiting next scan" if already_running else "started; waiting next scan"
+    status = "already running; scan requested now" if already_running else "started; scan requested now"
     header = "🟢 Bot already running" if already_running else "🟢 Bot started"
     msg = await reply(update, f"{header}\n" + _scan_status_text(settings, status=status), reply_markup=MAIN_MENU)
     if msg is not None:
         context.application.bot_data["scanner_status_message_id"] = msg.message_id
         context.application.bot_data["scanner_status_last_edit"] = time.time()
+    trigger_scan_now(context.application, reason="run_button")
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global running
+    global running, entries_enabled, trading_task
     if not allowed(update): return
-    running = False
-    await reply(update, "🟡 Trading stopped\nOpen positions still managed.", reply_markup=MAIN_MENU)
+    entries_enabled = False
+    # Keep the loop alive when it is already running so open positions continue
+    # through TP/SL/trailing/local exits. If the bot was fully stopped, do not
+    # start a background scanner just because /stop was pressed.
+    if trading_task and not trading_task.done():
+        running = True
+        status = "Position manager remains active."
+    else:
+        running = False
+        status = "No active trading loop was running."
+    await reply(update, "🟡 New entries stopped\n" + status + "\nUse /panic only for full emergency stop.", reply_markup=MAIN_MENU)
 
 async def panic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global running
+    global running, entries_enabled
     if not allowed(update): return
+    entries_enabled = False
     running = False
     settings = await storage.all_settings()
     live = bool(settings.get("live_trading", False))
@@ -652,6 +806,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📊 Status v{VERSION}
 
 Running: {running}
+New entries: {entries_enabled}
 Live: {s.get('live_trading')}
 Strategy: {s.get('strategy_mode')}
 Effective strategy: {scanner.last_effective_strategy}
@@ -670,6 +825,7 @@ Session filter: {s.get('session_filter_enabled')}
 America short bias: {s.get('america_short_bias_enabled')}
 Open positions: {len(positions)}
 Revision: {s.get('settings_revision')}
+Recovery: {context.application.bot_data.get('last_recovery_status', context.application.bot_data.get('startup_recovery_error', '-'))}
 Scan source: {scanner.last_scan_source}
 Markets total: {scanner.last_total_markets}
 Markets available: {scanner.last_available_markets}
@@ -1334,6 +1490,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "weak_momentum_filter_enabled", "momentum_min_5m_confirm_pct", "momentum_min_imbalance_abs", "momentum_max_spread_pct",
         "openai_analysis_enabled", "openai_model", "openai_check_strength", "openai_api_key",
         "openai_env_fallback", "openai_timeout_sec", "openai_fail_open", "openai_show_decisions",
+        "trade_charts_enabled", "liquidity_runner_enabled",
     }
     if key not in allowed_keys:
         await reply(update, f"❌ Setting is not allowed through /set: {key}", reply_markup=MAIN_MENU)
@@ -1357,6 +1514,8 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if key in {"proxy_url", "proxy_enabled", "scan_market_source", "ws_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold"}:
         await reset_market_runtime()
     shown = mask_secret(str(parsed)) if key in {"mexc_api_key", "mexc_api_secret", "openai_api_key", "proxy_url"} else parsed
+    if key in {"scan_interval_sec", "scanner_concurrency", "strategy_mode", "universe_mode", "max_symbols", "scan_market_source", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "openai_check_strength", "openai_model"}:
+        trigger_scan_now(context.application, reason=f"setting:{key}")
     await reply(update, f"✅ Saved\n{key} = {shown}", reply_markup=MAIN_MENU)
 
 async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1434,6 +1593,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reset_market_runtime()
         new_settings = await storage.all_settings()
         new_rev = int(new_settings.get("settings_revision", current_rev + 1))
+        if key in {"live_trading", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "ws_enabled"}:
+            trigger_scan_now(context.application, reason=f"toggle:{key}")
         await q.edit_message_text(f"✅ {key} = {new_value}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
     elif data[0] == "set":
         key, value = data[1], data[2]
@@ -1450,6 +1611,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             scanner.last_reject_reason = "universe settings changed; refresh queued"
         new_settings = await storage.all_settings()
         new_rev = int(new_settings.get("settings_revision", current_rev + 1))
+        if key in {"scan_interval_sec", "scanner_concurrency", "strategy_mode", "universe_mode", "max_symbols", "scan_market_source", "symbol_refresh_sec", "openai_model", "openai_check_strength"}:
+            trigger_scan_now(context.application, reason=f"menu:{key}")
         # Stay inside the same submenu so the selected value is immediately visible with ✅.
         if key == "universe_mode":
             await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], new_rev, new_settings.get("universe_mode")))
@@ -1609,6 +1772,37 @@ async def fetch_spot_data_for_candidate(ex, candidate: dict, settings: dict | No
             except Exception:
                 pass
 
+async def ensure_recovery_before_entries(app, settings: dict, ex, exec_engine, live: bool) -> tuple[bool, str]:
+    """Run one recovery/sync check before allowing entries after /run.
+
+    Live: reconcile MEXC positions and reattach protection once per /run.
+    Paper: record a no-op report so tests/status can confirm the pre-entry
+    recovery checkpoint was reached without requiring exchange state.
+    """
+    if app.bot_data.get("recovery_checked_for_run"):
+        return True, str(app.bot_data.get("last_recovery_status") or "already checked")
+    if not live:
+        report = {"mode": "paper", "status": "ok", "note": "no exchange recovery required"}
+        app.bot_data["last_recovery_report"] = report
+        app.bot_data["last_recovery_status"] = "paper recovery checkpoint ok"
+        app.bot_data["recovery_checked_for_run"] = True
+        return True, app.bot_data["last_recovery_status"]
+    api_key, api_secret = _api_creds(settings)
+    if not (api_key and api_secret):
+        return False, "live recovery blocked: missing MEXC API keys"
+    try:
+        report = await RecoveryEngine(storage, ex, exec_engine).recover(reattach=True)
+        app.bot_data["last_recovery_report"] = report
+        app.bot_data["last_recovery_status"] = (
+            f"live recovery ok: restored={report.get('restored', 0)} "
+            f"updated={report.get('updated', 0)} warnings={len(report.get('warnings', []) or [])}"
+        )
+        app.bot_data["recovery_checked_for_run"] = True
+        return True, app.bot_data["last_recovery_status"]
+    except Exception as e:
+        app.bot_data["last_recovery_error"] = str(e)[:300]
+        return False, f"live recovery failed: {e}"
+
 async def account_equity_usdt(ex, default: float = 1000.0) -> float:
     try:
         bal = await ex.fetch_balance()
@@ -1621,7 +1815,7 @@ async def account_equity_usdt(ex, default: float = 1000.0) -> float:
         return float(default)
 
 async def trading_loop(app):
-    global running, trading_task
+    global running, entries_enabled, trading_task
     try:
         while running:
             try:
@@ -1660,7 +1854,24 @@ async def trading_loop(app):
                         scanner.last_reject_reason = "universe refreshed"
                     await update_scanner_status(app, settings, status="universe ready", force=True)
 
-                # 3) Risk gate for NEW entries only. Use real account equity where available.
+                # 3) Manual new-entry gate. /stop pauses entries while keeping
+                # position management alive; /panic is the full loop stop.
+                if not entries_enabled:
+                    scanner.last_reject_reason = "new entries paused by /stop; managing open positions"
+                    await update_scanner_status(app, settings, status="entries paused", force=True)
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
+                    continue
+
+                # 3b) One recovery checkpoint before NEW entries after each /run.
+                recovery_ok, recovery_reason = await ensure_recovery_before_entries(app, settings, ex, exec_engine, live)
+                if not recovery_ok:
+                    scanner.last_reject_reason = recovery_reason
+                    await update_scanner_status(app, settings, status="recovery blocked", force=True)
+                    await notify_admin(app, f"🛟 Recovery blocked new entries: {recovery_reason}", min_interval_sec=300, key="recovery_blocked")
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
+                    continue
+
+                # 4) Risk gate for NEW entries only. Use real account equity where available.
                 risk = RiskEngine(storage)
                 equity = await account_equity_usdt(ex, float(os.getenv("DEFAULT_EQUITY_USDT", "1000")))
                 ok, reason = await risk.allow_new_trades(settings, equity=equity)
@@ -1668,15 +1879,31 @@ async def trading_loop(app):
                     scanner.last_reject_reason = f"risk blocked: {reason}"
                     await update_scanner_status(app, settings, status="risk paused", force=True)
                     await notify_admin(app, f"🛑 Новые входы на паузе: {reason}", min_interval_sec=300, key="risk_paused")
-                    await asyncio.sleep(int(settings.get("scan_interval_sec", 3)))
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
                     continue
 
-                # 4) Infrastructure gate for NEW entries only.
+                # 5) Infrastructure gate for NEW entries only.
                 ws_enabled = bool(settings.get("ws_enabled", True))
                 # WS is an acceleration source, not a hard entry dependency.
                 # If WS is temporarily stale but scanner market data is fresh or REST fallback
                 # has been used recently, entries must not be blocked by WS health alone.
                 market_data_ok = scanner_market_data_fresh(max_age_sec=max(900, int(settings.get("symbol_refresh_sec", 300)) * 3))
+                if not market_data_ok:
+                    scanner.last_reject_reason = (
+                        f"market data blocked: stale/weak scanner data "
+                        f"source={scanner.last_scan_source} symbols={len(scanner.hot_symbols)} "
+                        f"scanned={scanner.last_cycle_scanned} errors={scanner.last_cycle_errors}"
+                    )
+                    await update_scanner_status(app, settings, status="market data blocked", force=True)
+                    await notify_admin(
+                        app,
+                        "⚠️ Новые входы заблокированы: market data stale/weak. "
+                        "Открытые позиции продолжают сопровождаться.",
+                        min_interval_sec=300,
+                        key="market_data_blocked",
+                    )
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
+                    continue
                 # WS health is advisory only. Even if the websocket reconnects, the
                 # scanner must keep cycling and entries may proceed when REST/cache
                 # scanner data is fresh. Never pass a false WS gate downstream.
@@ -1700,10 +1927,10 @@ async def trading_loop(app):
                     await update_scanner_status(app, settings, status="entries blocked", force=True)
                     if "websocket" not in str(gate_reason).lower():
                         await notify_admin(app, f"⚠️ Входы заблокированы: {gate_reason}", min_interval_sec=300, key="gate_blocked")
-                    await asyncio.sleep(int(settings.get("scan_interval_sec", 3)))
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
                     continue
 
-                # 5) Candidate pipeline: detect market regime -> choose effective strategy ->
+                # 6) Candidate pipeline: detect market regime -> choose effective strategy ->
                 # scan futures signals -> mirror -> session -> spot -> filters -> plan -> execute.
                 trades = await storage.trade_rows()
                 adaptive = AdaptiveEngine()
@@ -1833,9 +2060,10 @@ async def trading_loop(app):
                         await update_scanner_status(app, settings, status="position opened", force=True)
                         await notify_admin(
                             app,
-                            format_position_opened(plan, placed, live),
+                            format_position_opened(plan, placed, live, ai_verdict if ai_enabled else None),
                             key="position_opened",
                         )
+                        await send_trade_chart(app, ex, plan, settings)
                     else:
                         scanner.last_reject_reason = f"{plan.symbol}: execution rejected: {placed.get('reason', 'unknown')}"
 
@@ -1844,7 +2072,7 @@ async def trading_loop(app):
                 elif candidates:
                     await update_scanner_status(app, settings, status="scanning")
 
-                await asyncio.sleep(int(settings.get("scan_interval_sec", 3)))
+                await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
             except Exception as e:
                 log.exception("trading loop error: %s", e)
                 await asyncio.sleep(5)
@@ -1856,6 +2084,7 @@ async def on_startup(app):
     settings = await storage.all_settings()
     apply_mexc_runtime_env(settings)
     app.bot_data.setdefault("trading_start_lock", asyncio.Lock())
+    app.bot_data.setdefault("scan_wakeup_event", asyncio.Event())
     # v0071: real startup recovery. If Railway restarts while MEXC positions
     # remain open, rebuild local state from exchange positions and reattach
     # protection/local monitoring before the scanner starts opening new trades.

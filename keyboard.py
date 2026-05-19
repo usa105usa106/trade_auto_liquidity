@@ -43,6 +43,8 @@ def settings_menu(revision: int, settings: dict | None = None):
         [InlineKeyboardButton(f"⚡ Live: {_onoff(settings, 'live_trading')}", callback_data=f"toggle:live_trading:{r}"), InlineKeyboardButton(api_label, callback_data=f"menu:api:{r}")],
         [InlineKeyboardButton(f"🧠 Auto Strategy: {_onoff(settings, 'auto_strategy_adaptation')}", callback_data=f"toggle:auto_strategy_adaptation:{r}")],
         [InlineKeyboardButton(f"🤖 ИИ анализ: {_onoff(settings, 'openai_analysis_enabled')} | {_value(settings, 'openai_model', 'gpt-5.4-mini')}", callback_data=f"menu:openai:{r}")],
+        [InlineKeyboardButton(f"📊 Графики сделок: {_onoff(settings, 'trade_charts_enabled')}", callback_data=f"toggle:trade_charts_enabled:{r}")],
+        [InlineKeyboardButton(f"🏃 Liquidity Runner: {_onoff(settings, 'liquidity_runner_enabled')}", callback_data=f"toggle:liquidity_runner_enabled:{r}")],
         [InlineKeyboardButton(f"🧭 Regime: {_onoff(settings, 'regime_adaptation')}", callback_data=f"toggle:regime_adaptation:{r}")],
         [InlineKeyboardButton(f"🪞 Mirror: {_value(settings, 'mirror_mode', 'off')}", callback_data=f"menu:mirror:{r}"), InlineKeyboardButton(f"🔎 Spot: {_onoff(settings, 'spot_confirmation_enabled')}", callback_data=f"toggle:spot_confirmation_enabled:{r}")],
         [InlineKeyboardButton(f"🌍 Session: {_onoff(settings, 'session_filter_enabled')}", callback_data=f"toggle:session_filter_enabled:{r}"), InlineKeyboardButton(f"🇺🇸 Bias: {_onoff(settings, 'america_short_bias_enabled')}", callback_data=f"toggle:america_short_bias_enabled:{r}")],
