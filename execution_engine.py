@@ -451,29 +451,35 @@ class ExecutionEngine:
         except Exception as e:
             return {"ok": False, "reason": str(e), "native_mexc_error": native_reason}
 
-    async def _create_stop_market_order(self, symbol: str, side: str, qty: float, stop_price: float) -> dict:
+    async def _create_trigger_market_order(self, symbol: str, side: str, qty: float, trigger_price: float, kind: str) -> dict:
         errors = []
-        # Prefer native MEXC plan order when available. It avoids ccxt routing
-        # differences and lets ExchangeClient choose the correct close side.
         try:
-            if hasattr(self.exchange_client, "mexc_place_stop_market"):
-                return await self.exchange_client.mexc_place_stop_market(
-                    symbol=symbol, close_side=side, amount=qty, trigger_price=stop_price,
-                    client_order_id=f"bot_sl_{int(time.time()*1000)}",
+            native_name = "mexc_place_take_profit_market" if kind == "tp" else "mexc_place_stop_market"
+            if hasattr(self.exchange_client, native_name):
+                fn = getattr(self.exchange_client, native_name)
+                return await fn(
+                    symbol=symbol, close_side=side, amount=qty, trigger_price=trigger_price,
+                    client_order_id=f"bot_{kind}_{int(time.time()*1000)}",
                 )
         except Exception as e:
-            errors.append(f"native_plan: {e}")
+            errors.append(f"native_{kind}_plan: {e}")
         attempts = [
-            ("market", None, {"reduceOnly": True, "stopPrice": stop_price, "triggerPrice": stop_price, "clientOrderId": f"bot_sl_{int(time.time()*1000)}"}),
-            ("market", None, {"reduceOnly": True, "stopLossPrice": stop_price, "clientOrderId": f"bot_sl_{int(time.time()*1000)}"}),
-            ("stop_market", None, {"reduceOnly": True, "stopPrice": stop_price, "triggerPrice": stop_price, "clientOrderId": f"bot_sl_{int(time.time()*1000)}"}),
+            ("market", None, {"reduceOnly": True, "stopPrice": trigger_price, "triggerPrice": trigger_price, "clientOrderId": f"bot_{kind}_{int(time.time()*1000)}"}),
+            ("market", None, {"reduceOnly": True, f"{'takeProfitPrice' if kind == 'tp' else 'stopLossPrice'}": trigger_price, "clientOrderId": f"bot_{kind}_{int(time.time()*1000)}"}),
+            ("stop_market", None, {"reduceOnly": True, "stopPrice": trigger_price, "triggerPrice": trigger_price, "clientOrderId": f"bot_{kind}_{int(time.time()*1000)}"}),
         ]
         for type_, price, params in attempts:
             try:
                 return await self.exchange_client.create_order(symbol, type_, side, qty, price, params)
             except Exception as e:
                 errors.append(f"{type_}: {e}")
-        raise RuntimeError("stop-market protection failed: " + " | ".join(errors))
+        raise RuntimeError(f"{kind}-market protection failed: " + " | ".join(errors))
+
+    async def _create_stop_market_order(self, symbol: str, side: str, qty: float, stop_price: float) -> dict:
+        return await self._create_trigger_market_order(symbol, side, qty, stop_price, "sl")
+
+    async def _create_take_profit_market_order(self, symbol: str, side: str, qty: float, take_price: float) -> dict:
+        return await self._create_trigger_market_order(symbol, side, qty, take_price, "tp")
 
     async def place_protection_orders(self, pos: dict, live: bool) -> dict:
         if not live:
@@ -489,10 +495,7 @@ class ExecutionEngine:
         try:
             tp = float(pos.get("take_price") or 0)
             if tp > 0:
-                order = await self.exchange_client.create_order(
-                    symbol, "limit", side, qty, tp,
-                    {"reduceOnly": True, "clientOrderId": f"bot_tp_{int(time.time()*1000)}"}
-                )
+                order = await self._create_take_profit_market_order(symbol, side, qty, tp)
                 out["tp_order_id"] = order.get("id")
         except Exception as e:
             out["tp_error"] = str(e)

@@ -352,6 +352,55 @@ def _position_money_fields(pos: dict) -> tuple[float, float, int, str]:
     return notional, margin, leverage, margin_type
 
 
+
+def _estimate_exchange_position_margin(positions: list, default_leverage: int = 5) -> tuple[float, int]:
+    """Estimate live position margin from exchange position rows.
+
+    MEXC sometimes returns USDT.positionMargin as 0 while open_positions
+    still contains live isolated positions. For Telegram diagnostics we should
+    not display a clean 0 in that case; estimate notional / leverage from
+    the actual exchange rows.
+    """
+    total = 0.0
+    count = 0
+    for pos in positions or []:
+        try:
+            info = pos.get("info") or {} if isinstance(pos, dict) else {}
+            qty = 0.0
+            for key in ("amount", "qty", "size", "contracts"):
+                v = pos.get(key) if isinstance(pos, dict) else None
+                if v not in (None, ""):
+                    qty = abs(float(v))
+                    if qty > 0:
+                        break
+            price = 0.0
+            for key in ("entryPrice", "entry_price", "markPrice"):
+                v = pos.get(key) if isinstance(pos, dict) else None
+                if v not in (None, "", 0, "0"):
+                    price = abs(float(v))
+                    if price > 0:
+                        break
+            if price <= 0 and isinstance(info, dict):
+                for key in ("openAvgPrice", "holdAvgPrice", "entryPrice", "price", "markPrice"):
+                    v = info.get(key)
+                    if v not in (None, "", 0, "0"):
+                        price = abs(float(v))
+                        if price > 0:
+                            break
+            lev = default_leverage
+            if isinstance(info, dict):
+                for key in ("leverage", "level"):
+                    v = info.get(key)
+                    if v not in (None, "", 0, "0"):
+                        lev = max(1, int(float(v)))
+                        break
+            if qty > 0 and price > 0:
+                total += qty * price / max(1, lev)
+                count += 1
+        except Exception:
+            continue
+    return total, count
+
 def _rr_from_levels(side: str, entry: float, sl: float, tp: float) -> float:
     try:
         if str(side).upper() == "SHORT":
@@ -868,6 +917,26 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         position_margin = usdt.get("positionMargin", "n/a") if isinstance(usdt, dict) else "n/a"
         frozen_balance = usdt.get("frozenBalance", "n/a") if isinstance(usdt, dict) else "n/a"
         unrealized = usdt.get("unrealized", "n/a") if isinstance(usdt, dict) else "n/a"
+        # MEXC can report positionMargin=0 even while open_positions returns
+        # live positions. Show a safe effective margin instead of misleading 0.
+        try:
+            raw_pm = float(position_margin or 0)
+        except Exception:
+            raw_pm = 0.0
+        exchange_positions = []
+        try:
+            if hasattr(ex, "_mexc_fetch_positions"):
+                exchange_positions = await ex._mexc_fetch_positions()
+            else:
+                exchange_positions = await ex.fetch_positions()
+        except Exception:
+            exchange_positions = []
+        est_pm, est_count = _estimate_exchange_position_margin(
+            exchange_positions,
+            int(float(s.get("mexc_order_leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or 5)),
+        )
+        if raw_pm <= 0 and est_pm > 0:
+            position_margin = f"~{est_pm:.6f} estimated ({est_count} open position; MEXC raw=0)"
     except Exception as e:
         balance_error = str(e)[:240]
         used = position_margin = frozen_balance = unrealized = "n/a"

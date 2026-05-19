@@ -930,20 +930,25 @@ class ExchangeClient:
             raise NotImplementedError("native close_all is MEXC only")
         return await self._mexc_private("POST", "/api/v1/private/position/close_all", body={})
 
-    async def mexc_place_stop_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, client_order_id: str = "") -> dict:
-        """Place a native MEXC futures stop-market close order.
+    async def mexc_place_trigger_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, kind: str = "sl", client_order_id: str = "") -> dict:
+        """Place a native MEXC futures trigger-market close order for TP or SL.
 
-        Used for SL protection. `close_side` is the side needed to close the
-        current position: sell closes long, buy closes short. MEXC uses side
-        code 4 to close long and 2 to close short. The trend value is selected
-        from the trigger direction: a buy stop normally triggers upward, a sell
-        stop normally triggers downward.
+        MEXC plan orders use numeric close sides: 2 closes a short position
+        (buy), 4 closes a long position (sell). The `trend` is the trigger
+        direction, not the order side:
+          - close short / buy: SL triggers upward, TP triggers downward
+          - close long / sell: SL triggers downward, TP triggers upward
+        Using trigger-market for both TP and SL avoids frozen reduce-only limit
+        orders and is more reliable after bot restarts.
         """
         msym = self._mexc_symbol(symbol)
         side_l = str(close_side).lower()
+        kind_l = str(kind or "sl").lower()
         mexc_side = 2 if side_l == "buy" else 4
-        # trend: 1 = trigger upward, 2 = trigger downward on common MEXC variants.
-        trend = 1 if side_l == "buy" else 2
+        if side_l == "buy":
+            trend = 1 if kind_l == "sl" else 2
+        else:
+            trend = 2 if kind_l == "sl" else 1
         body = {
             "symbol": msym,
             "vol": self._amount_to_mexc_vol(symbol, amount),
@@ -964,12 +969,18 @@ class ExchangeClient:
         return {
             "id": str(oid or ""),
             "symbol": self.normalize_symbol(symbol),
-            "type": "stop_market",
+            "type": f"{kind_l}_trigger_market",
             "side": close_side,
             "amount": amount,
             "price": None,
-            "info": {"native_mexc_stop": True, **(out if isinstance(out, dict) else {"raw": out})},
+            "info": {"native_mexc_trigger": True, "_protection_kind": kind_l, **(out if isinstance(out, dict) else {"raw": out})},
         }
+
+    async def mexc_place_stop_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, client_order_id: str = "") -> dict:
+        return await self.mexc_place_trigger_market(symbol, close_side, amount, trigger_price, kind="sl", client_order_id=client_order_id)
+
+    async def mexc_place_take_profit_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, client_order_id: str = "") -> dict:
+        return await self.mexc_place_trigger_market(symbol, close_side, amount, trigger_price, kind="tp", client_order_id=client_order_id)
 
     async def mexc_debug_state(self, symbol: str | None = None) -> dict:
         """Compact raw diagnostics for MEXC state without exposing credentials."""

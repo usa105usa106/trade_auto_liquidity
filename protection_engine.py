@@ -112,6 +112,15 @@ class ProtectionEngine:
         except Exception:
             out["reattach_error"] = "invalid qty/SL/TP"
             return out
+        # If one leg is missing or stale after restart, replace the symbol's
+        # protection set atomically: cancel old TP/SL/plan orders first, then
+        # recreate both legs with the current qty/SL/TP. This prevents duplicate
+        # stale stops and makes breakeven/runner SL updates effective on MEXC.
+        try:
+            if hasattr(self.exchange_client, "cancel_all_orders"):
+                await self.exchange_client.cancel_all_orders(pos.get("symbol"))
+        except Exception as e:
+            out["cancel_before_reattach_error"] = str(e)[:240]
         prot = await self.execution_engine.place_protection_orders(pos, live=True)
         out.update({"reattach_attempted": True, **prot})
         # Re-check after placement to avoid trusting a partially failed create_order response.

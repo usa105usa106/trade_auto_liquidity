@@ -1,6 +1,7 @@
 import time
 import os
 from scalp_exit_engine import ScalpExitPolicy
+from protection_engine import ProtectionEngine
 
 class PositionManager:
     """
@@ -160,6 +161,45 @@ class PositionManager:
                 pass
         return {"type": event_type, "symbol": symbol, "result": res}
 
+
+    async def _protection_watchdog(self, pos: dict, live: bool) -> dict | None:
+        """Periodically re-check and reattach exchange TP/SL for open positions.
+
+        This is intentionally independent from new-entry pause/run gates. After
+        a restart the bot may have local rows restored from MEXC, but MEXC TP/SL
+        legs may be missing. The watchdog keeps monitoring locally and also
+        keeps trying to rebuild exchange protection.
+        """
+        if not live:
+            return None
+        now = time.time()
+        interval = int(await self._setting("protection_watchdog_sec", os.getenv("PROTECTION_WATCHDOG_SEC", "20")) or 20)
+        try:
+            if interval <= 0 or now - float(pos.get("protection_checked_at") or pos.get("checked_at") or 0) < interval:
+                return None
+        except Exception:
+            pass
+        try:
+            pe = ProtectionEngine(self.execution_engine.exchange_client, self.execution_engine)
+            state = await pe.reconcile(pos, live=True, reattach=True)
+            pos.update(state)
+            pos["protection_checked_at"] = now
+            if state.get("protection_status") != "EXCHANGE PROTECTED":
+                pos["protection_mode"] = "local_monitoring"
+                pos["protection_warning"] = "exchange TP/SL not confirmed; bot monitors TP/SL locally"
+            else:
+                pos["protection_mode"] = "exchange"
+                pos.pop("protection_warning", None)
+            await self.storage.upsert_position(pos)
+            if state.get("reattach_attempted") or state.get("protection_status") != "EXCHANGE PROTECTED":
+                return {"type": "protection_watchdog", "symbol": pos.get("symbol"), **state}
+        except Exception as e:
+            pos["protection_warning"] = f"protection watchdog error: {str(e)[:180]}"
+            pos["protection_checked_at"] = now
+            await self.storage.upsert_position(pos)
+            return {"type": "protection_watchdog_error", "symbol": pos.get("symbol"), "error": str(e)}
+        return None
+
     async def _auto_close_on_protection_failed(self) -> bool:
         value = await self._setting("auto_close_on_protection_failed", os.getenv("ALLOW_AUTO_CLOSE_ON_PROTECTION_FAILED", "false"))
         return self._truthy(value, False)
@@ -252,6 +292,9 @@ class PositionManager:
                 except Exception:
                     pass
                 continue
+            wd = await self._protection_watchdog(pos, live)
+            if wd:
+                events.append(wd)
             try:
                 price=await price_provider(symbol)
             except Exception as e:
@@ -295,6 +338,10 @@ class PositionManager:
                 pos["updated_at"] = now
                 await self.storage.upsert_position(pos)
                 events.append({"type":"breakeven","symbol":symbol, "stop_price": new_stop})
+                pos["protection_checked_at"] = 0
+                wd = await self._protection_watchdog(pos, live)
+                if wd:
+                    events.append(wd)
                 stop = new_stop
             if is_liquidity_retest:
                 pos.setdefault("initial_stop_price", stop)
@@ -313,6 +360,10 @@ class PositionManager:
                     pos["updated_at"] = now
                     await self.storage.upsert_position(pos)
                     events.append({"type":"liquidity_runner", "symbol": symbol, "stop_price": runner_stop, "stage_r": runner_stage})
+                    pos["protection_checked_at"] = 0
+                    wd = await self._protection_watchdog(pos, live)
+                    if wd:
+                        events.append(wd)
                     stop = runner_stop
             if side=="LONG":
                 if take and price>=take:
