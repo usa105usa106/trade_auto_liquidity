@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = os.getenv("BOT_VERSION", "0073 SETTINGS RUNTIME SYNC + POSITION SAFETY")
+VERSION = os.getenv("BOT_VERSION", "0077 DEBUG CLEANUP")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)

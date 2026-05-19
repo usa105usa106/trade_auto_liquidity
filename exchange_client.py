@@ -274,14 +274,18 @@ class ExchangeClient:
 
 
     def _mexc_rest_base(self) -> str:
-        """Base URL for MEXC futures REST.
+        """Base URL for MEXC futures private REST.
 
-        MEXC support recommended using https://api.mexc.com instead of
-        https://contract.mexc.com for futures private requests when CDN 403
-        appears on the contract host. Keep it configurable, but default to the
-        support-recommended host.
+        Private trading requests must not use contract.mexc.com: that host can
+        return CDN 403 Access Denied for order/cancel/close endpoints. Even if
+        an old .env still contains contract.mexc.com, force the supported
+        private REST host to api.mexc.com. WebSocket may still use
+        wss://contract.mexc.com/edge separately.
         """
-        return os.getenv("MEXC_FUTURES_REST_BASE", "https://api.mexc.com").rstrip("/")
+        base = os.getenv("MEXC_FUTURES_REST_BASE", "https://api.mexc.com").rstrip("/")
+        if "contract.mexc.com" in base:
+            return "https://api.mexc.com"
+        return base or "https://api.mexc.com"
 
     async def _mexc_private_rate_limit(self):
         """Limit private MEXC requests to <=4 per 2 seconds.
@@ -423,13 +427,12 @@ class ExchangeClient:
     async def _mexc_private_read_any_base(self, path: str, query: dict | None = None):
         """Read native MEXC futures state from supported hosts.
 
-        Support recommended api.mexc.com for private trading after CDN 403 on
-        contract.mexc.com. For read-only state sync, MEXC can sometimes expose
-        fresher position/order state on one host before the other. Try the
-        configured host first, then api.mexc.com and contract.mexc.com.
+        Private MEXC REST is pinned to api.mexc.com-compatible hosts. Do not
+        fall back to contract.mexc.com here: private order endpoints on that
+        host can fail with CDN 403 and leak confusing errors into /close_all.
         """
         bases = []
-        for b in (self._mexc_rest_base(), "https://api.mexc.com", "https://contract.mexc.com"):
+        for b in (self._mexc_rest_base(), "https://api.mexc.com"):
             b = b.rstrip("/")
             if b not in bases:
                 bases.append(b)
@@ -589,8 +592,6 @@ class ExchangeClient:
         # empty rows from one endpoint while account/assets shows positionMargin.
         endpoints = [
             "/api/v1/private/position/open_positions",
-            "/api/v1/private/position/list/open_positions",
-            "/api/v1/private/position/holding",
         ]
         for query in queries:
             for endpoint in endpoints:
@@ -636,19 +637,58 @@ class ExchangeClient:
         oid = str(row.get("orderId") or row.get("id") or row.get("planOrderId") or row.get("stopOrderId") or row.get("externalOid") or "")
         side_raw = str(row.get("side") or row.get("positionType") or row.get("holdSide") or "")
         side = "buy" if side_raw in {"1", "2", "buy", "long"} else "sell"
-        vol = row.get("vol") or row.get("remainVol") or row.get("volume") or row.get("holdVol") or 0
+        vol = row.get("vol") or row.get("remainVol") or row.get("volume") or row.get("holdVol") or row.get("takeProfitVol") or row.get("stopLossVol") or 0
+        price = 0.0
+        for key in ("price", "executePrice", "triggerPrice", "stopPrice", "takeProfitPrice", "stopLossPrice", "takeProfitOrderPrice", "stopLossOrderPrice"):
+            try:
+                if row.get(key) not in (None, "", 0, "0"):
+                    price = float(row.get(key)); break
+            except Exception:
+                pass
+        typ = row.get("type") or row.get("orderType") or row.get("category")
+        src = str(row.get("_source_endpoint") or "")
+        if not typ and "stoporder" in src and (row.get("takeProfitPrice") or row.get("stopLossPrice")):
+            typ = "tpsl"
         return {
             "id": oid,
             "symbol": symbol,
             "side": side,
-            "type": row.get("type") or row.get("orderType") or row.get("category") or "unknown",
-            "price": float(row.get("price") or row.get("executePrice") or row.get("triggerPrice") or 0),
+            "type": typ or "unknown",
+            "price": price,
             "amount": self._mexc_contracts_to_amount(symbol, float(vol or 0)),
-            "remaining": self._mexc_contracts_to_amount(symbol, float(row.get("remainVol") or vol or 0)),
+            "remaining": self._mexc_contracts_to_amount(symbol, float(row.get("remainVol") or row.get("realityVol") or vol or 0)),
             "status": "open",
             "clientOrderId": row.get("externalOid"),
             "info": row,
         }
+
+    def _mexc_expand_tpsl_row(self, row: dict) -> list[dict]:
+        """Split MEXC combined TP/SL rows into explicit pseudo-orders.
+
+        /api/v1/private/stoporder/open_orders returns one row that can contain
+        both takeProfitPrice and stopLossPrice. The protection checker expects
+        separate TP and SL candidates, so expose both while preserving the raw
+        row in info.
+        """
+        out = []
+        base_id = str(row.get("id") or row.get("orderId") or row.get("positionId") or "")
+        if row.get("takeProfitPrice") not in (None, "", 0, "0"):
+            tp = dict(row)
+            tp["id"] = f"{base_id}:TP" if base_id else "TP"
+            tp["orderId"] = tp["id"]
+            tp["_protection_kind"] = "tp"
+            tp["_protection_price"] = row.get("takeProfitPrice")
+            tp["triggerPrice"] = row.get("takeProfitPrice")
+            out.append(tp)
+        if row.get("stopLossPrice") not in (None, "", 0, "0"):
+            sl = dict(row)
+            sl["id"] = f"{base_id}:SL" if base_id else "SL"
+            sl["orderId"] = sl["id"]
+            sl["_protection_kind"] = "sl"
+            sl["_protection_price"] = row.get("stopLossPrice")
+            sl["triggerPrice"] = row.get("stopLossPrice")
+            out.append(sl)
+        return out or [row]
 
     async def _mexc_fetch_open_orders(self, symbol=None):
         """Fetch normal open orders plus trigger/TP-SL style orders.
@@ -663,23 +703,23 @@ class ExchangeClient:
             candidates.extend([
                 ("/api/v1/private/order/list/open_orders/" + msym, {}),
                 ("/api/v1/private/order/list/open_orders", {"symbol": msym}),
-                ("/api/v1/private/planorder/list/orders", {"symbol": msym, "states": "1"}),
-                ("/api/v1/private/planorder/list/orders", {"symbol": msym, "isFinished": 0}),
-                ("/api/v1/private/stoporder/list/orders", {"symbol": msym, "states": "1"}),
-                ("/api/v1/private/stoporder/list/orders", {"symbol": msym, "isFinished": 0}),
-                ("/api/v1/private/tpsl/list/orders", {"symbol": msym, "states": "1"}),
-                ("/api/v1/private/tpsl/list/orders", {"symbol": msym, "isFinished": 0}),
+                ("/api/v1/private/planorder/list/orders", {"symbol": msym, "state": 1, "page_num": 1, "page_size": 100}),
+                ("/api/v1/private/planorder/list/orders", {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100}),
+                ("/api/v1/private/stoporder/open_orders", {"symbol": msym}),
+                ("/api/v1/private/stoporder/list/orders", {"symbol": msym, "state": 1, "is_finished": 0, "page_num": 1, "page_size": 100}),
+                ("/api/v1/private/stoporder/list/orders", {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100}),
+                ("/api/v1/private/tpsl/list/orders", {"symbol": msym, "state": 1, "is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/position/stop_orders", {"symbol": msym}),
             ])
         else:
             candidates.extend([
                 ("/api/v1/private/order/list/open_orders", {}),
-                ("/api/v1/private/planorder/list/orders", {"states": "1"}),
-                ("/api/v1/private/planorder/list/orders", {"isFinished": 0}),
-                ("/api/v1/private/stoporder/list/orders", {"states": "1"}),
-                ("/api/v1/private/stoporder/list/orders", {"isFinished": 0}),
-                ("/api/v1/private/tpsl/list/orders", {"states": "1"}),
-                ("/api/v1/private/tpsl/list/orders", {"isFinished": 0}),
+                ("/api/v1/private/planorder/list/orders", {"state": 1, "page_num": 1, "page_size": 100}),
+                ("/api/v1/private/planorder/list/orders", {"is_finished": 0, "page_num": 1, "page_size": 100}),
+                ("/api/v1/private/stoporder/open_orders", {}),
+                ("/api/v1/private/stoporder/list/orders", {"state": 1, "is_finished": 0, "page_num": 1, "page_size": 100}),
+                ("/api/v1/private/stoporder/list/orders", {"is_finished": 0, "page_num": 1, "page_size": 100}),
+                ("/api/v1/private/tpsl/list/orders", {"state": 1, "is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/position/stop_orders", {}),
             ])
         orders = []
@@ -690,7 +730,9 @@ class ExchangeClient:
                 rows = [r for r in self._mexc_rows(out.get("data")) if isinstance(r, dict)]
                 for r in rows:
                     r.setdefault("_source_endpoint", path)
-                    orders.append(self._mexc_parse_order(r))
+                    for expanded in self._mexc_expand_tpsl_row(r):
+                        expanded.setdefault("_source_endpoint", path)
+                        orders.append(self._mexc_parse_order(expanded))
             except Exception as e:
                 errors.append(f"{path}: {e}")
         # De-duplicate.
@@ -740,12 +782,11 @@ class ExchangeClient:
                 except Exception as e:
                     errors.append({"symbol": sym, "endpoint": path, "error": str(e)})
         if not seen and not symbol:
-            # Some accounts may have order reserves but listing may fail; attempt
-            # exchange-wide ccxt cancellation as a final fallback.
-            try:
-                results.append({"symbol": "all", "endpoint": "ccxt.cancel_all_orders", "result": await self.exchange.cancel_all_orders(None)})
-            except Exception as e:
-                errors.append({"symbol": "all", "error": str(e)})
+            # Do not call ccxt.cancel_all_orders(None) on MEXC. ccxt may route
+            # it to https://contract.mexc.com/api/v1/private/order/cancel_all,
+            # which is exactly the CDN-403 path this client is designed to
+            # avoid. With no discovered symbols there is nothing safe to cancel.
+            return {"ok": True, "cancelled_symbols": 0, "results": [], "errors": [], "skipped": "no symbols with open orders/positions"}
         return {"ok": len(errors) == 0, "cancelled_symbols": len(results), "results": results, "errors": errors}
 
 
@@ -840,8 +881,6 @@ class ExchangeClient:
         endpoints = [
             "/api/v1/private/account/assets",
             "/api/v1/private/position/open_positions",
-            "/api/v1/private/position/list/open_positions",
-            "/api/v1/private/position/holding",
             "/api/v1/private/order/list/open_orders",
             "/api/v1/private/planorder/list/orders",
             "/api/v1/private/stoporder/list/orders",
@@ -870,7 +909,15 @@ class ExchangeClient:
                         "sample": sample,
                     })
                 except Exception as e:
-                    report["endpoints"].append({"endpoint": ep, "query": q, "error": str(e)[:220]})
+                    # Debug output must stay clean for Telegram: do not spam users
+                    # with known unavailable MEXC variants/HTML/404 text. Keep the
+                    # compact suppressed list only for developers if needed later.
+                    report.setdefault("suppressed_errors", []).append({
+                        "endpoint": ep,
+                        "query": q,
+                        "error": str(e)[:220],
+                    })
+                    continue
         return report
 
     async def mexc_account_state(self):

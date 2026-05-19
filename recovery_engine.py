@@ -4,6 +4,8 @@ import os
 import time
 from typing import Any
 
+from protection_engine import ProtectionEngine
+
 
 class RecoveryEngine:
     """Restore bot state from real MEXC positions after restart.
@@ -89,12 +91,8 @@ class RecoveryEngine:
             return entry * (1 + sl_pct), entry * (1 - tp_pct)
         return entry * (1 - sl_pct), entry * (1 + tp_pct)
 
-    async def _protection_exists(self, symbol: str) -> bool:
-        try:
-            orders = await self.exchange_client.fetch_open_orders(symbol)
-            return bool(orders)
-        except Exception:
-            return False
+    async def _protection_state(self, pos: dict) -> dict:
+        return await ProtectionEngine(self.exchange_client, self.execution_engine).check(pos)
 
     async def recover(self, reattach: bool = True) -> dict:
         report = {
@@ -152,27 +150,23 @@ class RecoveryEngine:
                 "exchange_recovered": True,
                 "raw_exchange_position": ep,
             })
-            has_protection = await self._protection_exists(symbol)
-            if has_protection:
+            state = await ProtectionEngine(self.exchange_client, self.execution_engine).reconcile(pos, live=True, reattach=reattach)
+            pos.update(state)
+            if state.get("protection_status") == "EXCHANGE PROTECTED":
                 pos["protection_mode"] = "exchange"
                 pos.pop("protection_warning", None)
                 report["protection_ok"] += 1
+                if state.get("reattach_attempted"):
+                    report["reattach_attempted"] += 1
+                    report["reattach_ok"] += 1
             else:
                 pos["protection_mode"] = "local_monitoring"
-                pos["protection_warning"] = "recovered after restart; exchange TP/SL not found; local TP/SL monitor active"
+                pos["protection_warning"] = "exchange TP/SL not fully confirmed; local TP/SL monitor active"
                 report["local_monitoring"] += 1
-                if reattach and float(pos.get("qty") or 0) > 0 and float(pos.get("stop_price") or 0) > 0 and float(pos.get("take_price") or 0) > 0:
+                if reattach:
                     report["reattach_attempted"] += 1
-                    try:
-                        prot = await self.execution_engine.place_protection_orders(pos, live=True)
-                        pos.update(prot)
-                        if prot.get("ok"):
-                            pos["protection_mode"] = "exchange"
-                            pos.pop("protection_warning", None)
-                            report["reattach_ok"] += 1
-                    except Exception as e:
-                        pos["reattach_error"] = str(e)[:240]
-                        report["errors"].append(f"reattach {symbol}: {e}")
+                    if state.get("reattach_error") or state.get("tp_error") or state.get("sl_error"):
+                        report["errors"].append(f"reattach {symbol}: {state.get('reattach_error') or state.get('tp_error') or state.get('sl_error')}")
             pos = self.execution_engine._decorate_position_metrics(pos)
             await self.storage.upsert_position(pos)
             if old:

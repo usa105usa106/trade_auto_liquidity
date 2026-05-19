@@ -421,6 +421,12 @@ class ExecutionEngine:
             out["sl_error"] = str(e)
         if require_exchange_protection and (not out.get("tp_order_id") or not out.get("sl_order_id")):
             out["ok"] = False
+        out["protection_status"] = "EXCHANGE PROTECTED" if out.get("tp_order_id") and out.get("sl_order_id") else "LOCAL FALLBACK"
+        out["protection_mode"] = "exchange" if out["protection_status"] == "EXCHANGE PROTECTED" else "local_monitoring"
+        if out["protection_status"] != "EXCHANGE PROTECTED":
+            out["protection_warning"] = "exchange TP/SL not fully confirmed; local monitor fallback active"
+        else:
+            out.pop("protection_warning", None)
         return out
 
     async def cancel_entry(self, pos: dict, live: bool, reason: str = "limit_timeout"):

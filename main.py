@@ -16,6 +16,7 @@ from exchange_client import ExchangeClient
 from execution_engine import ExecutionEngine
 from sync_engine import SyncEngine
 from recovery_engine import RecoveryEngine
+from protection_engine import ProtectionEngine
 from scanner import Scanner
 from production_gate import ProductionGate
 from ws_engine import WebSocketSupervisor, futures_source_from_mode
@@ -520,13 +521,17 @@ async def panic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     failures.append(f"exchange {symbol}: {res.get('reason')}")
         except Exception as e:
             failures.append(f"fetch/close exchange positions: {e}")
-        # Final emergency fallback: native MEXC close_all, because some MEXC
-        # accounts can have position margin while open_positions returns empty.
-        if hasattr(ex, "mexc_close_all_positions_native"):
+        # Final emergency fallback: native MEXC close_all only if we did not
+        # already close listed positions. Suppress harmless MEXC 2009 responses
+        # meaning the position is already gone.
+        if closed_local == 0 and closed_external == 0 and hasattr(ex, "mexc_close_all_positions_native"):
             try:
                 native_close_res = await ex.mexc_close_all_positions_native()
             except Exception as e:
-                failures.append(f"native_close_all: {e}")
+                if "2009" not in str(e) and "nonexistent or closed" not in str(e).lower():
+                    failures.append(f"native_close_all: {e}")
+                else:
+                    native_close_res = {"ok": True, "skipped": "already closed"}
 
     text = (
         "🚨 PANIC MODE\n"
@@ -760,7 +765,7 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Import/update real exchange positions into local cache without
             # creating extra protection orders from a read-only /positions call.
             if exchange_positions:
-                rec = await RecoveryEngine(storage, ex, exec_engine).recover(reattach=False)
+                rec = await RecoveryEngine(storage, ex, exec_engine).recover(reattach=True)
                 if rec.get("restored") or rec.get("updated"):
                     reconcile_notes.append(f"reconciled local cache: +{rec.get('restored', 0)} restored, {rec.get('updated', 0)} updated")
 
@@ -821,10 +826,22 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             notional, margin, leverage, margin_type = _position_money_fields(p)
             coin = str(p.get('symbol', '')).split('/')[0]
             warn = ""
-            if p.get("protection_mode") == "local_monitoring" or p.get("protection_warning"):
-                warn = "\n⚠️ Protection: LOCAL monitoring only; exchange TP/SL not confirmed"
-                if p.get("tp_error") or p.get("sl_error"):
-                    warn += f"\nTP err: {str(p.get('tp_error') or '-')[:120]}\nSL err: {str(p.get('sl_error') or '-')[:120]}"
+            status = p.get("protection_status") or ("EXCHANGE PROTECTED" if p.get("protection_mode") == "exchange" else "LOCAL FALLBACK" if p.get("protection_mode") == "local_monitoring" else "UNKNOWN")
+            if status == "EXCHANGE PROTECTED":
+                warn = "\n🛡️ Protection: EXCHANGE PROTECTED (TP/SL confirmed on MEXC)"
+            elif status == "UNPROTECTED":
+                warn = "\n🚨 Protection: UNPROTECTED (no exchange TP/SL confirmed; local fallback may be unavailable)"
+            elif p.get("protection_mode") == "local_monitoring" or p.get("protection_warning"):
+                warn = "\n⚠️ Protection: LOCAL FALLBACK (exchange TP/SL not fully confirmed; bot monitors TP/SL locally)"
+            else:
+                warn = f"\nℹ️ Protection: {status}"
+            details = []
+            if p.get("tp_exists") is not None or p.get("sl_exists") is not None:
+                details.append(f"TP={'yes' if p.get('tp_exists') else 'no'} SL={'yes' if p.get('sl_exists') else 'no'}")
+            if p.get("tp_error") or p.get("sl_error") or p.get("protection_error") or p.get("reattach_error"):
+                details.append(f"err={str(p.get('protection_error') or p.get('reattach_error') or p.get('tp_error') or p.get('sl_error'))[:160]}")
+            if details:
+                warn += "\n" + " | ".join(details)
             lines.append(
                 f"{p.get('symbol')} {p.get('side')} {p.get('status')} "
                 f"entry={p.get('entry_price')} SL={p.get('stop_price')} TP={p.get('take_price')}\n"
@@ -976,13 +993,18 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cancel_res = await ex.cancel_all_orders()
         except Exception as e:
             failures.append(f"cancel_all: {e}")
-        # Extra safety: MEXC native close_all closes exchange-side positions even
-        # when position listing is stale/empty.
-        if hasattr(ex, "mexc_close_all_positions_native"):
+        # Extra safety: call native close_all only when nothing was listed and
+        # closed manually. If listed positions were already closed, MEXC often
+        # returns code 2009 (Position is nonexistent or closed), which is not a
+        # real failure and only confuses the operator.
+        if closed == 0 and hasattr(ex, "mexc_close_all_positions_native"):
             try:
                 native_res = await ex.mexc_close_all_positions_native()
             except Exception as e:
-                failures.append(f"native_close_all: {e}")
+                if "2009" not in str(e) and "nonexistent or closed" not in str(e).lower():
+                    failures.append(f"native_close_all: {e}")
+                else:
+                    native_res = {"ok": True, "skipped": "already closed"}
         # v0067: clear local cache only after balance confirms there is no hidden
         # position margin left. Previously the bot could erase local state while
         # MEXC still showed used/positionMargin > 0.
@@ -1022,16 +1044,19 @@ async def mexc_debug_state_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         if symbol:
             lines.append(f"Symbol: {symbol}")
             lines.append("Variants: " + ", ".join(report.get("variants") or [])[:500])
+        shown = 0
         for item in (report.get("endpoints") or [])[:24]:
             ep = item.get("endpoint")
             q = item.get("query")
             if item.get("error"):
-                lines.append(f"{ep} {q}: ERR {item.get('error')}")
-            else:
-                sample = str(item.get("sample"))
-                if len(sample) > 260:
-                    sample = sample[:260] + "..."
-                lines.append(f"{ep} {q}: rows={item.get('rows')} base={item.get('base')} sample={sample}")
+                continue
+            sample = str(item.get("sample"))
+            if len(sample) > 260:
+                sample = sample[:260] + "..."
+            lines.append(f"{ep} {q}: rows={item.get('rows')} base={item.get('base')} sample={sample}")
+            shown += 1
+        if shown == 0:
+            lines.append("No debug rows returned from supported MEXC endpoints")
         await reply(update, "\n".join(lines)[:3900], reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"🧪 MEXC debug failed: {e}", reply_markup=MAIN_MENU)

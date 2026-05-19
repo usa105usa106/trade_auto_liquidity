@@ -1,6 +1,7 @@
 import os
 import time
 from execution_engine import ExecutionEngine
+from protection_engine import ProtectionEngine
 
 
 class SyncEngine:
@@ -118,6 +119,26 @@ class SyncEngine:
                         report["warnings"].append(f"{symbol}: exchange protection placement failed: {protection}")
         except Exception as e:
             report["warnings"].append(f"positions sync failed: {e}")
+
+        try:
+            # Verify existing local open rows too; this catches lost TP/SL after restart
+            # even when the position was not newly imported.
+            eng = ExecutionEngine(self.storage, self.exchange_client)
+            pe = ProtectionEngine(self.exchange_client, eng)
+            for lp in await self.storage.positions():
+                if str(lp.get("status") or "").lower() != "open":
+                    continue
+                state = await pe.reconcile(lp, live=True, reattach=protect)
+                lp.update(state)
+                if state.get("protection_status") == "EXCHANGE PROTECTED":
+                    report["protected_positions"] = report.get("protected_positions", 0) + 1
+                    lp.pop("protection_warning", None)
+                else:
+                    lp["protection_warning"] = "exchange TP/SL not fully confirmed; local TP/SL monitor active"
+                    report["warnings"].append(f"{lp.get('symbol')}: protection status {state.get('protection_status')}")
+                await self.storage.upsert_position(lp)
+        except Exception as e:
+            report["warnings"].append(f"protection reconcile failed: {e}")
 
         try:
             orders = await self.exchange_client.fetch_open_orders()
