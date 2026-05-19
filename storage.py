@@ -95,6 +95,7 @@ DEFAULT_SETTINGS = {
     "ws_require_healthy_for_entries": False,
     "ws_stale_sec": 20,
     "settings_revision": 1,
+    "total_positions_opened": int(os.getenv("TOTAL_POSITIONS_OPENED", "0") or 0),
 }
 
 class Storage:
@@ -211,6 +212,24 @@ class Storage:
                     ("settings_revision", json.dumps(rev), time.time()),
                 )
             await db.commit()
+
+
+    async def increment_counter(self, key: str, amount: int = 1) -> int:
+        """Atomically increment a numeric setting and return the new value."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
+            row = await cur.fetchone()
+            try:
+                current = int(json.loads(row[0])) if row and row[0] is not None else 0
+            except Exception:
+                current = 0
+            new_value = current + int(amount or 0)
+            await db.execute(
+                "INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)",
+                (key, json.dumps(new_value), time.time()),
+            )
+            await db.commit()
+            return new_value
 
     async def all_settings(self) -> dict:
         async with aiosqlite.connect(self.path) as db:

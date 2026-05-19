@@ -112,14 +112,18 @@ class ExchangeClient:
         return (getattr(self.exchange, "markets", {}) or {}).get(norm, {"symbol": norm})
 
     def _mexc_symbol(self, symbol: str) -> str:
+        """Return the native MEXC futures contract id, e.g. XMR_USDT.
+
+        Some ccxt market ids are plain XMR/USDT. MEXC private futures
+        endpoints reject that spelling with `Contract does not exist`, so every
+        private REST body must use an underscore contract id.
+        """
         m = self._market(symbol)
         mid = str(m.get("id") or "")
         if mid:
-            return mid
+            return self._mexc_normalize_contract_id(mid)
         norm = str(m.get("symbol") or self.normalize_symbol(symbol))
-        base = norm.split("/", 1)[0]
-        quote = (norm.split("/", 1)[1].split(":", 1)[0] if "/" in norm else "USDT")
-        return f"{base}_{quote}"
+        return self._mexc_normalize_contract_id(norm)
 
     def mexc_symbol_variants(self, symbol: str) -> list[str]:
         """Return all symbol spellings MEXC may use for the same futures pair.
@@ -850,15 +854,46 @@ class ExchangeClient:
             ("/api/v1/private/order/cancel_all", "POST"),
             ("/api/v1/private/planorder/cancel_all", "POST"),
             ("/api/v1/private/stoporder/cancel_all", "POST"),
+            ("/api/v1/private/tpsl/cancel_all", "POST"),
         ]
         for sym in seen:
             msym = self._mexc_symbol(sym)
             for path, method in cancel_paths:
                 try:
                     out = await self._mexc_private(method, path, body={"symbol": msym})
-                    results.append({"symbol": self.normalize_symbol(sym), "endpoint": path, "result": out})
+                    results.append({"symbol": self.normalize_symbol(sym), "mexc_symbol": msym, "endpoint": path, "result": out})
                 except Exception as e:
-                    errors.append({"symbol": sym, "endpoint": path, "error": str(e)})
+                    errors.append({"symbol": sym, "mexc_symbol": msym, "endpoint": path, "error": str(e)})
+        # Fallback: cancel individual discovered normal/plan/stop orders. This
+        # releases frozen balance when cancel_all misses an endpoint variant.
+        try:
+            discovered = await self._mexc_fetch_open_orders(symbol)
+            for o in discovered:
+                info = o.get("info") if isinstance(o.get("info"), dict) else {}
+                oid = str(o.get("id") or info.get("orderId") or info.get("planOrderId") or info.get("stopOrderId") or "")
+                if not oid:
+                    continue
+                msym = self._mexc_symbol(o.get("symbol") or symbol)
+                candidates = [
+                    ("/api/v1/private/order/cancel", {"symbol": msym, "orderId": oid}),
+                    ("/api/v1/private/planorder/cancel", {"symbol": msym, "orderId": oid}),
+                    ("/api/v1/private/stoporder/cancel", {"symbol": msym, "orderId": oid}),
+                    ("/api/v1/private/tpsl/cancel", {"symbol": msym, "orderId": oid}),
+                ]
+                for path, body in candidates:
+                    try:
+                        out = await self._mexc_private("POST", path, body=body)
+                        results.append({"symbol": o.get("symbol"), "mexc_symbol": msym, "order_id": oid, "endpoint": path, "result": out})
+                        break
+                    except Exception as e:
+                        # Unsupported endpoint/order type is expected; keep only
+                        # the last compact error if every candidate fails.
+                        last_err = str(e)
+                else:
+                    errors.append({"symbol": o.get("symbol"), "mexc_symbol": msym, "order_id": oid, "endpoint": "individual_cancel", "error": last_err[:220]})
+        except Exception as e:
+            errors.append({"symbol": symbol or "*", "endpoint": "individual_cancel_discovery", "error": str(e)[:220]})
+
         if not seen and not symbol:
             # Do not call ccxt.cancel_all_orders(None) on MEXC. ccxt may route
             # it to https://contract.mexc.com/api/v1/private/order/cancel_all,

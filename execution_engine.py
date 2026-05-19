@@ -284,6 +284,13 @@ class ExecutionEngine:
             await self.storage.upsert_position(pos)
 
             if pos["status"] == "open":
+                try:
+                    pos["total_positions_opened"] = await self.storage.increment_counter("total_positions_opened", 1)
+                    await self.storage.upsert_position(pos)
+                except Exception as e:
+                    pos["open_counter_warning"] = str(e)[:160]
+
+            if pos["status"] == "open":
                 protection = await self.place_protection_orders(pos, live=True)
                 pos.update(protection)
                 await self.storage.upsert_position(pos)

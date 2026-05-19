@@ -367,14 +367,14 @@ def _estimate_exchange_position_margin(positions: list, default_leverage: int = 
         try:
             info = pos.get("info") or {} if isinstance(pos, dict) else {}
             qty = 0.0
-            for key in ("amount", "qty", "size", "contracts"):
+            for key in ("amount", "qty", "size", "contracts", "holdVol", "vol"):
                 v = pos.get(key) if isinstance(pos, dict) else None
                 if v not in (None, ""):
                     qty = abs(float(v))
                     if qty > 0:
                         break
             price = 0.0
-            for key in ("entryPrice", "entry_price", "markPrice"):
+            for key in ("entryPrice", "entry_price", "markPrice", "holdAvgPrice", "openAvgPrice"):
                 v = pos.get(key) if isinstance(pos, dict) else None
                 if v not in (None, "", 0, "0"):
                     price = abs(float(v))
@@ -684,12 +684,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /stop - остановить новые входы
 /panic - закрыть позиции и отменить ордера
 /status - статус
-/ping - отклик, RAM, uptime
-/balance - futures balance + IP/proxy
+/ping - отклик ms, RAM, uptime, открыто сейчас и общий счётчик открытий
+/balance - futures balance + IP/proxy; если MEXC margin=0 при открытых позициях, показывает estimated margin
 /positions - локальные + реальные позиции MEXC + protection mode
 /open_orders - обычные + plan/stop/TP-SL ордера MEXC
-/cancel_all - отменить все открытые ордера MEXC
-/close_all - закрыть все реальные позиции MEXC native close-all
+/cancel_all - отменить normal/plan/stop/TP-SL ордера MEXC, включая ghost/frozen orders
+/close_all - закрыть реальные позиции, отменить все ордера, затем сверить balance/cache
 /stats - статистика сделок
 /sync - синхронизация позиций/ордеров
 /sync_positions - подтянуть реальные позиции MEXC в бота
@@ -714,7 +714,7 @@ live_trading, risk_pct, max_open_positions, scan_interval_sec, scanner_concurren
 ws_update_throttle_ms, ws_max_updates_per_batch, ws_queue_limit,
 symbol_refresh_sec, universe_mode, strategy_mode, mirror_mode,
 spot_confirmation_enabled, session_filter_enabled, america_short_bias_enabled, ws_enabled,
-mexc_order_leverage, mexc_order_open_type, mexc_recv_window, margin_allocation_enabled, require_exchange_protection, auto_close_on_protection_failed,
+mexc_order_leverage, mexc_order_open_type, mexc_recv_window, margin_allocation_enabled, require_exchange_protection, auto_close_on_protection_failed, total_positions_opened,
 scan_market_source = binance_binance | mexc_mexc | mexc_binance.
 
 По умолчанию: mexc_binance = MEXC фьючи скан + Binance spot подтверждение.
@@ -891,10 +891,38 @@ Scanner error: {scanner.last_refresh_error or '-'}
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
+    t0 = time.perf_counter()
     proc = psutil.Process()
     ram = proc.memory_info().rss / 1024 / 1024
     uptime = int(time.time() - started_at)
-    await reply(update, f"🏓 Pong\nVersion: {VERSION}\nRAM: {ram:.1f} MB\nUptime: {uptime}s", reply_markup=MAIN_MENU)
+    total_opened = 0
+    local_open = 0
+    exchange_open = "n/a"
+    try:
+        total_opened = int(await storage.get("total_positions_opened", 0) or 0)
+        local_open = len([p for p in await storage.positions() if str(p.get("status", "open")).lower() in {"open", "pending"}])
+    except Exception:
+        pass
+    try:
+        s = await storage.all_settings()
+        ex = await get_exchange(s)
+        exec_engine = ExecutionEngine(storage, ex)
+        positions = await ex.fetch_positions()
+        exchange_open = len([p for p in (positions or []) if exec_engine.exchange_position_qty(p) > 0])
+    except Exception:
+        exchange_open = "n/a"
+    response_ms = (time.perf_counter() - t0) * 1000
+    await reply(
+        update,
+        f"🏓 Pong\n"
+        f"Version: {VERSION}\n"
+        f"Response: {response_ms:.0f} ms\n"
+        f"RAM: {ram:.1f} MB\n"
+        f"Uptime: {uptime}s\n"
+        f"Open now: local {local_open} | exchange {exchange_open}\n"
+        f"Total positions opened: {total_opened}",
+        reply_markup=MAIN_MENU,
+    )
 
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -1031,7 +1059,7 @@ def _exchange_position_text(p: dict) -> str:
     symbol = p.get("symbol") or info.get("symbol") or "-"
     side = str(p.get("side") or info.get("side") or "-").upper()
     qty = 0.0
-    for key in ("amount", "qty", "size", "contracts"):
+    for key in ("amount", "qty", "size", "contracts", "holdVol", "vol"):
         try:
             value = p.get(key)
             if value not in (None, ""):
@@ -1352,7 +1380,14 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
             post_pm = float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
             post_used = float(usdt.get("used") or ((bal or {}).get("used", {}) or {}).get("USDT") or 0)
-            if post_pm <= 0.5 and post_used <= 0.5:
+            try:
+                post_positions = [p for p in (await ex.fetch_positions() or []) if exec_engine.exchange_position_qty(p) > 0]
+            except Exception:
+                post_positions = []
+            # Balance.used/frozen can stay non-zero because of leftover orders.
+            # Local position cache must follow real exchange positions, not stale
+            # frozen margin, otherwise the bot monitors ghosts after /close_all.
+            if not post_positions:
                 for lp in await storage.positions():
                     try:
                         await storage.remove_position(lp.get("symbol"))
@@ -1360,10 +1395,8 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
                 local_cache_cleared = True
             else:
-                # MEXC may keep balance margin stale for a few seconds after flat.
-                # Do not show scary hidden-margin text; /positions exchange sync is
-                # the source of truth and will restore a real position if needed.
                 local_cache_cleared = False
+                failures.append(f"positions still open after close_all: {len(post_positions)}")
         except Exception as e:
             failures.append(f"post-close balance check: {e}")
         await reply(update, f"🧯 Close all sent\nListed positions closed: {closed}\nCancel all: {str(cancel_res)[:220] if cancel_res is not None else '-'}\nNative close_all: {str(native_res)[:300] if native_res is not None else '-'}\nPost used: {post_used if post_used is not None else '-'}\nPost position margin: {post_pm if post_pm is not None else '-'}\nLocal cache cleared: {'yes' if local_cache_cleared else 'no'}\nFailures: {[f for f in failures[:5] if 'hidden margin' not in str(f).lower()] if failures else '-'}", reply_markup=MAIN_MENU)

@@ -4,11 +4,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Previous packaged version markers for regression tests: 0078 SCALP EXIT SAFETY | 0089 OPENAI PROMPT QUALITY FIX
+# Previous packaged version markers for regression tests: 0078 SCALP EXIT SAFETY | 0089 OPENAI PROMPT QUALITY FIX | 0096 SAFE STOP MARKET RECOVERY
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
-VERSION = os.getenv("BOT_VERSION", "0096 SAFE STOP MARKET RECOVERY")
+VERSION = os.getenv("BOT_VERSION", "0097 CLOSE CANCEL BALANCE HARDENING")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
