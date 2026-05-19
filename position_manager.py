@@ -19,6 +19,34 @@ class PositionManager:
         self.limit_timeout_sec = int(os.getenv("LIMIT_TIMEOUT_SEC", "300"))
         self.breakeven_trigger_pct = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.30"))
 
+    @staticmethod
+    def _truthy(value, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    async def _setting(self, key: str, default):
+        try:
+            if hasattr(self.storage, "get"):
+                value = await self.storage.get(key, None)
+                if value is not None:
+                    return value
+        except Exception:
+            pass
+        return default
+
+    async def _runtime_limits(self) -> tuple[int, int, float]:
+        time_stop = int(await self._setting("time_stop_sec", self.time_stop_sec) or self.time_stop_sec)
+        limit_timeout = int(await self._setting("limit_timeout_sec", self.limit_timeout_sec) or self.limit_timeout_sec)
+        breakeven = float(await self._setting("breakeven_trigger_pct", self.breakeven_trigger_pct) or self.breakeven_trigger_pct)
+        return time_stop, limit_timeout, breakeven
+
+    async def _auto_close_on_protection_failed(self) -> bool:
+        value = await self._setting("auto_close_on_protection_failed", os.getenv("ALLOW_AUTO_CLOSE_ON_PROTECTION_FAILED", "false"))
+        return self._truthy(value, False)
+
     def pnl_pct(self, pos, price):
         entry = float(pos.get("entry_price") or 0)
         if entry <= 0:
@@ -40,7 +68,8 @@ class PositionManager:
             return {"type": "paper_limit_filled", "symbol": symbol}
 
         # Timeout: cancel stale limit entry and free slot.
-        if now - opened >= self.limit_timeout_sec:
+        _time_stop_sec, limit_timeout_sec, _breakeven_trigger_pct = await self._runtime_limits()
+        if now - opened >= limit_timeout_sec:
             res = await self.execution_engine.cancel_entry(pos, live=True, reason="limit_timeout")
             return {"type": "limit_timeout", "symbol": symbol, "result": res}
 
@@ -71,7 +100,7 @@ class PositionManager:
                     pos["protection_warning"] = "exchange protection failed; local TP/SL monitor active"
                     pos.update(protection)
                     await self.storage.upsert_position(pos)
-                    if os.getenv("ALLOW_AUTO_CLOSE_ON_PROTECTION_FAILED", "false").lower() in {"1", "true", "yes", "on"}:
+                    if await self._auto_close_on_protection_failed():
                         close_res = await self.execution_engine.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
                         return {"type": "protection_failed", "symbol": symbol, "result": close_res, "protection": protection}
                     return {"type": "protection_local", "symbol": symbol, "protection": protection}
@@ -87,6 +116,7 @@ class PositionManager:
 
     async def manage(self, price_provider, live: bool):
         events=[]; now=time.time()
+        time_stop_sec, _limit_timeout_sec, breakeven_trigger_pct = await self._runtime_limits()
         for pos in await self.storage.positions():
             status = pos.get("status")
             if status == "pending":
@@ -105,7 +135,7 @@ class PositionManager:
             if not price:
                 continue
             side=str(pos.get("side")).upper(); stop=float(pos.get("stop_price") or 0); take=float(pos.get("take_price") or 0); entry=float(pos.get("entry_price") or 0); opened=float(pos.get("opened_at") or now); pnl=self.pnl_pct(pos, price)
-            if pnl>=self.breakeven_trigger_pct and entry>0:
+            if pnl>=breakeven_trigger_pct and entry>0:
                 if (side=="LONG" and stop<entry) or (side=="SHORT" and stop>entry):
                     pos["stop_price"]=entry; await self.storage.upsert_position(pos); events.append({"type":"breakeven","symbol":symbol})
                     stop = entry
@@ -119,6 +149,6 @@ class PositionManager:
                     events.append({"type":"tp","symbol":symbol,"result":await self.execution_engine.close_position(pos,"take_profit",live,price)}); continue
                 if stop and price>=stop:
                     events.append({"type":"sl","symbol":symbol,"result":await self.execution_engine.close_position(pos,"stop_loss",live,price)}); continue
-            if now-opened>=self.time_stop_sec:
+            if now-opened>=time_stop_sec:
                 events.append({"type":"time_stop","symbol":symbol,"result":await self.execution_engine.close_position(pos,"time_stop",live,price)})
         return events

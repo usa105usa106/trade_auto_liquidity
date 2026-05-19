@@ -22,6 +22,31 @@ class ExecutionEngine:
         self.storage = storage
         self.exchange_client = exchange_client
 
+
+    @staticmethod
+    def _truthy(value, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    async def _setting_bool(self, key: str, env_key: str | None = None, default: bool = False) -> bool:
+        """Read runtime safety switches from SQLite first, env second.
+
+        /set stores values in SQLite, so execution must not rely only on
+        process environment variables. This keeps Telegram settings, Railway
+        env fallbacks, startup recovery and tests consistent.
+        """
+        try:
+            if hasattr(self.storage, "get"):
+                value = await self.storage.get(key, None)
+                if value is not None:
+                    return self._truthy(value, default)
+        except Exception:
+            pass
+        return self._truthy(os.getenv(env_key or key.upper()), default)
+
     def _lock_for(self, symbol: str) -> asyncio.Lock:
         if symbol not in self._symbol_locks:
             self._symbol_locks[symbol] = asyncio.Lock()
@@ -262,7 +287,8 @@ class ExecutionEngine:
                     pos["protection_warning"] = "exchange protection failed; local TP/SL monitor active"
                     pos["updated_at"] = time.time()
                     await self.storage.upsert_position(pos)
-                    if os.getenv("ALLOW_AUTO_CLOSE_ON_PROTECTION_FAILED", "false").lower() in {"1", "true", "yes", "on"}:
+                    auto_close = await self._setting_bool("auto_close_on_protection_failed", "ALLOW_AUTO_CLOSE_ON_PROTECTION_FAILED", False)
+                    if auto_close:
                         close_res = await self.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
                         return {"ok": False, "reason": "protection orders failed; auto-close explicitly enabled", "protection": protection, "close_result": close_res}
                     return {"ok": True, "order": order, "position": pos, "warning": "exchange protection failed; local TP/SL monitor active"}
@@ -375,7 +401,7 @@ class ExecutionEngine:
             return {}
         side = "sell" if str(pos.get("side")).upper() == "LONG" else "buy"
         out = {"ok": True}
-        require_exchange_protection = os.getenv("REQUIRE_EXCHANGE_PROTECTION", "true").lower() in {"1", "true", "yes", "on"}
+        require_exchange_protection = await self._setting_bool("require_exchange_protection", "REQUIRE_EXCHANGE_PROTECTION", True)
         try:
             tp = float(pos.get("take_price") or 0)
             if tp > 0:
@@ -470,5 +496,9 @@ class ExecutionEngine:
         if not confirmed_flat:
             return {"ok": False, "reason": pos.get("close_warning", "close not confirmed"), "pnl_usdt": pnl_usdt, "pnl_pct": pnl_pct}
         await self.storage.remove_position(symbol)
-        await self.storage.set_lock(symbol, 120, f"closed: {reason}")
+        try:
+            cooldown = int(await self.storage.get("cooldown_after_close_sec", 120) or 120)
+        except Exception:
+            cooldown = int(os.getenv("COOLDOWN_AFTER_CLOSE_SEC", "120") or 120)
+        await self.storage.set_lock(symbol, max(0, cooldown), f"closed: {reason}")
         return {"ok": True, "pnl_usdt": pnl_usdt, "pnl_pct": pnl_pct}

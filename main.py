@@ -15,6 +15,7 @@ from risk_engine import RiskEngine
 from exchange_client import ExchangeClient
 from execution_engine import ExecutionEngine
 from sync_engine import SyncEngine
+from recovery_engine import RecoveryEngine
 from scanner import Scanner
 from production_gate import ProductionGate
 from ws_engine import WebSocketSupervisor, futures_source_from_mode
@@ -405,6 +406,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /stats - статистика сделок
 /sync - синхронизация позиций/ордеров
 /sync_positions - подтянуть реальные позиции MEXC в бота
+/recovery - восстановить позиции MEXC после рестарта и проверить TP/SL
 /mexc_debug_state [SYMBOL] - raw debug MEXC positions/orders/symbol variants
 
 Note: /positions checks MEXC exchange-first; /open_orders scans normal + plan + stop + TP/SL endpoints. If exchange TP/SL is missing, local monitor protects positions kept in bot cache.
@@ -629,6 +631,73 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await reply(update, text, reply_markup=MAIN_MENU)
 
+
+
+def _position_identity_keys(pos: dict, ex=None) -> set[str]:
+    """Return stable MEXC-style keys for matching local and exchange rows."""
+    keys: set[str] = set()
+
+    def add(v):
+        if v in (None, ""):
+            return
+        try:
+            if ex and hasattr(ex, "_mexc_normalize_contract_id"):
+                k = ex._mexc_normalize_contract_id(v)
+            else:
+                k = str(v).upper().replace('/USDT:USDT', '_USDT').replace('/', '_').replace('-', '_')
+                if k.endswith('USDT') and '_' not in k:
+                    k = k[:-4] + '_USDT'
+            if k:
+                keys.add(k)
+        except Exception:
+            pass
+
+    for key in ("symbol", "mexc_symbol", "contract"):
+        add(pos.get(key))
+    for v in pos.get("symbol_variants") or []:
+        add(v)
+    info = pos.get("info") or {}
+    if isinstance(info, dict):
+        for key in ("symbol", "contract"):
+            add(info.get(key))
+    return keys
+
+
+def _dedupe_exchange_positions(rows: list[dict], ex=None) -> list[dict]:
+    """Collapse duplicate MEXC rows returned by several native endpoints."""
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows or []:
+        keys = sorted(_position_identity_keys(row, ex))
+        info = row.get("info") or {}
+        raw_side = ""
+        if isinstance(info, dict):
+            raw_side = str(info.get("positionType") or info.get("holdSide") or info.get("side") or "")
+        side = str(row.get("side") or raw_side or "").lower()
+        if raw_side in {"1"}:
+            side = "long"
+        elif raw_side in {"2"}:
+            side = "short"
+        ident = (keys[0] if keys else str(row.get("symbol") or ""), side)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(row)
+    return out
+
+
+async def _hidden_margin_present(ex) -> bool:
+    """Protect against MEXC returning empty position rows while balance still shows margin."""
+    try:
+        bal = await ex.fetch_balance()
+        usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
+        used = float(usdt.get("used") or ((bal or {}).get("used", {}) or {}).get("USDT") or 0)
+        pm = float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
+        upnl = float(usdt.get("unrealized") or 0)
+        return used > 0.5 or pm > 0.5 or abs(upnl) > 0.01
+    except Exception:
+        return False
+
 def _exchange_position_text(p: dict) -> str:
     info = p.get("info", {}) if isinstance(p.get("info"), dict) else {}
     symbol = p.get("symbol") or info.get("symbol") or "-"
@@ -667,15 +736,49 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     local = await storage.positions()
     exchange_positions = []
     exchange_error = ""
-    # v0069: /positions must be exchange-first and must NOT depend on
-    # live_trading/Run. A user can have real MEXC positions while the bot is
-    # stopped or live_trading is off; hiding them is dangerous.
+    reconcile_notes = []
+    # v0072: /positions reconciles exchange-first before rendering. It still must NOT depend on live_trading/Run. This removes
+    # stale local rows and imports real exchange-only rows so the screen no
+    # longer shows a mixed/duplicated position state after restart/close.
     api_key, api_secret = _api_creds(s)
+    ex = None
     if api_key and api_secret:
         try:
             ex = await get_exchange(s)
             raw_positions = await ex.fetch_positions() or []
-            exchange_positions = [p for p in raw_positions if ExecutionEngine(storage, ex).exchange_position_qty(p) > 0]
+            exec_engine = ExecutionEngine(storage, ex)
+            exchange_positions = _dedupe_exchange_positions([p for p in raw_positions if exec_engine.exchange_position_qty(p) > 0], ex)
+
+            exchange_keys = set()
+            for ep in exchange_positions:
+                exchange_keys |= _position_identity_keys(ep, ex)
+
+            hidden_margin = False
+            if not exchange_positions:
+                hidden_margin = await _hidden_margin_present(ex)
+
+            # Import/update real exchange positions into local cache without
+            # creating extra protection orders from a read-only /positions call.
+            if exchange_positions:
+                rec = await RecoveryEngine(storage, ex, exec_engine).recover(reattach=False)
+                if rec.get("restored") or rec.get("updated"):
+                    reconcile_notes.append(f"reconciled local cache: +{rec.get('restored', 0)} restored, {rec.get('updated', 0)} updated")
+
+            # Remove local open rows that no longer exist on MEXC. Do not prune
+            # if MEXC hides rows while balance still shows margin/PnL.
+            if not hidden_margin:
+                removed = 0
+                for lp in list(await storage.positions()):
+                    status = str(lp.get("status") or "").lower()
+                    if status not in {"open", "closing"}:
+                        continue
+                    lk = _position_identity_keys(lp, ex)
+                    if not (lk & exchange_keys):
+                        await storage.remove_position(lp.get("symbol"))
+                        removed += 1
+                if removed:
+                    reconcile_notes.append(f"removed stale local rows: {removed}")
+            local = await storage.positions()
         except Exception as e:
             exchange_error = str(e)[:220]
     if not local and not exchange_positions:
@@ -710,6 +813,8 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"\nExchange sync error: {exchange_error}"
         await reply(update, text, reply_markup=MAIN_MENU); return
     lines = ["📈 Positions"]
+    if reconcile_notes:
+        lines.append("\nSync cleanup: " + "; ".join(reconcile_notes))
     if local:
         lines.append("\nLocal bot state:")
         for p in local:
@@ -779,6 +884,21 @@ Mirror WR: {m['winrate']:.1f}%
 Mirror Expectancy: {m['expectancy']:.4f}
 """.strip()
     await reply(update, text, reply_markup=MAIN_MENU)
+
+
+async def recovery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    try:
+        ex = await get_exchange(s)
+        exec_engine = ExecutionEngine(storage, ex)
+        report = await RecoveryEngine(storage, ex, exec_engine).recover(reattach=True)
+        lines = ["🛟 Recovery engine"]
+        for k, v in report.items():
+            lines.append(f"{k}: {v}")
+        await reply(update, "\n".join(lines), reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"🛟 Recovery failed: {e}", reply_markup=MAIN_MENU)
 
 async def sync_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -1499,8 +1619,24 @@ async def trading_loop(app):
 
 async def on_startup(app):
     await storage.init()
-    apply_mexc_runtime_env(await storage.all_settings())
+    settings = await storage.all_settings()
+    apply_mexc_runtime_env(settings)
     app.bot_data.setdefault("trading_start_lock", asyncio.Lock())
+    # v0071: real startup recovery. If Railway restarts while MEXC positions
+    # remain open, rebuild local state from exchange positions and reattach
+    # protection/local monitoring before the scanner starts opening new trades.
+    try:
+        if str(settings.get("live_trading", False)).lower() in {"1", "true", "yes", "on"}:
+            api_key, api_secret = _api_creds(settings)
+            if api_key and api_secret:
+                ex = await get_exchange(settings)
+                exec_engine = ExecutionEngine(storage, ex)
+                report = await RecoveryEngine(storage, ex, exec_engine).recover(
+                    reattach=str(os.getenv("RECOVERY_REATTACH_PROTECTION", "true")).lower() in {"1", "true", "yes", "on"}
+                )
+                app.bot_data["startup_recovery_report"] = report
+    except Exception as e:
+        app.bot_data["startup_recovery_error"] = str(e)
 
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
@@ -1520,6 +1656,7 @@ def build_app():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("sync", sync_cmd))
     app.add_handler(CommandHandler("sync_positions", sync_positions_cmd))
+    app.add_handler(CommandHandler("recovery", recovery_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("mexc_settings", mexc_settings_cmd))
     app.add_handler(CommandHandler("leverage", leverage_cmd))
