@@ -164,6 +164,7 @@ class TradePlanner:
         max_positions = max(1, int(candidate.get("max_open_positions", settings.get("max_open_positions", 5)) or 5))
         leverage = max(1, int(float(settings.get("mexc_order_leverage", os.getenv("MEXC_ORDER_LEVERAGE", "5")) or 5)))
 
+        liq_stop_mode = (strategy == "ai_scalping") and self._bool_setting(settings, "ai_scalping_liquidation_stop_mode", False)
         risk_usdt = max(0.0, equity * risk_pct)
         stop_distance = price * (sl_pct / 100.0)
         if stop_distance <= 0:
@@ -177,19 +178,35 @@ class TradePlanner:
         # Example: 50 USDT balance / 5 max positions = 10 USDT max margin.
         # With 5x leverage, max notional for one trade = 50 USDT.
         max_margin_per_position = equity / max_positions if max_positions > 0 else equity
-        max_notional_by_margin = max_margin_per_position * leverage
 
-        notional_ceiling = self.max_order_usdt
-        if self._bool_setting(settings, "margin_allocation_enabled", True):
-            notional_ceiling = min(notional_ceiling, max_notional_by_margin)
+        if liq_stop_mode:
+            # v0116: AI BTC/ETH only high-risk mode. No exchange SL is placed.
+            # The planned SL distance is converted into high leverage so the
+            # isolated liquidation area acts as the hard loss boundary. This is
+            # approximate because the exact liquidation price depends on MEXC
+            # maintenance margin, mark price and fees, so we add a configurable
+            # buffer behind the planned SL and cap leverage.
+            margin_pct = max(0.001, min(1.0, float(settings.get("ai_scalping_liq_margin_pct", os.getenv("AI_SCALPING_LIQ_MARGIN_PCT", "0.05")) or 0.05)))
+            buffer_pct = max(0.0, float(settings.get("ai_scalping_liq_buffer_pct", os.getenv("AI_SCALPING_LIQ_BUFFER_PCT", "0.04")) or 0.04))
+            max_lev = max(1, int(float(settings.get("ai_scalping_liq_max_leverage", os.getenv("AI_SCALPING_LIQ_MAX_LEVERAGE", "200")) or 200)))
+            target_liq_distance_pct = max(0.05, sl_pct + buffer_pct)
+            leverage = max(1, min(max_lev, int(100.0 / target_liq_distance_pct)))
+            margin_usdt = min(max_margin_per_position, max(self.min_order_usdt / max(1, leverage), equity * margin_pct))
+            notional = min(self.max_order_usdt, max(self.min_order_usdt, margin_usdt * leverage))
+            expected_margin = notional / leverage if leverage > 0 else notional
+        else:
+            max_notional_by_margin = max_margin_per_position * leverage
+            notional_ceiling = self.max_order_usdt
+            if self._bool_setting(settings, "margin_allocation_enabled", True):
+                notional_ceiling = min(notional_ceiling, max_notional_by_margin)
 
-        if notional_ceiling < self.min_order_usdt:
-            # Account is too small for the configured number of slots/leverage/min order.
-            return None
+            if notional_ceiling < self.min_order_usdt:
+                # Account is too small for the configured number of slots/leverage/min order.
+                return None
 
-        notional = clamp(risk_notional, self.min_order_usdt, notional_ceiling)
+            notional = clamp(risk_notional, self.min_order_usdt, notional_ceiling)
+            expected_margin = notional / leverage if leverage > 0 else notional
         qty = notional / price
-        expected_margin = notional / leverage if leverage > 0 else notional
 
         if side == "LONG":
             stop = price * (1 - sl_pct / 100.0)
@@ -221,6 +238,9 @@ class TradePlanner:
             expected_margin_usdt=expected_margin,
             max_margin_per_position_usdt=max_margin_per_position,
             leverage=leverage,
+            liquidation_stop_mode=liq_stop_mode,
+            liquidation_buffer_pct=(float(settings.get("ai_scalping_liq_buffer_pct", os.getenv("AI_SCALPING_LIQ_BUFFER_PCT", "0.04")) or 0.04) if liq_stop_mode else 0.0),
+            liquidation_target_distance_pct=(sl_pct + float(settings.get("ai_scalping_liq_buffer_pct", os.getenv("AI_SCALPING_LIQ_BUFFER_PCT", "0.04")) or 0.04) if liq_stop_mode else 0.0),
             liquidity_retest_rr=lr_rr,
             liquidity_retest_zone_low=lr_zone_low,
             liquidity_retest_zone_high=lr_zone_high,

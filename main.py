@@ -735,7 +735,7 @@ ws_update_throttle_ms, ws_max_updates_per_batch, ws_queue_limit,
 symbol_refresh_sec, universe_mode, strategy_mode, mirror_mode,
 spot_confirmation_enabled, session_filter_enabled, america_short_bias_enabled, ws_enabled,
 mexc_order_leverage, mexc_order_open_type, mexc_recv_window, margin_allocation_enabled, require_exchange_protection, auto_close_on_protection_failed, total_positions_opened, ai_scalping_session_id, ai_scalping_session_reset_at,
-ai_scalping_symbols, ai_scalping_min_confidence, ai_scalping_tp_pct, ai_scalping_sl_pct, ai_scalping_btc_tp_pct, ai_scalping_btc_sl_pct, ai_scalping_eth_tp_pct, ai_scalping_eth_sl_pct, ai_scalping_max_spread_pct, ai_scalping_quality_filters_enabled, ai_scalping_quality_min_confidence, ai_scalping_quality_cooldown_sec, ai_scalping_quality_min_atr_pct, ai_scalping_quality_min_ema_gap_pct, ai_scalping_quality_min_ret_5m_abs_pct, ai_scalping_ai_cooldown_sec, ai_scalping_openai_fallback_enabled, ai_scalping_json_mode_enabled,
+ai_scalping_symbols, ai_scalping_min_confidence, ai_scalping_tp_pct, ai_scalping_sl_pct, ai_scalping_btc_tp_pct, ai_scalping_btc_sl_pct, ai_scalping_eth_tp_pct, ai_scalping_eth_sl_pct, ai_scalping_max_spread_pct, ai_scalping_quality_filters_enabled, ai_scalping_quality_min_confidence, ai_scalping_quality_cooldown_sec, ai_scalping_quality_min_atr_pct, ai_scalping_quality_min_ema_gap_pct, ai_scalping_quality_min_ret_5m_abs_pct, ai_scalping_ai_cooldown_sec, ai_scalping_openai_fallback_enabled, ai_scalping_json_mode_enabled, ai_scalping_liquidation_stop_mode, ai_scalping_liq_margin_pct, ai_scalping_liq_buffer_pct, ai_scalping_liq_max_leverage,
 scan_market_source = binance_binance | mexc_mexc | mexc_binance.
 
 По умолчанию: mexc_binance = MEXC фьючи скан + Binance spot подтверждение.
@@ -1650,7 +1650,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "openai_analysis_enabled", "openai_model", "openai_check_strength", "openai_api_key",
         "openai_env_fallback", "openai_timeout_sec", "openai_fail_open", "openai_show_decisions",
         "trade_charts_enabled", "liquidity_runner_enabled",
-        "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct", "ai_scalping_ai_cooldown_sec", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled",
+        "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct", "ai_scalping_ai_cooldown_sec", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled", "ai_scalping_liquidation_stop_mode", "ai_scalping_liq_margin_pct", "ai_scalping_liq_buffer_pct", "ai_scalping_liq_max_leverage",
     }
     if key not in allowed_keys:
         await reply(update, f"❌ Setting is not allowed through /set: {key}", reply_markup=MAIN_MENU)
@@ -1827,7 +1827,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reset_market_runtime()
         new_settings = await storage.all_settings()
         new_rev = int(new_settings.get("settings_revision", current_rev + 1))
-        if key in {"live_trading", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "ws_enabled", "ai_scalping_quality_filters_enabled", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled"}:
+        if key in {"live_trading", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "ws_enabled", "ai_scalping_quality_filters_enabled", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled", "ai_scalping_liquidation_stop_mode"}:
             trigger_scan_now(context.application, reason=f"toggle:{key}")
         await q.edit_message_text(f"✅ {key} = {new_value}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
     elif data[0] == "set":

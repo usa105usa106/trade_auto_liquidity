@@ -1307,8 +1307,8 @@ class ExchangeClient:
         params = params or {}
         reduce_only = bool(params.get("reduceOnly") or params.get("reduce_only"))
         is_opening = not reduce_only
-        target_leverage = int(os.getenv("MEXC_ORDER_LEVERAGE", "5") or "5")
-        target_open_type = int(os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or "1")
+        target_leverage = int(params.get("leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or "5")
+        target_open_type = int(params.get("openType") or os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or "1")
         leverage_setup = {"ok": None}
         margin_pre = None
         if is_opening:

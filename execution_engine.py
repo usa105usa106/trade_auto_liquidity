@@ -200,7 +200,7 @@ class ExecutionEngine:
             side = "buy" if plan.side.upper() == "LONG" else "sell"
             order_type = plan.order_type.lower()
             price = plan.entry_price if order_type == "limit" else None
-            params = {"clientOrderId": f"bot_entry_{int(time.time()*1000)}"}
+            params = {"clientOrderId": f"bot_entry_{int(time.time()*1000)}", "leverage": getattr(plan, "leverage", None)}
             try:
                 order = await self._create_order_retry(plan.symbol, order_type, side, plan.qty, price, params, attempts=2)
             except Exception as e:
@@ -216,6 +216,14 @@ class ExecutionEngine:
             pos["status"] = "pending" if order_type == "limit" else "open"
             pos["initial_stop_price"] = plan.stop_price
             pos["initial_take_price"] = plan.take_price
+            if bool(getattr(plan, "liquidation_stop_mode", False)):
+                pos["liquidation_stop_mode"] = True
+                pos["planned_stop_price"] = plan.stop_price
+                pos["stop_price"] = 0
+            if bool(getattr(plan, "liquidation_stop_mode", False)):
+                pos["liquidation_stop_mode"] = True
+                pos["planned_stop_price"] = plan.stop_price
+                pos["stop_price"] = 0
             pos["liquidity_runner_stage"] = 0
             pos["order_id"] = order.get("id")
             pos["opened_at"] = time.time()
@@ -525,6 +533,7 @@ class ExecutionEngine:
         pos = self._sanitize_position_for_exchange(dict(pos))
         symbol = pos["symbol"]
         qty = float(pos.get("qty") or 0)
+        liquidation_stop_mode = bool(pos.get("liquidation_stop_mode")) and str(pos.get("strategy") or "").lower() == "ai_scalping"
         if qty <= 0:
             return {"ok": False, "protection_status": "LOCAL BOT PROTECTED", "protection_mode": "local_monitoring", "protection_warning": "missing qty for exchange protection"}
         side = "sell" if str(pos.get("side")).upper() == "LONG" else "buy"
@@ -545,7 +554,20 @@ class ExecutionEngine:
                 await asyncio.sleep(delay)
             tp = float(pos.get("take_price") or 0)
             sl = float(pos.get("stop_price") or 0)
-            if str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc" and hasattr(self.exchange_client, "mexc_place_tpsl_by_position"):
+            if liquidation_stop_mode:
+                try:
+                    if tp > 0:
+                        order = await self._create_take_profit_market_order(symbol, side, qty, tp)
+                        out["tp_order_id"] = order.get("id")
+                        out["tp_raw"] = order
+                    else:
+                        out["tp_error"] = "missing take_price"
+                    out["sl_exists"] = True
+                    out["sl_order_id"] = "LIQUIDATION_STOP"
+                    out["liquidation_stop_mode"] = True
+                except Exception as e:
+                    out["tp_error"] = str(e)[:500]
+            elif str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc" and hasattr(self.exchange_client, "mexc_place_tpsl_by_position"):
                 try:
                     if tp <= 0 or sl <= 0:
                         raise RuntimeError("missing take_price/stop_price for position TP/SL")
@@ -578,11 +600,19 @@ class ExecutionEngine:
                 except Exception as e:
                     out["sl_error"] = str(e)[:500]
             await asyncio.sleep(delay)
-            verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), str(out.get("sl_order_id") or ""))
-            out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})
-            out["ok"] = bool(out.get("tp_exists") and out.get("sl_exists"))
-            out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
-            out["protection_mode"] = "exchange" if out["ok"] else "local_monitoring"
+            if liquidation_stop_mode:
+                verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), "LIQUIDATION_STOP")
+                out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})
+                out["sl_exists"] = True
+                out["ok"] = bool(out.get("tp_exists"))
+                out["protection_status"] = "TP + LIQUIDATION STOP" if out["ok"] else "LOCAL BOT PROTECTED"
+                out["protection_mode"] = "exchange_tp_liquidation_sl" if out["ok"] else "local_monitoring"
+            else:
+                verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), str(out.get("sl_order_id") or ""))
+                out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})
+                out["ok"] = bool(out.get("tp_exists") and out.get("sl_exists"))
+                out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
+                out["protection_mode"] = "exchange" if out["ok"] else "local_monitoring"
             history.append({k: v for k, v in out.items() if k not in {"tp_raw", "sl_raw"}})
             best = out
             if out["ok"]:

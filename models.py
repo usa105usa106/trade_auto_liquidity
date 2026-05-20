@@ -31,6 +31,9 @@ class TradePlan:
     expected_margin_usdt: float = 0.0
     max_margin_per_position_usdt: float = 0.0
     leverage: int = 0
+    liquidation_stop_mode: bool = False
+    liquidation_buffer_pct: float = 0.0
+    liquidation_target_distance_pct: float = 0.0
     liquidity_retest_rr: float = 0.0
     liquidity_retest_zone_low: float = 0.0
     liquidity_retest_zone_high: float = 0.0
