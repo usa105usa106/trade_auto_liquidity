@@ -131,6 +131,26 @@ def parse_ai_scalp_decision(text: str, allowed_symbols: list[str], model: str) -
             except Exception:
                 data = None
     if not isinstance(data, dict):
+        # v0110: Some providers/models may still return plain text despite
+        # JSON instructions, e.g. "WAIT No reliable market data" or
+        # "LONG confidence 0.82 ...". Treat this as a valid fallback instead
+        # of breaking the AI scalping loop. LONG/SHORT without confidence stays
+        # at 0.0 and will be rejected by the normal confidence gate.
+        plain = re.sub(r"^```(?:json|text)?\s*", "", raw, flags=re.I).strip()
+        plain = re.sub(r"\s*```$", "", plain).strip()
+        m_dec = re.search(r"\b(LONG|SHORT|WAIT)\b", plain, flags=re.I)
+        if m_dec:
+            decision = m_dec.group(1).upper()
+            conf = 0.0
+            m_conf = re.search(r"(?:confidence|conf)\s*[:=]?\s*(0(?:\.\d+)?|1(?:\.0+)?|\d{1,3}(?:\.\d+)?)", plain, flags=re.I)
+            if m_conf:
+                conf = _f(m_conf.group(1), 0.0)
+                if conf > 1:
+                    conf /= 100.0
+            reason = plain[m_dec.end():].strip(" :-—–\n\t")[:220]
+            # In decide_symbol() there is exactly one allowed symbol, so use it.
+            symbol = allowed_symbols[0] if allowed_symbols else ""
+            return AIScalpDecision(ok=True, symbol=symbol, decision=decision, confidence=max(0.0, min(1.0, conf)), reason=reason, raw=raw[:1000], model=model)
         return AIScalpDecision(ok=False, error="AI did not return JSON", raw=raw[:1000], model=model)
     symbol = str(data.get("symbol") or "").upper().replace("/", "").replace(":USDT", "")
     norm_allowed = {s.upper().replace("/", "").replace(":USDT", ""): s for s in allowed_symbols}
