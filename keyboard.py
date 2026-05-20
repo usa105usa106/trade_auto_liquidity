@@ -4,11 +4,10 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["▶️ Run", "⏹ Stop"],
     ["📊 Status", "🚨 Panic"],
     ["📈 Positions", "📉 Stats"],
-    ["📊 AI Stats"],
     ["💰 Balance", "🏓 Ping"],
     ["⚙️ Settings", "🔐 API"],
     ["🤖 AI BTC/ETH scalping"],
-    ["⚙️ MEXC"],
+    ["📊 AI Stats", "⚙️ MEXC"],
 ], resize_keyboard=True)
 
 def _onoff(settings: dict | None, key: str) -> str:

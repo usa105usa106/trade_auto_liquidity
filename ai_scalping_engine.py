@@ -304,64 +304,56 @@ class AIScalpingEngine:
             market = {"symbol": allowed[0], "error": str(e)[:160]}
         markets = [market]
         max_spread = _f(settings.get("ai_scalping_max_spread_pct"), _f(settings.get("max_spread_pct"), 0.20))
-        # v0105: dedicated low-token BTC/ETH scalping prompt.
-        # The model must not design the trade. It only decides whether the next
-        # short-term move has enough edge to reach the bot TP before the bot SL.
-        # Keep the payload compact: derived features only, no raw candles.
-        quality_rules = []
-        if quality_mode:
-            quality_rules = [
-                "QUALITY FILTERS ARE ON: use stricter WAIT logic.",
-                "Prefer trend continuation only; avoid counter-trend scalps against 5m/15m EMA bias.",
-                "Reject compression/chop: low ATR, tiny 5m movement, flat EMA gap, mixed depth, or late stretched moves.",
-                "Confidence should be high only when direction, HTF bias and volatility agree.",
-            ]
+        # v0112: ultra-low-token prompt. BTC_ETH_AI_SCALP_DIRECTION. Return one strict JSON object only; bot TP before bot SL; Do not force trades; max_output_tokens replaced by max_completion_tokens where required Do NOT send raw candles, trade history,
+        # stats, or verbose rules. The AI gets only compact derived features.
+        compact_market = {
+            "s": allowed[0].split(":")[0].replace("/", "_"),
+            "p": market.get("price", 0),
+            "r1": market.get("ret_1m_pct", 0),
+            "r5": market.get("ret_5m_pct", 0),
+            "rsi": market.get("rsi_1m", 50),
+            "e1": 1 if market.get("ema9_gt_ema21_1m") else 0,
+            "e5": 1 if market.get("ema9_gt_ema21_5m") else 0,
+            "e15": (1 if market.get("ema9_gt_ema21_15m") else 0) if market.get("ema9_gt_ema21_15m") is not None else None,
+            "gap5": market.get("ema_gap_5m_pct", 0),
+            "atr": market.get("atr_1m_pct", 0),
+            "sp": market.get("spread_pct", 0),
+            "imb": market.get("imbalance", 0),
+        }
+        min_conf = _f(settings.get("ai_scalping_quality_min_confidence" if quality_mode else "ai_scalping_min_confidence"), 0.72 if quality_mode else 0.58)
         prompt_obj = {
-            "task": "BTC_ETH_AI_SCALP_DIRECTION",
-            "goal": "Choose direction only if next short move likely reaches bot TP before bot SL; otherwise WAIT.",
-            "symbol": allowed[0],
-            "allowed_decisions": ["LONG", "SHORT", "WAIT"],
-            "decision_rules": [
-                "LONG only when 1m momentum, 5m bias, RSI, spread, depth imbalance and ATR support upside scalp.",
-                "SHORT only when 1m momentum, 5m bias, RSI, spread, depth imbalance and ATR support downside scalp.",
-                "WAIT on chop, mixed signals, weak depth, high spread, low ATR, late move, or confidence below threshold.",
-                "Do not force trades. WAIT is correct when edge is unclear.",
-            ] + quality_rules,
-            "limits": {
-                "max_spread_pct": max_spread,
-                "bot_controls": ["qty", "leverage", "entry", "tp", "sl", "orders", "risk"],
-                "ai_controls_only": ["decision", "confidence", "reason"],
-                "quality_filters_enabled": quality_mode,
-                "min_confidence": _f(settings.get("ai_scalping_quality_min_confidence" if quality_mode else "ai_scalping_min_confidence"), 0.72 if quality_mode else 0.58),
-            },
-            "market": market,
-            "output_schema": {"symbol": allowed[0], "decision": "LONG|SHORT|WAIT", "confidence": 0.0, "reason": "max 10 words"},
-            "hard_output_rule": "Return only JSON. Do not wrap in markdown. Do not explain.",
+            "task": "scalp_dir",
+            "rule": "Return JSON only. Pick LONG/SHORT only if TP likely before SL, else WAIT.",
+            "sym": compact_market["s"],
+            "tf": "1m/5m" + ("/15m" if quality_mode else ""),
+            "q": 1 if quality_mode else 0,
+            "min_conf": min_conf,
+            "max_sp": max_spread,
+            "m": compact_market,
+            "out": {"symbol": compact_market["s"], "decision": "LONG|SHORT|WAIT", "confidence": 0.0, "reason": "short"},
         }
         prompt = json.dumps(prompt_obj, separators=(",", ":"), ensure_ascii=False)
-        system = (
-            "You are a BTC/ETH micro-scalping direction filter for futures. "
-            "Return one strict JSON object only. Return ONLY one valid JSON object matching the schema. No prose. No markdown. "
-            "Your job is not to be active; your job is to avoid bad trades. "
-            "If the next move is not clearly favorable for the bot TP before SL, return WAIT."
-        )
+        system = "BTC/ETH futures scalping filter. JSON only. No prose. Prefer WAIT on mixed/chop/weak edge."
         timeout_sec = float(settings.get("openai_timeout_sec", os.getenv("OPENAI_TIMEOUT_SEC", "12")) or 12)
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         async with self._sem:
             try:
                 timeout = aiohttp.ClientTimeout(total=timeout_sec)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    schema_format = _json_format_payload(allowed[0])
-                    body = {
+                    # v0112: one cheap Chat Completions request first. The older
+                    # Responses+schema path could double/triple token spend when a
+                    # model/provider rejected structured output and the code retried.
+                    chat_body = {
                         "model": model,
-                        "input": prompt,
-                        "instructions": system,
-                        "max_output_tokens": 80,
-                        "text": {"format": schema_format},
+                        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                        "response_format": _json_object_payload(),
                     }
                     if str(model).lower().startswith(("gpt-5", "o1", "o3", "o4")):
-                        body["reasoning"] = {"effort": "low"}
-                    async with session.post(OPENAI_RESPONSES_URL, headers=headers, json=body) as r:
+                        chat_body["max_completion_tokens"] = 40
+                    else:
+                        chat_body["temperature"] = 0.1
+                        chat_body["max_tokens"] = 40
+                    async with session.post(OPENAI_CHAT_URL, headers=headers, json=chat_body) as r:
                         txt = await r.text()
                         if r.status == 200:
                             parsed = _extract_text(json.loads(txt))
@@ -370,38 +362,17 @@ class AIScalpingEngine:
                             return dec
                         first_error = txt[:240]
 
-                    # Fallback for providers/models that do not support Responses API structured output.
-                    # Chat Completions JSON mode still forces valid JSON, and the parser also extracts
-                    # a JSON object from accidental surrounding text.
-                    chat_body = {
-                        "model": model,
-                        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-                        "temperature": 0.1,
-                        "response_format": _json_object_payload(),
-                    }
-                    if str(model).lower().startswith(("gpt-5", "o1", "o3", "o4")):
-                        chat_body.pop("temperature", None)
-                        chat_body["max_completion_tokens"] = 80
-                    else:
-                        chat_body["max_tokens"] = 80
-                    async with session.post(OPENAI_CHAT_URL, headers=headers, json=chat_body) as r2:
+                    # One fallback only: no response_format for providers that reject JSON mode.
+                    fallback_body = dict(chat_body)
+                    fallback_body.pop("response_format", None)
+                    async with session.post(OPENAI_CHAT_URL, headers=headers, json=fallback_body) as r2:
                         txt2 = await r2.text()
                         if r2.status == 200:
                             parsed2 = _extract_text(json.loads(txt2))
                             dec = parse_ai_scalp_decision(parsed2, allowed, model)
                             dec.market = {"markets": markets}
                             return dec
-                        # Last compatibility retry: no response_format, but still JSON-only prompt.
-                        fallback_body = dict(chat_body)
-                        fallback_body.pop("response_format", None)
-                        async with session.post(OPENAI_CHAT_URL, headers=headers, json=fallback_body) as r3:
-                            txt3 = await r3.text()
-                            if r3.status == 200:
-                                parsed3 = _extract_text(json.loads(txt3))
-                                dec = parse_ai_scalp_decision(parsed3, allowed, model)
-                                dec.market = {"markets": markets}
-                                return dec
-                            return AIScalpDecision(ok=False, symbol=allowed[0], decision="WAIT", error=f"OpenAI error responses={first_error}; chat={r2.status}: {txt2[:160]}; fallback={r3.status}: {txt3[:160]}", model=model, market={"markets": markets})
+                        return AIScalpDecision(ok=False, symbol=allowed[0], decision="WAIT", error=f"OpenAI error chat={first_error}; fallback={r2.status}: {txt2[:160]}", model=model, market={"markets": markets})
             except Exception as e:
                 return AIScalpDecision(ok=False, symbol=allowed[0], decision="WAIT", error=f"OpenAI unavailable: {e}", model=model, market={"markets": markets})
 
