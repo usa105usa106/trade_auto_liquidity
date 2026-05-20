@@ -75,21 +75,39 @@ class RecoveryEngine:
         except Exception:
             return 0.0
 
-    def _fallback_tp_sl(self, ex_pos: dict) -> tuple[float, float]:
-        """Conservative emergency TP/SL for exchange-only recovered rows.
+    def _fallback_tp_sl(self, ex_pos: dict, settings: dict | None = None) -> tuple[float, float, str]:
+        """Fallback TP/SL for exchange-only recovered rows.
 
-        Used only when original local plan was lost after restart/redeploy.
-        Defaults mirror the planner's conservative bounds and can be overridden.
+        v0104: when the bot is in AI BTC/ETH scalping mode and the local
+        SQLite row was lost, recovered BTC/ETH positions must use the same
+        deterministic scalping TP/SL as fresh entries. Otherwise a restart can
+        silently reattach wider generic recovery levels.
         """
         entry = self._entry(ex_pos)
         if entry <= 0:
-            return 0.0, 0.0
+            return 0.0, 0.0, "none"
+        settings = settings or {}
         side = self._side(ex_pos)
-        sl_pct = float(os.getenv("RECOVERY_LOCAL_SL_PCT", os.getenv("MAX_SL_PCT", "0.60")) or 0.60) / 100.0
-        tp_pct = float(os.getenv("RECOVERY_LOCAL_TP_PCT", os.getenv("MIN_TP_PCT", "0.25")) or 0.25) / 100.0
+        keys = self._keys(ex_pos)
+        symbol_key = " ".join(sorted(keys)).upper()
+        scalping_mode = str(settings.get("strategy_mode", "")).lower() == "ai_scalping"
+
+        if scalping_mode and "BTC_USDT" in symbol_key:
+            tp_pct = float(settings.get("ai_scalping_btc_tp_pct", os.getenv("AI_SCALPING_BTC_TP_PCT", "0.18")) or 0.18) / 100.0
+            sl_pct = float(settings.get("ai_scalping_btc_sl_pct", os.getenv("AI_SCALPING_BTC_SL_PCT", "0.26")) or 0.26) / 100.0
+            source = "ai_scalping_btc"
+        elif scalping_mode and "ETH_USDT" in symbol_key:
+            tp_pct = float(settings.get("ai_scalping_eth_tp_pct", os.getenv("AI_SCALPING_ETH_TP_PCT", "0.22")) or 0.22) / 100.0
+            sl_pct = float(settings.get("ai_scalping_eth_sl_pct", os.getenv("AI_SCALPING_ETH_SL_PCT", "0.32")) or 0.32) / 100.0
+            source = "ai_scalping_eth"
+        else:
+            sl_pct = float(os.getenv("RECOVERY_LOCAL_SL_PCT", os.getenv("MAX_SL_PCT", "0.60")) or 0.60) / 100.0
+            tp_pct = float(os.getenv("RECOVERY_LOCAL_TP_PCT", os.getenv("MIN_TP_PCT", "0.25")) or 0.25) / 100.0
+            source = "generic_recovery"
+
         if side == "SHORT":
-            return entry * (1 + sl_pct), entry * (1 - tp_pct)
-        return entry * (1 - sl_pct), entry * (1 + tp_pct)
+            return entry * (1 + sl_pct), entry * (1 - tp_pct), source
+        return entry * (1 - sl_pct), entry * (1 + tp_pct), source
 
     async def _protection_state(self, pos: dict) -> dict:
         return await ProtectionEngine(self.exchange_client, self.execution_engine).check(pos)
@@ -112,6 +130,10 @@ class RecoveryEngine:
             report["errors"].append(f"fetch_positions: {e}")
             return report
         local_positions = await self.storage.positions()
+        try:
+            settings = await self.storage.all_settings()
+        except Exception:
+            settings = {}
         report["exchange_positions"] = len(exchange_positions)
         report["local_before"] = len(local_positions)
         local_by_key: dict[str, dict] = {}
@@ -131,8 +153,9 @@ class RecoveryEngine:
             side = self._side(ep)
             stop_price = (old or {}).get("stop_price")
             take_price = (old or {}).get("take_price")
+            recovery_source = "local"
             if not stop_price or not take_price:
-                stop_price, take_price = self._fallback_tp_sl(ep)
+                stop_price, take_price, recovery_source = self._fallback_tp_sl(ep, settings)
             pos = dict(old or {})
             pos.update({
                 "symbol": symbol,
@@ -144,7 +167,8 @@ class RecoveryEngine:
                 "qty": qty or pos.get("qty"),
                 "stop_price": float(stop_price or 0),
                 "take_price": float(take_price or 0),
-                "strategy": pos.get("strategy") or "recovered_exchange",
+                "strategy": pos.get("strategy") or ("ai_scalping" if recovery_source.startswith("ai_scalping") else "recovered_exchange"),
+                "recovery_tp_sl_source": recovery_source,
                 "opened_at": pos.get("opened_at") or time.time(),
                 "updated_at": time.time(),
                 "exchange_recovered": True,

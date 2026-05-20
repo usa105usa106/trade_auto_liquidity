@@ -302,7 +302,9 @@ class ExecutionEngine:
                     pos["protection_warning"] = "exchange protection failed; bot monitors TP/SL locally"
                     pos["updated_at"] = time.time()
                     await self.storage.upsert_position(pos)
-                    auto_close = await self._setting_bool("auto_close_on_protection_failed", "ALLOW_AUTO_CLOSE_ON_PROTECTION_FAILED", False)
+                    auto_close = await self._setting_bool("auto_close_on_protection_failed", "AUTO_CLOSE_ON_PROTECTION_FAILED", False)
+                    if str(pos.get("strategy") or "").lower() == "ai_scalping":
+                        auto_close = True
                     if auto_close:
                         close_res = await self.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
                         return {"ok": False, "reason": "protection orders failed; auto-close explicitly enabled", "protection": protection, "close_result": close_res}
@@ -488,6 +490,35 @@ class ExecutionEngine:
     async def _create_take_profit_market_order(self, symbol: str, side: str, qty: float, take_price: float) -> dict:
         return await self._create_trigger_market_order(symbol, side, qty, take_price, "tp")
 
+    async def _verify_exchange_protection(self, pos: dict, tp_order_id: str = "", sl_order_id: str = "") -> dict:
+        """Confirm that both TP and SL are actually visible on exchange.
+
+        MEXC may accept a request but return an empty id or expose the order only
+        through plan/stop endpoints. For live scalping, trusting the create
+        response is unsafe, so every protection placement is confirmed with
+        fetch_open_orders(), which already merges normal + plan + stop/TP-SL
+        endpoints in exchange_client.
+        """
+        try:
+            # Unit-test/non-MEXC adapters often cannot expose native plan/stop
+            # endpoints. The strict exchange-first verification is required for
+            # MEXC live futures; for generic adapters an id from both create calls
+            # is the best available confirmation.
+            if str(getattr(self.exchange_client, "exchange_id", "") or "").lower() != "mexc" and tp_order_id and sl_order_id:
+                return {"tp_exists": True, "sl_exists": True, "protection_status": "EXCHANGE PROTECTED", "protection_mode": "exchange"}
+            from protection_engine import ProtectionEngine
+            check_pos = {**dict(pos), "tp_order_id": tp_order_id, "sl_order_id": sl_order_id}
+            orders = await self.exchange_client.fetch_open_orders(check_pos.get("symbol"))
+            return ProtectionEngine(self.exchange_client).classify_orders(check_pos, orders or [])
+        except Exception as e:
+            return {
+                "tp_exists": False,
+                "sl_exists": False,
+                "protection_status": "LOCAL BOT PROTECTED",
+                "protection_mode": "local_monitoring",
+                "verify_error": str(e)[:240],
+            }
+
     async def place_protection_orders(self, pos: dict, live: bool) -> dict:
         if not live:
             return {}
@@ -495,33 +526,75 @@ class ExecutionEngine:
         symbol = pos["symbol"]
         qty = float(pos.get("qty") or 0)
         if qty <= 0:
-            return {}
+            return {"ok": False, "protection_status": "LOCAL BOT PROTECTED", "protection_mode": "local_monitoring", "protection_warning": "missing qty for exchange protection"}
         side = "sell" if str(pos.get("side")).upper() == "LONG" else "buy"
-        out = {"ok": True}
         require_exchange_protection = await self._setting_bool("require_exchange_protection", "REQUIRE_EXCHANGE_PROTECTION", True)
-        try:
+        attempts = max(1, int(os.getenv("PROTECTION_PLACE_MAX_ATTEMPTS", "3") or "3"))
+        delay = float(os.getenv("PROTECTION_RECHECK_DELAY_SEC", "0.8") or "0.8")
+        history = []
+        best = {"ok": False}
+        for i in range(attempts):
+            out = {"ok": True, "attempt": i + 1}
+            # On retry, remove stale/partial protection first. Without this MEXC
+            # can leave one valid leg and reject/duplicate the other.
+            if i > 0 and hasattr(self.exchange_client, "cancel_all_orders"):
+                try:
+                    await self.exchange_client.cancel_all_orders(symbol)
+                except Exception as e:
+                    out["retry_cancel_error"] = str(e)[:240]
+                await asyncio.sleep(delay)
             tp = float(pos.get("take_price") or 0)
-            if tp > 0:
-                order = await self._create_take_profit_market_order(symbol, side, qty, tp)
-                out["tp_order_id"] = order.get("id")
-        except Exception as e:
-            out["tp_error"] = str(e)
-        try:
             sl = float(pos.get("stop_price") or 0)
-            if sl > 0:
-                order = await self._create_stop_market_order(symbol, side, qty, sl)
-                out["sl_order_id"] = order.get("id")
-        except Exception as e:
-            out["sl_error"] = str(e)
-        if require_exchange_protection and (not out.get("tp_order_id") or not out.get("sl_order_id")):
-            out["ok"] = False
-        out["protection_status"] = "EXCHANGE PROTECTED" if out.get("tp_order_id") and out.get("sl_order_id") else "LOCAL BOT PROTECTED"
-        out["protection_mode"] = "exchange" if out["protection_status"] == "EXCHANGE PROTECTED" else "local_monitoring"
-        if out["protection_status"] != "EXCHANGE PROTECTED":
-            out["protection_warning"] = "exchange TP/SL not fully confirmed; bot monitors locally"
-        else:
-            out.pop("protection_warning", None)
-        return out
+            if str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc" and hasattr(self.exchange_client, "mexc_place_tpsl_by_position"):
+                try:
+                    if tp <= 0 or sl <= 0:
+                        raise RuntimeError("missing take_price/stop_price for position TP/SL")
+                    order = await self.exchange_client.mexc_place_tpsl_by_position(
+                        symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp,
+                        client_order_id=f"bot_tpsl_{int(time.time()*1000)}",
+                    )
+                    out["tp_order_id"] = order.get("id")
+                    out["sl_order_id"] = order.get("id")
+                    out["tpsl_raw"] = order
+                except Exception as e:
+                    out["tpsl_error"] = str(e)[:500]
+            else:
+                try:
+                    if tp > 0:
+                        order = await self._create_take_profit_market_order(symbol, side, qty, tp)
+                        out["tp_order_id"] = order.get("id")
+                        out["tp_raw"] = order
+                    else:
+                        out["tp_error"] = "missing take_price"
+                except Exception as e:
+                    out["tp_error"] = str(e)[:500]
+                try:
+                    if sl > 0:
+                        order = await self._create_stop_market_order(symbol, side, qty, sl)
+                        out["sl_order_id"] = order.get("id")
+                        out["sl_raw"] = order
+                    else:
+                        out["sl_error"] = "missing stop_price"
+                except Exception as e:
+                    out["sl_error"] = str(e)[:500]
+            await asyncio.sleep(delay)
+            verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), str(out.get("sl_order_id") or ""))
+            out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})
+            out["ok"] = bool(out.get("tp_exists") and out.get("sl_exists"))
+            out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
+            out["protection_mode"] = "exchange" if out["ok"] else "local_monitoring"
+            history.append({k: v for k, v in out.items() if k not in {"tp_raw", "sl_raw"}})
+            best = out
+            if out["ok"]:
+                out["protection_attempts"] = history
+                out.pop("protection_warning", None)
+                return out
+        best["ok"] = not require_exchange_protection
+        best["protection_status"] = "LOCAL BOT PROTECTED"
+        best["protection_mode"] = "local_monitoring"
+        best["protection_attempts"] = history
+        best["protection_warning"] = "exchange TP/SL not confirmed after retries"
+        return best
 
     async def cancel_entry(self, pos: dict, live: bool, reason: str = "limit_timeout"):
         symbol = pos["symbol"]

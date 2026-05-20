@@ -4,8 +4,10 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["▶️ Run", "⏹ Stop"],
     ["📊 Status", "🚨 Panic"],
     ["📈 Positions", "📉 Stats"],
+    ["📊 AI Stats"],
     ["💰 Balance", "🏓 Ping"],
     ["⚙️ Settings", "🔐 API"],
+    ["🤖 AI BTC/ETH scalping"],
     ["⚙️ MEXC"],
 ], resize_keyboard=True)
 
@@ -43,6 +45,7 @@ def settings_menu(revision: int, settings: dict | None = None):
         [InlineKeyboardButton(f"⚡ Live: {_onoff(settings, 'live_trading')}", callback_data=f"toggle:live_trading:{r}"), InlineKeyboardButton(api_label, callback_data=f"menu:api:{r}")],
         [InlineKeyboardButton(f"🧠 Auto Strategy: {_onoff(settings, 'auto_strategy_adaptation')}", callback_data=f"toggle:auto_strategy_adaptation:{r}")],
         [InlineKeyboardButton(f"🤖 ИИ анализ: {_onoff(settings, 'openai_analysis_enabled')} | {_value(settings, 'openai_model', 'gpt-5.4-mini')}", callback_data=f"menu:openai:{r}")],
+        [InlineKeyboardButton(f"🛡 AI scalp quality: {_onoff(settings, 'ai_scalping_quality_filters_enabled')}", callback_data=f"toggle:ai_scalping_quality_filters_enabled:{r}")],
         [InlineKeyboardButton(f"📊 Графики сделок: {_onoff(settings, 'trade_charts_enabled')}", callback_data=f"toggle:trade_charts_enabled:{r}")],
         [InlineKeyboardButton(f"🏃 Liquidity Runner: {_onoff(settings, 'liquidity_runner_enabled')}", callback_data=f"toggle:liquidity_runner_enabled:{r}")],
         [InlineKeyboardButton(f"🧭 Regime: {_onoff(settings, 'regime_adaptation')}", callback_data=f"toggle:regime_adaptation:{r}")],
@@ -84,4 +87,13 @@ def openai_menu(revision: int, settings: dict | None = None):
         [InlineKeyboardButton("✅ API key saved" if key_ready else ("ENV fallback ON" if env_fallback else "○ API key missing"), callback_data=f"openai:key_help:{r}")],
         [InlineKeyboardButton(f"🌐 Env fallback: {_onoff(settings, 'openai_env_fallback')}", callback_data=f"toggle:openai_env_fallback:{r}"), InlineKeyboardButton("🗑 Clear key", callback_data=f"openai:clear:{r}")],
         [InlineKeyboardButton("⬅️ Back", callback_data=f"menu:settings:{r}")],
+    ])
+
+
+def ai_stats_menu(revision: int):
+    r = str(revision)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Current session stats", callback_data=f"aistats:current:{r}")],
+        [InlineKeyboardButton("📊 Lifetime stats", callback_data=f"aistats:lifetime:{r}")],
+        [InlineKeyboardButton("♻ Reset AI session", callback_data=f"aistats:reset:{r}")],
     ])

@@ -201,7 +201,7 @@ class PositionManager:
         return None
 
     async def _auto_close_on_protection_failed(self) -> bool:
-        value = await self._setting("auto_close_on_protection_failed", os.getenv("ALLOW_AUTO_CLOSE_ON_PROTECTION_FAILED", "false"))
+        value = await self._setting("auto_close_on_protection_failed", os.getenv("AUTO_CLOSE_ON_PROTECTION_FAILED", os.getenv("ALLOW_AUTO_CLOSE_ON_PROTECTION_FAILED", "false")))
         return self._truthy(value, False)
 
     def pnl_pct(self, pos, price):
@@ -257,7 +257,10 @@ class PositionManager:
                     pos["protection_warning"] = "exchange protection failed; bot monitors TP/SL locally"
                     pos.update(protection)
                     await self.storage.upsert_position(pos)
-                    if await self._auto_close_on_protection_failed():
+                    auto_close = await self._auto_close_on_protection_failed()
+                    if str(pos.get("strategy") or "").lower() == "ai_scalping":
+                        auto_close = True
+                    if auto_close:
                         close_res = await self.execution_engine.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
                         return {"type": "protection_failed", "symbol": symbol, "result": close_res, "protection": protection}
                     return {"type": "protection_local", "symbol": symbol, "protection": protection}

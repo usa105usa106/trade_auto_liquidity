@@ -6,7 +6,7 @@ import psutil
 
 from config import TELEGRAM_TOKEN, ADMIN_IDS, VERSION, DEFAULT_EXCHANGE
 from storage import Storage
-from keyboard import MAIN_MENU, settings_menu, choices_menu, api_menu, openai_menu, format_duration_seconds
+from keyboard import MAIN_MENU, settings_menu, choices_menu, api_menu, openai_menu, ai_stats_menu, format_duration_seconds
 from adaptive_engine import AdaptiveEngine
 from mirror_engine import MirrorEngine
 from session_engine import SessionEngine
@@ -22,6 +22,8 @@ from production_gate import ProductionGate
 from ws_engine import WebSocketSupervisor, futures_source_from_mode
 from trade_planner import TradePlanner
 from openai_signal_engine import OpenAISignalEngine
+from ai_scalping_engine import AIScalpingEngine
+from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
 
@@ -31,6 +33,8 @@ log = logging.getLogger("bot")
 storage = Storage()
 scanner = Scanner()
 ai_signal_engine = OpenAISignalEngine()
+ai_scalping_engine = AIScalpingEngine()
+ai_stats_manager = AIStatsManager(storage)
 running = False
 # New-entry switch is intentionally separate from the loop switch.
 # /stop pauses entries but keeps the position manager alive; /panic stops the loop.
@@ -691,6 +695,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /cancel_all - отменить normal/plan/stop/TP-SL ордера MEXC, включая ghost/frozen orders
 /close_all - закрыть реальные позиции, отменить все ордера, затем сверить balance/cache
 /stats - статистика сделок
+/ai_stats - меню статистики AI BTC/ETH scalping
+/ai_stats_current - текущая AI session статистика
+/ai_stats_lifetime - lifetime AI статистика
+/ai_stats_reset - сбросить текущую AI session
 /sync - синхронизация позиций/ордеров
 /sync_positions - подтянуть реальные позиции MEXC в бота
 /recovery - восстановить позиции MEXC после рестарта и проверить TP/SL
@@ -700,12 +708,13 @@ Note: /positions checks MEXC exchange-first; /open_orders scans normal + plan + 
 /proxy on|off|test|set URL
 /api status|set KEY SECRET|clear|test - API биржи через чат
 /openai status|set KEY|clear|test - OpenAI ключ для ИИ проверки
+AI scalping loop: кнопка 🤖 AI BTC/ETH scalping или /set strategy_mode ai_scalping. BTC и ETH независимы: AI-запрос только по символу без открытой позиции. После live-входа биржевые TP/SL обязательны; если MEXC не подтвердил защиту после retry, позиция аварийно закрывается. Доп. фильтры качества включаются отдельно: ai_scalping_quality_filters_enabled.
 /mexc_settings - показать MEXC параметры ордера
 /leverage 5 - плечо MEXC futures
 /open_type 1 - 1 isolated, 2 cross
 /recv_window 20000 - окно timestamp для MEXC
 /set margin_allocation_enabled true|false - делить баланс по слотам
-/set auto_close_on_protection_failed true|false - авто-закрытие если TP/SL не встал
+/set auto_close_on_protection_failed true|false - авто-закрытие если биржевые TP/SL не подтвердились после входа
 /set require_exchange_protection true|false - требовать exchange TP/SL
 /set key value - ручная настройка
 
@@ -714,7 +723,8 @@ live_trading, risk_pct, max_open_positions, scan_interval_sec, scanner_concurren
 ws_update_throttle_ms, ws_max_updates_per_batch, ws_queue_limit,
 symbol_refresh_sec, universe_mode, strategy_mode, mirror_mode,
 spot_confirmation_enabled, session_filter_enabled, america_short_bias_enabled, ws_enabled,
-mexc_order_leverage, mexc_order_open_type, mexc_recv_window, margin_allocation_enabled, require_exchange_protection, auto_close_on_protection_failed, total_positions_opened,
+mexc_order_leverage, mexc_order_open_type, mexc_recv_window, margin_allocation_enabled, require_exchange_protection, auto_close_on_protection_failed, total_positions_opened, ai_scalping_session_id, ai_scalping_session_reset_at,
+ai_scalping_symbols, ai_scalping_min_confidence, ai_scalping_tp_pct, ai_scalping_sl_pct, ai_scalping_btc_tp_pct, ai_scalping_btc_sl_pct, ai_scalping_eth_tp_pct, ai_scalping_eth_sl_pct, ai_scalping_max_spread_pct, ai_scalping_quality_filters_enabled, ai_scalping_quality_min_confidence, ai_scalping_quality_cooldown_sec, ai_scalping_quality_min_atr_pct, ai_scalping_quality_min_ema_gap_pct, ai_scalping_quality_min_ret_5m_abs_pct,
 scan_market_source = binance_binance | mexc_mexc | mexc_binance.
 
 По умолчанию: mexc_binance = MEXC фьючи скан + Binance spot подтверждение.
@@ -1252,6 +1262,27 @@ Mirror Expectancy: {m['expectancy']:.4f}
     await reply(update, text, reply_markup=MAIN_MENU)
 
 
+
+async def ai_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    rev = int(s.get("settings_revision", 1))
+    cur = await ai_stats_manager.summary("current")
+    await reply(update, AIStatsManager.format(cur), reply_markup=ai_stats_menu(rev))
+
+async def ai_stats_current_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    await reply(update, AIStatsManager.format(await ai_stats_manager.summary("current")), reply_markup=MAIN_MENU)
+
+async def ai_stats_lifetime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    await reply(update, AIStatsManager.format(await ai_stats_manager.summary("lifetime")), reply_markup=MAIN_MENU)
+
+async def ai_stats_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    sid = await ai_stats_manager.reset_session()
+    await reply(update, f"♻ AI scalping session reset\nNew session ID: {sid}", reply_markup=MAIN_MENU)
+
 async def recovery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     s = await storage.all_settings()
@@ -1608,6 +1639,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "openai_analysis_enabled", "openai_model", "openai_check_strength", "openai_api_key",
         "openai_env_fallback", "openai_timeout_sec", "openai_fail_open", "openai_show_decisions",
         "trade_charts_enabled", "liquidity_runner_enabled",
+        "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct",
     }
     if key not in allowed_keys:
         await reply(update, f"❌ Setting is not allowed through /set: {key}", reply_markup=MAIN_MENU)
@@ -1624,6 +1656,27 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update, "❌ OpenAI strength must be weak, medium, or strong.", reply_markup=MAIN_MENU)
         return
     await storage.set(key, parsed)
+    # v0104: /set strategy_mode ai_scalping must be a real mode switch, not
+    # only a marker. It automatically enables OpenAI and the BTC/ETH scalping
+    # defaults, matching the main menu button.
+    if key == "strategy_mode" and str(parsed).lower() == "ai_scalping":
+        ai_defaults = {
+            "openai_analysis_enabled": True,
+            "openai_show_decisions": True,
+            "ai_scalping_symbols": "BTC_USDT,ETH_USDT",
+            "ai_scalping_btc_tp_pct": 0.18,
+            "ai_scalping_btc_sl_pct": 0.26,
+            "ai_scalping_eth_tp_pct": 0.22,
+            "ai_scalping_eth_sl_pct": 0.32,
+            "max_open_positions": 2,
+            "auto_strategy_adaptation": False,
+            "regime_adaptation": False,
+            "liquidity_runner_enabled": False,
+            "spot_confirmation_enabled": False,
+            "session_filter_enabled": False,
+        }
+        for k2, v2 in ai_defaults.items():
+            await storage.set(k2, v2, bump_revision=False)
     if key in {"mexc_api_key", "mexc_api_secret", "proxy_url", "proxy_enabled", "mexc_order_leverage", "mexc_order_open_type", "mexc_recv_window", "margin_allocation_enabled", "require_exchange_protection", "auto_close_on_protection_failed"}:
         new_settings = await storage.all_settings()
         apply_mexc_runtime_env(new_settings)
@@ -1631,7 +1684,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if key in {"proxy_url", "proxy_enabled", "scan_market_source", "ws_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold"}:
         await reset_market_runtime()
     shown = mask_secret(str(parsed)) if key in {"mexc_api_key", "mexc_api_secret", "openai_api_key", "proxy_url"} else parsed
-    if key in {"scan_interval_sec", "scanner_concurrency", "strategy_mode", "universe_mode", "max_symbols", "scan_market_source", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "openai_check_strength", "openai_model"}:
+    if key in {"scan_interval_sec", "scanner_concurrency", "strategy_mode", "universe_mode", "max_symbols", "scan_market_source", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "openai_check_strength", "openai_model", "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct"}:
         trigger_scan_now(context.application, reason=f"setting:{key}")
     await reply(update, f"✅ Saved\n{key} = {shown}", reply_markup=MAIN_MENU)
 
@@ -1673,13 +1726,66 @@ async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await reply(update, "Unknown proxy command", reply_markup=MAIN_MENU)
 
+
+async def ai_scalping_toggle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    enabled = str(s.get("strategy_mode", "hybrid")).lower() == "ai_scalping"
+    if enabled:
+        updates = {
+            "strategy_mode": "hybrid",
+            "auto_strategy_adaptation": True,
+            "regime_adaptation": True,
+            "spot_confirmation_enabled": True,
+            "session_filter_enabled": True,
+            "openai_analysis_enabled": False,
+        }
+        for k, v in updates.items():
+            await storage.set(k, v, bump_revision=False)
+        await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+        trigger_scan_now(context.application, reason="ai_scalping:off")
+        await reply(update, "○ AI BTC/ETH scalping OFF\nРежим возвращён на hybrid adaptive.", reply_markup=MAIN_MENU)
+        return
+
+    updates = {
+        "strategy_mode": "ai_scalping",
+        "ai_scalping_symbols": "BTC_USDT,ETH_USDT",
+        "ai_scalping_btc_tp_pct": 0.18,
+        "ai_scalping_btc_sl_pct": 0.26,
+        "ai_scalping_eth_tp_pct": 0.22,
+        "ai_scalping_eth_sl_pct": 0.32,
+        "max_open_positions": 2,
+        "scan_interval_sec": 60,
+        "auto_strategy_adaptation": False,
+        "regime_adaptation": False,
+        "liquidity_runner_enabled": False,
+        "mirror_mode": "off",
+        "spot_confirmation_enabled": False,
+        "session_filter_enabled": False,
+        "america_short_bias_enabled": False,
+        "openai_analysis_enabled": True,
+        "openai_show_decisions": True,
+    }
+    for k, v in updates.items():
+        await storage.set(k, v, bump_revision=False)
+    await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+    scanner.last_refresh = 0
+    trigger_scan_now(context.application, reason="ai_scalping:on")
+    await reply(
+        update,
+        "✅ AI BTC/ETH scalping ON\n"
+        "Включено: только BTC/ETH, независимый AI-запрос по каждому символу после закрытия именно его позиции.\n"
+        "Отключено: scanner strategies, spot/session filters, mirror, regime/adaptive strategy.",
+        reply_markup=MAIN_MENU,
+    )
+
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     text = update.message.text
     mapping = {
         "▶️ Run": run_cmd, "⏹ Stop": stop_cmd, "📊 Status": status_cmd, "🚨 Panic": panic_cmd,
         "📈 Positions": positions_cmd, "📉 Stats": stats_cmd, "💰 Balance": balance_cmd,
-        "🏓 Ping": ping_cmd, "⚙️ Settings": settings_cmd, "🔐 API": api_cmd, "⚙️ MEXC": mexc_settings_cmd,
+        "🏓 Ping": ping_cmd, "⚙️ Settings": settings_cmd, "🔐 API": api_cmd, "📊 AI Stats": ai_stats_cmd, "🤖 AI BTC/ETH scalping": ai_scalping_toggle_cmd, "⚙️ MEXC": mexc_settings_cmd,
     }
     fn = mapping.get(text)
     if fn: await fn(update, context)
@@ -1710,7 +1816,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reset_market_runtime()
         new_settings = await storage.all_settings()
         new_rev = int(new_settings.get("settings_revision", current_rev + 1))
-        if key in {"live_trading", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "ws_enabled"}:
+        if key in {"live_trading", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "ws_enabled", "ai_scalping_quality_filters_enabled"}:
             trigger_scan_now(context.application, reason=f"toggle:{key}")
         await q.edit_message_text(f"✅ {key} = {new_value}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
     elif data[0] == "set":
@@ -1734,7 +1840,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key == "universe_mode":
             await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], new_rev, new_settings.get("universe_mode")))
         elif key == "strategy_mode":
-            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("Hybrid adaptive","hybrid"),("All strategies","all")], new_rev, new_settings.get("strategy_mode")))
+            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("AI BTC/ETH scalp","ai_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], new_rev, new_settings.get("strategy_mode")))
         elif key == "scan_market_source":
             await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], new_rev, new_settings.get("scan_market_source", "mexc_binance")))
         elif key == "scan_interval_sec":
@@ -1782,6 +1888,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await q.edit_message_text(f"❌ API test failed: {e}", reply_markup=api_menu(current_rev, s))
         else:
             await q.edit_message_text("🔐 API menu\nUse /api set API_KEY API_SECRET to save keys.", reply_markup=api_menu(current_rev, s))
+    elif data[0] == "aistats":
+        action = data[1] if len(data) > 1 else "current"
+        if action == "reset":
+            sid = await ai_stats_manager.reset_session()
+            new_settings = await storage.all_settings()
+            new_rev = int(new_settings.get("settings_revision", current_rev + 1))
+            await q.edit_message_text(f"♻ AI scalping session reset\nNew session ID: {sid}", reply_markup=ai_stats_menu(new_rev))
+        elif action == "lifetime":
+            await q.edit_message_text(AIStatsManager.format(await ai_stats_manager.summary("lifetime")), reply_markup=ai_stats_menu(current_rev))
+        else:
+            await q.edit_message_text(AIStatsManager.format(await ai_stats_manager.summary("current")), reply_markup=ai_stats_menu(current_rev))
     elif data[0] == "openai":
         action = data[1] if len(data) > 1 else "status"
         if action == "clear":
@@ -1801,7 +1918,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif name == "universe":
             await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], rev, s.get("universe_mode")))
         elif name == "strategy":
-            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("Hybrid adaptive","hybrid"),("All strategies","all")], rev, s.get("strategy_mode")))
+            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("AI BTC/ETH scalp","ai_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], rev, s.get("strategy_mode")))
         elif name == "marketsource":
             await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], rev, s.get("scan_market_source", "mexc_binance")))
         elif name == "scan":
@@ -2047,6 +2164,123 @@ async def trading_loop(app):
                     await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
                     continue
 
+                # 6) AI BTC/ETH dual scalping loop. In this mode the bot does not run the
+                # legacy signal scanner. BTC and ETH are independent: if BTC is open,
+                # ETH can still ask AI and trade; if ETH is open, BTC can still trade.
+                # A new AI request is made only for a symbol with no active local/exchange position.
+                if str(settings.get("strategy_mode", "hybrid")).lower() == "ai_scalping":
+                    symbols = ai_scalping_engine.symbols(settings)
+
+                    def _base(sym: str) -> str:
+                        x = str(sym or "").upper().replace("_", "/")
+                        if x.startswith("BTC"):
+                            return "BTC"
+                        if x.startswith("ETH"):
+                            return "ETH"
+                        return x.split("/")[0].split("_")[0].split(":")[0]
+
+                    active_bases = set()
+                    try:
+                        for p in await storage.positions():
+                            if str(p.get("status", "open")).lower() in {"open", "pending"}:
+                                active_bases.add(_base(p.get("symbol")))
+                    except Exception as e:
+                        scanner.last_reject_reason = f"AI scalp local position check warning: {e}"
+                    exchange_active_count = 0
+                    try:
+                        raw_pos = await ex.fetch_positions(symbols)
+                        for p in (raw_pos or []):
+                            if exec_engine.exchange_position_qty(p) > 0:
+                                active_bases.add(_base(p.get("symbol") or (p.get("info") or {}).get("symbol")))
+                                exchange_active_count += 1
+                    except Exception as e:
+                        scanner.last_reject_reason = f"AI scalp exchange position check warning: {e}"
+
+                    opened = []
+                    waited = []
+                    errors = []
+                    for symbol in symbols:
+                        b = _base(symbol)
+                        if b in active_bases:
+                            waited.append(f"{b}:active")
+                            continue
+
+                        if bool(settings.get("ai_scalping_quality_filters_enabled", False)):
+                            try:
+                                cd = int(float(settings.get("ai_scalping_quality_cooldown_sec", 45) or 45))
+                                if cd > 0:
+                                    now_ts = time.time()
+                                    recent = [t for t in await storage.trade_rows(since=now_ts - cd) if str(t.get("strategy", "")).lower() == "ai_scalping" and _base(t.get("symbol")) == b]
+                                    if recent:
+                                        left = max(1, int(cd - (now_ts - max(float(t.get("ts_close") or now_ts) for t in recent))))
+                                        waited.append(f"{b}:cooldown {left}s")
+                                        continue
+                            except Exception as e:
+                                waited.append(f"{b}:cooldown check warning {e}")
+
+                        decision = await ai_scalping_engine.decide_symbol(ex, settings, symbol)
+                        if not decision.ok:
+                            errors.append(f"{b}:{decision.error or 'AI unavailable'}")
+                            continue
+                        if decision.decision == "WAIT":
+                            waited.append(f"{b}:WAIT {decision.reason or 'no edge'}")
+                            try:
+                                await ai_stats_manager.record_wait(symbol, decision.reason or "no edge", decision.confidence, decision.model)
+                            except Exception:
+                                pass
+                            continue
+                        cand = ai_scalping_engine.make_candidate(decision, settings)
+                        if not cand:
+                            waited.append(f"{b}:local reject {decision.decision} conf={decision.confidence:.2f}")
+                            continue
+                        plan = TradePlanner().make_plan(cand, settings, equity_usdt=equity)
+                        if plan:
+                            try:
+                                plan.session = f"ai_scalping_session_{int(await storage.get('ai_scalping_session_id', 1) or 1)}"
+                            except Exception:
+                                plan.session = "ai_scalping"
+                        if not plan:
+                            waited.append(f"{b}:planner reject {decision.decision}")
+                            continue
+                        try:
+                            placed = await exec_engine.place_entry(plan, live)
+                        except Exception as e:
+                            errors.append(f"{b}:execution exception {e}")
+                            continue
+                        if placed.get("ok"):
+                            active_bases.add(b)
+                            opened.append(f"{plan.symbol} {plan.side} conf={decision.confidence:.2f}")
+                            await notify_admin(
+                                app,
+                                (
+                                    f"🤖 AI scalp opened\n"
+                                    f"{plan.symbol} {plan.side}\n"
+                                    f"Model: {decision.model}\n"
+                                    f"Conf: {decision.confidence:.2f}\n"
+                                    f"Reason: {decision.reason or '-'}\n"
+                                    f"TP: {plan.take_price:.6g}\n"
+                                    f"SL: {plan.stop_price:.6g}"
+                                ),
+                                key=f"ai_scalp_opened_{b}",
+                            )
+                            await send_trade_chart(app, ex, plan, settings)
+                        else:
+                            waited.append(f"{b}:execution rejected {placed.get('reason', 'unknown')}")
+
+                    if opened:
+                        scanner.last_signal_summary = "AI scalp opened: " + "; ".join(opened)
+                        scanner.last_reject_reason = "Dual loop: next AI request per symbol after that symbol closes"
+                        await update_scanner_status(app, settings, status="ai scalp opened", force=True)
+                    else:
+                        scanner.last_signal_summary = f"AI scalp dual: active={sorted(active_bases)} exchange={exchange_active_count}"
+                        msg = "; ".join(waited + errors) or "no action"
+                        scanner.last_reject_reason = msg[:500]
+                        await update_scanner_status(app, settings, status="ai scalp wait", force=bool(errors))
+                        if errors:
+                            await notify_admin(app, f"⚠️ AI scalping skipped: {scanner.last_reject_reason}", min_interval_sec=120, key="ai_scalp_error")
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
+                    continue
+
                 # 6) Candidate pipeline: detect market regime -> choose effective strategy ->
                 # scan futures signals -> mirror -> session -> spot -> filters -> plan -> execute.
                 trades = await storage.trade_rows()
@@ -2234,6 +2468,10 @@ def build_app():
     app.add_handler(CommandHandler("cancel_all", cancel_all_cmd))
     app.add_handler(CommandHandler("close_all", close_all_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("ai_stats", ai_stats_cmd))
+    app.add_handler(CommandHandler("ai_stats_current", ai_stats_current_cmd))
+    app.add_handler(CommandHandler("ai_stats_lifetime", ai_stats_lifetime_cmd))
+    app.add_handler(CommandHandler("ai_stats_reset", ai_stats_reset_cmd))
     app.add_handler(CommandHandler("sync", sync_cmd))
     app.add_handler(CommandHandler("sync_positions", sync_positions_cmd))
     app.add_handler(CommandHandler("recovery", recovery_cmd))

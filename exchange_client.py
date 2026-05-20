@@ -125,6 +125,15 @@ class ExchangeClient:
         norm = str(m.get("symbol") or self.normalize_symbol(symbol))
         return self._mexc_normalize_contract_id(norm)
 
+    def mexc_contract_symbol(self, symbol: str) -> str:
+        """Public native MEXC contract id helper, e.g. BTC_USDT.
+
+        Use this for every native MEXC private endpoint.  Display/ccxt symbols
+        like BTC/USDT:USDT are allowed inside the bot, but must never be sent
+        to `/api/v1/private/*` as `symbol`.
+        """
+        return self._mexc_symbol(symbol)
+
     def mexc_symbol_variants(self, symbol: str) -> list[str]:
         """Return all symbol spellings MEXC may use for the same futures pair.
 
@@ -446,8 +455,15 @@ class ExchangeClient:
         if not self.api_key or not self.api_secret:
             raise RuntimeError("MEXC API key/secret is missing")
         await self._mexc_private_rate_limit()
-        body = body or {}
-        query = query or {}
+        body = dict(body or {})
+        query = dict(query or {})
+        # Native MEXC futures private endpoints require underscore contract ids
+        # such as BTC_USDT.  Normalize at the final request boundary so no
+        # caller can accidentally send a display/ccxt symbol like BTC/USDT.
+        if body.get("symbol") not in (None, ""):
+            body["symbol"] = self._mexc_normalize_contract_id(body.get("symbol"))
+        if query.get("symbol") not in (None, ""):
+            query["symbol"] = self._mexc_normalize_contract_id(query.get("symbol"))
         method = method.upper()
         base = (base_url or self._mexc_rest_base()).rstrip("/")
         if method == "GET":
@@ -959,6 +975,97 @@ class ExchangeClient:
         out = await self._mexc_private("POST", "/api/v1/private/order/create", body=body)
         return {"ok": True, "symbol": self._mexc_id_to_symbol(msym), "mexc_symbol": msym, "vol": vol, "side": close_side, "result": out}
 
+
+    def _mexc_position_qty_contracts_from_parsed(self, pos: dict) -> int:
+        """Return exact MEXC contract volume from a parsed/open position."""
+        info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+        raw_vol = info.get("holdVol") or info.get("vol") or pos.get("contracts")
+        try:
+            raw_f = abs(float(raw_vol or 0))
+        except Exception:
+            raw_f = 0.0
+        if raw_f >= 1:
+            return max(1, int(round(raw_f)))
+        amount_f = 0.0
+        for key in ("amount", "qty", "size"):
+            try:
+                if pos.get(key) not in (None, ""):
+                    amount_f = abs(float(pos.get(key) or 0)); break
+            except Exception:
+                pass
+        if amount_f <= 0 and raw_f > 0:
+            amount_f = raw_f
+        if amount_f > 0:
+            return self._amount_to_mexc_vol(pos.get("symbol") or info.get("symbol") or "", amount_f)
+        return 0
+
+    async def mexc_find_open_position(self, symbol: str, side: str | None = None) -> dict:
+        """Find the live MEXC open position row for symbol/side.
+
+        TP/SL-by-position requires positionId and exact holdVol from
+        /api/v1/private/position/open_positions, not local cached qty.
+        """
+        positions = await self.fetch_positions([symbol])
+        want = str(side or "").lower()
+        for p in positions or []:
+            ps = str(p.get("side") or "").lower()
+            if want and ps and ps != want:
+                continue
+            info = p.get("info") if isinstance(p.get("info"), dict) else {}
+            pid = info.get("positionId") or info.get("id")
+            vol = self._mexc_position_qty_contracts_from_parsed(p)
+            if pid and vol > 0:
+                return p
+        raise RuntimeError(f"live MEXC position not found for {symbol} side={side or '*'}")
+
+    async def mexc_place_tpsl_by_position(self, symbol: str, side: str, qty: float, stop_price: float, take_price: float, client_order_id: str = "") -> dict:
+        """Place real MEXC TP/SL attached to an existing position.
+
+        This uses the documented `/api/v1/private/stoporder/place` endpoint,
+        which requires `positionId` and creates TP/SL *by position*.  It is
+        different from generic `/planorder/place`; plan orders can exist as
+        standalone trigger orders and are easier to mismatch with position side,
+        quantity, or symbol format.
+        """
+        if self.exchange_id != "mexc":
+            raise NotImplementedError("native MEXC TP/SL-by-position is MEXC only")
+        side_l = str(side or "").lower()
+        live_pos = await self.mexc_find_open_position(symbol, "long" if side_l == "sell" else "short")
+        info = live_pos.get("info") if isinstance(live_pos.get("info"), dict) else {}
+        pid = info.get("positionId") or info.get("id")
+        vol = self._mexc_position_qty_contracts_from_parsed(live_pos)
+        if not pid or vol <= 0:
+            raise RuntimeError(f"cannot place TP/SL: missing positionId/holdVol pid={pid!r} vol={vol!r}")
+        body = {
+            "positionId": int(pid),
+            "vol": vol,
+            "lossTrend": 1,
+            "profitTrend": 1,
+            "stopLossPrice": self._mexc_price_to_precision(symbol, float(stop_price)),
+            "takeProfitPrice": self._mexc_price_to_precision(symbol, float(take_price)),
+            "priceProtect": 0,
+            "profitLossVolType": "SAME",
+            "volType": 2,
+            "takeProfitType": 0,
+            "stopLossType": 0,
+            "takeProfitOrderPrice": 0,
+            "stopLossOrderPrice": 0,
+            "takeProfitReverse": 2,
+            "stopLossReverse": 2,
+        }
+        out = await self._mexc_private("POST", "/api/v1/private/stoporder/place", body=body)
+        data = out.get("data") if isinstance(out, dict) else None
+        oid = data.get("id") if isinstance(data, dict) else data
+        return {
+            "id": str(oid or ""),
+            "symbol": self.normalize_symbol(symbol),
+            "type": "position_tpsl",
+            "side": side,
+            "amount": qty,
+            "price": None,
+            "info": {"native_mexc_position_tpsl": True, "positionId": pid, "vol": vol, **(out if isinstance(out, dict) else {"raw": out})},
+        }
+
     async def mexc_close_all_positions_native(self):
         """Emergency exchange-side close all positions endpoint."""
         if self.exchange_id != "mexc":
@@ -1215,12 +1322,12 @@ class ExchangeClient:
         else:
             mexc_side = 1 if is_buy else 3
         t = str(type_).lower()
-        if t in {"market", "stop_market"} and not any(k in params for k in ("stopPrice", "triggerPrice", "stopLossPrice")):
+        if t in {"market", "stop_market"} and not any(k in params for k in ("stopPrice", "triggerPrice", "stopLossPrice", "takeProfitPrice")):
             mexc_type = 5  # market
             order_price = 0
-        elif any(k in params for k in ("stopPrice", "triggerPrice", "stopLossPrice")):
+        elif any(k in params for k in ("stopPrice", "triggerPrice", "stopLossPrice", "takeProfitPrice")):
             # Native plan order. Used for SL/TP fallback only if ccxt fails.
-            trigger_price = self._mexc_price_to_precision(symbol, float(params.get("triggerPrice") or params.get("stopPrice") or params.get("stopLossPrice")))
+            trigger_price = self._mexc_price_to_precision(symbol, float(params.get("triggerPrice") or params.get("stopPrice") or params.get("stopLossPrice") or params.get("takeProfitPrice")))
             body = {
                 "symbol": self._mexc_symbol(symbol),
                 "vol": self._amount_to_mexc_vol(symbol, amount),
@@ -1231,7 +1338,7 @@ class ExchangeClient:
                 "executePrice": 0,
                 "orderType": 5,
                 "triggerType": 1,
-                "trend": 1,
+                "trend": (1 if (str(side).lower() == "buy" and params.get("stopLossPrice")) or (str(side).lower() == "sell" and params.get("takeProfitPrice")) else 2),
             }
             if params.get("clientOrderId"):
                 body["externalOid"] = str(params.get("clientOrderId"))[:32]

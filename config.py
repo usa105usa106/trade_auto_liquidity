@@ -8,7 +8,7 @@ load_dotenv()
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
-VERSION = os.getenv("BOT_VERSION", "0097 CLOSE CANCEL BALANCE HARDENING")
+VERSION = os.getenv("BOT_VERSION", "0107 AI SCALPING STATS SESSIONS | 0106 AI SCALPING QUALITY FILTERS | 0105 AI SCALPING PROMPT TUNED")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -84,6 +84,22 @@ class Defaults:
     liquidity_retest_min_mtf_score: float = env_float("LIQUIDITY_RETEST_MIN_MTF_SCORE", -0.25)
     liquidity_retest_require_clean_path: bool = env_bool("LIQUIDITY_RETEST_REQUIRE_CLEAN_PATH", False)
     liquidity_runner_enabled: bool = env_bool("LIQUIDITY_RUNNER_ENABLED", False)
+
+    ai_scalping_symbols: str = os.getenv("AI_SCALPING_SYMBOLS", "BTC_USDT,ETH_USDT")
+    ai_scalping_min_confidence: float = env_float("AI_SCALPING_MIN_CONFIDENCE", 0.58)
+    ai_scalping_tp_pct: float = env_float("AI_SCALPING_TP_PCT", 0.18)
+    ai_scalping_sl_pct: float = env_float("AI_SCALPING_SL_PCT", 0.26)
+    ai_scalping_btc_tp_pct: float = env_float("AI_SCALPING_BTC_TP_PCT", 0.18)
+    ai_scalping_btc_sl_pct: float = env_float("AI_SCALPING_BTC_SL_PCT", 0.26)
+    ai_scalping_eth_tp_pct: float = env_float("AI_SCALPING_ETH_TP_PCT", 0.22)
+    ai_scalping_eth_sl_pct: float = env_float("AI_SCALPING_ETH_SL_PCT", 0.32)
+    ai_scalping_max_spread_pct: float = env_float("AI_SCALPING_MAX_SPREAD_PCT", 0.08)
+    ai_scalping_quality_filters_enabled: bool = env_bool("AI_SCALPING_QUALITY_FILTERS_ENABLED", False)
+    ai_scalping_quality_min_confidence: float = env_float("AI_SCALPING_QUALITY_MIN_CONFIDENCE", 0.72)
+    ai_scalping_quality_cooldown_sec: int = env_int("AI_SCALPING_QUALITY_COOLDOWN_SEC", 45)
+    ai_scalping_quality_min_atr_pct: float = env_float("AI_SCALPING_QUALITY_MIN_ATR_PCT", 0.035)
+    ai_scalping_quality_min_ema_gap_pct: float = env_float("AI_SCALPING_QUALITY_MIN_EMA_GAP_PCT", 0.015)
+    ai_scalping_quality_min_ret_5m_abs_pct: float = env_float("AI_SCALPING_QUALITY_MIN_RET_5M_ABS_PCT", 0.035)
 
 DEFAULTS = Defaults()
 DB_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")

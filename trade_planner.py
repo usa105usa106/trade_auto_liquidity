@@ -55,6 +55,16 @@ class TradePlanner:
                 "tp_mult": float(os.getenv("REVERSAL_TP_ATR_MULT", "1.8")),
                 "sl_mult": float(os.getenv("REVERSAL_SL_ATR_MULT", "1.4")),
             },
+
+            "ai_scalping": {
+                # Default fallback is BTC scalping; ETH uses per-symbol settings below.
+                "min_tp": float(os.getenv("AI_SCALPING_TP_PCT", "0.18")),
+                "max_tp": float(os.getenv("AI_SCALPING_TP_PCT", "0.18")),
+                "min_sl": float(os.getenv("AI_SCALPING_SL_PCT", "0.26")),
+                "max_sl": float(os.getenv("AI_SCALPING_SL_PCT", "0.26")),
+                "tp_mult": 1.0,
+                "sl_mult": 1.0,
+            },
             "liquidity_retest": {
                 # v0082: not a scalp profile. SL comes from the liquidity zone/wick,
                 # TP is adaptive RR (2R/3R/4R). These bands are safety clamps only.
@@ -125,6 +135,22 @@ class TradePlanner:
                         tp_pct = clamp(target_pct, float(profile["min_tp"]), float(profile["max_tp"]))
                         rr = clamp(target_rr, 2.0, 4.0)
             candidate["liquidity_retest_rr"] = rr
+        elif strategy == "ai_scalping":
+            # v0103: BTC and ETH use different fixed scalp distances.
+            # AI chooses only direction; bot keeps deterministic TP/SL.
+            sym_key = str(candidate.get("symbol") or "").upper().replace("/", "_").replace(":USDT", "")
+            if sym_key.startswith("ETH_USDT"):
+                tp_default = os.getenv("AI_SCALPING_ETH_TP_PCT", "0.22")
+                sl_default = os.getenv("AI_SCALPING_ETH_SL_PCT", "0.32")
+                tp_setting = "ai_scalping_eth_tp_pct"
+                sl_setting = "ai_scalping_eth_sl_pct"
+            else:
+                tp_default = os.getenv("AI_SCALPING_BTC_TP_PCT", os.getenv("AI_SCALPING_TP_PCT", "0.18"))
+                sl_default = os.getenv("AI_SCALPING_BTC_SL_PCT", os.getenv("AI_SCALPING_SL_PCT", "0.26"))
+                tp_setting = "ai_scalping_btc_tp_pct"
+                sl_setting = "ai_scalping_btc_sl_pct"
+            tp_pct = max(0.01, float(settings.get(tp_setting, tp_default) or tp_default))
+            sl_pct = max(0.01, float(settings.get(sl_setting, sl_default) or sl_default))
         else:
             sl_pct = clamp(atr_pct * float(profile["sl_mult"]), float(profile["min_sl"]), float(profile["max_sl"]))
             tp_pct = clamp(atr_pct * float(profile["tp_mult"]), float(profile["min_tp"]), float(profile["max_tp"]))
@@ -172,7 +198,7 @@ class TradePlanner:
             stop = price * (1 + sl_pct / 100.0)
             take = price * (1 - tp_pct / 100.0)
 
-        order_type = "market" if strategy == "momentum" else "limit"
+        order_type = "market" if strategy in {"momentum", "ai_scalping"} else "limit"
         lr_rr = float(candidate.get("liquidity_retest_rr") or (details.get("adaptive_rr") if isinstance(details, dict) else 0) or 0)
         lr_zone_low = float(details.get("zone_low") or 0) if isinstance(details, dict) else 0.0
         lr_zone_high = float(details.get("zone_high") or 0) if isinstance(details, dict) else 0.0

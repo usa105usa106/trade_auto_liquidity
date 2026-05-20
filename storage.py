@@ -66,6 +66,22 @@ DEFAULT_SETTINGS = {
     "liquidity_retest_min_mtf_score": DEFAULTS.liquidity_retest_min_mtf_score,
     "liquidity_retest_require_clean_path": DEFAULTS.liquidity_retest_require_clean_path,
     "liquidity_runner_enabled": DEFAULTS.liquidity_runner_enabled,
+
+    "ai_scalping_symbols": DEFAULTS.ai_scalping_symbols,
+    "ai_scalping_min_confidence": DEFAULTS.ai_scalping_min_confidence,
+    "ai_scalping_tp_pct": DEFAULTS.ai_scalping_tp_pct,
+    "ai_scalping_sl_pct": DEFAULTS.ai_scalping_sl_pct,
+    "ai_scalping_btc_tp_pct": DEFAULTS.ai_scalping_btc_tp_pct,
+    "ai_scalping_btc_sl_pct": DEFAULTS.ai_scalping_btc_sl_pct,
+    "ai_scalping_eth_tp_pct": DEFAULTS.ai_scalping_eth_tp_pct,
+    "ai_scalping_eth_sl_pct": DEFAULTS.ai_scalping_eth_sl_pct,
+    "ai_scalping_max_spread_pct": DEFAULTS.ai_scalping_max_spread_pct,
+    "ai_scalping_quality_filters_enabled": DEFAULTS.ai_scalping_quality_filters_enabled,
+    "ai_scalping_quality_min_confidence": DEFAULTS.ai_scalping_quality_min_confidence,
+    "ai_scalping_quality_cooldown_sec": DEFAULTS.ai_scalping_quality_cooldown_sec,
+    "ai_scalping_quality_min_atr_pct": DEFAULTS.ai_scalping_quality_min_atr_pct,
+    "ai_scalping_quality_min_ema_gap_pct": DEFAULTS.ai_scalping_quality_min_ema_gap_pct,
+    "ai_scalping_quality_min_ret_5m_abs_pct": DEFAULTS.ai_scalping_quality_min_ret_5m_abs_pct,
     "proxy_enabled": DEFAULTS.proxy_enabled,
     "proxy_url": DEFAULTS.proxy_url,
     "mexc_order_leverage": DEFAULTS.mexc_order_leverage,
@@ -96,6 +112,8 @@ DEFAULT_SETTINGS = {
     "ws_stale_sec": 20,
     "settings_revision": 1,
     "total_positions_opened": int(os.getenv("TOTAL_POSITIONS_OPENED", "0") or 0),
+    "ai_scalping_session_id": int(os.getenv("AI_SCALPING_SESSION_ID", "1") or 1),
+    "ai_scalping_session_reset_at": float(os.getenv("AI_SCALPING_SESSION_RESET_AT", "0") or 0),
 }
 
 class Storage:
@@ -155,6 +173,19 @@ class Storage:
                 symbol TEXT PRIMARY KEY,
                 locked_until REAL,
                 reason TEXT
+            )
+            """)
+            await db.execute("""
+            CREATE TABLE IF NOT EXISTS ai_scalping_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                session_id INTEGER NOT NULL,
+                symbol TEXT,
+                event TEXT NOT NULL,
+                reason TEXT,
+                confidence REAL,
+                model TEXT,
+                raw TEXT
             )
             """)
             await db.commit()
@@ -298,6 +329,36 @@ class Storage:
             cur = await db.execute(q, params)
             rows = await cur.fetchall()
         return [json.loads(r[0]) for r in rows if r and r[0]]
+
+
+    async def add_ai_scalping_event(self, event: dict) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("""
+            INSERT INTO ai_scalping_events(ts,session_id,symbol,event,reason,confidence,model,raw)
+            VALUES(?,?,?,?,?,?,?,?)
+            """, (
+                float(event.get("ts", time.time())), int(event.get("session_id", 1) or 1),
+                event.get("symbol"), event.get("event"), event.get("reason"),
+                event.get("confidence"), event.get("model"), json.dumps(event),
+            ))
+            await db.commit()
+
+    async def ai_scalping_events(self, since: float | None = None) -> list[dict]:
+        q = "SELECT raw FROM ai_scalping_events"
+        params = ()
+        if since:
+            q += " WHERE ts>=?"
+            params = (since,)
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(q, params)
+            rows = await cur.fetchall()
+        out = []
+        for r in rows:
+            try:
+                out.append(json.loads(r[0]))
+            except Exception:
+                pass
+        return out
 
     async def set_lock(self, symbol: str, seconds: int, reason: str) -> None:
         async with aiosqlite.connect(self.path) as db:
