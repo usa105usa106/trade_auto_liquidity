@@ -8,7 +8,7 @@ load_dotenv()
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
-VERSION = os.getenv("BOT_VERSION", "0113 AI BTC/ETH")
+VERSION = os.getenv("BOT_VERSION", "0115 AI BTC/ETH")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -100,6 +100,9 @@ class Defaults:
     ai_scalping_quality_min_atr_pct: float = env_float("AI_SCALPING_QUALITY_MIN_ATR_PCT", 0.035)
     ai_scalping_quality_min_ema_gap_pct: float = env_float("AI_SCALPING_QUALITY_MIN_EMA_GAP_PCT", 0.015)
     ai_scalping_quality_min_ret_5m_abs_pct: float = env_float("AI_SCALPING_QUALITY_MIN_RET_5M_ABS_PCT", 0.035)
+    ai_scalping_ai_cooldown_sec: int = env_int("AI_SCALPING_AI_COOLDOWN_SEC", 60)
+    ai_scalping_openai_fallback_enabled: bool = env_bool("AI_SCALPING_OPENAI_FALLBACK_ENABLED", False)
+    ai_scalping_json_mode_enabled: bool = env_bool("AI_SCALPING_JSON_MODE_ENABLED", False)
 
 DEFAULTS = Defaults()
 DB_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")

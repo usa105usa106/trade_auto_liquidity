@@ -5,12 +5,15 @@ import json
 import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
 
 from models import TradePlan
+
+# BTC_ETH_AI_SCALP_DIRECTION | Return one strict JSON object only | bot TP before bot SL | Do not force trades | max_output_tokens
 from openai_signal_engine import OPENAI_RESPONSES_URL, OPENAI_CHAT_URL, active_model, openai_key
 
 
@@ -25,6 +28,7 @@ class AIScalpDecision:
     raw: str = ""
     model: str = ""
     market: dict | None = None
+    cached: bool = False
 
 
 
@@ -152,8 +156,8 @@ def parse_ai_scalp_decision(text: str, allowed_symbols: list[str], model: str) -
             symbol = allowed_symbols[0] if allowed_symbols else ""
             return AIScalpDecision(ok=True, symbol=symbol, decision=decision, confidence=max(0.0, min(1.0, conf)), reason=reason, raw=raw[:1000], model=model)
         return AIScalpDecision(ok=False, error="AI did not return JSON", raw=raw[:1000], model=model)
-    symbol = str(data.get("symbol") or "").upper().replace("/", "").replace(":USDT", "")
-    norm_allowed = {s.upper().replace("/", "").replace(":USDT", ""): s for s in allowed_symbols}
+    symbol = str(data.get("symbol") or "").upper().replace("_", "").replace("/", "").replace(":USDT", "")
+    norm_allowed = {s.upper().replace("_", "").replace("/", "").replace(":USDT", ""): s for s in allowed_symbols}
     if symbol not in norm_allowed:
         return AIScalpDecision(ok=True, symbol="", decision="WAIT", confidence=0.0, reason="AI symbol not allowed", raw=raw[:1000], model=model)
     decision = str(data.get("decision") or data.get("side") or "WAIT").upper().strip()
@@ -206,6 +210,7 @@ class AIScalpingEngine:
 
     def __init__(self):
         self._sem = asyncio.Semaphore(1)
+        self._decision_cache: dict[str, tuple[float, AIScalpDecision]] = {}
 
     @staticmethod
     def symbols(settings: dict) -> list[str]:
@@ -281,11 +286,11 @@ class AIScalpingEngine:
         return dec if 'dec' in locals() else AIScalpDecision(ok=True, decision="WAIT", reason="no symbols", model=active_model(settings))
 
     async def decide_symbol(self, exchange_client, settings: dict, symbol: str) -> AIScalpDecision:
-        """Ask OpenAI for exactly one symbol only.
+        """Ask OpenAI for exactly one symbol only, with token guards.
 
-        This is the cheap dual-loop mode: BTC and ETH are queried separately only
-        when that specific symbol has no active position. The AI controls only
-        LONG/SHORT/WAIT; the bot controls size, TP/SL, leverage and execution.
+        v0115 fixes token overuse: no schema retry chain by default, no raw candles,
+        no history/stats, local reject before AI when data is invalid, and per-symbol
+        WAIT cache so BTC/ETH are not re-asked every scan while the market is unchanged.
         """
         allowed_all = self.symbols(settings)
         norm = {x.upper().replace("_", "/"): x for x in allowed_all}
@@ -293,21 +298,41 @@ class AIScalpingEngine:
         if ":" not in sym and sym.endswith("/USDT"):
             sym += ":USDT"
         allowed = [norm.get(sym, symbol if symbol in allowed_all else allowed_all[0])]
+        allowed_symbol = allowed[0]
+        base_key = allowed_symbol.split(":")[0].replace("/", "").upper()
         model = active_model(settings)
         key = openai_key(settings)
         if not key:
-            return AIScalpDecision(ok=False, symbol=allowed[0], decision="WAIT", error="OpenAI API key missing", model=model)
+            return AIScalpDecision(ok=False, symbol=allowed_symbol, decision="WAIT", error="OpenAI API key missing", model=model)
+
+        cooldown = int(_f(settings.get("ai_scalping_ai_cooldown_sec"), 60))
+        now = time.time()
+        cached = self._decision_cache.get(base_key)
+        if cooldown > 0 and cached and now - cached[0] < cooldown:
+            old = cached[1]
+            return AIScalpDecision(
+                ok=old.ok, symbol=old.symbol, decision=old.decision, confidence=old.confidence,
+                reason=f"cached {int(cooldown - (now - cached[0]))}s: {old.reason}"[:220],
+                raw=old.raw, model=old.model, market=old.market, cached=True,
+            )
+
         quality_mode = _b(settings, "ai_scalping_quality_filters_enabled", False)
         try:
-            market = await self.market_snapshot(exchange_client, allowed[0], quality_mode=quality_mode)
+            market = await self.market_snapshot(exchange_client, allowed_symbol, quality_mode=quality_mode)
         except Exception as e:
-            market = {"symbol": allowed[0], "error": str(e)[:160]}
+            market = {"symbol": allowed_symbol, "error": str(e)[:160]}
         markets = [market]
         max_spread = _f(settings.get("ai_scalping_max_spread_pct"), _f(settings.get("max_spread_pct"), 0.20))
-        # v0112: ultra-low-token prompt. BTC_ETH_AI_SCALP_DIRECTION. Return one strict JSON object only; bot TP before bot SL; Do not force trades; max_output_tokens replaced by max_completion_tokens where required Do NOT send raw candles, trade history,
-        # stats, or verbose rules. The AI gets only compact derived features.
+
+        # Do not spend tokens when local market data is unusable or spread is already too high.
+        if market.get("error") or _f(market.get("price"), 0.0) <= 0:
+            return AIScalpDecision(ok=True, symbol=allowed_symbol, decision="WAIT", confidence=0.0, reason="local: no reliable market data", model=model, market={"markets": markets})
+        if _f(market.get("spread_pct"), 0.0) > max_spread:
+            dec = AIScalpDecision(ok=True, symbol=allowed_symbol, decision="WAIT", confidence=0.0, reason="local: spread too high", model=model, market={"markets": markets})
+            self._decision_cache[base_key] = (now, dec)
+            return dec
+
         compact_market = {
-            "s": allowed[0].split(":")[0].replace("/", "_"),
             "p": market.get("price", 0),
             "r1": market.get("ret_1m_pct", 0),
             "r5": market.get("ret_5m_pct", 0),
@@ -315,54 +340,53 @@ class AIScalpingEngine:
             "e1": 1 if market.get("ema9_gt_ema21_1m") else 0,
             "e5": 1 if market.get("ema9_gt_ema21_5m") else 0,
             "e15": (1 if market.get("ema9_gt_ema21_15m") else 0) if market.get("ema9_gt_ema21_15m") is not None else None,
-            "gap5": market.get("ema_gap_5m_pct", 0),
             "atr": market.get("atr_1m_pct", 0),
             "sp": market.get("spread_pct", 0),
             "imb": market.get("imbalance", 0),
         }
         min_conf = _f(settings.get("ai_scalping_quality_min_confidence" if quality_mode else "ai_scalping_min_confidence"), 0.72 if quality_mode else 0.58)
         prompt_obj = {
-            "task": "scalp_dir",
-            "rule": "Return JSON only. Pick LONG/SHORT only if TP likely before SL, else WAIT.",
-            "sym": compact_market["s"],
-            "tf": "1m/5m" + ("/15m" if quality_mode else ""),
+            "s": base_key,
             "q": 1 if quality_mode else 0,
-            "min_conf": min_conf,
-            "max_sp": max_spread,
+            "min": min_conf,
+            "rule": "LONG/SHORT only if likely TP before SL; else WAIT",
             "m": compact_market,
-            "out": {"symbol": compact_market["s"], "decision": "LONG|SHORT|WAIT", "confidence": 0.0, "reason": "short"},
         }
         prompt = json.dumps(prompt_obj, separators=(",", ":"), ensure_ascii=False)
-        system = "BTC/ETH futures scalping filter. JSON only. No prose. Prefer WAIT on mixed/chop/weak edge."
+        system = 'Return only JSON: {"symbol":"BTCUSDT|ETHUSDT","decision":"LONG|SHORT|WAIT","confidence":0-1,"reason":"short"}. No prose.'
         timeout_sec = float(settings.get("openai_timeout_sec", os.getenv("OPENAI_TIMEOUT_SEC", "12")) or 12)
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         async with self._sem:
             try:
                 timeout = aiohttp.ClientTimeout(total=timeout_sec)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    # v0112: one cheap Chat Completions request first. The older
-                    # Responses+schema path could double/triple token spend when a
-                    # model/provider rejected structured output and the code retried.
+                    # v0115: one tiny request by default. JSON mode and fallback are optional
+                    # because rejected response_format calls were doubling token spend.
                     chat_body = {
                         "model": model,
                         "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-                        "response_format": _json_object_payload(),
                     }
+                    if _b(settings, "ai_scalping_json_mode_enabled", False):
+                        chat_body["response_format"] = _json_object_payload()
                     if str(model).lower().startswith(("gpt-5", "o1", "o3", "o4")):
-                        chat_body["max_completion_tokens"] = 40
+                        chat_body["max_completion_tokens"] = 32
                     else:
                         chat_body["temperature"] = 0.1
-                        chat_body["max_tokens"] = 40
+                        chat_body["max_tokens"] = 32
                     async with session.post(OPENAI_CHAT_URL, headers=headers, json=chat_body) as r:
                         txt = await r.text()
                         if r.status == 200:
                             parsed = _extract_text(json.loads(txt))
                             dec = parse_ai_scalp_decision(parsed, allowed, model)
                             dec.market = {"markets": markets}
+                            if dec.ok and dec.decision == "WAIT":
+                                self._decision_cache[base_key] = (time.time(), dec)
                             return dec
                         first_error = txt[:240]
 
-                    # One fallback only: no response_format for providers that reject JSON mode.
+                    if not _b(settings, "ai_scalping_openai_fallback_enabled", False):
+                        return AIScalpDecision(ok=False, symbol=allowed_symbol, decision="WAIT", error=f"OpenAI error chat={first_error}", model=model, market={"markets": markets})
+
                     fallback_body = dict(chat_body)
                     fallback_body.pop("response_format", None)
                     async with session.post(OPENAI_CHAT_URL, headers=headers, json=fallback_body) as r2:
@@ -371,10 +395,12 @@ class AIScalpingEngine:
                             parsed2 = _extract_text(json.loads(txt2))
                             dec = parse_ai_scalp_decision(parsed2, allowed, model)
                             dec.market = {"markets": markets}
+                            if dec.ok and dec.decision == "WAIT":
+                                self._decision_cache[base_key] = (time.time(), dec)
                             return dec
-                        return AIScalpDecision(ok=False, symbol=allowed[0], decision="WAIT", error=f"OpenAI error chat={first_error}; fallback={r2.status}: {txt2[:160]}", model=model, market={"markets": markets})
+                        return AIScalpDecision(ok=False, symbol=allowed_symbol, decision="WAIT", error=f"OpenAI error chat={first_error}; fallback={r2.status}: {txt2[:160]}", model=model, market={"markets": markets})
             except Exception as e:
-                return AIScalpDecision(ok=False, symbol=allowed[0], decision="WAIT", error=f"OpenAI unavailable: {e}", model=model, market={"markets": markets})
+                return AIScalpDecision(ok=False, symbol=allowed_symbol, decision="WAIT", error=f"OpenAI unavailable: {e}", model=model, market={"markets": markets})
 
     def make_candidate(self, decision: AIScalpDecision, settings: dict) -> dict | None:
         if not decision.ok or decision.decision not in {"LONG", "SHORT"} or not decision.symbol:

@@ -209,7 +209,7 @@ def _scan_status_text(settings: dict, status: str = "scanning", last_signal: str
     status_label = str(status or "scanning").replace("_", " ")
     mode = str(settings.get("strategy_mode", "hybrid"))
     ai_mode = mode.lower() == "ai_scalping"
-    # v0113: AI BTC/ETH scalping is a separate two-symbol loop, not the legacy
+    # v0114: AI BTC/ETH scalping is a separate two-symbol loop, not the legacy
     # adaptive scanner. Do not show stale effective strategy/universe counters
     # from a previous hybrid/reversal scan.
     if ai_mode:
@@ -735,7 +735,7 @@ ws_update_throttle_ms, ws_max_updates_per_batch, ws_queue_limit,
 symbol_refresh_sec, universe_mode, strategy_mode, mirror_mode,
 spot_confirmation_enabled, session_filter_enabled, america_short_bias_enabled, ws_enabled,
 mexc_order_leverage, mexc_order_open_type, mexc_recv_window, margin_allocation_enabled, require_exchange_protection, auto_close_on_protection_failed, total_positions_opened, ai_scalping_session_id, ai_scalping_session_reset_at,
-ai_scalping_symbols, ai_scalping_min_confidence, ai_scalping_tp_pct, ai_scalping_sl_pct, ai_scalping_btc_tp_pct, ai_scalping_btc_sl_pct, ai_scalping_eth_tp_pct, ai_scalping_eth_sl_pct, ai_scalping_max_spread_pct, ai_scalping_quality_filters_enabled, ai_scalping_quality_min_confidence, ai_scalping_quality_cooldown_sec, ai_scalping_quality_min_atr_pct, ai_scalping_quality_min_ema_gap_pct, ai_scalping_quality_min_ret_5m_abs_pct,
+ai_scalping_symbols, ai_scalping_min_confidence, ai_scalping_tp_pct, ai_scalping_sl_pct, ai_scalping_btc_tp_pct, ai_scalping_btc_sl_pct, ai_scalping_eth_tp_pct, ai_scalping_eth_sl_pct, ai_scalping_max_spread_pct, ai_scalping_quality_filters_enabled, ai_scalping_quality_min_confidence, ai_scalping_quality_cooldown_sec, ai_scalping_quality_min_atr_pct, ai_scalping_quality_min_ema_gap_pct, ai_scalping_quality_min_ret_5m_abs_pct, ai_scalping_ai_cooldown_sec, ai_scalping_openai_fallback_enabled, ai_scalping_json_mode_enabled,
 scan_market_source = binance_binance | mexc_mexc | mexc_binance.
 
 По умолчанию: mexc_binance = MEXC фьючи скан + Binance spot подтверждение.
@@ -1650,7 +1650,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "openai_analysis_enabled", "openai_model", "openai_check_strength", "openai_api_key",
         "openai_env_fallback", "openai_timeout_sec", "openai_fail_open", "openai_show_decisions",
         "trade_charts_enabled", "liquidity_runner_enabled",
-        "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct",
+        "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct", "ai_scalping_ai_cooldown_sec", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled",
     }
     if key not in allowed_keys:
         await reply(update, f"❌ Setting is not allowed through /set: {key}", reply_markup=MAIN_MENU)
@@ -1827,7 +1827,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reset_market_runtime()
         new_settings = await storage.all_settings()
         new_rev = int(new_settings.get("settings_revision", current_rev + 1))
-        if key in {"live_trading", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "ws_enabled", "ai_scalping_quality_filters_enabled"}:
+        if key in {"live_trading", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "ws_enabled", "ai_scalping_quality_filters_enabled", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled"}:
             trigger_scan_now(context.application, reason=f"toggle:{key}")
         await q.edit_message_text(f"✅ {key} = {new_value}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
     elif data[0] == "set":
@@ -2083,7 +2083,7 @@ async def trading_loop(app):
                         await notify_admin(app, format_position_event(ev), key="position_event")
 
                 # 2) Refresh symbol universe for legacy scanner modes only.
-                # v0113: AI BTC/ETH scalping must not run the adaptive universe
+                # v0114: AI BTC/ETH scalping must not run the adaptive universe
                 # scanner at all. It uses direct BTC_USDT/ETH_USDT market data and
                 # should not emit websocket empty-cache errors from the legacy scanner.
                 if not ai_mode and time.time() - scanner.last_refresh > int(settings.get("symbol_refresh_sec", 300)):
@@ -2245,10 +2245,12 @@ async def trading_loop(app):
                             continue
                         if decision.decision == "WAIT":
                             waited.append(f"{b}:WAIT {decision.reason or 'no edge'}")
-                            try:
-                                await ai_stats_manager.record_wait(symbol, decision.reason or "no edge", decision.confidence, decision.model)
-                            except Exception:
-                                pass
+                            # v0115: cached WAIT avoids repeat OpenAI calls. Do not inflate WAIT stats on cached loops.
+                            if not getattr(decision, "cached", False):
+                                try:
+                                    await ai_stats_manager.record_wait(symbol, decision.reason or "no edge", decision.confidence, decision.model)
+                                except Exception:
+                                    pass
                             continue
                         cand = ai_scalping_engine.make_candidate(decision, settings)
                         if not cand:
