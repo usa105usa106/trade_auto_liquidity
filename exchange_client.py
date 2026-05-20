@@ -241,13 +241,12 @@ class ExchangeClient:
 
     def _amount_to_mexc_vol(self, symbol: str, amount: float) -> int:
         """MEXC futures API expects integer contract volume, not base coin amount."""
-        m = self._market(symbol)
         amount = float(amount or 0)
-        contract_size = float(m.get("contractSize") or m.get("contract_size") or 0)
+        contract_size = self._mexc_contract_size(symbol)
         if contract_size > 0:
             vol = amount / contract_size
         else:
-            # Fallback for USDT perpetuals when ccxt metadata is incomplete.
+            # Fallback for unknown contracts when metadata is incomplete.
             vol = amount
         vol = int(round(vol))
         return max(1, vol)
@@ -597,14 +596,33 @@ class ExchangeClient:
             return f"{base}/{quote}:USDT"
         return raw
 
-    def _mexc_contracts_to_amount(self, symbol: str, contracts: float) -> float:
+    def _mexc_contract_size(self, symbol: str) -> float:
+        """Return MEXC futures contract size in base coin.
+
+        MEXC position/order APIs use integer contracts (holdVol/vol).  If ccxt
+        market metadata is missing contractSize, falling back to 1 incorrectly
+        treats 13 BTC_USDT contracts as 13 BTC.  Hard-code the major MEXC
+        contracts used by AI scalping so qty/notional/protection volume stay
+        correct even when metadata is incomplete.
+        """
         try:
             m = self._market(symbol)
-            contract_size = float(m.get("contractSize") or m.get("contract_size") or 0)
-            if contract_size > 0:
-                return abs(float(contracts or 0)) * contract_size
+            cs = float(m.get("contractSize") or m.get("contract_size") or 0)
+            if cs > 0:
+                return cs
         except Exception:
             pass
+        sid = self._mexc_normalize_contract_id(symbol)
+        fallback = {
+            "BTC_USDT": 0.0001,
+            "ETH_USDT": 0.01,
+        }
+        return float(fallback.get(sid, 0.0))
+
+    def _mexc_contracts_to_amount(self, symbol: str, contracts: float) -> float:
+        cs = self._mexc_contract_size(symbol)
+        if cs > 0:
+            return abs(float(contracts or 0)) * cs
         return abs(float(contracts or 0))
 
     def _mexc_position_qty_contracts(self, row: dict) -> float:

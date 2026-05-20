@@ -27,7 +27,14 @@ class SyncEngine:
             contracts = abs(float(raw or 0))
             cs = p.get("contractSize") or info.get("contractSize") or info.get("contract_size")
             cs_f = float(cs or 0)
-            return contracts * cs_f if cs_f > 0 else contracts
+            if cs_f > 0:
+                return contracts * cs_f
+            symbol = p.get("symbol") or info.get("symbol") or ""
+            if hasattr(self.exchange_client, "_mexc_contracts_to_amount"):
+                converted = self.exchange_client._mexc_contracts_to_amount(symbol, contracts)
+                if converted > 0 and converted != contracts:
+                    return converted
+            return contracts
         except Exception:
             return 0.0
 

@@ -357,9 +357,47 @@ def mexc_order_settings_text(settings: dict) -> str:
         "/recv_window 20000"
     )
 
+def _position_contract_fields(pos: dict) -> tuple[float, float]:
+    """Return (contracts, contract_size) for MEXC futures rows when present."""
+    info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+    raw = pos.get("exchange_contracts") or pos.get("contracts")
+    if raw in (None, ""):
+        raw = info.get("holdVol") or info.get("vol") or info.get("positionVol")
+    try:
+        contracts = abs(float(raw or 0))
+    except Exception:
+        contracts = 0.0
+    cs = pos.get("contractSize") or pos.get("contract_size") or info.get("contractSize") or info.get("contract_size")
+    try:
+        contract_size = float(cs or 0)
+    except Exception:
+        contract_size = 0.0
+    # Hard fallback for the major MEXC contracts used by AI scalping.
+    symbol_key = str(pos.get("mexc_symbol") or pos.get("symbol") or info.get("symbol") or "").upper().replace("/", "_").replace(":USDT", "")
+    if contract_size <= 0:
+        if "BTC_USDT" in symbol_key or "BTCUSDT" in symbol_key:
+            contract_size = 0.0001
+        elif "ETH_USDT" in symbol_key or "ETHUSDT" in symbol_key:
+            contract_size = 0.01
+    return contracts, contract_size
+
+def _position_base_qty(pos: dict) -> float:
+    """Base coin quantity for display/notional; never show MEXC contracts as BTC/ETH."""
+    contracts, cs = _position_contract_fields(pos)
+    if contracts > 0 and cs > 0:
+        return contracts * cs
+    for key in ("amount", "qty", "size"):
+        try:
+            value = pos.get(key)
+            if value not in (None, ""):
+                return abs(float(value))
+        except Exception:
+            pass
+    return 0.0
+
 def _position_money_fields(pos: dict) -> tuple[float, float, int, str]:
-    entry = float(pos.get("entry_price") or 0)
-    qty = float(pos.get("qty") or 0)
+    entry = float(pos.get("entry_price") or pos.get("entryPrice") or 0)
+    qty = _position_base_qty(pos)
     notional = float(pos.get("notional_usdt") or (abs(entry * qty) if entry and qty else 0))
     leverage = int(float(pos.get("leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or 5))
     margin_type = str(pos.get("margin_type") or ("isolated" if int(float(os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or 1)) == 1 else "cross"))
@@ -1079,14 +1117,8 @@ def _exchange_position_text(p: dict) -> str:
     info = p.get("info", {}) if isinstance(p.get("info"), dict) else {}
     symbol = p.get("symbol") or info.get("symbol") or "-"
     side = str(p.get("side") or info.get("side") or "-").upper()
-    qty = 0.0
-    for key in ("amount", "qty", "size", "contracts", "holdVol", "vol"):
-        try:
-            value = p.get(key)
-            if value not in (None, ""):
-                qty = abs(float(value)); break
-        except Exception:
-            pass
+    qty = _position_base_qty(p)
+    contracts, contract_size = _position_contract_fields(p)
     entry = 0.0
     for key in ("entryPrice", "entry_price", "average"):
         try:
@@ -1105,7 +1137,8 @@ def _exchange_position_text(p: dict) -> str:
                 pass
     notional = abs(qty * entry) if qty and entry else 0.0
     coin = str(symbol).split('/')[0]
-    return f"{symbol} {side} exchange\nQty={qty:.6f} {coin} / {notional:.2f} USDT | entry={entry:.8f}"
+    extra = f"contracts={contracts:.0f} | " if contracts > 0 and contract_size > 0 else ""
+    return f"{symbol} {side} exchange\n{extra}Qty={qty:.8f} {coin} / {notional:.2f} USDT | entry={entry:.8f}"
 
 async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -1215,7 +1248,7 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(
                 f"{p.get('symbol')} {p.get('side')} {p.get('status')} "
                 f"entry={p.get('entry_price')} SL={p.get('stop_price')} TP={p.get('take_price')}\n"
-                f"Qty={float(p.get('qty') or 0):.6f} {coin} / {notional:.2f} USDT | "
+                f"Qty={_position_base_qty(p):.8f} {coin} / {notional:.2f} USDT | "
                 f"Lev={leverage}x | Margin={margin_type} ~{margin:.2f} USDT" + warn
             )
     if exchange_positions:

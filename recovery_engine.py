@@ -157,6 +157,8 @@ class RecoveryEngine:
             if not stop_price or not take_price:
                 stop_price, take_price, recovery_source = self._fallback_tp_sl(ep, settings)
             pos = dict(old or {})
+            strategy = pos.get("strategy") or ("ai_scalping" if recovery_source.startswith("ai_scalping") or str(settings.get("strategy_mode", "")).lower() == "ai_scalping" else "recovered_exchange")
+            liq_mode = bool(settings.get("ai_scalping_liquidation_stop_mode")) and strategy == "ai_scalping"
             pos.update({
                 "symbol": symbol,
                 "mexc_symbol": ep.get("mexc_symbol") or (ep.get("info") or {}).get("symbol"),
@@ -165,9 +167,12 @@ class RecoveryEngine:
                 "status": "open",
                 "entry_price": entry or pos.get("entry_price"),
                 "qty": qty or pos.get("qty"),
+                "exchange_contracts": ep.get("contracts") or ((ep.get("info") or {}).get("holdVol") if isinstance(ep.get("info"), dict) else None),
+                "contractSize": ep.get("contractSize") or ((ep.get("info") or {}).get("contractSize") if isinstance(ep.get("info"), dict) else None),
                 "stop_price": float(stop_price or 0),
                 "take_price": float(take_price or 0),
-                "strategy": pos.get("strategy") or ("ai_scalping" if recovery_source.startswith("ai_scalping") else "recovered_exchange"),
+                "strategy": strategy,
+                "liquidation_stop_mode": liq_mode,
                 "recovery_tp_sl_source": recovery_source,
                 "opened_at": pos.get("opened_at") or time.time(),
                 "updated_at": time.time(),

@@ -8,7 +8,7 @@ load_dotenv()
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
-VERSION = os.getenv("BOT_VERSION", "0118 AI BTC/ETH")
+VERSION = os.getenv("BOT_VERSION", "0121 AI BTC/ETH")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -67,6 +67,13 @@ class Defaults:
     margin_allocation_enabled: bool = env_bool("MARGIN_ALLOCATION_ENABLED", True)
     require_exchange_protection: bool = env_bool("REQUIRE_EXCHANGE_PROTECTION", True)
     auto_close_on_protection_failed: bool = env_bool("AUTO_CLOSE_ON_PROTECTION_FAILED", False)
+
+    protection_post_open_delay_sec: float = env_float("PROTECTION_POST_OPEN_DELAY_SEC", 1.5)
+    protection_position_wait_sec: float = env_float("PROTECTION_POSITION_WAIT_SEC", 6.0)
+    protection_position_poll_sec: float = env_float("PROTECTION_POSITION_POLL_SEC", 0.5)
+    protection_min_trigger_pct: float = env_float("PROTECTION_MIN_TRIGGER_PCT", 0.12)
+    protection_min_trigger_ticks: int = env_int("PROTECTION_MIN_TRIGGER_TICKS", 5)
+    protection_distance_expand_mult: float = env_float("PROTECTION_DISTANCE_EXPAND_MULT", 1.25)
     liquidity_retest_default_rr: float = env_float("LIQUIDITY_RETEST_DEFAULT_RR", 3.0)
     liquidity_retest_sl_buffer_pct: float = env_float("LIQUIDITY_RETEST_SL_BUFFER_PCT", 0.04)
     liquidity_retest_time_stop_sec: int = env_int("LIQUIDITY_RETEST_TIME_STOP_SEC", 1800)

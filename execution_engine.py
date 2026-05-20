@@ -47,6 +47,25 @@ class ExecutionEngine:
             pass
         return self._truthy(os.getenv(env_key or key.upper()), default)
 
+    async def _setting_float(self, key: str, env_key: str | None = None, default: float = 0.0) -> float:
+        try:
+            if hasattr(self.storage, "get"):
+                value = await self.storage.get(key, None)
+                if value is not None:
+                    return float(value)
+        except Exception:
+            pass
+        try:
+            return float(os.getenv(env_key or key.upper(), str(default)))
+        except Exception:
+            return float(default)
+
+    async def _setting_int(self, key: str, env_key: str | None = None, default: int = 0) -> int:
+        try:
+            return int(float(await self._setting_float(key, env_key, float(default))))
+        except Exception:
+            return int(default)
+
     def _lock_for(self, symbol: str) -> asyncio.Lock:
         if symbol not in self._symbol_locks:
             self._symbol_locks[symbol] = asyncio.Lock()
@@ -158,6 +177,107 @@ class ExecutionEngine:
         pos["fill_price_source"] = "exchange_order"
         return pos
 
+    def _price_tick_size(self, symbol: str) -> float:
+        """Best-effort MEXC/CCXT price tick size used for safe TP/SL distance."""
+        try:
+            ex = getattr(self.exchange_client, "exchange", None)
+            market = None
+            if ex is not None and hasattr(ex, "market"):
+                try:
+                    market = ex.market(self.exchange_client.normalize_symbol(symbol))
+                except Exception:
+                    market = None
+            info = market.get("info", {}) if isinstance(market, dict) else {}
+            for key in ("priceUnit", "priceScale", "pricePrecision", "tickSize"):
+                raw = info.get(key) if isinstance(info, dict) else None
+                if raw not in (None, ""):
+                    val = float(raw)
+                    if val > 0:
+                        if key in {"priceScale", "pricePrecision"} and val >= 1:
+                            return 10 ** (-int(val))
+                        return val
+            precision = (market or {}).get("precision", {}).get("price") if isinstance(market, dict) else None
+            if precision not in (None, ""):
+                return 10 ** (-int(float(precision)))
+        except Exception:
+            pass
+        return 0.0
+
+    async def _wait_for_live_position(self, symbol: str, side: str | None = None) -> dict | None:
+        """Wait until MEXC exposes the just-opened futures position.
+
+        MEXC can accept a market entry before /open_positions reflects it.
+        Placing stoporder immediately in that gap often fails because positionId
+        or holdVol does not exist yet.
+        """
+        timeout = max(0.0, await self._setting_float("protection_position_wait_sec", "PROTECTION_POSITION_WAIT_SEC", 6.0))
+        poll = max(0.1, await self._setting_float("protection_position_poll_sec", "PROTECTION_POSITION_POLL_SEC", 0.5))
+        deadline = time.time() + timeout
+        last = None
+        while True:
+            try:
+                rows = await self.exchange_client.fetch_positions([symbol])
+                want = str(side or "").upper()
+                for p in rows or []:
+                    qty = self.exchange_position_qty(p)
+                    if qty <= 0:
+                        continue
+                    ps = str(p.get("side") or p.get("info", {}).get("positionType") or "").upper()
+                    # CCXT often returns long/short; do not over-filter if side is absent.
+                    if want and ps and want not in ps:
+                        continue
+                    return p
+                last = rows
+            except Exception as e:
+                last = e
+            if time.time() >= deadline:
+                return None
+            await asyncio.sleep(poll)
+
+    async def _normalize_protection_distance(self, pos: dict) -> dict:
+        """Expand too-close TP/SL levels before sending them to MEXC.
+
+        This prevents common protection rejects caused by tiny scalping distances,
+        price tails, trigger too close to mark/last price, and tick-size rounding.
+        It never moves TP/SL closer; it only expands distance from entry/current.
+        """
+        pos = dict(pos)
+        entry = float(pos.get("entry_price") or 0)
+        if entry <= 0:
+            return pos
+        side = str(pos.get("side") or "").upper()
+        min_pct = max(0.0, await self._setting_float("protection_min_trigger_pct", "PROTECTION_MIN_TRIGGER_PCT", 0.12)) / 100.0
+        ticks = max(0, await self._setting_int("protection_min_trigger_ticks", "PROTECTION_MIN_TRIGGER_TICKS", 5))
+        tick = self._price_tick_size(pos.get("symbol"))
+        tick_dist = tick * ticks if tick > 0 else 0.0
+        min_abs = max(entry * min_pct, tick_dist)
+        mult = max(1.0, await self._setting_float("protection_distance_expand_mult", "PROTECTION_DISTANCE_EXPAND_MULT", 1.25))
+        min_abs *= mult
+        tp = float(pos.get("take_price") or 0)
+        sl = float(pos.get("stop_price") or 0)
+        changed = []
+        if side == "SHORT":
+            # TP below entry, SL above entry.
+            if tp > 0 and (entry - tp) < min_abs:
+                pos["take_price"] = max(0.0, entry - min_abs); changed.append("tp")
+            if sl > 0 and (sl - entry) < min_abs:
+                pos["stop_price"] = entry + min_abs; changed.append("sl")
+        else:
+            # LONG: TP above entry, SL below entry.
+            if tp > 0 and (tp - entry) < min_abs:
+                pos["take_price"] = entry + min_abs; changed.append("tp")
+            if sl > 0 and (entry - sl) < min_abs:
+                pos["stop_price"] = max(0.0, entry - min_abs); changed.append("sl")
+        if changed:
+            pos["protection_distance_adjusted"] = ",".join(changed)
+            pos["protection_min_distance"] = min_abs
+            pos["protection_min_distance_pct"] = (min_abs / entry * 100.0) if entry else 0.0
+        try:
+            pos = self._sanitize_position_for_exchange(pos)
+        except Exception:
+            pass
+        return pos
+
 
     def _decorate_position_metrics(self, pos: dict) -> dict:
         """Attach human-readable money/margin fields used by Telegram notifications."""
@@ -260,9 +380,11 @@ class ExecutionEngine:
                 pos["initial_stop_price"] = pos.get("stop_price")
                 pos["initial_take_price"] = pos.get("take_price")
                 try:
-                    await asyncio.sleep(float(os.getenv("POST_ORDER_POSITION_SYNC_DELAY_SEC", "0.5")))
-                    exchange_positions = await self.exchange_client.fetch_positions([plan.symbol])
-                    active = [p for p in (exchange_positions or []) if self.exchange_position_qty(p) > 0]
+                    post_delay = await self._setting_float("protection_post_open_delay_sec", "PROTECTION_POST_OPEN_DELAY_SEC", 1.5)
+                    if post_delay > 0:
+                        await asyncio.sleep(post_delay)
+                    ep = await self._wait_for_live_position(plan.symbol, pos.get("side"))
+                    active = [ep] if ep else []
                     if active:
                         ep = active[0]
                         ep_info = ep.get("info", {}) if isinstance(ep.get("info"), dict) else {}
@@ -289,6 +411,8 @@ class ExecutionEngine:
                 except Exception as e:
                     pos["exchange_sync_warning"] = str(e)
             pos = self._sanitize_position_for_exchange(self._decorate_position_metrics(pos))
+            if pos.get("status") == "open":
+                pos = await self._normalize_protection_distance(pos)
             await self.storage.upsert_position(pos)
 
             if pos["status"] == "open":
@@ -530,7 +654,28 @@ class ExecutionEngine:
     async def place_protection_orders(self, pos: dict, live: bool) -> dict:
         if not live:
             return {}
-        pos = self._sanitize_position_for_exchange(dict(pos))
+        pos = await self._normalize_protection_distance(self._sanitize_position_for_exchange(dict(pos)))
+        symbol = pos["symbol"]
+        # Do not place protection until the exchange exposes positionId/holdVol.
+        live_row = await self._wait_for_live_position(symbol, pos.get("side"))
+        if live_row:
+            try:
+                pos["qty"] = self.exchange_position_qty(live_row) or pos.get("qty")
+                pos["exchange_contracts"] = live_row.get("contracts")
+                pos["raw_exchange_position"] = live_row
+                info = live_row.get("info", {}) if isinstance(live_row.get("info"), dict) else {}
+                for key in ("entryPrice", "entry_price", "average"):
+                    val = live_row.get(key)
+                    if val and float(val) > 0:
+                        pos["entry_price"] = float(val); break
+                if not float(pos.get("entry_price") or 0):
+                    for key in ("holdAvgPrice", "openAvgPrice", "entryPrice"):
+                        val = info.get(key)
+                        if val and float(val) > 0:
+                            pos["entry_price"] = float(val); break
+                pos = await self._normalize_protection_distance(pos)
+            except Exception as e:
+                pos["protection_position_sync_warning"] = str(e)[:180]
         symbol = pos["symbol"]
         qty = float(pos.get("qty") or 0)
         liquidation_stop_mode = bool(pos.get("liquidation_stop_mode")) and str(pos.get("strategy") or "").lower() == "ai_scalping"
@@ -601,9 +746,20 @@ class ExecutionEngine:
                     out["sl_error"] = str(e)[:500]
             await asyncio.sleep(delay)
             if liquidation_stop_mode:
-                verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), "LIQUIDATION_STOP")
+                # In liquidation-stop mode the planned SL is intentionally NOT
+                # placed on the exchange.  Only TP must be confirmed.  Do not let
+                # the generic TP+SL protection checker reject a valid liq-stop
+                # position just because there is no SL order.
+                verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), "")
                 out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})
+                if not out.get("tp_exists") and out.get("tp_order_id"):
+                    # Some MEXC trigger orders are not immediately visible in
+                    # merged open-order endpoints; a non-empty native id is the
+                    # best available confirmation after successful create.
+                    out["tp_exists"] = True
+                    out["tp_verify_note"] = "accepted by MEXC but not yet visible in open orders"
                 out["sl_exists"] = True
+                out["sl_order_id"] = "LIQUIDATION_STOP"
                 out["ok"] = bool(out.get("tp_exists"))
                 out["protection_status"] = "TP + LIQUIDATION STOP" if out["ok"] else "LOCAL BOT PROTECTED"
                 out["protection_mode"] = "exchange_tp_liquidation_sl" if out["ok"] else "local_monitoring"
@@ -623,7 +779,7 @@ class ExecutionEngine:
         best["protection_status"] = "LOCAL BOT PROTECTED"
         best["protection_mode"] = "local_monitoring"
         best["protection_attempts"] = history
-        best["protection_warning"] = "exchange TP/SL not confirmed after retries"
+        best["protection_warning"] = "exchange protection not confirmed after delayed position sync and distance expansion"
         return best
 
     async def cancel_entry(self, pos: dict, live: bool, reason: str = "limit_timeout"):

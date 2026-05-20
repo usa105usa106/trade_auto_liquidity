@@ -80,6 +80,21 @@ class ProtectionEngine:
             if side_ok and sl_price > 0 and price > 0 and abs(price - sl_price) / sl_price < 0.002:
                 found_sl = True; matched_sl_id = oid or matched_sl_id
 
+        liq_mode = bool(pos.get("liquidation_stop_mode")) and str(pos.get("strategy") or "").lower() == "ai_scalping"
+        if liq_mode:
+            # In AI liquidation-stop mode no exchange SL should exist: liquidation
+            # is the planned hard stop.  Only TP must be present/confirmed.
+            status = "TP + LIQUIDATION STOP" if found_tp else "LOCAL BOT PROTECTED"
+            return {
+                "tp_exists": found_tp,
+                "sl_exists": True,
+                "tp_order_id": matched_tp_id or pos.get("tp_order_id"),
+                "sl_order_id": "LIQUIDATION_STOP",
+                "protection_status": status,
+                "protection_mode": "exchange_tp_liquidation_sl" if found_tp else "local_monitoring",
+                "checked_at": time.time(),
+            }
+
         status = "EXCHANGE PROTECTED" if (found_tp and found_sl) else "LOCAL BOT PROTECTED"
         return {
             "tp_exists": found_tp,
@@ -105,12 +120,13 @@ class ProtectionEngine:
         out = await self.check(pos)
         if out.get("protection_status") == "EXCHANGE PROTECTED" or not reattach or not live or not self.execution_engine:
             return out
+        liq_mode = bool(pos.get("liquidation_stop_mode")) and str(pos.get("strategy") or "").lower() == "ai_scalping"
         try:
-            if float(pos.get("qty") or 0) <= 0 or float(pos.get("stop_price") or 0) <= 0 or float(pos.get("take_price") or 0) <= 0:
-                out["reattach_error"] = "missing qty/SL/TP"
+            if float(pos.get("qty") or 0) <= 0 or float(pos.get("take_price") or 0) <= 0 or ((not liq_mode) and float(pos.get("stop_price") or 0) <= 0):
+                out["reattach_error"] = "missing qty/TP" if liq_mode else "missing qty/SL/TP"
                 return out
         except Exception:
-            out["reattach_error"] = "invalid qty/SL/TP"
+            out["reattach_error"] = "invalid qty/TP" if liq_mode else "invalid qty/SL/TP"
             return out
         # If one leg is missing or stale after restart, replace the symbol's
         # protection set atomically: cancel old TP/SL/plan orders first, then
