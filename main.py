@@ -208,12 +208,23 @@ def _scan_status_text(settings: dict, status: str = "scanning", last_signal: str
     decision = _short_reason(last_decision or scanner.last_reject_reason or "-", 130)
     status_label = str(status or "scanning").replace("_", " ")
     mode = str(settings.get("strategy_mode", "hybrid"))
-    effective = str(scanner.last_effective_strategy or mode)
-    universe = str(settings.get("universe_mode", "adaptive"))
+    ai_mode = mode.lower() == "ai_scalping"
+    # v0113: AI BTC/ETH scalping is a separate two-symbol loop, not the legacy
+    # adaptive scanner. Do not show stale effective strategy/universe counters
+    # from a previous hybrid/reversal scan.
+    if ai_mode:
+        effective = mode
+        universe = "BTC/ETH only"
+        checked = 2
+        errors = 0
+        loaded = 2
+    else:
+        effective = str(scanner.last_effective_strategy or mode)
+        universe = str(settings.get("universe_mode", "adaptive"))
+        checked = int(getattr(scanner, "last_cycle_scanned", 0) or 0)
+        errors = int(getattr(scanner, "last_cycle_errors", 0) or 0)
+        loaded = len(getattr(scanner, "hot_symbols", []) or [])
     scan_every = format_duration_seconds(settings.get("scan_interval_sec", 5))
-    checked = int(getattr(scanner, "last_cycle_scanned", 0) or 0)
-    errors = int(getattr(scanner, "last_cycle_errors", 0) or 0)
-    loaded = len(getattr(scanner, "hot_symbols", []) or [])
     icon = "🟢" if status_label in {"scanning", "universe ready"} else ("🟡" if "blocked" not in status_label and "paused" not in status_label else "🛑")
     lines = [
         f"🔎 Scanner: {icon} {status_label}",
@@ -225,7 +236,7 @@ def _scan_status_text(settings: dict, status: str = "scanning", last_signal: str
         f"⏱ Next cycle pause: {scan_every}",
         f"🕒 {time.strftime('%H:%M:%S')}",
     ]
-    if scanner.last_refresh_error:
+    if (not ai_mode) and scanner.last_refresh_error:
         lines.append(f"⚠️ Source issue: {_short_reason(scanner.last_refresh_error, 90)}")
     return "\n".join(lines)
 
@@ -2054,6 +2065,7 @@ async def trading_loop(app):
         while running:
             try:
                 settings = await storage.all_settings()
+                ai_mode = str(settings.get("strategy_mode", "hybrid")).lower() == "ai_scalping"
                 live = bool(settings.get("live_trading", False))
                 ex = await get_exchange(settings)
                 ws = await get_ws(settings)
@@ -2070,9 +2082,11 @@ async def trading_loop(app):
                     if ev.get("type") not in {"pending_sync_warning", "price_error"}:
                         await notify_admin(app, format_position_event(ev), key="position_event")
 
-                # 2) Refresh symbol universe. Normal scanner progress is kept in one
-                # editable live-status message to avoid chat spam.
-                if time.time() - scanner.last_refresh > int(settings.get("symbol_refresh_sec", 300)):
+                # 2) Refresh symbol universe for legacy scanner modes only.
+                # v0113: AI BTC/ETH scalping must not run the adaptive universe
+                # scanner at all. It uses direct BTC_USDT/ETH_USDT market data and
+                # should not emit websocket empty-cache errors from the legacy scanner.
+                if not ai_mode and time.time() - scanner.last_refresh > int(settings.get("symbol_refresh_sec", 300)):
                     await update_scanner_status(app, settings, status="refreshing universe", force=True)
                     await scanner.refresh_symbols(ex, settings, ws_supervisor=ws)
                     if scanner.last_refresh_error:
@@ -2087,6 +2101,13 @@ async def trading_loop(app):
                     else:
                         scanner.last_reject_reason = "universe refreshed"
                     await update_scanner_status(app, settings, status="universe ready", force=True)
+                elif ai_mode:
+                    # Clear stale legacy scanner state so status is not displayed as
+                    # ai_scalping -> reversal/adaptive loaded 110.
+                    scanner.last_effective_strategy = "ai_scalping"
+                    scanner.last_refresh_error = ""
+                    scanner.last_cycle_scanned = 2
+                    scanner.last_cycle_errors = 0
 
                 # 3) Manual new-entry gate. /stop pauses entries while keeping
                 # position management alive; /panic is the full loop stop.
@@ -2121,7 +2142,7 @@ async def trading_loop(app):
                 # WS is an acceleration source, not a hard entry dependency.
                 # If WS is temporarily stale but scanner market data is fresh or REST fallback
                 # has been used recently, entries must not be blocked by WS health alone.
-                market_data_ok = scanner_market_data_fresh(max_age_sec=max(900, int(settings.get("symbol_refresh_sec", 300)) * 3))
+                market_data_ok = True if ai_mode else scanner_market_data_fresh(max_age_sec=max(900, int(settings.get("symbol_refresh_sec", 300)) * 3))
                 if not market_data_ok:
                     scanner.last_reject_reason = (
                         f"market data blocked: stale/weak scanner data "
@@ -2168,7 +2189,7 @@ async def trading_loop(app):
                 # legacy signal scanner. BTC and ETH are independent: if BTC is open,
                 # ETH can still ask AI and trade; if ETH is open, BTC can still trade.
                 # A new AI request is made only for a symbol with no active local/exchange position.
-                if str(settings.get("strategy_mode", "hybrid")).lower() == "ai_scalping":
+                if ai_mode:
                     symbols = ai_scalping_engine.symbols(settings)
 
                     def _base(sym: str) -> str:
