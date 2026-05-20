@@ -29,6 +29,7 @@ class AIScalpDecision:
     model: str = ""
     market: dict | None = None
     cached: bool = False
+    confidence_inferred: bool = False
 
 
 
@@ -52,6 +53,27 @@ def _r(v: Any, n: int = 6) -> float:
         return round(float(v), n)
     except Exception:
         return 0.0
+
+
+def _clean_reason(text: Any, limit: int = 160) -> str:
+    """Compact human-readable AI/local reason for Telegram logs.
+
+    This is local formatting only; it never calls OpenAI and never spends tokens.
+    It also repairs common malformed/truncated model outputs such as:
+    BTC:WAIT "confidence":0.92,"reason":"mixed momentum".
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    m = re.search(r'"reason"\s*:\s*"([^"{}]{0,220})', raw, flags=re.I)
+    if m:
+        raw = m.group(1)
+    raw = re.sub(r'^[,\s:"{}\[\]]+', '', raw)
+    raw = re.sub(r'"?\s*,?\s*"?(?:confidence|symbol|decision)"?\s*[:=].*$', '', raw, flags=re.I)
+    raw = raw.replace('\\n', ' ').replace('\n', ' ')
+    raw = re.sub(r'\s+', ' ', raw).strip(' ;,.-–—')
+    return raw[:limit]
+
 
 
 def _ema(values: list[float], period: int) -> float:
@@ -135,26 +157,36 @@ def parse_ai_scalp_decision(text: str, allowed_symbols: list[str], model: str) -
             except Exception:
                 data = None
     if not isinstance(data, dict):
-        # v0110: Some providers/models may still return plain text despite
-        # JSON instructions, e.g. "WAIT No reliable market data" or
-        # "LONG confidence 0.82 ...". Treat this as a valid fallback instead
-        # of breaking the AI scalping loop. LONG/SHORT without confidence stays
-        # at 0.0 and will be rejected by the normal confidence gate.
+        # Some providers/models may still return plain text or malformed JSON
+        # despite strict instructions, e.g. "WAIT No reliable market data",
+        # "LONG confidence 0.82 ...", or a truncated object containing only
+        # decision text. Do not convert LONG/SHORT without a parsed confidence
+        # to 0.00: that creates false local rejects. Use a conservative fallback
+        # and mark it in the reason/log so the operator can see what happened.
         plain = re.sub(r"^```(?:json|text)?\s*", "", raw, flags=re.I).strip()
         plain = re.sub(r"\s*```$", "", plain).strip()
         m_dec = re.search(r"\b(LONG|SHORT|WAIT)\b", plain, flags=re.I)
         if m_dec:
             decision = m_dec.group(1).upper()
-            conf = 0.0
             m_conf = re.search(r"(?:confidence|conf)\s*[:=]?\s*(0(?:\.\d+)?|1(?:\.0+)?|\d{1,3}(?:\.\d+)?)", plain, flags=re.I)
+            inferred = False
             if m_conf:
                 conf = _f(m_conf.group(1), 0.0)
                 if conf > 1:
                     conf /= 100.0
-            reason = plain[m_dec.end():].strip(" :-—–\n\t")[:220]
+            else:
+                # Missing confidence must not become 0.00 for LONG/SHORT.
+                # 0.72 is intentionally conservative: it passes normal mode
+                # and meets the default quality gate, but is still visible in logs.
+                conf = 0.72 if decision in {"LONG", "SHORT"} else 0.65
+                inferred = True
+            m_reason = re.search(r'"reason"\s*:\s*"([^"{}]{0,220})', plain, flags=re.I)
+            reason = _clean_reason(m_reason.group(1) if m_reason else plain[m_dec.end():], 180)
+            if inferred:
+                reason = ("confidence missing -> fallback %.2f; %s" % (conf, reason)).strip(" ;")[:220]
             # In decide_symbol() there is exactly one allowed symbol, so use it.
             symbol = allowed_symbols[0] if allowed_symbols else ""
-            return AIScalpDecision(ok=True, symbol=symbol, decision=decision, confidence=max(0.0, min(1.0, conf)), reason=reason, raw=raw[:1000], model=model)
+            return AIScalpDecision(ok=True, symbol=symbol, decision=decision, confidence=max(0.0, min(1.0, conf)), reason=reason, raw=raw[:1000], model=model, confidence_inferred=inferred)
         return AIScalpDecision(ok=False, error="AI did not return JSON", raw=raw[:1000], model=model)
     symbol = str(data.get("symbol") or "").upper().replace("_", "").replace("/", "").replace(":USDT", "")
     norm_allowed = {s.upper().replace("_", "").replace("/", "").replace(":USDT", ""): s for s in allowed_symbols}
@@ -163,17 +195,26 @@ def parse_ai_scalp_decision(text: str, allowed_symbols: list[str], model: str) -
     decision = str(data.get("decision") or data.get("side") or "WAIT").upper().strip()
     if decision not in {"LONG", "SHORT", "WAIT"}:
         decision = "WAIT"
-    conf = _f(data.get("confidence"), 0.0)
-    if conf > 1:
-        conf /= 100.0
+    inferred = False
+    if data.get("confidence") is None:
+        conf = 0.72 if decision in {"LONG", "SHORT"} else 0.65
+        inferred = True
+    else:
+        conf = _f(data.get("confidence"), 0.0)
+        if conf > 1:
+            conf /= 100.0
+    reason = _clean_reason(data.get("reason") or "", 180)
+    if inferred:
+        reason = ("confidence missing -> fallback %.2f; %s" % (conf, reason)).strip(" ;")[:220]
     return AIScalpDecision(
         ok=True,
         symbol=norm_allowed[symbol],
         decision=decision,
         confidence=max(0.0, min(1.0, conf)),
-        reason=str(data.get("reason") or "")[:220],
+        reason=reason,
         raw=raw[:1000],
         model=model,
+        confidence_inferred=inferred,
     )
 
 
@@ -349,11 +390,15 @@ class AIScalpingEngine:
             "s": base_key,
             "q": 1 if quality_mode else 0,
             "min": min_conf,
-            "rule": "LONG/SHORT only if likely TP before SL; else WAIT",
+            "rule": (
+                "quality: trade only clean 1m/5m/15m continuation; WAIT if mixed"
+                if quality_mode else
+                "normal: choose LONG/SHORT on usable short edge; WAIT only if mixed or unsafe"
+            ),
             "m": compact_market,
         }
         prompt = json.dumps(prompt_obj, separators=(",", ":"), ensure_ascii=False)
-        system = 'Return only JSON: {"symbol":"BTCUSDT|ETHUSDT","decision":"LONG|SHORT|WAIT","confidence":0-1,"reason":"short"}. No prose.'
+        system = 'JSON only. Return {"symbol":"BTCUSDT|ETHUSDT","decision":"LONG|SHORT|WAIT","confidence":0-1,"reason":"short"}. No prose.'
         timeout_sec = float(settings.get("openai_timeout_sec", os.getenv("OPENAI_TIMEOUT_SEC", "12")) or 12)
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         async with self._sem:
@@ -401,6 +446,52 @@ class AIScalpingEngine:
                         return AIScalpDecision(ok=False, symbol=allowed_symbol, decision="WAIT", error=f"OpenAI error chat={first_error}; fallback={r2.status}: {txt2[:160]}", model=model, market={"markets": markets})
             except Exception as e:
                 return AIScalpDecision(ok=False, symbol=allowed_symbol, decision="WAIT", error=f"OpenAI unavailable: {e}", model=model, market={"markets": markets})
+
+    def candidate_reject_reason(self, decision: AIScalpDecision, settings: dict) -> str:
+        """Return exact local reject reason without extra OpenAI calls."""
+        if not decision.ok:
+            return decision.error or "AI unavailable"
+        if decision.decision not in {"LONG", "SHORT"}:
+            return f"AI decision {decision.decision}"
+        if not decision.symbol:
+            return "missing symbol"
+        quality_mode = _b(settings, "ai_scalping_quality_filters_enabled", False)
+        min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.58)
+        if quality_mode:
+            min_conf = max(min_conf, _f(settings.get("ai_scalping_quality_min_confidence"), 0.72))
+        if decision.confidence < min_conf:
+            return f"confidence {decision.confidence:.2f} < {min_conf:.2f}"
+        market = {}
+        for m in ((decision.market or {}).get("markets") or []):
+            if m.get("symbol") == decision.symbol:
+                market = m
+                break
+        price = _f(market.get("price"), 0.0)
+        if price <= 0:
+            return "no reliable price"
+        max_spread = _f(settings.get("ai_scalping_max_spread_pct"), _f(settings.get("max_spread_pct"), 0.20))
+        spread = _f(market.get("spread_pct"), 0.0)
+        if spread > max_spread:
+            return f"spread {spread:.3f}% > max {max_spread:.3f}%"
+        if quality_mode:
+            side = decision.decision
+            bias5 = market.get("ema9_gt_ema21_5m")
+            bias15 = market.get("ema9_gt_ema21_15m")
+            if side == "LONG" and (bias5 is False or bias15 is False):
+                return "quality HTF bias mismatch for LONG"
+            if side == "SHORT" and (bias5 is True or bias15 is True):
+                return "quality HTF bias mismatch for SHORT"
+            min_atr = _f(settings.get("ai_scalping_quality_min_atr_pct"), 0.035)
+            min_gap = _f(settings.get("ai_scalping_quality_min_ema_gap_pct"), 0.015)
+            min_ret5 = _f(settings.get("ai_scalping_quality_min_ret_5m_abs_pct"), 0.035)
+            atr = _f(market.get("atr_1m_pct"), 0.0)
+            gap = _f(market.get("ema_gap_5m_pct"), 0.0)
+            ret5 = abs(_f(market.get("ret_5m_pct"), 0.0))
+            if atr < min_atr:
+                return f"quality ATR {atr:.3f}% < {min_atr:.3f}%"
+            if gap < min_gap and ret5 < min_ret5:
+                return f"quality chop: ema_gap {gap:.3f}% < {min_gap:.3f}% and ret5 {ret5:.3f}% < {min_ret5:.3f}%"
+        return "unknown local reject"
 
     def make_candidate(self, decision: AIScalpDecision, settings: dict) -> dict | None:
         if not decision.ok or decision.decision not in {"LONG", "SHORT"} or not decision.symbol:

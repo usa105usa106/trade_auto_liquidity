@@ -2243,8 +2243,11 @@ async def trading_loop(app):
                         if not decision.ok:
                             errors.append(f"{b}:{decision.error or 'AI unavailable'}")
                             continue
+                        reason_short = str(decision.reason or "no edge").strip()
+                        if len(reason_short) > 90:
+                            reason_short = reason_short[:87] + "..."
                         if decision.decision == "WAIT":
-                            waited.append(f"{b}:WAIT {decision.reason or 'no edge'}")
+                            waited.append(f"{b}:WAIT {decision.confidence:.2f} — {reason_short}")
                             # v0115: cached WAIT avoids repeat OpenAI calls. Do not inflate WAIT stats on cached loops.
                             if not getattr(decision, "cached", False):
                                 try:
@@ -2254,7 +2257,11 @@ async def trading_loop(app):
                             continue
                         cand = ai_scalping_engine.make_candidate(decision, settings)
                         if not cand:
-                            waited.append(f"{b}:local reject {decision.decision} conf={decision.confidence:.2f}")
+                            try:
+                                why = ai_scalping_engine.candidate_reject_reason(decision, settings)
+                            except Exception as e:
+                                why = f"local reject reason error: {e}"
+                            waited.append(f"{b}:reject {decision.decision}: {why}")
                             continue
                         plan = TradePlanner().make_plan(cand, settings, equity_usdt=equity)
                         if plan:
