@@ -357,12 +357,13 @@ class AIScalpingEngine:
                         "model": model,
                         "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
                         "temperature": 0.1,
-                        "max_tokens": 80,
                         "response_format": _json_object_payload(),
                     }
                     if str(model).lower().startswith(("gpt-5", "o1", "o3", "o4")):
                         chat_body.pop("temperature", None)
                         chat_body["max_completion_tokens"] = 80
+                    else:
+                        chat_body["max_tokens"] = 80
                     async with session.post(OPENAI_CHAT_URL, headers=headers, json=chat_body) as r2:
                         txt2 = await r2.text()
                         if r2.status == 200:
