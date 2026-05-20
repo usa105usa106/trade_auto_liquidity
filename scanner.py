@@ -44,6 +44,7 @@ class Scanner:
         self.last_reject_top_reasons = []
         self.last_reject_examples = []
         self.last_ai_check_symbols = []
+        self.last_ai_candidates_count = 0
         self.engine = SignalEngine(
             min_confidence=float(os.getenv("SIGNAL_MIN_CONFIDENCE", "70")),
             volume_spike_mult=float(os.getenv("SIGNAL_VOLUME_SPIKE_MULT", "1.8")),
@@ -385,6 +386,12 @@ class Scanner:
             reason = str(reason or "unknown").strip()[:90] or "unknown"
             # Keep reason buckets readable; exact examples stay below.
             bucket = reason.split(":", 1)[0]
+            for prefix in ("no sweep", "no reclaim", "no BOS/displacement", "no retest", "RR low", "spread high", "retest wick low", "zone quality low", "MTF weak", "clean path absent", "confidence", "AI WAIT"):
+                if reason.startswith(prefix):
+                    bucket = prefix
+                    break
+            if reason.startswith("liquidity_retest filters"):
+                bucket = "liquidity_retest filters"
             reject_counts[bucket] += 1
             if len(reject_examples[bucket]) < 3:
                 reject_examples[bucket].append(f"{symbol}->{reason}")
@@ -437,7 +444,8 @@ class Scanner:
                 break
 
         self._record_cycle_health(scanned, errors, settings)
-        self.last_reject_top_reasons = reject_counts.most_common(6)
+        self.last_ai_candidates_count = len(out)
+        self.last_reject_top_reasons = reject_counts.most_common(8)
         ex = []
         for reason, _count in self.last_reject_top_reasons[:4]:
             ex.extend(reject_examples.get(reason, [])[:2])

@@ -156,6 +156,15 @@ class SignalEngine:
             self.liquidity_retest_min_mtf_score = min(self.liquidity_retest_min_mtf_score, -0.70)
             self.liquidity_retest_require_clean_path = False
 
+    def _liquidity_mode(self) -> str:
+        return str(getattr(self, "liquidity_retest_quality_mode", "a_plus") or "a_plus").lower().replace("+", "_plus").replace("-", "_")
+
+    def _liq_allows_partial_reclaim(self) -> bool:
+        return self._liquidity_mode() in {"normal", "aggressive"}
+
+    def _liq_allows_soft_structure(self) -> bool:
+        return self._liquidity_mode() == "aggressive"
+
     def analyze_symbol(
         self,
         symbol: str,
@@ -220,7 +229,7 @@ class SignalEngine:
                 best = max(raw_candidates, key=lambda x: float(x.get("confidence", 0)))
                 self.last_reject_reason = f"confidence {float(best.get('confidence', 0)):.1f} < {self.min_confidence:.1f}"
             elif preferred_strategy == "liquidity_retest":
-                self.last_reject_reason = "liquidity_retest filters: no valid sweep/reclaim/retest/RR"
+                self.last_reject_reason = getattr(self, "last_liquidity_retest_reject_reason", "liquidity_retest filters: no valid sweep/reclaim/retest/RR")
             else:
                 self.last_reject_reason = "no strategy setup"
             return None
@@ -511,7 +520,12 @@ class SignalEngine:
         min_target_rr = self.liquidity_retest_min_target_rr
         min_retest_wick = self.liquidity_retest_min_retest_rejection_wick
         min_zone_quality = self.liquidity_retest_min_zone_quality
+        mode = self._liquidity_mode()
+        allow_partial_reclaim = mode in {"normal", "aggressive"}
+        soft_structure = mode == "aggressive"
+        self.last_liquidity_retest_reject_reason = "no sweep"
         if spread_pct > max_spread:
+            self.last_liquidity_retest_reject_reason = f"spread high {spread_pct:.3f}% > {max_spread:.3f}%"
             return out
 
         swing_highs, swing_lows = self._swing_points(highs, lows, 2, 2)
@@ -534,14 +548,23 @@ class SignalEngine:
             ref_low = prior_sw_lows[-1][1] if prior_sw_lows else min(lows[sweep_idx-20:sweep_idx])
 
             # LONG: take sell-side liquidity, reclaim, bullish displacement/BOS, retest demand OB/FVG.
-            if l < ref_low and cl > ref_low and lower_wick >= min_sweep_wick and pct(cl, ref_low) >= min_reclaim_pct:
+            long_sweep = l < ref_low and lower_wick >= min_sweep_wick
+            long_reclaim = cl > ref_low and pct(cl, ref_low) >= min_reclaim_pct
+            if allow_partial_reclaim and long_sweep and not long_reclaim:
+                long_reclaim = cl >= ref_low - tol and now_c >= ref_low - tol
+            if long_sweep:
+                self.last_liquidity_retest_reject_reason = "no reclaim"
+            if long_sweep and long_reclaim:
+                self.last_liquidity_retest_reject_reason = "no BOS/displacement"
                 bos_level = max(highs[max(0, sweep_idx-12):sweep_idx+1])
                 disp_idx = None
                 for j in range(sweep_idx + 1, len(candles) - 1):
                     jo, jh, jl, jc, jv = map(float, [candles[j][1], candles[j][2], candles[j][3], candles[j][4], candles[j][5]])
                     body_ratio = abs(jc - jo) / max(1e-12, jh - jl)
                     disp = pct(jc, cl)
-                    if jc > bos_level and disp >= min_displacement_pct and body_ratio >= min_displacement_body:
+                    strict_bos = jc > bos_level and disp >= min_displacement_pct and body_ratio >= min_displacement_body
+                    soft_bos = soft_structure and jc > cl and disp >= (min_displacement_pct * 0.55) and body_ratio >= (min_displacement_body * 0.70)
+                    if strict_bos or soft_bos:
                         disp_idx = j
                         break
                 if disp_idx is None:
@@ -571,13 +594,25 @@ class SignalEngine:
                 mtf_score = self._mtf_bias_score(candles, "LONG") if self.liquidity_retest_mtf_enabled else 0.0
                 clean_path = self._clean_path_to_target(side="LONG", close=close, target=liquidity_target, highs=highs, lows=lows)
                 zone_quality = self._zone_quality(zone_src=zone_src, fvg=fvg, displacement_pct=displacement, volume_ratio=local_vol_ratio, bos_strength=bos_strength, sweep_wick=lower_wick, retest_wick=retest_wick)
+                if not retest:
+                    self.last_liquidity_retest_reject_reason = "no retest"
+                elif target_rr < min_target_rr:
+                    self.last_liquidity_retest_reject_reason = f"RR low {target_rr:.2f} < {min_target_rr:.2f}"
+                elif retest_wick < min_retest_wick:
+                    self.last_liquidity_retest_reject_reason = f"retest wick low {retest_wick:.2f} < {min_retest_wick:.2f}"
+                elif zone_quality < min_zone_quality:
+                    self.last_liquidity_retest_reject_reason = f"zone quality low {zone_quality:.2f} < {min_zone_quality:.2f}"
+                elif mtf_score < self.liquidity_retest_min_mtf_score:
+                    self.last_liquidity_retest_reject_reason = f"MTF weak {mtf_score:.2f} < {self.liquidity_retest_min_mtf_score:.2f}"
+                elif self.liquidity_retest_require_clean_path and not clean_path:
+                    self.last_liquidity_retest_reject_reason = "clean path absent"
                 if (
                     retest and structure_ok and target_rr >= min_target_rr
                     and retest_wick >= min_retest_wick
-                    and zone_intact
+                    and (zone_intact or soft_structure)
                     and zone_quality >= min_zone_quality
                     and mtf_score >= self.liquidity_retest_min_mtf_score
-                    and (clean_path or not self.liquidity_retest_require_clean_path)
+                    and (clean_path or not self.liquidity_retest_require_clean_path or soft_structure)
                 ):
                     rr = self._rr_from_structure(side="LONG", score_bits=1.0, volume_ratio=local_vol_ratio, displacement_pct=displacement, has_fvg=bool(fvg), bos_strength=bos_strength, bias=(0.5 if imbalance > 0 else 0.0), zone_quality=zone_quality, mtf_score=mtf_score, clean_path=clean_path)
                     score = 67 + min(12, max(0, local_vol_ratio - 1) * 6) + min(10, max(0, displacement) * 7) + min(8, max(0, bos_strength) * 8) + (5 if fvg else 0) + (4 if imbalance > 0 else 0) + min(6, zone_quality * 1.5) + min(4, max(0, mtf_score) * 3)
@@ -592,14 +627,23 @@ class SignalEngine:
                     }))
 
             # SHORT: take buy-side liquidity, reject, bearish displacement/BOS, retest supply OB/FVG.
-            if h > ref_high and cl < ref_high and upper_wick >= min_sweep_wick and pct(ref_high, cl) >= min_reclaim_pct:
+            short_sweep = h > ref_high and upper_wick >= min_sweep_wick
+            short_reclaim = cl < ref_high and pct(ref_high, cl) >= min_reclaim_pct
+            if allow_partial_reclaim and short_sweep and not short_reclaim:
+                short_reclaim = cl <= ref_high + tol and now_c <= ref_high + tol
+            if short_sweep:
+                self.last_liquidity_retest_reject_reason = "no reclaim"
+            if short_sweep and short_reclaim:
+                self.last_liquidity_retest_reject_reason = "no BOS/displacement"
                 bos_level = min(lows[max(0, sweep_idx-12):sweep_idx+1])
                 disp_idx = None
                 for j in range(sweep_idx + 1, len(candles) - 1):
                     jo, jh, jl, jc, jv = map(float, [candles[j][1], candles[j][2], candles[j][3], candles[j][4], candles[j][5]])
                     body_ratio = abs(jc - jo) / max(1e-12, jh - jl)
                     disp = pct(cl, jc)
-                    if jc < bos_level and disp >= min_displacement_pct and body_ratio >= min_displacement_body:
+                    strict_bos = jc < bos_level and disp >= min_displacement_pct and body_ratio >= min_displacement_body
+                    soft_bos = soft_structure and jc < cl and disp >= (min_displacement_pct * 0.55) and body_ratio >= (min_displacement_body * 0.70)
+                    if strict_bos or soft_bos:
                         disp_idx = j
                         break
                 if disp_idx is None:
@@ -628,13 +672,25 @@ class SignalEngine:
                 mtf_score = self._mtf_bias_score(candles, "SHORT") if self.liquidity_retest_mtf_enabled else 0.0
                 clean_path = self._clean_path_to_target(side="SHORT", close=close, target=liquidity_target, highs=highs, lows=lows)
                 zone_quality = self._zone_quality(zone_src=zone_src, fvg=fvg, displacement_pct=displacement, volume_ratio=local_vol_ratio, bos_strength=bos_strength, sweep_wick=upper_wick, retest_wick=retest_wick)
+                if not retest:
+                    self.last_liquidity_retest_reject_reason = "no retest"
+                elif target_rr < min_target_rr:
+                    self.last_liquidity_retest_reject_reason = f"RR low {target_rr:.2f} < {min_target_rr:.2f}"
+                elif retest_wick < min_retest_wick:
+                    self.last_liquidity_retest_reject_reason = f"retest wick low {retest_wick:.2f} < {min_retest_wick:.2f}"
+                elif zone_quality < min_zone_quality:
+                    self.last_liquidity_retest_reject_reason = f"zone quality low {zone_quality:.2f} < {min_zone_quality:.2f}"
+                elif mtf_score < self.liquidity_retest_min_mtf_score:
+                    self.last_liquidity_retest_reject_reason = f"MTF weak {mtf_score:.2f} < {self.liquidity_retest_min_mtf_score:.2f}"
+                elif self.liquidity_retest_require_clean_path and not clean_path:
+                    self.last_liquidity_retest_reject_reason = "clean path absent"
                 if (
                     retest and structure_ok and target_rr >= min_target_rr
                     and retest_wick >= min_retest_wick
-                    and zone_intact
+                    and (zone_intact or soft_structure)
                     and zone_quality >= min_zone_quality
                     and mtf_score >= self.liquidity_retest_min_mtf_score
-                    and (clean_path or not self.liquidity_retest_require_clean_path)
+                    and (clean_path or not self.liquidity_retest_require_clean_path or soft_structure)
                 ):
                     rr = self._rr_from_structure(side="SHORT", score_bits=1.0, volume_ratio=local_vol_ratio, displacement_pct=displacement, has_fvg=bool(fvg), bos_strength=bos_strength, bias=(0.5 if imbalance < 0 else 0.0), zone_quality=zone_quality, mtf_score=mtf_score, clean_path=clean_path)
                     score = 67 + min(12, max(0, local_vol_ratio - 1) * 6) + min(10, max(0, displacement) * 7) + min(8, max(0, bos_strength) * 8) + (5 if fvg else 0) + (4 if imbalance < 0 else 0) + min(6, zone_quality * 1.5) + min(4, max(0, mtf_score) * 3)

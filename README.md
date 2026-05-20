@@ -274,3 +274,10 @@ MARGIN_ALLOCATION_ENABLED=true
 - Если exchange TP/SL protection не поставился, бот оставляет позицию под локальным мониторингом TP/SL/time-stop вместо немедленного удаления состояния.
 - /positions показывает protection mode и warning.
 - /cancel_all и /close_all также чистят локальное состояние после успешной команды.
+
+
+## v0125 TIMEZONE + REJECT DEBUG
+
+- Scanner status time now uses fixed UTC+3 display time to match Telegram/Moscow time instead of server UTC.
+- Main loop no longer overwrites detailed scanner/signal rejection reasons with the generic `no candidates passed signal engine` text when a real reason already exists.
+- Version updated to `0125 TIMEZONE + REJECT DEBUG`.

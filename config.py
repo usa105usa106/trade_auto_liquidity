@@ -8,7 +8,7 @@ load_dotenv()
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
-VERSION = os.getenv("BOT_VERSION", "0123 AI BTC/ETH")
+VERSION = os.getenv("BOT_VERSION", "0125 TIMEZONE + REJECT DEBUG")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)

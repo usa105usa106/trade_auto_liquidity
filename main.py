@@ -1,4 +1,5 @@
 import os, time, asyncio, logging
+from datetime import datetime, timezone, timedelta
 import aiohttp
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -234,6 +235,8 @@ def _scan_status_text(settings: dict, status: str = "scanning", last_signal: str
         f"🎯 Last setup: {signal}",
         f"🧠 Decision: {decision}",
     ]
+    ai_candidates = int(getattr(scanner, "last_ai_candidates_count", 0) or 0)
+    lines.append(f"🤖 AI candidates: {ai_candidates}")
     if ai_mode:
         ai_list = getattr(scanner, "last_ai_check_symbols", []) or []
         if ai_list:
@@ -248,7 +251,7 @@ def _scan_status_text(settings: dict, status: str = "scanning", last_signal: str
             lines.append("📌 Examples: " + "; ".join(map(str, examples[:3])))
     lines += [
         f"⏱ Next cycle pause: {scan_every}",
-        f"🕒 {time.strftime('%H:%M:%S')}",
+        f"🕒 {datetime.now(timezone(timedelta(hours=3))).strftime('%H:%M:%S')}",
     ]
     if (not ai_mode) and scanner.last_refresh_error:
         lines.append(f"⚠️ Source issue: {_short_reason(scanner.last_refresh_error, 90)}")
@@ -2419,7 +2422,11 @@ async def trading_loop(app):
                     )
                 else:
                     scanner.last_signal_summary = "none"
-                    scanner.last_reject_reason = "no candidates passed signal engine"
+                    # Keep the detailed reject reason collected by scanner/signal_engine.
+                    # Previously this was overwritten with a generic message, which hid
+                    # useful diagnostics such as invalid sweep/reclaim/retest/RR.
+                    if not str(getattr(scanner, "last_reject_reason", "") or "").strip() or str(scanner.last_reject_reason).strip() in {"-", "none"}:
+                        scanner.last_reject_reason = "no candidates passed signal engine"
                     await update_scanner_status(app, settings, status="scanning")
 
                 opened_this_cycle = False
