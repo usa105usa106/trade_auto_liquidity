@@ -153,6 +153,34 @@ def parse_ai_scalp_decision(text: str, allowed_symbols: list[str], model: str) -
     )
 
 
+
+
+def ai_scalp_json_schema(symbol: str) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "symbol": {"type": "string", "enum": [symbol]},
+            "decision": {"type": "string", "enum": ["LONG", "SHORT", "WAIT"]},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "reason": {"type": "string", "maxLength": 80},
+        },
+        "required": ["symbol", "decision", "confidence", "reason"],
+    }
+
+
+def _json_format_payload(symbol: str) -> dict:
+    return {
+        "type": "json_schema",
+        "name": "ai_scalp_decision",
+        "strict": True,
+        "schema": ai_scalp_json_schema(symbol),
+    }
+
+
+def _json_object_payload() -> dict:
+    return {"type": "json_object"}
+
 class AIScalpingEngine:
     """Low-token BTC/ETH direction selector. Bot keeps sizing, TP/SL and execution."""
 
@@ -288,11 +316,12 @@ class AIScalpingEngine:
             },
             "market": market,
             "output_schema": {"symbol": allowed[0], "decision": "LONG|SHORT|WAIT", "confidence": 0.0, "reason": "max 10 words"},
+            "hard_output_rule": "Return only JSON. Do not wrap in markdown. Do not explain.",
         }
         prompt = json.dumps(prompt_obj, separators=(",", ":"), ensure_ascii=False)
         system = (
             "You are a BTC/ETH micro-scalping direction filter for futures. "
-            "Return one strict JSON object only. No prose. No markdown. "
+            "Return one strict JSON object only. Return ONLY one valid JSON object matching the schema. No prose. No markdown. "
             "Your job is not to be active; your job is to avoid bad trades. "
             "If the next move is not clearly favorable for the bot TP before SL, return WAIT."
         )
@@ -302,7 +331,14 @@ class AIScalpingEngine:
             try:
                 timeout = aiohttp.ClientTimeout(total=timeout_sec)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    body = {"model": model, "input": prompt, "instructions": system, "max_output_tokens": 80}
+                    schema_format = _json_format_payload(allowed[0])
+                    body = {
+                        "model": model,
+                        "input": prompt,
+                        "instructions": system,
+                        "max_output_tokens": 80,
+                        "text": {"format": schema_format},
+                    }
                     if str(model).lower().startswith(("gpt-5", "o1", "o3", "o4")):
                         body["reasoning"] = {"effort": "low"}
                     async with session.post(OPENAI_RESPONSES_URL, headers=headers, json=body) as r:
@@ -313,7 +349,17 @@ class AIScalpingEngine:
                             dec.market = {"markets": markets}
                             return dec
                         first_error = txt[:240]
-                    chat_body = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}], "temperature": 0.0, "max_tokens": 80}
+
+                    # Fallback for providers/models that do not support Responses API structured output.
+                    # Chat Completions JSON mode still forces valid JSON, and the parser also extracts
+                    # a JSON object from accidental surrounding text.
+                    chat_body = {
+                        "model": model,
+                        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                        "temperature": 0.1,
+                        "max_tokens": 80,
+                        "response_format": _json_object_payload(),
+                    }
                     if str(model).lower().startswith(("gpt-5", "o1", "o3", "o4")):
                         chat_body.pop("temperature", None)
                         chat_body["max_completion_tokens"] = 80
@@ -324,7 +370,17 @@ class AIScalpingEngine:
                             dec = parse_ai_scalp_decision(parsed2, allowed, model)
                             dec.market = {"markets": markets}
                             return dec
-                        return AIScalpDecision(ok=False, symbol=allowed[0], decision="WAIT", error=f"OpenAI error responses={first_error}; chat={r2.status}: {txt2[:200]}", model=model, market={"markets": markets})
+                        # Last compatibility retry: no response_format, but still JSON-only prompt.
+                        fallback_body = dict(chat_body)
+                        fallback_body.pop("response_format", None)
+                        async with session.post(OPENAI_CHAT_URL, headers=headers, json=fallback_body) as r3:
+                            txt3 = await r3.text()
+                            if r3.status == 200:
+                                parsed3 = _extract_text(json.loads(txt3))
+                                dec = parse_ai_scalp_decision(parsed3, allowed, model)
+                                dec.market = {"markets": markets}
+                                return dec
+                            return AIScalpDecision(ok=False, symbol=allowed[0], decision="WAIT", error=f"OpenAI error responses={first_error}; chat={r2.status}: {txt2[:160]}; fallback={r3.status}: {txt3[:160]}", model=model, market={"markets": markets})
             except Exception as e:
                 return AIScalpDecision(ok=False, symbol=allowed[0], decision="WAIT", error=f"OpenAI unavailable: {e}", model=model, market={"markets": markets})
 
