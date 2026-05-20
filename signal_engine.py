@@ -79,6 +79,7 @@ class SignalEngine:
         self.liquidity_retest_mtf_enabled = str(os.getenv("LIQUIDITY_RETEST_MTF_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
         self.liquidity_retest_min_mtf_score = float(os.getenv("LIQUIDITY_RETEST_MIN_MTF_SCORE", "-0.25"))
         self.liquidity_retest_require_clean_path = str(os.getenv("LIQUIDITY_RETEST_REQUIRE_CLEAN_PATH", "false")).lower() in {"1", "true", "yes", "on"}
+        self.liquidity_retest_quality_mode = str(os.getenv("LIQUIDITY_RETEST_QUALITY_MODE", "a_plus") or "a_plus").lower()
 
     @staticmethod
     def _truthy(value, default: bool = False) -> bool:
@@ -120,6 +121,40 @@ class SignalEngine:
         self.liquidity_retest_mtf_enabled = self._truthy(settings.get("liquidity_retest_mtf_enabled"), self.liquidity_retest_mtf_enabled)
         self.liquidity_retest_min_mtf_score = self._float_setting(settings, "liquidity_retest_min_mtf_score", self.liquidity_retest_min_mtf_score)
         self.liquidity_retest_require_clean_path = self._truthy(settings.get("liquidity_retest_require_clean_path"), self.liquidity_retest_require_clean_path)
+        self.liquidity_retest_quality_mode = str(settings.get("liquidity_retest_quality_mode", self.liquidity_retest_quality_mode) or "a_plus").lower()
+        self._apply_liquidity_retest_quality_profile()
+
+    def _apply_liquidity_retest_quality_profile(self) -> None:
+        """Runtime liquidity_retest quality presets.
+
+        a_plus = old strict behavior. normal/aggressive only relax thresholds;
+        they do not reduce the scanned universe.
+        """
+        mode = str(getattr(self, "liquidity_retest_quality_mode", "a_plus") or "a_plus").lower().replace("+", "_plus").replace("-", "_")
+        if mode in {"a", "a_plus", "aplus", "strict"}:
+            return
+        if mode == "normal":
+            self.liquidity_retest_min_target_rr = min(self.liquidity_retest_min_target_rr, 1.45)
+            self.liquidity_retest_min_zone_quality = min(self.liquidity_retest_min_zone_quality, 1.45)
+            self.liquidity_retest_min_sweep_wick = min(self.liquidity_retest_min_sweep_wick, 0.18)
+            self.liquidity_retest_min_reclaim_pct = min(self.liquidity_retest_min_reclaim_pct, 0.025)
+            self.liquidity_retest_min_retest_rejection_wick = min(self.liquidity_retest_min_retest_rejection_wick, 0.16)
+            self.liquidity_retest_min_displacement_pct = min(self.liquidity_retest_min_displacement_pct, 0.07)
+            self.liquidity_retest_min_displacement_body = min(self.liquidity_retest_min_displacement_body, 0.42)
+            self.liquidity_retest_min_volume_ratio = min(self.liquidity_retest_min_volume_ratio, 1.05)
+            self.liquidity_retest_min_mtf_score = min(self.liquidity_retest_min_mtf_score, -0.45)
+            return
+        if mode == "aggressive":
+            self.liquidity_retest_min_target_rr = min(self.liquidity_retest_min_target_rr, 1.20)
+            self.liquidity_retest_min_zone_quality = min(self.liquidity_retest_min_zone_quality, 1.05)
+            self.liquidity_retest_min_sweep_wick = min(self.liquidity_retest_min_sweep_wick, 0.12)
+            self.liquidity_retest_min_reclaim_pct = min(self.liquidity_retest_min_reclaim_pct, 0.015)
+            self.liquidity_retest_min_retest_rejection_wick = min(self.liquidity_retest_min_retest_rejection_wick, 0.10)
+            self.liquidity_retest_min_displacement_pct = min(self.liquidity_retest_min_displacement_pct, 0.04)
+            self.liquidity_retest_min_displacement_body = min(self.liquidity_retest_min_displacement_body, 0.30)
+            self.liquidity_retest_min_volume_ratio = min(self.liquidity_retest_min_volume_ratio, 0.95)
+            self.liquidity_retest_min_mtf_score = min(self.liquidity_retest_min_mtf_score, -0.70)
+            self.liquidity_retest_require_clean_path = False
 
     def analyze_symbol(
         self,
@@ -129,7 +164,9 @@ class SignalEngine:
         orderbook: dict | None = None,
         preferred_strategy: str = "hybrid",
     ) -> dict | None:
+        self.last_reject_reason = "-"
         if not candles or len(candles) < max(30, self.breakout_lookback + 5):
+            self.last_reject_reason = "not enough candles"
             return None
 
         closes = [float(c[4]) for c in candles]
@@ -158,6 +195,7 @@ class SignalEngine:
 
         orderbook_metrics = self._orderbook_metrics(orderbook)
         if not orderbook_metrics["valid"]:
+            self.last_reject_reason = "invalid orderbook"
             return None
         spread_pct = orderbook_metrics["spread_pct"]
         depth_usdt = orderbook_metrics["depth_usdt"]
@@ -175,8 +213,16 @@ class SignalEngine:
         if preferred_strategy == "liquidity_retest":
             candidates += self._liquidity_retest(symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance)
 
+        raw_candidates = list(candidates)
         candidates = [c for c in candidates if c["confidence"] >= self.min_confidence]
         if not candidates:
+            if raw_candidates:
+                best = max(raw_candidates, key=lambda x: float(x.get("confidence", 0)))
+                self.last_reject_reason = f"confidence {float(best.get('confidence', 0)):.1f} < {self.min_confidence:.1f}"
+            elif preferred_strategy == "liquidity_retest":
+                self.last_reject_reason = "liquidity_retest filters: no valid sweep/reclaim/retest/RR"
+            else:
+                self.last_reject_reason = "no strategy setup"
             return None
         candidates.sort(key=lambda x: x["confidence"], reverse=True)
         return candidates[0]

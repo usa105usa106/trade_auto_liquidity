@@ -38,6 +38,7 @@ def settings_menu(revision: int, settings: dict | None = None):
         [InlineKeyboardButton(f"🌐 Universe: {_value(settings, 'universe_mode', 'adaptive')}", callback_data=f"menu:universe:{r}")],
         [InlineKeyboardButton(f"📡 Фьючи|Спот: {_value(settings, 'scan_market_source', 'mexc_binance')}", callback_data=f"menu:marketsource:{r}")],
         [InlineKeyboardButton(f"📈 Strategy: {_value(settings, 'strategy_mode', 'hybrid')}", callback_data=f"menu:strategy:{r}")],
+        [InlineKeyboardButton(f"💧 Liq retest quality: {_value(settings, 'liquidity_retest_quality_mode', 'a_plus')}", callback_data=f"menu:liquidity_quality:{r}")],
         [InlineKeyboardButton(f"⏱ Scan: {format_duration_seconds((settings or {}).get('scan_interval_sec', 5))}", callback_data=f"menu:scan:{r}"), InlineKeyboardButton(f"🧵 Concurrency: {_value(settings, 'scanner_concurrency', '5')}", callback_data=f"menu:concurrency:{r}")],
         [InlineKeyboardButton(f"🔄 Refresh: {_value(settings, 'symbol_refresh_sec', '300')}s", callback_data=f"menu:refresh:{r}")],
         [InlineKeyboardButton(f"📊 Risk: {float((settings or {}).get('risk_pct', 0.005))*100:.2f}%", callback_data=f"menu:risk:{r}"), InlineKeyboardButton(f"🔥 Max Pos: {_value(settings, 'max_open_positions', '5')}", callback_data=f"menu:maxpos:{r}")],

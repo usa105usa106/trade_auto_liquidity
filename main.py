@@ -5,7 +5,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Cal
 import psutil
 
 from config import TELEGRAM_TOKEN, ADMIN_IDS, VERSION, DEFAULT_EXCHANGE
-from storage import Storage
+from storage import Storage, DEFAULT_SETTINGS
 from keyboard import MAIN_MENU, settings_menu, choices_menu, api_menu, openai_menu, ai_stats_menu, format_duration_seconds
 from adaptive_engine import AdaptiveEngine
 from mirror_engine import MirrorEngine
@@ -233,6 +233,20 @@ def _scan_status_text(settings: dict, status: str = "scanning", last_signal: str
         f"✅ Checked: {checked}" + (f" | errors {errors}" if errors else ""),
         f"🎯 Last setup: {signal}",
         f"🧠 Decision: {decision}",
+    ]
+    if ai_mode:
+        ai_list = getattr(scanner, "last_ai_check_symbols", []) or []
+        if ai_list:
+            lines.append("🤖 AI checked: " + ", ".join(map(str, ai_list[:8])))
+    elif bool(settings.get("scanner_reject_log_enabled", True)):
+        top_rejects = getattr(scanner, "last_reject_top_reasons", []) or []
+        if top_rejects:
+            top = "; ".join(f"{r}:{c}" for r, c in top_rejects[:4])
+            lines.append(f"🚫 Top rejects: {top}")
+        examples = getattr(scanner, "last_reject_examples", []) or []
+        if examples:
+            lines.append("📌 Examples: " + "; ".join(map(str, examples[:3])))
+    lines += [
         f"⏱ Next cycle pause: {scan_every}",
         f"🕒 {time.strftime('%H:%M:%S')}",
     ]
@@ -1101,17 +1115,22 @@ def _dedupe_exchange_positions(rows: list[dict], ex=None) -> list[dict]:
     return out
 
 
-async def _hidden_margin_present(ex) -> bool:
-    """Protect against MEXC returning empty position rows while balance still shows margin."""
+async def _hidden_margin_snapshot(ex) -> dict:
+    """Read MEXC balance margin robustly when open_positions returns empty."""
     try:
         bal = await ex.fetch_balance()
         usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
         used = float(usdt.get("used") or ((bal or {}).get("used", {}) or {}).get("USDT") or 0)
         pm = float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
-        upnl = float(usdt.get("unrealized") or 0)
-        return used > 0.5 or pm > 0.5 or abs(upnl) > 0.01
-    except Exception:
-        return False
+        frozen = float(usdt.get("frozenBalance") or usdt.get("frozen_balance") or 0)
+        upnl = float(usdt.get("unrealized") or usdt.get("unrealizedPnl") or 0)
+        hidden = used > 0.5 or pm > 0.5 or abs(upnl) > 0.01
+        return {"hidden": hidden, "used": used, "positionMargin": pm, "frozen": frozen, "unrealized": upnl}
+    except Exception as e:
+        return {"hidden": False, "error": str(e)[:180]}
+
+async def _hidden_margin_present(ex) -> bool:
+    return bool((await _hidden_margin_snapshot(ex)).get("hidden"))
 
 def _exchange_position_text(p: dict) -> str:
     info = p.get("info", {}) if isinstance(p.get("info"), dict) else {}
@@ -1202,20 +1221,16 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ex2 = await get_exchange(s)
                 bal = await ex2.fetch_balance()
                 usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
-                used = float(usdt.get("used") or ((bal or {}).get("used", {}) or {}).get("USDT") or 0)
-                pm = float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
-                frozen = float(usdt.get("frozenBalance") or 0)
-                upnl = float(usdt.get("unrealized") or 0)
-                if used > 0.5 or pm > 0.5 or abs(upnl) > 0.01:
+                snap = await _hidden_margin_snapshot(ex2)
+                if snap.get("hidden"):
                     text = (
-                        "📈 Positions: ⚠️ hidden exchange margin\n⚠️ Hidden MEXC margin detected"
-                        f"\nUsed: {used:.4f} USDT"
-                        f"\nPosition margin: {pm:.4f} USDT"
-                        f"\nFrozen: {frozen:.4f} USDT"
-                        f"\nUnrealized PnL: {upnl:.4f} USDT"
-                        "\n\nMEXC did not return a position row, but account assets show live margin/PnL."
-                        "\nThis is NOT flat. Do not start new trading until it is closed."
-                        "\nUse /close_all to send native MEXC close-all, then /balance."
+                        "📈 Positions: ⚠️ hidden exchange margin\n⚠️ MEXC has live exposure, but open_positions returned empty"
+                        f"\nUsed: {float(snap.get('used') or 0):.4f} USDT"
+                        f"\nPosition margin: {float(snap.get('positionMargin') or 0):.4f} USDT"
+                        f"\nFrozen: {float(snap.get('frozen') or 0):.4f} USDT"
+                        f"\nUnrealized PnL: {float(snap.get('unrealized') or 0):.4f} USDT"
+                        "\n\nThis is NOT flat. The bot must keep treating the account as exposed."
+                        "\nUse /close_all, then /balance. Do not start new trades until used/margin = 0."
                     )
         except Exception as e:
             text += f"\nHidden-margin check failed: {str(e)[:160]}"
@@ -1678,7 +1693,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "breakeven_trigger_pct", "breakeven_offset_pct", "scalp_exit_enabled", "scalp_trailing_enabled",
         "scalp_trailing_start_pct", "scalp_trailing_giveback_pct", "smart_time_stop_min_sec",
         "smart_time_stop_stale_abs_pct", "smart_time_stop_extend_profit_pct", "smart_time_stop_max_extend_sec",
-        "liquidity_retest_default_rr", "liquidity_retest_sl_buffer_pct", "liquidity_retest_time_stop_sec", "liquidity_retest_min_displacement_pct", "liquidity_retest_min_displacement_body", "liquidity_retest_min_volume_ratio", "liquidity_retest_min_target_rr", "liquidity_retest_zone_tolerance_pct", "liquidity_retest_min_sweep_wick", "liquidity_retest_min_reclaim_pct", "liquidity_retest_max_spread_pct", "liquidity_retest_min_retest_rejection_wick", "liquidity_retest_min_zone_quality", "liquidity_retest_mtf_enabled", "liquidity_retest_min_mtf_score", "liquidity_retest_require_clean_path",
+        "liquidity_retest_default_rr", "liquidity_retest_sl_buffer_pct", "liquidity_retest_time_stop_sec", "liquidity_retest_min_displacement_pct", "liquidity_retest_min_displacement_body", "liquidity_retest_min_volume_ratio", "liquidity_retest_min_target_rr", "liquidity_retest_zone_tolerance_pct", "liquidity_retest_min_sweep_wick", "liquidity_retest_min_reclaim_pct", "liquidity_retest_max_spread_pct", "liquidity_retest_min_retest_rejection_wick", "liquidity_retest_min_zone_quality", "liquidity_retest_mtf_enabled", "liquidity_retest_min_mtf_score", "liquidity_retest_require_clean_path", "liquidity_retest_quality_mode", "scanner_reject_log_enabled",
         "weak_momentum_filter_enabled", "momentum_min_5m_confirm_pct", "momentum_min_imbalance_abs", "momentum_max_spread_pct",
         "openai_analysis_enabled", "openai_model", "openai_check_strength", "openai_api_key",
         "openai_env_fallback", "openai_timeout_sec", "openai_fail_open", "openai_show_decisions",
@@ -1698,6 +1713,9 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if key == "openai_check_strength" and str(parsed).lower() not in {"weak", "medium", "strong"}:
         await reply(update, "❌ OpenAI strength must be weak, medium, or strong.", reply_markup=MAIN_MENU)
+        return
+    if key == "liquidity_retest_quality_mode" and str(parsed).lower() not in {"a_plus", "normal", "aggressive"}:
+        await reply(update, "❌ Liquidity retest quality must be a_plus, normal, or aggressive.", reply_markup=MAIN_MENU)
         return
     await storage.set(key, parsed)
     # v0104: /set strategy_mode ai_scalping must be a real mode switch, not
@@ -1728,7 +1746,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if key in {"proxy_url", "proxy_enabled", "scan_market_source", "ws_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold"}:
         await reset_market_runtime()
     shown = mask_secret(str(parsed)) if key in {"mexc_api_key", "mexc_api_secret", "openai_api_key", "proxy_url"} else parsed
-    if key in {"scan_interval_sec", "scanner_concurrency", "strategy_mode", "universe_mode", "max_symbols", "scan_market_source", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "openai_check_strength", "openai_model", "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct"}:
+    if key in {"scan_interval_sec", "scanner_concurrency", "strategy_mode", "universe_mode", "max_symbols", "scan_market_source", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "openai_check_strength", "openai_model", "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct", "liquidity_retest_quality_mode", "scanner_reject_log_enabled"}:
         trigger_scan_now(context.application, reason=f"setting:{key}")
     await reply(update, f"✅ Saved\n{key} = {shown}", reply_markup=MAIN_MENU)
 
@@ -1871,6 +1889,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             parsed = value
         await storage.set(key, parsed)
+        if key == "strategy_mode" and str(parsed).lower() == "ai_scalping":
+            for k2, v2 in {
+                "openai_analysis_enabled": True, "openai_show_decisions": True,
+                "ai_scalping_symbols": "BTC_USDT,ETH_USDT", "max_open_positions": 2,
+                "auto_strategy_adaptation": False, "regime_adaptation": False,
+                "liquidity_runner_enabled": False, "spot_confirmation_enabled": False,
+                "session_filter_enabled": False, "america_short_bias_enabled": False, "mirror_mode": "off",
+            }.items():
+                await storage.set(k2, v2, bump_revision=False)
+        elif key == "strategy_mode" and str(s.get("strategy_mode", "hybrid")).lower() == "ai_scalping" and str(parsed).lower() != "ai_scalping":
+            for k2 in ["auto_strategy_adaptation", "regime_adaptation", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "mirror_mode", "openai_analysis_enabled", "openai_show_decisions", "liquidity_runner_enabled", "max_open_positions"]:
+                await storage.set(k2, DEFAULT_SETTINGS.get(k2, s.get(k2)), bump_revision=False)
         if key in {"scan_market_source", "ws_enabled", "proxy_url", "proxy_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold"}:
             await reset_market_runtime()
         if key in {"universe_mode", "max_symbols", "scan_market_source"}:
@@ -1878,7 +1908,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             scanner.last_reject_reason = "universe settings changed; refresh queued"
         new_settings = await storage.all_settings()
         new_rev = int(new_settings.get("settings_revision", current_rev + 1))
-        if key in {"scan_interval_sec", "scanner_concurrency", "strategy_mode", "universe_mode", "max_symbols", "scan_market_source", "symbol_refresh_sec", "openai_model", "openai_check_strength"}:
+        if key in {"scan_interval_sec", "scanner_concurrency", "strategy_mode", "universe_mode", "max_symbols", "scan_market_source", "symbol_refresh_sec", "openai_model", "openai_check_strength", "liquidity_retest_quality_mode"}:
             trigger_scan_now(context.application, reason=f"menu:{key}")
         # Stay inside the same submenu so the selected value is immediately visible with ✅.
         if key == "universe_mode":
@@ -1905,6 +1935,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("🧠 OpenAI model", reply_markup=choices_menu("openai_model", [("gpt-5.4-mini default","gpt-5.4-mini"),("gpt-4o-mini","gpt-4o-mini"),("gpt-5.5","gpt-5.5"),("gpt-5.5-pro","gpt-5.5-pro"),("gpt-4.1","gpt-4.1")], new_rev, new_settings.get("openai_model", "gpt-5.4-mini")))
         elif key == "openai_check_strength":
             await q.edit_message_text("🛡 OpenAI check strength", reply_markup=choices_menu("openai_check_strength", [("Weak","weak"),("Medium default","medium"),("Strong","strong")], new_rev, new_settings.get("openai_check_strength", "medium")))
+        elif key == "liquidity_retest_quality_mode":
+            await q.edit_message_text("💧 Liquidity retest quality", reply_markup=choices_menu("liquidity_retest_quality_mode", [("A+ only (strict/current)","a_plus"),("Normal","normal"),("Aggressive","aggressive")], new_rev, new_settings.get("liquidity_retest_quality_mode", "a_plus")))
         else:
             await q.edit_message_text(f"✅ {key} = {parsed}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
     elif data[0] == "api":
@@ -1985,6 +2017,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("🧠 OpenAI model", reply_markup=choices_menu("openai_model", [("gpt-5.4-mini default","gpt-5.4-mini"),("gpt-4o-mini","gpt-4o-mini"),("gpt-5.5","gpt-5.5"),("gpt-5.5-pro","gpt-5.5-pro"),("gpt-4.1","gpt-4.1")], rev, s.get("openai_model", "gpt-5.4-mini")))
         elif name == "openai_strength":
             await q.edit_message_text("🛡 OpenAI check strength", reply_markup=choices_menu("openai_check_strength", [("Weak","weak"),("Medium default","medium"),("Strong","strong")], rev, s.get("openai_check_strength", "medium")))
+        elif name == "liquidity_quality":
+            await q.edit_message_text("💧 Liquidity retest quality", reply_markup=choices_menu("liquidity_retest_quality_mode", [("A+ only (strict/current)","a_plus"),("Normal","normal"),("Aggressive","aggressive")], rev, s.get("liquidity_retest_quality_mode", "a_plus")))
         elif name == "api":
             await q.edit_message_text("🔐 API menu\nUse /api set API_KEY API_SECRET to save keys.", reply_markup=api_menu(rev, s))
 
@@ -2253,6 +2287,7 @@ async def trading_loop(app):
                     opened = []
                     waited = []
                     errors = []
+                    ai_checked = []
                     for symbol in symbols:
                         b = _base(symbol)
                         if b in active_bases:
@@ -2272,6 +2307,7 @@ async def trading_loop(app):
                             except Exception as e:
                                 waited.append(f"{b}:cooldown check warning {e}")
 
+                        ai_checked.append(b)
                         decision = await ai_scalping_engine.decide_symbol(ex, settings, symbol)
                         if not decision.ok:
                             errors.append(f"{b}:{decision.error or 'AI unavailable'}")
@@ -2330,6 +2366,7 @@ async def trading_loop(app):
                         else:
                             waited.append(f"{b}:execution rejected {placed.get('reason', 'unknown')}")
 
+                    scanner.last_ai_check_symbols = ai_checked
                     if opened:
                         scanner.last_signal_summary = "AI scalp opened: " + "; ".join(opened)
                         scanner.last_reject_reason = "Dual loop: next AI request per symbol after that symbol closes"
@@ -2386,6 +2423,7 @@ async def trading_loop(app):
                     await update_scanner_status(app, settings, status="scanning")
 
                 opened_this_cycle = False
+                scanner.last_ai_check_symbols = []
                 for cand in candidates:
                     original_symbol = cand.get("symbol")
                     cand = MirrorEngine(str(settings.get("mirror_mode", "off"))).apply(cand, adaptive_stats)
@@ -2436,6 +2474,11 @@ async def trading_loop(app):
                             format_ai_decision(plan, preview, stage="start"),
                             message_id=None,
                         )
+                    if ai_enabled:
+                        try:
+                            scanner.last_ai_check_symbols.append(str(plan.symbol))
+                        except Exception:
+                            pass
                     ai_verdict = await ai_signal_engine.validate(cand, plan, settings)
                     if ai_enabled:
                         if ai_show:

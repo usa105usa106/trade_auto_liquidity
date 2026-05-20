@@ -2,6 +2,7 @@ import time
 import os
 import logging
 import asyncio
+from collections import Counter, defaultdict
 from signal_engine import SignalEngine
 from regime_engine import RegimeEngine
 
@@ -40,6 +41,9 @@ class Scanner:
         self.last_cycle_scanned = 0
         self.last_slowdown_sec = 0
         self.error_streak = 0
+        self.last_reject_top_reasons = []
+        self.last_reject_examples = []
+        self.last_ai_check_symbols = []
         self.engine = SignalEngine(
             min_confidence=float(os.getenv("SIGNAL_MIN_CONFIDENCE", "70")),
             volume_spike_mult=float(os.getenv("SIGNAL_VOLUME_SPIKE_MULT", "1.8")),
@@ -374,6 +378,16 @@ class Scanner:
         sem = asyncio.Semaphore(self.last_concurrency)
         errors = 0
         scanned = 0
+        reject_counts = Counter()
+        reject_examples = defaultdict(list)
+
+        def _record_reject(symbol: str, reason: str) -> None:
+            reason = str(reason or "unknown").strip()[:90] or "unknown"
+            # Keep reason buckets readable; exact examples stay below.
+            bucket = reason.split(":", 1)[0]
+            reject_counts[bucket] += 1
+            if len(reject_examples[bucket]) < 3:
+                reject_examples[bucket].append(f"{symbol}->{reason}")
 
         async def scan_one(symbol: str) -> dict | None:
             nonlocal errors, scanned
@@ -382,11 +396,13 @@ class Scanner:
                     scanned += 1
                     candles = await exchange_client.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
                     if not candles:
+                        _record_reject(symbol, "no candles")
                         return None
                     try:
                         orderbook = await exchange_client.fetch_order_book(symbol, limit=20)
                     except Exception as e:
                         errors += 1
+                        _record_reject(symbol, f"orderbook error")
                         log.debug("orderbook unavailable for %s: %s", symbol, e)
                         return None
                     candidate = self.engine.analyze_symbol(
@@ -399,9 +415,12 @@ class Scanner:
                     if candidate:
                         candidate["market_regime"] = regime
                         candidate["effective_strategy_mode"] = preferred_strategy
+                    else:
+                        _record_reject(symbol, getattr(self.engine, "last_reject_reason", "no candidate"))
                     return candidate
                 except Exception as e:
                     errors += 1
+                    _record_reject(symbol, "scan exception")
                     log.debug("candidate scan failed for %s: %s", symbol, e)
                     return None
 
@@ -418,6 +437,11 @@ class Scanner:
                 break
 
         self._record_cycle_health(scanned, errors, settings)
+        self.last_reject_top_reasons = reject_counts.most_common(6)
+        ex = []
+        for reason, _count in self.last_reject_top_reasons[:4]:
+            ex.extend(reject_examples.get(reason, [])[:2])
+        self.last_reject_examples = ex[:8]
         out.sort(key=lambda c: float(c.get("confidence", 0)), reverse=True)
         return out[:max_candidates]
 

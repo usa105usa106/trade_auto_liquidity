@@ -8,7 +8,7 @@ load_dotenv()
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
-VERSION = os.getenv("BOT_VERSION", "0121 AI BTC/ETH")
+VERSION = os.getenv("BOT_VERSION", "0123 AI BTC/ETH")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -90,6 +90,8 @@ class Defaults:
     liquidity_retest_mtf_enabled: bool = env_bool("LIQUIDITY_RETEST_MTF_ENABLED", True)
     liquidity_retest_min_mtf_score: float = env_float("LIQUIDITY_RETEST_MIN_MTF_SCORE", -0.25)
     liquidity_retest_require_clean_path: bool = env_bool("LIQUIDITY_RETEST_REQUIRE_CLEAN_PATH", False)
+    liquidity_retest_quality_mode: str = os.getenv("LIQUIDITY_RETEST_QUALITY_MODE", "a_plus")
+    scanner_reject_log_enabled: bool = env_bool("SCANNER_REJECT_LOG_ENABLED", True)
     liquidity_runner_enabled: bool = env_bool("LIQUIDITY_RUNNER_ENABLED", False)
 
     ai_scalping_symbols: str = os.getenv("AI_SCALPING_SYMBOLS", "BTC_USDT,ETH_USDT")

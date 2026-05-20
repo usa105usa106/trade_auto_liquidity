@@ -826,6 +826,26 @@ class ExecutionEngine:
                 return True, results
         return (not await self._find_exchange_position_row(symbol)), results
 
+
+    async def _mexc_hidden_margin_after_close(self) -> tuple[bool, dict]:
+        """Return True when MEXC balance still shows live position margin.
+
+        MEXC can occasionally return an empty open_positions list immediately
+        after a close attempt while account/assets still shows used/position
+        margin. In that case we must NOT delete local position state, because
+        the exchange may still have live exposure that /positions cannot see.
+        """
+        try:
+            bal = await self.exchange_client.fetch_balance()
+            usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
+            used = float(usdt.get("used") or ((bal or {}).get("used", {}) or {}).get("USDT") or 0)
+            pm = float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
+            upnl = float(usdt.get("unrealized") or 0)
+            hidden = used > 0.5 or pm > 0.5 or abs(upnl) > 0.01
+            return hidden, {"used": used, "positionMargin": pm, "unrealized": upnl}
+        except Exception as e:
+            return False, {"error": str(e)[:180]}
+
     async def close_position(self, pos: dict, reason: str, live: bool, exit_price: float | None = None):
         symbol = pos["symbol"]
         side = "sell" if str(pos.get("side")).upper() == "LONG" else "buy"
@@ -841,6 +861,7 @@ class ExecutionEngine:
                 exchange_row = await self._find_exchange_position_row(symbol)
                 if exchange_row:
                     pos["qty"] = self.exchange_position_qty(exchange_row) or qty
+                    qty = float(pos.get("qty") or qty or 0)
                     pos["exchange_contracts"] = exchange_row.get("contracts") or (exchange_row.get("info") or {}).get("holdVol")
                     pos["raw_exchange_position"] = exchange_row
                 flat, close_attempts = await self._close_until_flat(symbol, reason, side, qty)
@@ -897,9 +918,15 @@ class ExecutionEngine:
                             break
                     except Exception:
                         continue
+                if confirmed_flat:
+                    hidden, hidden_state = await self._mexc_hidden_margin_after_close()
+                    if hidden:
+                        confirmed_flat = False
+                        pos["close_warning"] = "close order sent, but MEXC balance still shows live margin/PnL while open_positions is hidden"
+                        pos["hidden_margin_state"] = hidden_state
                 if not confirmed_flat:
                     pos["status"] = "open"
-                    pos["close_warning"] = "close order sent; exchange position still open after grace recheck"
+                    pos["close_warning"] = pos.get("close_warning") or "close order sent; exchange position still open after grace recheck"
                     pos["updated_at"] = time.time()
                     await self.storage.upsert_position(pos)
             except Exception as e:

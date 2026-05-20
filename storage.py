@@ -65,6 +65,8 @@ DEFAULT_SETTINGS = {
     "liquidity_retest_mtf_enabled": DEFAULTS.liquidity_retest_mtf_enabled,
     "liquidity_retest_min_mtf_score": DEFAULTS.liquidity_retest_min_mtf_score,
     "liquidity_retest_require_clean_path": DEFAULTS.liquidity_retest_require_clean_path,
+    "liquidity_retest_quality_mode": DEFAULTS.liquidity_retest_quality_mode,
+    "scanner_reject_log_enabled": DEFAULTS.scanner_reject_log_enabled,
     "liquidity_runner_enabled": DEFAULTS.liquidity_runner_enabled,
 
     "ai_scalping_symbols": DEFAULTS.ai_scalping_symbols,
