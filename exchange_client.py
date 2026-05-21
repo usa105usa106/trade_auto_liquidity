@@ -1173,11 +1173,11 @@ class ExchangeClient:
         except Exception:
             entry = 0.0
         safe_sl, safe_tp, safe_msg = await self.mexc_safe_tpsl_prices(symbol, side, float(stop_price), float(take_price), entry)
-        # MEXC trend is trigger direction: 1 = price rises to trigger, 2 = price falls to trigger.
-        # `side` here is the close side.  Closing a long uses sell; closing a short uses buy.
-        is_long_position = side_l == "sell"
-        loss_trend = 2 if is_long_position else 1
-        profit_trend = 1 if is_long_position else 2
+        # For /stoporder/place, MEXC lossTrend/profitTrend are trigger price
+        # reference types (1 latest price, 2 fair price, 3 index price), not the
+        # trigger direction. Use latest price by default for fast scalping.
+        loss_trend = int(os.getenv("MEXC_TPSL_LOSS_TREND", "1") or "1")
+        profit_trend = int(os.getenv("MEXC_TPSL_PROFIT_TREND", "1") or "1")
         body = {
             "symbol": self._mexc_symbol(symbol),
             "positionId": int(pid),
@@ -1465,10 +1465,15 @@ class ExchangeClient:
         else:
             mexc_side = 1 if is_buy else 3
         t = str(type_).lower()
-        if t in {"market", "stop_market"} and not any(k in params for k in ("stopPrice", "triggerPrice", "stopLossPrice", "takeProfitPrice")):
+        has_trigger_price = any(k in params for k in ("stopPrice", "triggerPrice"))
+        has_attached_tpsl = any(k in params for k in ("stopLossPrice", "takeProfitPrice"))
+        # v0146: opening orders may carry attached TP/SL. Do not mis-route those
+        # orders to /planorder/place; send them to /order/create with the TP/SL
+        # fields included below. Only reduce-only trigger orders use planorder.
+        if t in {"market", "stop_market"} and not (has_trigger_price or (has_attached_tpsl and reduce_only)):
             mexc_type = 5  # market
             order_price = 0
-        elif any(k in params for k in ("stopPrice", "triggerPrice", "stopLossPrice", "takeProfitPrice")):
+        elif has_trigger_price or (has_attached_tpsl and reduce_only):
             # Native plan order. Used for SL/TP fallback only if ccxt fails.
             trigger_price = self._mexc_price_to_precision(symbol, float(params.get("triggerPrice") or params.get("stopPrice") or params.get("stopLossPrice") or params.get("takeProfitPrice")))
             body = {
@@ -1501,6 +1506,24 @@ class ExchangeClient:
             "openType": target_open_type,
             "leverage": target_leverage,
         }
+        # Attach native MEXC TP/SL to the opening order when provided.
+        # For /order/create, lossTrend/profitTrend are reference price types
+        # (1 latest, 2 fair, 3 index), NOT trigger direction.
+        if is_opening:
+            if params.get("stopLossPrice") not in (None, "", 0, "0"):
+                body["stopLossPrice"] = self._mexc_price_to_precision(symbol, float(params.get("stopLossPrice")))
+                body["lossTrend"] = int(params.get("lossTrend") or 1)
+                body["stopLossType"] = int(params.get("stopLossType") or 0)
+                body["stopLossOrderPrice"] = self._mexc_price_to_precision(symbol, float(params.get("stopLossOrderPrice") or 0))
+                body["stopLossReverse"] = int(params.get("stopLossReverse") or 2)
+            if params.get("takeProfitPrice") not in (None, "", 0, "0"):
+                body["takeProfitPrice"] = self._mexc_price_to_precision(symbol, float(params.get("takeProfitPrice")))
+                body["profitTrend"] = int(params.get("profitTrend") or 1)
+                body["takeProfitType"] = int(params.get("takeProfitType") or 0)
+                body["takeProfitOrderPrice"] = self._mexc_price_to_precision(symbol, float(params.get("takeProfitOrderPrice") or 0))
+                body["takeProfitReverse"] = int(params.get("takeProfitReverse") or 2)
+            if ("stopLossPrice" in body) or ("takeProfitPrice" in body):
+                body["priceProtect"] = int(params.get("priceProtect") or 0)
         if params.get("clientOrderId"):
             body["externalOid"] = str(params.get("clientOrderId"))[:32]
         out = await self._mexc_private("POST", "/api/v1/private/order/create", body=body)

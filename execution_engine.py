@@ -377,6 +377,29 @@ class ExecutionEngine:
             order_type = plan.order_type.lower()
             price = plan.entry_price if order_type == "limit" else None
             params = {"clientOrderId": f"bot_entry_{int(time.time()*1000)}", "leverage": getattr(plan, "leverage", None)}
+            # v0146: for normal MEXC scalping attach TP/SL already to the entry order.
+            # MEXC /order/create supports takeProfitPrice/stopLossPrice on opening
+            # orders; this is more reliable than opening first and trying to attach
+            # protection a few seconds later. Liquidation-stop mode intentionally
+            # has no exchange SL, so it still places TP after the position is live.
+            if str(getattr(plan, "strategy", "") or "").lower() == "ai_scalping" and not bool(getattr(plan, "liquidation_stop_mode", False)):
+                try:
+                    if float(getattr(plan, "take_price", 0) or 0) > 0 and float(getattr(plan, "stop_price", 0) or 0) > 0:
+                        params.update({
+                            "takeProfitPrice": float(getattr(plan, "take_price", 0) or 0),
+                            "stopLossPrice": float(getattr(plan, "stop_price", 0) or 0),
+                            "profitTrend": 1,
+                            "lossTrend": 1,
+                            "priceProtect": 0,
+                            "takeProfitType": 0,
+                            "stopLossType": 0,
+                            "takeProfitOrderPrice": 0,
+                            "stopLossOrderPrice": 0,
+                            "takeProfitReverse": 2,
+                            "stopLossReverse": 2,
+                        })
+                except Exception:
+                    pass
             try:
                 order = await self._create_order_retry(plan.symbol, order_type, side, plan.qty, price, params, attempts=2)
             except Exception as e:
@@ -401,6 +424,17 @@ class ExecutionEngine:
             pos["opened_at"] = time.time()
             pos["updated_at"] = time.time()
             pos["raw_order"] = order
+            # v0147: remember that the opening order was sent with attached TP/SL.
+            # This lets the protection routine first verify existing exchange-side
+            # TP/SL before creating fallback orders, instead of blindly placing
+            # duplicates or reporting LOCAL PROTECTION too early.
+            try:
+                if params.get("takeProfitPrice") or params.get("stopLossPrice"):
+                    pos["entry_attached_tpsl_requested"] = True
+                    pos["entry_attached_take_price"] = params.get("takeProfitPrice")
+                    pos["entry_attached_stop_price"] = params.get("stopLossPrice")
+            except Exception:
+                pass
             # v0068: persist every known MEXC symbol spelling immediately.
             # Railway redeploys/local DB resets can still lose cache, but while
             # the bot is running this prevents symbol mismatch from hiding the
@@ -745,6 +779,20 @@ class ExecutionEngine:
         require_exchange_protection = await self._setting_bool("require_exchange_protection", "REQUIRE_EXCHANGE_PROTECTION", True)
         attempts = max(1, int(os.getenv("PROTECTION_PLACE_MAX_ATTEMPTS", "3") or "3"))
         delay = float(os.getenv("PROTECTION_RECHECK_DELAY_SEC", "0.8") or "0.8")
+
+        # v0147 robust flow:
+        # 1) entry order may already have native MEXC TP/SL attached; verify it first.
+        # 2) only if missing, attach TP/SL to the now-live position.
+        # 3) only if still missing, create separate trigger-market fallback legs.
+        try:
+            existing = await self._verify_exchange_protection(pos, str(pos.get("tp_order_id") or ""), str(pos.get("sl_order_id") or ""))
+            if liquidation_stop_mode:
+                if existing.get("tp_exists"):
+                    return {**existing, "ok": True, "sl_exists": True, "sl_order_id": "LIQUIDATION_STOP", "protection_status": "TP + LIQUIDATION STOP", "protection_mode": "exchange_tp_liquidation_sl", "protection_note": "existing TP detected before reattach"}
+            elif existing.get("tp_exists") and existing.get("sl_exists"):
+                return {**existing, "ok": True, "protection_status": "EXCHANGE PROTECTED", "protection_mode": "exchange", "protection_note": "existing TP/SL detected before reattach"}
+        except Exception as e:
+            pos["pre_protection_verify_warning"] = str(e)[:180]
         if str(pos.get("strategy") or "").lower() == "ai_scalping":
             # AI scalping uses very small TP/SL distances; MEXC often needs an
             # extra second before the native TPSL order becomes visible.
@@ -754,9 +802,11 @@ class ExecutionEngine:
         best = {"ok": False}
         for i in range(attempts):
             out = {"ok": True, "attempt": i + 1}
-            # On retry, remove stale/partial protection first. Without this MEXC
-            # can leave one valid leg and reject/duplicate the other.
-            if i > 0 and hasattr(self.exchange_client, "cancel_all_orders"):
+            # Do NOT cancel all orders on early retries. In v0146 this could
+            # remove an attached TP/SL leg that was actually accepted but not yet
+            # visible in every endpoint. Only do destructive cleanup after several
+            # failed attempts, and only when explicitly enabled.
+            if i >= 2 and os.getenv("PROTECTION_CANCEL_STALE_ON_RETRY", "false").lower() in {"1", "true", "yes", "on"} and hasattr(self.exchange_client, "cancel_all_orders"):
                 try:
                     await self.exchange_client.cancel_all_orders(symbol)
                 except Exception as e:
@@ -809,7 +859,18 @@ class ExecutionEngine:
                     else:
                         out["tpsl_error"] = str(e)[:500]
 
-                if not native_tpsl_ok:
+                if native_tpsl_ok:
+                    # A combined native TP/SL request was accepted. Give MEXC one
+                    # visibility delay; if endpoints still do not show protection,
+                    # the generic verification block below will still treat the
+                    # accepted id as protected for fast AI scalps while watchdog
+                    # keeps reconciling.
+                    pass
+                else:
+                    # Fallback: create separate trigger-market reduce-only close
+                    # orders. This is the second layer after attached-entry and
+                    # by-position TP/SL. Place both legs; verification below will
+                    # classify them by trigger price/kind.
                     try:
                         if tp > 0:
                             order = await self._create_take_profit_market_order(symbol, side, qty, tp)
