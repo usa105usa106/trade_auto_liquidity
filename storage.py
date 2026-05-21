@@ -92,6 +92,7 @@ DEFAULT_SETTINGS = {
     "ai_scalping_liq_margin_pct": DEFAULTS.ai_scalping_liq_margin_pct,
     "ai_scalping_liq_buffer_pct": DEFAULTS.ai_scalping_liq_buffer_pct,
     "ai_scalping_liq_max_leverage": DEFAULTS.ai_scalping_liq_max_leverage,
+    "ai_scalping_protection_delay_sec": DEFAULTS.ai_scalping_protection_delay_sec,
     "proxy_enabled": DEFAULTS.proxy_enabled,
     "proxy_url": DEFAULTS.proxy_url,
     "mexc_order_leverage": DEFAULTS.mexc_order_leverage,

@@ -257,12 +257,12 @@ class PositionManager:
                     pos["protection_warning"] = "exchange protection failed; bot monitors TP/SL locally"
                     pos.update(protection)
                     await self.storage.upsert_position(pos)
-                    auto_close = await self._auto_close_on_protection_failed()
-                    if str(pos.get("strategy") or "").lower() == "ai_scalping":
-                        auto_close = True
-                    if auto_close:
-                        close_res = await self.execution_engine.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
-                        return {"type": "protection_failed", "symbol": symbol, "result": close_res, "protection": protection}
+                    # Never kill an already-filled live position only because
+                    # TP/SL attachment failed. Local monitoring below still closes
+                    # on real take_price/stop_price, and the watchdog keeps trying
+                    # to reattach exchange protection.
+                    pos["auto_close_on_protection_failed_ignored"] = True
+                    await self.storage.upsert_position(pos)
                     return {"type": "protection_local", "symbol": symbol, "protection": protection}
                 return {"type": "limit_filled", "symbol": symbol}
             if status in {"canceled", "cancelled", "rejected", "expired"}:
@@ -308,9 +308,13 @@ class PositionManager:
             side=str(pos.get("side")).upper(); stop=float(pos.get("stop_price") or 0); take=float(pos.get("take_price") or 0); entry=float(pos.get("entry_price") or 0); opened=float(pos.get("opened_at") or now); pnl=self.pnl_pct(pos, price)
             strategy = str(pos.get("strategy") or "").lower()
             is_liquidity_retest = strategy == "liquidity_retest"
+            is_ai_scalping = strategy == "ai_scalping"
+            ai_manage_only_tpsl = str(await self._setting("ai_scalping_manage_only_tpsl", os.getenv("AI_SCALPING_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
             policy = await self._refresh_scalp_policy()
             policy.update_best_pnl(pos, pnl)
-            if is_liquidity_retest:
+            if is_ai_scalping and ai_manage_only_tpsl:
+                move_be, new_stop = False, 0.0
+            elif is_liquidity_retest:
                 # v0082: no aggressive scalp BE. Move to BE only after price has
                 # travelled roughly 1R, because this strategy targets 2R-4R.
                 risk_pct = 0.0
@@ -387,16 +391,22 @@ class PositionManager:
                     if ev: events.append(ev)
                     continue
             if not is_liquidity_retest:
-                trailing_reason = policy.trailing_exit_reason(pos, pnl)
-                if trailing_reason:
-                    ev = await self._close_and_event(pos, "trailing_exit", trailing_reason, live, price)
-                    if ev: events.append(ev)
-                    continue
-                time_reason = policy.time_stop_reason(pos, pnl, now-opened, time_stop_sec)
-                if time_reason:
-                    ev = await self._close_and_event(pos, "time_stop", time_reason, live, price)
-                    if ev: events.append(ev)
-                    continue
+                if is_ai_scalping and ai_manage_only_tpsl:
+                    # For AI scalping do not choke a live trade with BE/trailing/time-stop.
+                    # Local manager closes only when real price reaches TP or SL; watchdog
+                    # separately keeps trying to attach native MEXC TP/SL.
+                    pass
+                else:
+                    trailing_reason = policy.trailing_exit_reason(pos, pnl)
+                    if trailing_reason:
+                        ev = await self._close_and_event(pos, "trailing_exit", trailing_reason, live, price)
+                        if ev: events.append(ev)
+                        continue
+                    time_reason = policy.time_stop_reason(pos, pnl, now-opened, time_stop_sec)
+                    if time_reason:
+                        ev = await self._close_and_event(pos, "time_stop", time_reason, live, price)
+                        if ev: events.append(ev)
+                        continue
             else:
                 # v0082: liquidity_retest is not ultra-scalp. Keep only a long
                 # hard safety timeout so dead retests don't live forever.

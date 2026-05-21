@@ -239,6 +239,82 @@ class ExchangeClient:
             out["take_price"] = self._mexc_price_to_precision(symbol, float(take_price or 0))
         return out
 
+    async def _mexc_reference_price(self, symbol: str, fallback: float = 0.0) -> float:
+        """Best reference price for validating TP/SL trigger direction.
+
+        MEXC rejects triggers that are already crossed or too close to mark/last.
+        Prefer mark/fair price from contract detail, then ticker, then fallback.
+        """
+        try:
+            msym = self._mexc_symbol(symbol)
+            resp = await self._mexc_public("GET", f"/api/v1/contract/ticker?symbol={msym}")
+            data = resp.get("data") if isinstance(resp, dict) else None
+            row = data[0] if isinstance(data, list) and data else data
+            if isinstance(row, dict):
+                for key in ("fairPrice", "markPrice", "indexPrice", "lastPrice"):
+                    val = row.get(key)
+                    if val not in (None, "") and float(val) > 0:
+                        return float(val)
+        except Exception:
+            pass
+        try:
+            t = await self.fetch_ticker(symbol)
+            for key in ("mark", "last", "close"):
+                val = t.get(key) if isinstance(t, dict) else None
+                if val not in (None, "") and float(val) > 0:
+                    return float(val)
+        except Exception:
+            pass
+        return float(fallback or 0)
+
+    def _mexc_price_tick(self, symbol: str) -> float:
+        try:
+            m = self._market(symbol)
+            info = m.get("info") or {}
+            for key in ("priceUnit", "tickSize"):
+                val = info.get(key) if isinstance(info, dict) else None
+                if val not in (None, "") and float(val) > 0:
+                    return float(val)
+            prec = (m.get("precision") or {}).get("price")
+            if prec not in (None, ""):
+                f = float(prec)
+                return f if 0 < f < 1 else 10 ** (-int(f))
+        except Exception:
+            pass
+        return 0.0
+
+    async def mexc_safe_tpsl_prices(self, symbol: str, side: str, stop_price: float, take_price: float, entry_price: float) -> tuple[float, float, str]:
+        """Move TP/SL away from mark/last so MEXC accepts native position TP/SL.
+
+        This mirrors the older bot that worked better: open the position first,
+        read mark/position data, then only send triggers that are on the correct
+        side of the current price with a tick/min-distance buffer.
+        """
+        ref = await self._mexc_reference_price(symbol, entry_price)
+        ref = float(ref or entry_price or 0)
+        tick = self._mexc_price_tick(symbol) or max(ref * 0.00001, 1e-12)
+        min_pct = float(os.getenv("MEXC_TPSL_MIN_TRIGGER_PCT", os.getenv("PROTECTION_MIN_TRIGGER_PCT", "0.12"))) / 100.0
+        min_ticks = int(float(os.getenv("MEXC_TPSL_MIN_TRIGGER_TICKS", os.getenv("PROTECTION_MIN_TRIGGER_TICKS", "5"))))
+        min_dist = max(ref * min_pct, tick * max(1, min_ticks))
+        close_side = str(side or "").lower()
+        is_long = close_side == "sell"  # closing LONG is sell; closing SHORT is buy
+        sl = float(stop_price or 0)
+        tp = float(take_price or 0)
+        changed = []
+        if is_long:
+            if sl > 0 and sl >= ref - min_dist:
+                sl = ref - min_dist; changed.append("sl")
+            if tp > 0 and tp <= ref + min_dist:
+                tp = ref + min_dist; changed.append("tp")
+        else:
+            if sl > 0 and sl <= ref + min_dist:
+                sl = ref + min_dist; changed.append("sl")
+            if tp > 0 and tp >= ref - min_dist:
+                tp = ref - min_dist; changed.append("tp")
+        sl = self._mexc_price_to_precision(symbol, sl) if sl > 0 else 0.0
+        tp = self._mexc_price_to_precision(symbol, tp) if tp > 0 else 0.0
+        return sl, tp, f"ref={ref:g} tick={tick:g} min_dist={min_dist:g} adjusted={','.join(changed) or 'no'}"
+
     def _amount_to_mexc_vol(self, symbol: str, amount: float) -> int:
         """MEXC futures API expects integer contract volume, not base coin amount."""
         amount = float(amount or 0)
@@ -1017,6 +1093,20 @@ class ExchangeClient:
             return self._amount_to_mexc_vol(pos.get("symbol") or info.get("symbol") or "", amount_f)
         return 0
 
+    def _mexc_position_side_matches(self, row: dict, side: str | None) -> bool:
+        want = str(side or "").lower()
+        if not want:
+            return True
+        info = row.get("info") if isinstance(row.get("info"), dict) else {}
+        vals = {str(v).strip().lower() for v in (row.get("side"), row.get("positionSide"), info.get("side"), info.get("positionSide"), info.get("positionType")) if v not in (None, "")}
+        if not vals:
+            return True
+        if want in {"long", "buy"}:
+            return bool(vals & {"long", "buy", "bid", "1"})
+        if want in {"short", "sell"}:
+            return bool(vals & {"short", "sell", "ask", "2"})
+        return True
+
     async def mexc_find_open_position(self, symbol: str, side: str | None = None) -> dict:
         """Find the live MEXC open position row for symbol/side.
 
@@ -1025,16 +1115,17 @@ class ExchangeClient:
         """
         positions = await self.fetch_positions([symbol])
         want = str(side or "").lower()
+        last_seen = None
         for p in positions or []:
-            ps = str(p.get("side") or "").lower()
-            if want and ps and ps != want:
+            if not self._mexc_position_side_matches(p, want):
                 continue
             info = p.get("info") if isinstance(p.get("info"), dict) else {}
-            pid = info.get("positionId") or info.get("id")
+            pid = info.get("positionId") or info.get("position_id") or info.get("id") or p.get("id")
             vol = self._mexc_position_qty_contracts_from_parsed(p)
+            last_seen = {"pid": pid, "vol": vol, "side": p.get("side") or info.get("positionType")}
             if pid and vol > 0:
                 return p
-        raise RuntimeError(f"live MEXC position not found for {symbol} side={side or '*'}")
+        raise RuntimeError(f"live MEXC position not found for {symbol} side={side or '*'} last_seen={last_seen}")
 
     async def mexc_place_tpsl_by_position(self, symbol: str, side: str, qty: float, stop_price: float, take_price: float, client_order_id: str = "") -> dict:
         """Place real MEXC TP/SL attached to an existing position.
@@ -1054,13 +1145,19 @@ class ExchangeClient:
         vol = self._mexc_position_qty_contracts_from_parsed(live_pos)
         if not pid or vol <= 0:
             raise RuntimeError(f"cannot place TP/SL: missing positionId/holdVol pid={pid!r} vol={vol!r}")
+        entry = 0.0
+        try:
+            entry = float(live_pos.get("entryPrice") or live_pos.get("average") or info.get("holdAvgPrice") or info.get("openAvgPrice") or 0)
+        except Exception:
+            entry = 0.0
+        safe_sl, safe_tp, safe_msg = await self.mexc_safe_tpsl_prices(symbol, side, float(stop_price), float(take_price), entry)
         body = {
             "positionId": int(pid),
             "vol": vol,
             "lossTrend": 1,
             "profitTrend": 1,
-            "stopLossPrice": self._mexc_price_to_precision(symbol, float(stop_price)),
-            "takeProfitPrice": self._mexc_price_to_precision(symbol, float(take_price)),
+            "stopLossPrice": safe_sl,
+            "takeProfitPrice": safe_tp,
             "priceProtect": 0,
             "profitLossVolType": "SAME",
             "volType": 2,
@@ -1081,7 +1178,7 @@ class ExchangeClient:
             "side": side,
             "amount": qty,
             "price": None,
-            "info": {"native_mexc_position_tpsl": True, "positionId": pid, "vol": vol, **(out if isinstance(out, dict) else {"raw": out})},
+            "info": {"native_mexc_position_tpsl": True, "positionId": pid, "vol": vol, "safe_tpsl": safe_msg, "safe_stop_price": safe_sl, "safe_take_price": safe_tp, **(out if isinstance(out, dict) else {"raw": out})},
         }
 
     async def mexc_close_all_positions_native(self):

@@ -203,6 +203,39 @@ class ExecutionEngine:
             pass
         return 0.0
 
+    def _live_position_side_matches(self, row: dict, side: str | None) -> bool:
+        """Robust MEXC side match for LONG/SHORT, buy/sell, and numeric positionType.
+
+        MEXC/CCXT can expose the same futures side as LONG/SHORT, buy/sell,
+        or positionType 1/2.  A strict string comparison can make the bot think
+        the freshly opened position is missing and skip native TP/SL attachment.
+        """
+        want = str(side or "").upper()
+        if not want:
+            return True
+        info = row.get("info", {}) if isinstance(row.get("info"), dict) else {}
+        raw_values = [row.get("side"), row.get("positionSide"), info.get("side"), info.get("positionSide"), info.get("positionType")]
+        vals = {str(v).strip().upper() for v in raw_values if v not in (None, "")}
+        if not vals:
+            return True
+        if want in {"LONG", "BUY"}:
+            if vals & {"LONG", "BUY", "BID", "1"}:
+                return True
+            try:
+                signed = float(row.get("contracts") or row.get("amount") or info.get("positionAmt") or 0)
+                return signed > 0
+            except Exception:
+                return False
+        if want in {"SHORT", "SELL"}:
+            if vals & {"SHORT", "SELL", "ASK", "2"}:
+                return True
+            try:
+                signed = float(row.get("contracts") or row.get("amount") or info.get("positionAmt") or 0)
+                return signed < 0
+            except Exception:
+                return False
+        return True
+
     async def _wait_for_live_position(self, symbol: str, side: str | None = None) -> dict | None:
         """Wait until MEXC exposes the just-opened futures position.
 
@@ -222,9 +255,15 @@ class ExecutionEngine:
                     qty = self.exchange_position_qty(p)
                     if qty <= 0:
                         continue
-                    ps = str(p.get("side") or p.get("info", {}).get("positionType") or "").upper()
-                    # CCXT often returns long/short; do not over-filter if side is absent.
-                    if want and ps and want not in ps:
+                    # CCXT/MEXC side fields are not stable (LONG, long, buy,
+                    # positionType=1/2). Use a tolerant matcher so TP/SL placement
+                    # does not race/fail only because of side formatting.
+                    if not self._live_position_side_matches(p, want):
+                        continue
+                    info = p.get("info", {}) if isinstance(p.get("info"), dict) else {}
+                    pid = info.get("positionId") or info.get("position_id") or info.get("id") or p.get("id")
+                    if not pid:
+                        last = p
                         continue
                     return p
                 last = rows
@@ -278,6 +317,19 @@ class ExecutionEngine:
             pass
         return pos
 
+
+    def _is_mexc_tpsl_already_exists_error(self, err: object) -> bool:
+        text = str(err or "").lower()
+        needles = (
+            "5005",
+            "already exists",
+            "already exist",
+            "tpsl already",
+            "tp/sl already",
+            "position tp/sl",
+            "mexc_tpsl_already_exists",
+        )
+        return any(n in text for n in needles)
 
     def _decorate_position_metrics(self, pos: dict) -> dict:
         """Attach human-readable money/margin fields used by Telegram notifications."""
@@ -380,7 +432,14 @@ class ExecutionEngine:
                 pos["initial_stop_price"] = pos.get("stop_price")
                 pos["initial_take_price"] = pos.get("take_price")
                 try:
+                    # MEXC futures can expose the opened position a bit later than
+                    # the market-entry response. For AI scalping we wait slightly
+                    # longer before attaching TP/SL, then _wait_for_live_position()
+                    # polls until positionId/holdVol are visible.
                     post_delay = await self._setting_float("protection_post_open_delay_sec", "PROTECTION_POST_OPEN_DELAY_SEC", 1.5)
+                    if str(pos.get("strategy") or "").lower() == "ai_scalping":
+                        ai_delay = await self._setting_float("ai_scalping_protection_delay_sec", "AI_SCALPING_PROTECTION_DELAY_SEC", 3.0)
+                        post_delay = max(post_delay, ai_delay)
                     if post_delay > 0:
                         await asyncio.sleep(post_delay)
                     ep = await self._wait_for_live_position(plan.symbol, pos.get("side"))
@@ -434,12 +493,13 @@ class ExecutionEngine:
                     pos["protection_warning"] = "exchange protection failed; bot monitors TP/SL locally"
                     pos["updated_at"] = time.time()
                     await self.storage.upsert_position(pos)
-                    auto_close = await self._setting_bool("auto_close_on_protection_failed", "AUTO_CLOSE_ON_PROTECTION_FAILED", False)
-                    if str(pos.get("strategy") or "").lower() == "ai_scalping":
-                        auto_close = True
-                    if auto_close:
-                        close_res = await self.close_position(pos, "protection_failed", live=True, exit_price=pos.get("entry_price"))
-                        return {"ok": False, "reason": "protection orders failed; auto-close explicitly enabled", "protection": protection, "close_result": close_res}
+                    # Never force-close an already-open live position only because
+                    # exchange TP/SL was not confirmed. This was the behaviour that
+                    # choked scalps into repeated small losses. The bot keeps local
+                    # TP/SL monitoring active and the watchdog keeps reattaching
+                    # native MEXC position TP/SL in the background loop.
+                    pos["auto_close_on_protection_failed_ignored"] = True
+                    await self.storage.upsert_position(pos)
                     return {"ok": True, "order": order, "position": pos, "warning": "exchange protection failed; bot monitors TP/SL locally"}
             return {"ok": True, "order": order, "position": pos}
 
@@ -685,6 +745,11 @@ class ExecutionEngine:
         require_exchange_protection = await self._setting_bool("require_exchange_protection", "REQUIRE_EXCHANGE_PROTECTION", True)
         attempts = max(1, int(os.getenv("PROTECTION_PLACE_MAX_ATTEMPTS", "3") or "3"))
         delay = float(os.getenv("PROTECTION_RECHECK_DELAY_SEC", "0.8") or "0.8")
+        if str(pos.get("strategy") or "").lower() == "ai_scalping":
+            # AI scalping uses very small TP/SL distances; MEXC often needs an
+            # extra second before the native TPSL order becomes visible.
+            attempts = max(attempts, int(os.getenv("AI_SCALPING_PROTECTION_ATTEMPTS", "5") or "5"))
+            delay = max(delay, float(os.getenv("AI_SCALPING_PROTECTION_RECHECK_DELAY_SEC", "1.2") or "1.2"))
         history = []
         best = {"ok": False}
         for i in range(attempts):
@@ -724,7 +789,15 @@ class ExecutionEngine:
                     out["sl_order_id"] = order.get("id")
                     out["tpsl_raw"] = order
                 except Exception as e:
-                    out["tpsl_error"] = str(e)[:500]
+                    if self._is_mexc_tpsl_already_exists_error(e):
+                        out["tp_order_id"] = "MEXC_TPSL_ALREADY_EXISTS"
+                        out["sl_order_id"] = "MEXC_TPSL_ALREADY_EXISTS"
+                        out["tp_exists"] = True
+                        out["sl_exists"] = True
+                        out["tpsl_already_exists"] = True
+                        out["tpsl_note"] = "MEXC says native position TP/SL already exists; treating as protected"
+                    else:
+                        out["tpsl_error"] = str(e)[:500]
             else:
                 try:
                     if tp > 0:
@@ -766,6 +839,14 @@ class ExecutionEngine:
             else:
                 verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), str(out.get("sl_order_id") or ""))
                 out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})
+                if out.get("tpsl_raw") and (out.get("tp_order_id") or out.get("sl_order_id")):
+                    # MEXC position TP/SL may be accepted by stoporder/place but
+                    # appear in open-orders/plan endpoints with a delay. Treat a
+                    # successful native TPSL response with an id as exchange
+                    # protected, while the watchdog continues periodic reconcile.
+                    out["tp_exists"] = True
+                    out["sl_exists"] = True
+                    out["tpsl_verify_note"] = "accepted by MEXC but not yet visible in open orders"
                 out["ok"] = bool(out.get("tp_exists") and out.get("sl_exists"))
                 out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
                 out["protection_mode"] = "exchange" if out["ok"] else "local_monitoring"

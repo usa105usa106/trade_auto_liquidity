@@ -8,7 +8,7 @@ load_dotenv()
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
-VERSION = os.getenv("BOT_VERSION", "0128 AI SCALPING LOCAL NORMAL MODE")
+VERSION = os.getenv("BOT_VERSION", "0132 MEXC TPSL SAFE ALL MODES")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -117,6 +117,7 @@ class Defaults:
     ai_scalping_liq_margin_pct: float = env_float("AI_SCALPING_LIQ_MARGIN_PCT", 0.05)
     ai_scalping_liq_buffer_pct: float = env_float("AI_SCALPING_LIQ_BUFFER_PCT", 0.04)
     ai_scalping_liq_max_leverage: int = env_int("AI_SCALPING_LIQ_MAX_LEVERAGE", 200)
+    ai_scalping_protection_delay_sec: float = env_float("AI_SCALPING_PROTECTION_DELAY_SEC", 3.0)
 
 DEFAULTS = Defaults()
 DB_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")

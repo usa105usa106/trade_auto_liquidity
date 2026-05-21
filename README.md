@@ -1,3 +1,10 @@
+# v0130 AI scalping TP/SL protection fix
+
+- MEXC native position TP/SL now opens position first, waits for positionId/holdVol, then sends `/stoporder/place`.
+- TP/SL trigger prices are moved away from mark/last by tick/min-distance before sending, to avoid too-close trigger rejects.
+- AI scalping no longer uses breakeven/trailing/time-stop by default; local manager closes only on TP or SL while watchdog retries exchange TP/SL.
+- Set `AI_SCALPING_MANAGE_ONLY_TPSL=0` to restore old BE/trailing/time-stop behavior.
+
 # Liquidity Telegram Bot v0067 SAFE LOCAL STATE + HIDDEN MARGIN
 
 Signal-engine build for Railway with real futures-first candidate generation.
@@ -300,3 +307,12 @@ MARGIN_ALLOCATION_ENABLED=true
 - Normal mode now trades from the local liquidity setup gate only: sweep, reclaim, range edge, spread, quality score, adaptive TP/SL.
 - With `ai_scalping_quality_filters_enabled = true`, OpenAI remains mandatory as final validator.
 - No loss-streak protection was added.
+
+
+## v0129 AI SCALPING SAFE PROTECTION
+
+- Version updated to `0129 AI SCALPING SAFE PROTECTION`.
+- AI scalping no longer force-closes a live position when MEXC TP/SL confirmation is delayed or unavailable.
+- After entry, AI scalping waits longer before placing TP/SL (`AI_SCALPING_PROTECTION_DELAY_SEC=3.0`) and retries protection more times.
+- If exchange TP/SL is still not confirmed, the position remains under local monitoring: the bot closes on local `take_price` or `stop_price`, while the watchdog keeps trying to restore exchange protection.
+- A successful native MEXC TPSL response with an id is treated as protected even if open-order visibility lags.
