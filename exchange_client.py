@@ -815,8 +815,30 @@ class ExchangeClient:
     def _mexc_parse_order(self, row: dict) -> dict:
         symbol = self._mexc_id_to_symbol(str(row.get("symbol") or row.get("contract") or ""))
         oid = str(row.get("orderId") or row.get("id") or row.get("planOrderId") or row.get("stopOrderId") or row.get("externalOid") or "")
-        side_raw = str(row.get("side") or row.get("positionType") or row.get("holdSide") or "")
-        side = "buy" if side_raw in {"1", "2", "buy", "long"} else "sell"
+        # Normalize order side to the actual CLOSE direction expected by
+        # ProtectionEngine (LONG must be closed with sell, SHORT with buy).
+        # MEXC uses different numeric fields across endpoints:
+        #   order/plan side: 1 open long, 2 close short, 3 open short, 4 close long
+        #   stoporder/position rows may expose positionType/holdSide instead:
+        #       1/long = a LONG position, so its TP/SL close side is sell
+        #       2/short = a SHORT position, so its TP/SL close side is buy
+        src = str(row.get("_source_endpoint") or "").lower()
+        side_raw = str(row.get("side") or "").lower()
+        pos_raw = str(row.get("positionType") or row.get("holdSide") or "").lower()
+        if side_raw in {"2", "buy"}:
+            side = "buy"
+        elif side_raw in {"4", "sell"}:
+            side = "sell"
+        elif side_raw == "1":
+            side = "buy"
+        elif side_raw == "3":
+            side = "sell"
+        elif pos_raw in {"1", "long"}:
+            side = "sell" if ("stoporder" in src or "tpsl" in src or "position/stop" in src) else "buy"
+        elif pos_raw in {"2", "short"}:
+            side = "buy" if ("stoporder" in src or "tpsl" in src or "position/stop" in src) else "sell"
+        else:
+            side = ""
         vol = row.get("vol") or row.get("remainVol") or row.get("volume") or row.get("holdVol") or row.get("takeProfitVol") or row.get("stopLossVol") or 0
         price = 0.0
         for key in ("price", "executePrice", "triggerPrice", "stopPrice", "takeProfitPrice", "stopLossPrice", "takeProfitOrderPrice", "stopLossOrderPrice"):

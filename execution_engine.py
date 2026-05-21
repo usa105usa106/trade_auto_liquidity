@@ -778,6 +778,11 @@ class ExecutionEngine:
                 except Exception as e:
                     out["tp_error"] = str(e)[:500]
             elif str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc" and hasattr(self.exchange_client, "mexc_place_tpsl_by_position"):
+                # v0135: MEXC sometimes rejects/does not expose by-position TP/SL.
+                # First try native attached TP/SL; if it is missing or returns no id,
+                # immediately fall back to two reduce-only trigger-market plan orders
+                # (one TP and one SL). Do not leave the trade protected only locally.
+                native_tpsl_ok = False
                 try:
                     if tp <= 0 or sl <= 0:
                         raise RuntimeError("missing take_price/stop_price for position TP/SL")
@@ -785,9 +790,13 @@ class ExecutionEngine:
                         symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp,
                         client_order_id=f"bot_tpsl_{int(time.time()*1000)}",
                     )
-                    out["tp_order_id"] = order.get("id")
-                    out["sl_order_id"] = order.get("id")
+                    oid = str(order.get("id") or "")
+                    out["tp_order_id"] = oid
+                    out["sl_order_id"] = oid
                     out["tpsl_raw"] = order
+                    native_tpsl_ok = bool(oid)
+                    if not native_tpsl_ok:
+                        out["tpsl_error"] = "MEXC by-position TP/SL returned empty id; falling back to trigger-market TP+SL"
                 except Exception as e:
                     if self._is_mexc_tpsl_already_exists_error(e):
                         out["tp_order_id"] = "MEXC_TPSL_ALREADY_EXISTS"
@@ -796,8 +805,29 @@ class ExecutionEngine:
                         out["sl_exists"] = True
                         out["tpsl_already_exists"] = True
                         out["tpsl_note"] = "MEXC says native position TP/SL already exists; treating as protected"
+                        native_tpsl_ok = True
                     else:
                         out["tpsl_error"] = str(e)[:500]
+
+                if not native_tpsl_ok:
+                    try:
+                        if tp > 0:
+                            order = await self._create_take_profit_market_order(symbol, side, qty, tp)
+                            out["tp_order_id"] = order.get("id")
+                            out["tp_raw"] = order
+                        else:
+                            out["tp_error"] = "missing take_price"
+                    except Exception as e:
+                        out["tp_error"] = str(e)[:500]
+                    try:
+                        if sl > 0:
+                            order = await self._create_stop_market_order(symbol, side, qty, sl)
+                            out["sl_order_id"] = order.get("id")
+                            out["sl_raw"] = order
+                        else:
+                            out["sl_error"] = "missing stop_price"
+                    except Exception as e:
+                        out["sl_error"] = str(e)[:500]
             else:
                 try:
                     if tp > 0:

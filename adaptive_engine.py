@@ -18,13 +18,30 @@ class AdaptiveEngine:
             losses = [abs(float(x.get("pnl_usdt") or 0)) for x in rows if float(x.get("pnl_usdt") or 0) < 0]
             pnl = sum(wins) - sum(losses)
             total = len(rows)
+            gross_win = sum(wins)
+            gross_loss = sum(losses)
+            if gross_loss > 0:
+                pf = gross_win / gross_loss
+                pf_display = f"{pf:.2f}"
+            elif gross_win > 0:
+                # No losses yet. Mathematically PF is infinite/undefined, not 999.
+                # Keep a capped numeric value for old strategy scoring, but expose
+                # a human-readable value for Telegram stats.
+                pf = 10.0
+                pf_display = "∞"
+            else:
+                pf = 0.0
+                pf_display = "-"
             return {
                 "trades": total,
+                "wins": len(wins),
+                "losses": len(losses),
                 "winrate": safe_div(len(wins), total, 0)*100,
                 "pnl": pnl,
-                "profit_factor": safe_div(sum(wins), sum(losses), 999 if wins else 0),
+                "profit_factor": pf,
+                "profit_factor_display": pf_display,
                 "expectancy": safe_div(pnl, total, 0),
-                "drawdown_proxy": sum(losses),
+                "drawdown_proxy": gross_loss,
             }
 
         stats = {"strategies": {k: metrics(v) for k,v in by_strategy.items()}}

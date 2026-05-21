@@ -8,7 +8,7 @@ load_dotenv()
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
-VERSION = os.getenv("BOT_VERSION", "0132 MEXC TPSL SAFE ALL MODES")
+VERSION = os.getenv("BOT_VERSION", "0135 MEXC TPSL FORCE EXCHANGE")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)

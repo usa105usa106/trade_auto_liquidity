@@ -1376,17 +1376,26 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trades = await storage.trade_rows()
     stats = AdaptiveEngine().calc_stats(trades)
     n = stats["normal"]; m = stats["mirror"]
+    n_pf = n.get("profit_factor_display", f"{float(n.get('profit_factor') or 0):.2f}")
+    m_pf = m.get("profit_factor_display", f"{float(m.get('profit_factor') or 0):.2f}")
     text = f"""
 📉 Stats
 
 Trades: {len(trades)}
-Normal PF: {n['profit_factor']:.2f}
+
+Normal: {n.get('wins', 0)}W/{n.get('losses', 0)}L
+Normal PF: {n_pf}
 Normal WR: {n['winrate']:.1f}%
+Normal PnL: {n['pnl']:.4f} USDT
 Normal Expectancy: {n['expectancy']:.4f}
 
-Mirror PF: {m['profit_factor']:.2f}
+Mirror: {m.get('wins', 0)}W/{m.get('losses', 0)}L
+Mirror PF: {m_pf}
 Mirror WR: {m['winrate']:.1f}%
+Mirror PnL: {m['pnl']:.4f} USDT
 Mirror Expectancy: {m['expectancy']:.4f}
+
+PF ∞ = прибыльные сделки есть, убыточных ещё нет.
 """.strip()
     await reply(update, text, reply_markup=MAIN_MENU)
 
@@ -2424,6 +2433,20 @@ async def trading_loop(app):
                         if not plan:
                             waited.append(f"{b}:planner reject {decision.decision}")
                             continue
+                        if live:
+                            try:
+                                bal = await ex.fetch_balance()
+                                usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
+                                free = float(usdt.get("free") or ((bal or {}).get("free", {}) or {}).get("USDT") or 0)
+                                need = float(getattr(plan, "expected_margin_usdt", 0.0) or 0.0)
+                                # MEXC can require a little extra for fees/funding buffers.
+                                min_free = need * 1.05 + 0.5
+                                if need > 0 and free < min_free:
+                                    waited.append(f"{b}:skip balance free={free:.2f} need≈{min_free:.2f}")
+                                    continue
+                            except Exception as e:
+                                waited.append(f"{b}:balance precheck warning {e}")
+                                continue
                         try:
                             placed = await exec_engine.place_entry(plan, live)
                         except Exception as e:
