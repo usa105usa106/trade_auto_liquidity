@@ -117,6 +117,192 @@ def _atr_pct(candles: list[list[Any]], period: int = 14) -> float:
     return (atr / last_close * 100.0) if last_close > 0 else 0.2
 
 
+def _local_scalp_setup(candles: list[list[Any]], side: str, price: float, atr_pct: float) -> dict:
+    """Detect a tiny BTC/ETH scalp setup before asking AI to trade.
+
+    This is intentionally deterministic and cheap: the AI may confirm direction,
+    but the bot must first see liquidity interaction near the edge of the recent
+    range. It rejects mid-range direction guesses.
+    """
+    side = str(side or "").upper()
+    if len(candles) < 24 or price <= 0:
+        return {"valid": False, "reason": "setup: not enough candles", "score": 0.0}
+    prev = candles[-24:-4]
+    recent = candles[-4:]
+    prev_high = max(_f(c[2]) for c in prev)
+    prev_low = min(_f(c[3]) for c in prev)
+    range_pct = ((prev_high - prev_low) / price * 100.0) if price > 0 else 0.0
+    if range_pct <= 0:
+        return {"valid": False, "reason": "setup: invalid range", "score": 0.0}
+    pos = (price - prev_low) / max(1e-12, prev_high - prev_low)
+    min_range = max(0.06, min(0.22, atr_pct * 1.35))
+    if range_pct < min_range:
+        return {"valid": False, "reason": f"setup: range {range_pct:.3f}% < {min_range:.3f}%", "score": 0.0, "range_pct": range_pct, "range_pos": pos}
+
+    last_close = _f(candles[-1][4])
+    last_high = max(_f(c[2]) for c in recent)
+    last_low = min(_f(c[3]) for c in recent)
+    ret3 = ((_f(candles[-1][4]) - _f(candles[-4][4])) / _f(candles[-4][4]) * 100.0) if _f(candles[-4][4]) else 0.0
+    vol_prev = sum(_f(c[5]) for c in candles[-24:-4]) / max(1, len(candles[-24:-4]))
+    vol_recent = sum(_f(c[5]) for c in recent) / max(1, len(recent))
+    vol_ratio = vol_recent / max(1e-12, vol_prev) if vol_prev > 0 else 1.0
+    buffer = max(price * 0.00008, price * (atr_pct / 100.0) * 0.12)
+
+    if side == "LONG":
+        swept = last_low < (prev_low - buffer)
+        reclaimed = last_close > (prev_low + buffer * 0.25)
+        near_edge = pos <= 0.40
+        impulse_ok = ret3 >= -max(0.04, atr_pct * 0.7)
+        swing_stop = min(last_low, prev_low)
+        target = prev_high
+        stop_pct = ((price - swing_stop) / price * 100.0) if swing_stop > 0 else 0.0
+        target_pct = ((target - price) / price * 100.0) if target > price else 0.0
+    elif side == "SHORT":
+        swept = last_high > (prev_high + buffer)
+        reclaimed = last_close < (prev_high - buffer * 0.25)
+        near_edge = pos >= 0.60
+        impulse_ok = ret3 <= max(0.04, atr_pct * 0.7)
+        swing_stop = max(last_high, prev_high)
+        target = prev_low
+        stop_pct = ((swing_stop - price) / price * 100.0) if swing_stop > 0 else 0.0
+        target_pct = ((price - target) / price * 100.0) if target < price else 0.0
+    else:
+        return {"valid": False, "reason": "setup: no side", "score": 0.0}
+
+    rr = target_pct / max(0.01, stop_pct) if target_pct > 0 else 0.0
+    score = 0.0
+    score += 30.0 if swept else 0.0
+    score += 25.0 if reclaimed else 0.0
+    score += 15.0 if near_edge else 0.0
+    score += 10.0 if impulse_ok else 0.0
+    score += min(10.0, max(0.0, vol_ratio - 1.0) * 8.0)
+    score += min(10.0, max(0.0, rr - 0.8) * 8.0)
+    valid = bool(swept and reclaimed and near_edge and impulse_ok and rr >= 0.85)
+    parts = []
+    if not swept: parts.append("no sweep")
+    if not reclaimed: parts.append("no reclaim")
+    if not near_edge: parts.append("mid range")
+    if not impulse_ok: parts.append("bad impulse")
+    if rr < 0.85: parts.append(f"RR {rr:.2f} < 0.85")
+    return {
+        "valid": valid,
+        "reason": "setup ok" if valid else "setup: " + ", ".join(parts),
+        "score": round(score, 2),
+        "range_high": _r(prev_high, 4),
+        "range_low": _r(prev_low, 4),
+        "range_pct": _r(range_pct, 4),
+        "range_pos": _r(pos, 4),
+        "swept": swept,
+        "reclaimed": reclaimed,
+        "vol_ratio": _r(vol_ratio, 3),
+        "swing_stop": _r(swing_stop, 4),
+        "target": _r(target, 4),
+        "structure_sl_pct": _r(stop_pct, 4),
+        "structure_tp_pct": _r(target_pct, 4),
+        "structure_rr": _r(rr, 3),
+    }
+
+
+def _quality_score(market: dict, setup: dict, side: str) -> dict:
+    side = str(side or "").upper()
+    score = 0.0
+    reasons = []
+    atr = _f(market.get("atr_1m_pct"), 0.0)
+    spread = _f(market.get("spread_pct"), 0.0)
+    ret5 = _f(market.get("ret_5m_pct"), 0.0)
+    imb = _f(market.get("imbalance"), 0.0)
+    e1 = market.get("ema9_gt_ema21_1m")
+    e5 = market.get("ema9_gt_ema21_5m")
+    e15 = market.get("ema9_gt_ema21_15m")
+    score += min(20.0, max(0.0, atr) * 220.0)
+    score += max(0.0, 15.0 - spread * 180.0)
+    score += min(20.0, max(0.0, _f(setup.get("score"), 0.0)) * 0.25)
+    score += min(15.0, abs(ret5) * 130.0)
+    if (side == "LONG" and e1 is True) or (side == "SHORT" and e1 is False):
+        score += 8.0
+    else:
+        reasons.append("1m bias weak")
+    if (side == "LONG" and e5 is True) or (side == "SHORT" and e5 is False):
+        score += 10.0
+    else:
+        reasons.append("5m bias weak")
+    if e15 is not None:
+        if (side == "LONG" and e15 is True) or (side == "SHORT" and e15 is False):
+            score += 7.0
+        else:
+            reasons.append("15m conflict")
+    if (side == "LONG" and imb > -0.15) or (side == "SHORT" and imb < 0.15):
+        score += 5.0
+    else:
+        reasons.append("orderbook against")
+    return {"score": round(max(0.0, min(100.0, score)), 2), "notes": "; ".join(reasons[:3])}
+
+
+
+def _compact_ai_setup_features(market: dict, long_setup: dict, short_setup: dict) -> dict:
+    """Build a tiny ready-feature payload for OpenAI.
+
+    The model receives facts only, not candles. Local code already calculated
+    liquidity sweep/reclaim/range/ATR/RR, so AI spends tokens on validation
+    instead of rediscovering the setup from raw OHLCV.
+    """
+    def pack(side: str, setup: dict) -> dict:
+        return {
+            "side": side,
+            "ok": 1 if setup.get("valid") else 0,
+            "score": _r(setup.get("score"), 1),
+            "reason": str(setup.get("reason") or "")[:48],
+            "sweep": 1 if setup.get("swept") else 0,
+            "reclaim": 1 if setup.get("reclaimed") else 0,
+            "edge": "low" if side == "LONG" else "high",
+            "rp": _r(setup.get("range_pos"), 3),
+            "rr": _r(setup.get("structure_rr"), 2),
+            "sl": _r(setup.get("structure_sl_pct"), 3),
+            "tp": _r(setup.get("structure_tp_pct"), 3),
+            "vol": _r(setup.get("vol_ratio"), 2),
+        }
+
+    candidates = []
+    if long_setup.get("valid"):
+        candidates.append(pack("LONG", long_setup))
+    if short_setup.get("valid"):
+        candidates.append(pack("SHORT", short_setup))
+
+    def align(side: str) -> int:
+        e1 = market.get("ema9_gt_ema21_1m")
+        e5 = market.get("ema9_gt_ema21_5m")
+        e15 = market.get("ema9_gt_ema21_15m")
+        if side == "LONG":
+            vals = [e1 is True, e5 is True]
+            if e15 is not None:
+                vals.append(e15 is True)
+        else:
+            vals = [e1 is False, e5 is False]
+            if e15 is not None:
+                vals.append(e15 is False)
+        return int(sum(1 for x in vals if x))
+
+    for c in candidates:
+        q = _quality_score(market, long_setup if c["side"] == "LONG" else short_setup, c["side"])
+        c["q"] = _r(q.get("score"), 1)
+        c["mtf"] = align(c["side"])
+        if q.get("notes"):
+            c["warn"] = str(q.get("notes"))[:42]
+
+    return {
+        "p": market.get("price", 0),
+        "atr": market.get("atr_1m_pct", 0),
+        "sp": market.get("spread_pct", 0),
+        "r1": market.get("ret_1m_pct", 0),
+        "r5": market.get("ret_5m_pct", 0),
+        "rsi": market.get("rsi_1m", 50),
+        "imb": market.get("imbalance", 0),
+        "e1": 1 if market.get("ema9_gt_ema21_1m") else 0,
+        "e5": 1 if market.get("ema9_gt_ema21_5m") else 0,
+        "e15": (1 if market.get("ema9_gt_ema21_15m") else 0) if market.get("ema9_gt_ema21_15m") is not None else None,
+        "cand": candidates,
+    }
+
 def _extract_text(data: dict) -> str:
     chunks = []
     def walk(obj):
@@ -297,6 +483,7 @@ class AIScalpingEngine:
         return {
             "symbol": symbol,
             "price": _r(price, 4),
+            "_candles1": c1,
             "ret_1m_pct": _r(ret_1m, 4),
             "ret_5m_pct": _r(ret_5m, 4),
             "rsi_1m": _r(_rsi(closes1, 14), 2),
@@ -342,8 +529,12 @@ class AIScalpingEngine:
         allowed_symbol = allowed[0]
         base_key = allowed_symbol.split(":")[0].replace("/", "").upper()
         model = active_model(settings)
+        quality_mode = _b(settings, "ai_scalping_quality_filters_enabled", False)
+        # v0128: OpenAI is required only in quality mode. In normal mode the
+        # deterministic local liquidity setup gate can open trades without AI,
+        # which avoids half-day stalls and cuts token usage to zero for normal scalping.
         key = openai_key(settings)
-        if not key:
+        if quality_mode and not key:
             return AIScalpDecision(ok=False, symbol=allowed_symbol, decision="WAIT", error="OpenAI API key missing", model=model)
 
         cooldown = int(_f(settings.get("ai_scalping_ai_cooldown_sec"), 60))
@@ -357,7 +548,6 @@ class AIScalpingEngine:
                 raw=old.raw, model=old.model, market=old.market, cached=True,
             )
 
-        quality_mode = _b(settings, "ai_scalping_quality_filters_enabled", False)
         try:
             market = await self.market_snapshot(exchange_client, allowed_symbol, quality_mode=quality_mode)
         except Exception as e:
@@ -373,32 +563,51 @@ class AIScalpingEngine:
             self._decision_cache[base_key] = (now, dec)
             return dec
 
-        compact_market = {
-            "p": market.get("price", 0),
-            "r1": market.get("ret_1m_pct", 0),
-            "r5": market.get("ret_5m_pct", 0),
-            "rsi": market.get("rsi_1m", 50),
-            "e1": 1 if market.get("ema9_gt_ema21_1m") else 0,
-            "e5": 1 if market.get("ema9_gt_ema21_5m") else 0,
-            "e15": (1 if market.get("ema9_gt_ema21_15m") else 0) if market.get("ema9_gt_ema21_15m") is not None else None,
-            "atr": market.get("atr_1m_pct", 0),
-            "sp": market.get("spread_pct", 0),
-            "imb": market.get("imbalance", 0),
-        }
+        atr_pct = _f(market.get("atr_1m_pct"), 0.0)
+        price = _f(market.get("price"), 0.0)
+        long_setup = _local_scalp_setup(market.get("_candles1") or [], "LONG", price, atr_pct)
+        short_setup = _local_scalp_setup(market.get("_candles1") or [], "SHORT", price, atr_pct)
+
+        # Do not spend OpenAI tokens when the deterministic liquidity setup gate
+        # has no valid LONG/SHORT candidate. This is the main token saver.
+        if not long_setup.get("valid") and not short_setup.get("valid"):
+            reason = f"local: no setup L={long_setup.get('reason','')}; S={short_setup.get('reason','')}"
+            dec = AIScalpDecision(ok=True, symbol=allowed_symbol, decision="WAIT", confidence=0.0, reason=reason[:220], model=model, market={"markets": markets})
+            self._decision_cache[base_key] = (now, dec)
+            return dec
+
+        # v0128 normal mode: no OpenAI approval required. Pick the best valid
+        # local setup and return a synthetic decision that still passes through
+        # make_candidate(), planner, TP/SL, spread and quality-score checks.
+        if not quality_mode:
+            valid_setups = []
+            if long_setup.get("valid"):
+                ql = _quality_score(market, long_setup, "LONG")
+                valid_setups.append(("LONG", long_setup, ql))
+            if short_setup.get("valid"):
+                qs = _quality_score(market, short_setup, "SHORT")
+                valid_setups.append(("SHORT", short_setup, qs))
+            if not valid_setups:
+                dec = AIScalpDecision(ok=True, symbol=allowed_symbol, decision="WAIT", confidence=0.0, reason="local: no valid setup", model="local_setup_gate", market={"markets": markets})
+                self._decision_cache[base_key] = (now, dec)
+                return dec
+            side, setup, q = max(valid_setups, key=lambda x: (_f(x[2].get("score"), 0.0), _f(x[1].get("structure_rr"), 0.0), _f(x[1].get("score"), 0.0)))
+            min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.58)
+            conf = max(min_conf, min(0.90, max(_f(q.get("score"), 0.0), _f(setup.get("score"), 0.0)) / 100.0))
+            reason = f"local setup {side}: score={_f(setup.get('score'),0):.1f} q={_f(q.get('score'),0):.1f} rr={_f(setup.get('structure_rr'),0):.2f}"
+            return AIScalpDecision(ok=True, symbol=allowed_symbol, decision=side, confidence=conf, reason=reason[:180], raw="local_setup_gate_no_ai", model="local_setup_gate", market={"markets": markets})
+
+        feature_payload = _compact_ai_setup_features(market, long_setup, short_setup)
         min_conf = _f(settings.get("ai_scalping_quality_min_confidence" if quality_mode else "ai_scalping_min_confidence"), 0.72 if quality_mode else 0.58)
         prompt_obj = {
             "s": base_key,
-            "q": 1 if quality_mode else 0,
+            "mode": "quality" if quality_mode else "normal",
             "min": min_conf,
-            "rule": (
-                "quality: trade only clean 1m/5m/15m continuation; WAIT if mixed"
-                if quality_mode else
-                "normal: choose LONG/SHORT on usable short edge; WAIT only if mixed or unsafe"
-            ),
-            "m": compact_market,
+            "task": "validate one listed liquidity scalp candidate; choose only candidate side or WAIT",
+            "x": feature_payload,
         }
         prompt = json.dumps(prompt_obj, separators=(",", ":"), ensure_ascii=False)
-        system = 'JSON only. Return {"symbol":"BTCUSDT|ETHUSDT","decision":"LONG|SHORT|WAIT","confidence":0-1,"reason":"short"}. No prose.'
+        system = 'JSON only. You are a setup validator, not a direction predictor. Use only x.cand sides; if target path/MTF/chop unclear return WAIT. Return {"symbol":"BTCUSDT|ETHUSDT","decision":"LONG|SHORT|WAIT","confidence":0-1,"reason":"short"}.'
         timeout_sec = float(settings.get("openai_timeout_sec", os.getenv("OPENAI_TIMEOUT_SEC", "12")) or 12)
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         async with self._sem:
@@ -473,14 +682,14 @@ class AIScalpingEngine:
         spread = _f(market.get("spread_pct"), 0.0)
         if spread > max_spread:
             return f"spread {spread:.3f}% > max {max_spread:.3f}%"
+        setup = _local_scalp_setup(market.get("_candles1") or [], decision.decision, price, _f(market.get("atr_1m_pct"), 0.0))
+        if not setup.get("valid"):
+            return str(setup.get("reason") or "setup rejected")
+        q = _quality_score(market, setup, decision.decision)
+        min_q = _f(settings.get("ai_scalping_setup_min_quality_score"), 58.0)
+        if q.get("score", 0.0) < min_q:
+            return f"quality score {q.get('score', 0):.1f} < {min_q:.1f}: {q.get('notes') or 'weak setup'}"
         if quality_mode:
-            side = decision.decision
-            bias5 = market.get("ema9_gt_ema21_5m")
-            bias15 = market.get("ema9_gt_ema21_15m")
-            if side == "LONG" and (bias5 is False or bias15 is False):
-                return "quality HTF bias mismatch for LONG"
-            if side == "SHORT" and (bias5 is True or bias15 is True):
-                return "quality HTF bias mismatch for SHORT"
             min_atr = _f(settings.get("ai_scalping_quality_min_atr_pct"), 0.035)
             min_gap = _f(settings.get("ai_scalping_quality_min_ema_gap_pct"), 0.015)
             min_ret5 = _f(settings.get("ai_scalping_quality_min_ret_5m_abs_pct"), 0.035)
@@ -513,14 +722,14 @@ class AIScalpingEngine:
         max_spread = _f(settings.get("ai_scalping_max_spread_pct"), _f(settings.get("max_spread_pct"), 0.20))
         if _f(market.get("spread_pct"), 0.0) > max_spread:
             return None
+        setup = _local_scalp_setup(market.get("_candles1") or [], decision.decision, price, _f(market.get("atr_1m_pct"), 0.0))
+        if not setup.get("valid"):
+            return None
+        q = _quality_score(market, setup, decision.decision)
+        min_q = _f(settings.get("ai_scalping_setup_min_quality_score"), 58.0)
+        if q.get("score", 0.0) < min_q:
+            return None
         if quality_mode:
-            side = decision.decision
-            bias5 = market.get("ema9_gt_ema21_5m")
-            bias15 = market.get("ema9_gt_ema21_15m")
-            if side == "LONG" and (bias5 is False or bias15 is False):
-                return None
-            if side == "SHORT" and (bias5 is True or bias15 is True):
-                return None
             min_atr = _f(settings.get("ai_scalping_quality_min_atr_pct"), 0.035)
             min_gap = _f(settings.get("ai_scalping_quality_min_ema_gap_pct"), 0.015)
             min_ret5 = _f(settings.get("ai_scalping_quality_min_ret_5m_abs_pct"), 0.035)
@@ -531,13 +740,23 @@ class AIScalpingEngine:
                 return None
             if gap < min_gap and ret5 < min_ret5:
                 return None
+        clean_market = {k: v for k, v in market.items() if not str(k).startswith("_")}
+        atr = max(0.01, _f(market.get("atr_1m_pct"), 0.18))
+        raw_sl = max(_f(setup.get("structure_sl_pct"), 0.0), atr * 1.15)
+        # Cap absurd wick stops, but keep them wider than the old fixed micro-stop.
+        sl_pct = max(0.16, min(0.75, raw_sl))
+        rr_target = 1.35 if q.get("score", 0) < 72 else 1.55
+        raw_tp = max(_f(setup.get("structure_tp_pct"), 0.0), sl_pct * rr_target)
+        tp_pct = max(0.18, min(1.10, raw_tp))
         return {
             "symbol": decision.symbol,
             "side": decision.decision,
             "strategy": "ai_scalping",
             "confidence": decision.confidence,
             "futures_price": price,
-            "atr_pct": max(0.01, _f(market.get("atr_1m_pct"), 0.18)),
+            "atr_pct": atr,
+            "ai_scalping_tp_pct": _r(tp_pct, 4),
+            "ai_scalping_sl_pct": _r(sl_pct, 4),
             "risk_pct": _f(settings.get("risk_pct"), 0.005),
-            "score_details": {"ai_reason": decision.reason, "ai_model": decision.model, **market},
+            "score_details": {"ai_reason": decision.reason, "ai_model": decision.model, "setup": setup, "quality_score": q, **clean_market},
         }

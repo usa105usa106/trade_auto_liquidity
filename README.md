@@ -281,3 +281,22 @@ MARGIN_ALLOCATION_ENABLED=true
 - Scanner status time now uses fixed UTC+3 display time to match Telegram/Moscow time instead of server UTC.
 - Main loop no longer overwrites detailed scanner/signal rejection reasons with the generic `no candidates passed signal engine` text when a real reason already exists.
 - Version updated to `0125 TIMEZONE + REJECT DEBUG`.
+
+
+## v0127 AI SCALPING COMPACT FEATURES
+
+- Version updated to `0127 AI SCALPING COMPACT FEATURES`.
+- BTC/ETH AI scalping no longer opens only because AI returned LONG/SHORT.
+- Added local sweep/reclaim/range-edge setup gate before candidate creation.
+- Added quality score for AI scalping setup; default minimum is `AI_SCALPING_SETUP_MIN_QUALITY_SCORE=58`.
+- Added adaptive TP/SL for AI scalping from structure and ATR; old fixed BTC/ETH TP/SL values remain fallback only.
+- Did not add consecutive-loss protection in this version.
+
+
+## v0128 AI SCALPING LOCAL NORMAL MODE
+
+- Version updated to `0128 AI SCALPING LOCAL NORMAL MODE`.
+- For ETH/BTC AI scalping with `ai_scalping_quality_filters_enabled = false`, OpenAI approval is no longer required.
+- Normal mode now trades from the local liquidity setup gate only: sweep, reclaim, range edge, spread, quality score, adaptive TP/SL.
+- With `ai_scalping_quality_filters_enabled = true`, OpenAI remains mandatory as final validator.
+- No loss-streak protection was added.

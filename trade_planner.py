@@ -136,21 +136,28 @@ class TradePlanner:
                         rr = clamp(target_rr, 2.0, 4.0)
             candidate["liquidity_retest_rr"] = rr
         elif strategy == "ai_scalping":
-            # v0103: BTC and ETH use different fixed scalp distances.
-            # AI chooses only direction; bot keeps deterministic TP/SL.
-            sym_key = str(candidate.get("symbol") or "").upper().replace("/", "_").replace(":USDT", "")
-            if sym_key.startswith("ETH_USDT"):
-                tp_default = os.getenv("AI_SCALPING_ETH_TP_PCT", "0.22")
-                sl_default = os.getenv("AI_SCALPING_ETH_SL_PCT", "0.32")
-                tp_setting = "ai_scalping_eth_tp_pct"
-                sl_setting = "ai_scalping_eth_sl_pct"
+            # v0126: AI no longer opens on direction alone. The engine attaches
+            # structure/ATR based distances after a sweep/reclaim setup gate.
+            # Keep old fixed env/settings only as fallback for legacy candidates.
+            adaptive_tp = candidate.get("ai_scalping_tp_pct")
+            adaptive_sl = candidate.get("ai_scalping_sl_pct")
+            if adaptive_tp is not None and adaptive_sl is not None:
+                tp_pct = max(0.01, float(adaptive_tp or 0.0))
+                sl_pct = max(0.01, float(adaptive_sl or 0.0))
             else:
-                tp_default = os.getenv("AI_SCALPING_BTC_TP_PCT", os.getenv("AI_SCALPING_TP_PCT", "0.18"))
-                sl_default = os.getenv("AI_SCALPING_BTC_SL_PCT", os.getenv("AI_SCALPING_SL_PCT", "0.26"))
-                tp_setting = "ai_scalping_btc_tp_pct"
-                sl_setting = "ai_scalping_btc_sl_pct"
-            tp_pct = max(0.01, float(settings.get(tp_setting, tp_default) or tp_default))
-            sl_pct = max(0.01, float(settings.get(sl_setting, sl_default) or sl_default))
+                sym_key = str(candidate.get("symbol") or "").upper().replace("/", "_").replace(":USDT", "")
+                if sym_key.startswith("ETH_USDT"):
+                    tp_default = os.getenv("AI_SCALPING_ETH_TP_PCT", "0.22")
+                    sl_default = os.getenv("AI_SCALPING_ETH_SL_PCT", "0.32")
+                    tp_setting = "ai_scalping_eth_tp_pct"
+                    sl_setting = "ai_scalping_eth_sl_pct"
+                else:
+                    tp_default = os.getenv("AI_SCALPING_BTC_TP_PCT", os.getenv("AI_SCALPING_TP_PCT", "0.18"))
+                    sl_default = os.getenv("AI_SCALPING_BTC_SL_PCT", os.getenv("AI_SCALPING_SL_PCT", "0.26"))
+                    tp_setting = "ai_scalping_btc_tp_pct"
+                    sl_setting = "ai_scalping_btc_sl_pct"
+                tp_pct = max(0.01, float(settings.get(tp_setting, tp_default) or tp_default))
+                sl_pct = max(0.01, float(settings.get(sl_setting, sl_default) or sl_default))
         else:
             sl_pct = clamp(atr_pct * float(profile["sl_mult"]), float(profile["min_sl"]), float(profile["max_sl"]))
             tp_pct = clamp(atr_pct * float(profile["tp_mult"]), float(profile["min_tp"]), float(profile["max_tp"]))

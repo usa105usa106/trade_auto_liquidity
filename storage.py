@@ -84,6 +84,7 @@ DEFAULT_SETTINGS = {
     "ai_scalping_quality_min_atr_pct": DEFAULTS.ai_scalping_quality_min_atr_pct,
     "ai_scalping_quality_min_ema_gap_pct": DEFAULTS.ai_scalping_quality_min_ema_gap_pct,
     "ai_scalping_quality_min_ret_5m_abs_pct": DEFAULTS.ai_scalping_quality_min_ret_5m_abs_pct,
+    "ai_scalping_setup_min_quality_score": DEFAULTS.ai_scalping_setup_min_quality_score,
     "ai_scalping_ai_cooldown_sec": DEFAULTS.ai_scalping_ai_cooldown_sec,
     "ai_scalping_openai_fallback_enabled": DEFAULTS.ai_scalping_openai_fallback_enabled,
     "ai_scalping_json_mode_enabled": DEFAULTS.ai_scalping_json_mode_enabled,
