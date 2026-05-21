@@ -309,6 +309,7 @@ class PositionManager:
             strategy = str(pos.get("strategy") or "").lower()
             is_liquidity_retest = strategy == "liquidity_retest"
             is_ai_scalping = strategy == "ai_scalping"
+            liquidation_stop_mode = bool(pos.get("liquidation_stop_mode")) and is_ai_scalping
             ai_manage_only_tpsl = str(await self._setting("ai_scalping_manage_only_tpsl", os.getenv("AI_SCALPING_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
             policy = await self._refresh_scalp_policy()
             policy.update_best_pnl(pos, pnl)
@@ -377,7 +378,7 @@ class PositionManager:
                     ev = await self._close_and_event(pos, "tp", "take_profit", live, price)
                     if ev: events.append(ev)
                     continue
-                if stop and price<=stop:
+                if stop and price<=stop and not liquidation_stop_mode:
                     ev = await self._close_and_event(pos, "sl", "stop_loss", live, price)
                     if ev: events.append(ev)
                     continue
@@ -386,7 +387,7 @@ class PositionManager:
                     ev = await self._close_and_event(pos, "tp", "take_profit", live, price)
                     if ev: events.append(ev)
                     continue
-                if stop and price>=stop:
+                if stop and price>=stop and not liquidation_stop_mode:
                     ev = await self._close_and_event(pos, "sl", "stop_loss", live, price)
                     if ev: events.append(ev)
                     continue

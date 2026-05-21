@@ -1173,11 +1173,17 @@ class ExchangeClient:
         except Exception:
             entry = 0.0
         safe_sl, safe_tp, safe_msg = await self.mexc_safe_tpsl_prices(symbol, side, float(stop_price), float(take_price), entry)
+        # MEXC trend is trigger direction: 1 = price rises to trigger, 2 = price falls to trigger.
+        # `side` here is the close side.  Closing a long uses sell; closing a short uses buy.
+        is_long_position = side_l == "sell"
+        loss_trend = 2 if is_long_position else 1
+        profit_trend = 1 if is_long_position else 2
         body = {
+            "symbol": self._mexc_symbol(symbol),
             "positionId": int(pid),
             "vol": vol,
-            "lossTrend": 1,
-            "profitTrend": 1,
+            "lossTrend": loss_trend,
+            "profitTrend": profit_trend,
             "stopLossPrice": safe_sl,
             "takeProfitPrice": safe_tp,
             "priceProtect": 0,

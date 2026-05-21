@@ -361,6 +361,10 @@ class ExecutionEngine:
                 pos["status"] = "pending" if plan.order_type.lower() == "limit" else "open"
                 pos["initial_stop_price"] = plan.stop_price
                 pos["initial_take_price"] = plan.take_price
+                if bool(getattr(plan, "liquidation_stop_mode", False)):
+                    pos["liquidation_stop_mode"] = True
+                    pos["planned_stop_price"] = plan.stop_price
+                    pos["stop_price"] = 0
                 pos["liquidity_runner_stage"] = 0
                 pos["opened_at"] = time.time()
                 pos["updated_at"] = time.time()
@@ -388,10 +392,6 @@ class ExecutionEngine:
             pos["status"] = "pending" if order_type == "limit" else "open"
             pos["initial_stop_price"] = plan.stop_price
             pos["initial_take_price"] = plan.take_price
-            if bool(getattr(plan, "liquidation_stop_mode", False)):
-                pos["liquidation_stop_mode"] = True
-                pos["planned_stop_price"] = plan.stop_price
-                pos["stop_price"] = 0
             if bool(getattr(plan, "liquidation_stop_mode", False)):
                 pos["liquidation_stop_mode"] = True
                 pos["planned_stop_price"] = plan.stop_price
@@ -877,6 +877,18 @@ class ExecutionEngine:
                     out["tp_exists"] = True
                     out["sl_exists"] = True
                     out["tpsl_verify_note"] = "accepted by MEXC but not yet visible in open orders"
+                # MEXC plan/stop orders can be accepted and return ids before they
+                # become visible through the open-order/plan-order list endpoints.
+                # For normal AI scalping, do not downgrade a successfully accepted
+                # TP+SL pair to LOCAL PROTECTION just because the visibility check
+                # lags for a few seconds.  The watchdog still reconciles later.
+                if str(pos.get("strategy") or "").lower() == "ai_scalping":
+                    if out.get("tp_order_id") and not out.get("tp_exists"):
+                        out["tp_exists"] = True
+                        out["tp_verify_note"] = "accepted by MEXC but not yet visible in open orders"
+                    if out.get("sl_order_id") and not out.get("sl_exists"):
+                        out["sl_exists"] = True
+                        out["sl_verify_note"] = "accepted by MEXC but not yet visible in open orders"
                 out["ok"] = bool(out.get("tp_exists") and out.get("sl_exists"))
                 out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
                 out["protection_mode"] = "exchange" if out["ok"] else "local_monitoring"

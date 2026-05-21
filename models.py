@@ -34,6 +34,8 @@ class TradePlan:
     liquidation_stop_mode: bool = False
     liquidation_buffer_pct: float = 0.0
     liquidation_target_distance_pct: float = 0.0
+    liquidation_estimated_distance_pct: float = 0.0
+    liquidation_leverage_capped: bool = False
     liquidity_retest_rr: float = 0.0
     liquidity_retest_zone_low: float = 0.0
     liquidity_retest_zone_high: float = 0.0

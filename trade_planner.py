@@ -172,6 +172,15 @@ class TradePlanner:
         leverage = max(1, int(float(settings.get("mexc_order_leverage", os.getenv("MEXC_ORDER_LEVERAGE", "5")) or 5)))
 
         liq_stop_mode = (strategy == "ai_scalping") and self._bool_setting(settings, "ai_scalping_liquidation_stop_mode", False)
+        if liq_stop_mode:
+            # If the signal's micro-stop is closer than the exchange can emulate
+            # with max leverage, widen the planned liquidation distance to the
+            # closest feasible value. Example: 200x cannot liquidate at 0.16%;
+            # its approximate minimum distance is 0.50%.
+            _max_lev_for_floor = max(1, int(float(settings.get("ai_scalping_liq_max_leverage", os.getenv("AI_SCALPING_LIQ_MAX_LEVERAGE", "200")) or 200)))
+            _min_feasible_liq_pct = 100.0 / _max_lev_for_floor
+            if sl_pct < _min_feasible_liq_pct:
+                sl_pct = _min_feasible_liq_pct
         risk_usdt = max(0.0, equity * risk_pct)
         stop_distance = price * (sl_pct / 100.0)
         if stop_distance <= 0:
@@ -184,20 +193,30 @@ class TradePlanner:
         # v0064 safety: fixed margin allocation per slot.
         # Example: 50 USDT balance / 5 max positions = 10 USDT max margin.
         # With 5x leverage, max notional for one trade = 50 USDT.
-        max_margin_per_position = equity / max_positions if max_positions > 0 else equity
+        trade_margin_pct = max(0.001, min(1.0, float(settings.get("trade_margin_pct", os.getenv("TRADE_MARGIN_PCT", "0.10")) or 0.10)))
+        # Per user requirement: one trade may use at most this share of account balance as isolated margin.
+        # Default is 10%; max_positions no longer silently raises/lower the single-trade allocation.
+        max_margin_per_position = equity * trade_margin_pct
 
+        liq_buffer_pct = 0.0
+        liq_target_distance_pct = 0.0
+        liq_estimated_distance_pct = 0.0
+        liq_leverage_capped = False
         if liq_stop_mode:
-            # v0116: AI BTC/ETH only high-risk mode. No exchange SL is placed.
-            # The planned SL distance is converted into high leverage so the
-            # isolated liquidation area acts as the hard loss boundary. This is
-            # approximate because the exact liquidation price depends on MEXC
-            # maintenance margin, mark price and fees, so we add a configurable
-            # buffer behind the planned SL and cap leverage.
-            margin_pct = max(0.001, min(1.0, float(settings.get("ai_scalping_liq_margin_pct", os.getenv("AI_SCALPING_LIQ_MARGIN_PCT", "0.05")) or 0.05)))
-            buffer_pct = max(0.0, float(settings.get("ai_scalping_liq_buffer_pct", os.getenv("AI_SCALPING_LIQ_BUFFER_PCT", "0.04")) or 0.04))
+            # Liquidation-stop mode:
+            # - DO NOT place an exchange SL. Liquidation is the hard stop.
+            # - Convert the planned SL distance (%) into isolated leverage.
+            #   Approximation: liquidation distance from entry is about 100 / leverage %.
+            # - If exchange max leverage is too low, the real liquidation will be
+            #   farther than the planned SL; expose that in the plan so the user sees it.
+            margin_pct = max(0.001, min(1.0, float(settings.get("ai_scalping_liq_margin_pct", os.getenv("AI_SCALPING_LIQ_MARGIN_PCT", "0.01")) or 0.01)))
+            liq_buffer_pct = max(0.0, float(settings.get("ai_scalping_liq_buffer_pct", os.getenv("AI_SCALPING_LIQ_BUFFER_PCT", "0.00")) or 0.0))
             max_lev = max(1, int(float(settings.get("ai_scalping_liq_max_leverage", os.getenv("AI_SCALPING_LIQ_MAX_LEVERAGE", "200")) or 200)))
-            target_liq_distance_pct = max(0.05, sl_pct + buffer_pct)
-            leverage = max(1, min(max_lev, int(100.0 / target_liq_distance_pct)))
+            liq_target_distance_pct = max(0.05, sl_pct + liq_buffer_pct)
+            raw_leverage = max(1.0, 100.0 / liq_target_distance_pct)
+            leverage = max(1, min(max_lev, int(raw_leverage)))
+            liq_leverage_capped = raw_leverage > max_lev
+            liq_estimated_distance_pct = 100.0 / max(1, leverage)
             margin_usdt = min(max_margin_per_position, max(self.min_order_usdt / max(1, leverage), equity * margin_pct))
             notional = min(self.max_order_usdt, max(self.min_order_usdt, margin_usdt * leverage))
             expected_margin = notional / leverage if leverage > 0 else notional
@@ -246,8 +265,10 @@ class TradePlanner:
             max_margin_per_position_usdt=max_margin_per_position,
             leverage=leverage,
             liquidation_stop_mode=liq_stop_mode,
-            liquidation_buffer_pct=(float(settings.get("ai_scalping_liq_buffer_pct", os.getenv("AI_SCALPING_LIQ_BUFFER_PCT", "0.04")) or 0.04) if liq_stop_mode else 0.0),
-            liquidation_target_distance_pct=(sl_pct + float(settings.get("ai_scalping_liq_buffer_pct", os.getenv("AI_SCALPING_LIQ_BUFFER_PCT", "0.04")) or 0.04) if liq_stop_mode else 0.0),
+            liquidation_buffer_pct=liq_buffer_pct if liq_stop_mode else 0.0,
+            liquidation_target_distance_pct=liq_target_distance_pct if liq_stop_mode else 0.0,
+            liquidation_estimated_distance_pct=liq_estimated_distance_pct if liq_stop_mode else 0.0,
+            liquidation_leverage_capped=liq_leverage_capped if liq_stop_mode else False,
             liquidity_retest_rr=lr_rr,
             liquidity_retest_zone_low=lr_zone_low,
             liquidity_retest_zone_high=lr_zone_high,

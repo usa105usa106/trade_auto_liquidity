@@ -30,6 +30,7 @@ class AIScalpDecision:
     market: dict | None = None
     cached: bool = False
     confidence_inferred: bool = False
+    tp_strength: float = 0.0  # 0..1, AI/local strength used to select TP inside BTC/ETH range
 
 
 
@@ -366,13 +367,17 @@ def parse_ai_scalp_decision(text: str, allowed_symbols: list[str], model: str) -
                 # and meets the default quality gate, but is still visible in logs.
                 conf = 0.72 if decision in {"LONG", "SHORT"} else 0.65
                 inferred = True
+            m_tp = re.search(r"(?:tp_strength|tp|strength)\s*[:=]?\s*(0(?:\.\d+)?|1(?:\.0+)?|\d{1,3}(?:\.\d+)?)", plain, flags=re.I)
+            tp_strength = _f(m_tp.group(1), conf) if m_tp else conf
+            if tp_strength > 1:
+                tp_strength /= 100.0
             m_reason = re.search(r'"reason"\s*:\s*"([^"{}]{0,220})', plain, flags=re.I)
             reason = _clean_reason(m_reason.group(1) if m_reason else plain[m_dec.end():], 180)
             if inferred:
                 reason = ("confidence missing -> fallback %.2f; %s" % (conf, reason)).strip(" ;")[:220]
             # In decide_symbol() there is exactly one allowed symbol, so use it.
             symbol = allowed_symbols[0] if allowed_symbols else ""
-            return AIScalpDecision(ok=True, symbol=symbol, decision=decision, confidence=max(0.0, min(1.0, conf)), reason=reason, raw=raw[:1000], model=model, confidence_inferred=inferred)
+            return AIScalpDecision(ok=True, symbol=symbol, decision=decision, confidence=max(0.0, min(1.0, conf)), reason=reason, raw=raw[:1000], model=model, confidence_inferred=inferred, tp_strength=max(0.0, min(1.0, tp_strength)))
         return AIScalpDecision(ok=False, error="AI did not return JSON", raw=raw[:1000], model=model)
     symbol = str(data.get("symbol") or "").upper().replace("_", "").replace("/", "").replace(":USDT", "")
     norm_allowed = {s.upper().replace("_", "").replace("/", "").replace(":USDT", ""): s for s in allowed_symbols}
@@ -389,6 +394,9 @@ def parse_ai_scalp_decision(text: str, allowed_symbols: list[str], model: str) -
         conf = _f(data.get("confidence"), 0.0)
         if conf > 1:
             conf /= 100.0
+    tp_strength = _f(data.get("tp_strength"), conf)
+    if tp_strength > 1:
+        tp_strength /= 100.0
     reason = _clean_reason(data.get("reason") or "", 180)
     if inferred:
         reason = ("confidence missing -> fallback %.2f; %s" % (conf, reason)).strip(" ;")[:220]
@@ -401,6 +409,7 @@ def parse_ai_scalp_decision(text: str, allowed_symbols: list[str], model: str) -
         raw=raw[:1000],
         model=model,
         confidence_inferred=inferred,
+        tp_strength=max(0.0, min(1.0, tp_strength)),
     )
 
 
@@ -414,6 +423,7 @@ def ai_scalp_json_schema(symbol: str) -> dict:
             "symbol": {"type": "string", "enum": [symbol]},
             "decision": {"type": "string", "enum": ["LONG", "SHORT", "WAIT"]},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "tp_strength": {"type": "number", "minimum": 0, "maximum": 1},
             "reason": {"type": "string", "maxLength": 80},
         },
         "required": ["symbol", "decision", "confidence", "reason"],
@@ -545,7 +555,7 @@ class AIScalpingEngine:
             return AIScalpDecision(
                 ok=old.ok, symbol=old.symbol, decision=old.decision, confidence=old.confidence,
                 reason=f"cached {int(cooldown - (now - cached[0]))}s: {old.reason}"[:220],
-                raw=old.raw, model=old.model, market=old.market, cached=True,
+                raw=old.raw, model=old.model, market=old.market, cached=True, tp_strength=old.tp_strength,
             )
 
         try:
@@ -576,10 +586,10 @@ class AIScalpingEngine:
             self._decision_cache[base_key] = (now, dec)
             return dec
 
-        # v0128 normal mode: no OpenAI approval required. Pick the best valid
-        # local setup and return a synthetic decision that still passes through
-        # make_candidate(), planner, TP/SL, spread and quality-score checks.
-        if not quality_mode:
+        # v0143: ETH/BTC scalp mode uses a tiny AI prompt when API key exists.
+        # Local setup gate still runs first, so tokens are spent only on real candidates.
+        # If OpenAI is disabled/missing, keep safe local fallback.
+        if not quality_mode and (not key or not _b(settings, "ai_scalping_ai_entry_filter_enabled", True)):
             valid_setups = []
             if long_setup.get("valid"):
                 ql = _quality_score(market, long_setup, "LONG")
@@ -593,21 +603,20 @@ class AIScalpingEngine:
                 return dec
             side, setup, q = max(valid_setups, key=lambda x: (_f(x[2].get("score"), 0.0), _f(x[1].get("structure_rr"), 0.0), _f(x[1].get("score"), 0.0)))
             min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.58)
-            conf = max(min_conf, min(0.90, max(_f(q.get("score"), 0.0), _f(setup.get("score"), 0.0)) / 100.0))
+            strength = max(0.0, min(1.0, max(_f(q.get("score"), 0.0), _f(setup.get("score"), 0.0)) / 100.0))
+            conf = max(min_conf, min(0.90, strength))
             reason = f"local setup {side}: score={_f(setup.get('score'),0):.1f} q={_f(q.get('score'),0):.1f} rr={_f(setup.get('structure_rr'),0):.2f}"
-            return AIScalpDecision(ok=True, symbol=allowed_symbol, decision=side, confidence=conf, reason=reason[:180], raw="local_setup_gate_no_ai", model="local_setup_gate", market={"markets": markets})
+            return AIScalpDecision(ok=True, symbol=allowed_symbol, decision=side, confidence=conf, reason=reason[:180], raw="local_setup_gate_no_ai", model="local_setup_gate", market={"markets": markets}, tp_strength=strength)
 
         feature_payload = _compact_ai_setup_features(market, long_setup, short_setup)
         min_conf = _f(settings.get("ai_scalping_quality_min_confidence" if quality_mode else "ai_scalping_min_confidence"), 0.72 if quality_mode else 0.58)
-        prompt_obj = {
-            "s": base_key,
-            "mode": "quality" if quality_mode else "normal",
-            "min": min_conf,
-            "task": "validate one listed liquidity scalp candidate; choose only candidate side or WAIT",
-            "x": feature_payload,
-        }
+        prompt_obj = {"s": base_key, "min": min_conf, "x": feature_payload}
         prompt = json.dumps(prompt_obj, separators=(",", ":"), ensure_ascii=False)
-        system = 'JSON only. You are a setup validator, not a direction predictor. Use only x.cand sides; if target path/MTF/chop unclear return WAIT. Return {"symbol":"BTCUSDT|ETHUSDT","decision":"LONG|SHORT|WAIT","confidence":0-1,"reason":"short"}.'
+        system = (
+            'BTC/ETH micro-scalp filter. JSON only. '
+            'Use only listed x.cand side. ENTER only if fresh momentum after sweep/reclaim, not flat, not late, not exhaustion. '
+            'Prefer quick 0% fee scalps. Return {"symbol":"BTCUSDT|ETHUSDT","decision":"LONG|SHORT|WAIT","confidence":0-1,"tp_strength":0-1,"reason":"max8w"}.'
+        )
         timeout_sec = float(settings.get("openai_timeout_sec", os.getenv("OPENAI_TIMEOUT_SEC", "12")) or 12)
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         async with self._sem:
@@ -623,10 +632,10 @@ class AIScalpingEngine:
                     if _b(settings, "ai_scalping_json_mode_enabled", False):
                         chat_body["response_format"] = _json_object_payload()
                     if str(model).lower().startswith(("gpt-5", "o1", "o3", "o4")):
-                        chat_body["max_completion_tokens"] = 32
+                        chat_body["max_completion_tokens"] = 40
                     else:
-                        chat_body["temperature"] = 0.1
-                        chat_body["max_tokens"] = 32
+                        chat_body["temperature"] = 0
+                        chat_body["max_tokens"] = 40
                     async with session.post(OPENAI_CHAT_URL, headers=headers, json=chat_body) as r:
                         txt = await r.text()
                         if r.status == 200:
@@ -742,12 +751,28 @@ class AIScalpingEngine:
                 return None
         clean_market = {k: v for k, v in market.items() if not str(k).startswith("_")}
         atr = max(0.01, _f(market.get("atr_1m_pct"), 0.18))
-        raw_sl = max(_f(setup.get("structure_sl_pct"), 0.0), atr * 1.15)
-        # Cap absurd wick stops, but keep them wider than the old fixed micro-stop.
-        sl_pct = max(0.16, min(0.75, raw_sl))
-        rr_target = 1.35 if q.get("score", 0) < 72 else 1.55
-        raw_tp = max(_f(setup.get("structure_tp_pct"), 0.0), sl_pct * rr_target)
-        tp_pct = max(0.18, min(1.10, raw_tp))
+        # v0143 ETH/BTC micro-scalp brackets. TP is chosen by AI/local setup
+        # strength inside the symbol range; SL is ALWAYS 2x TP. No separate random SL.
+        base = str(decision.symbol or "").upper()
+        if base.startswith("BTC"):
+            min_tp_pct = _f(settings.get("ai_scalping_btc_min_tp_pct"), _f(os.getenv("AI_SCALPING_BTC_MIN_TP_PCT"), 0.08))
+            max_tp_pct = _f(settings.get("ai_scalping_btc_max_tp_pct"), _f(os.getenv("AI_SCALPING_BTC_MAX_TP_PCT"), 0.12))
+        elif base.startswith("ETH"):
+            min_tp_pct = _f(settings.get("ai_scalping_eth_min_tp_pct"), _f(os.getenv("AI_SCALPING_ETH_MIN_TP_PCT"), 0.10))
+            max_tp_pct = _f(settings.get("ai_scalping_eth_max_tp_pct"), _f(os.getenv("AI_SCALPING_ETH_MAX_TP_PCT"), 0.16))
+        else:
+            min_tp_pct = _f(settings.get("ai_scalping_min_tp_pct"), _f(os.getenv("AI_SCALPING_MIN_TP_PCT"), 0.08))
+            max_tp_pct = _f(settings.get("ai_scalping_max_tp_pct"), _f(os.getenv("AI_SCALPING_MAX_TP_PCT"), 0.14))
+        min_tp_pct = max(0.01, min_tp_pct)
+        max_tp_pct = max(min_tp_pct, max_tp_pct)
+        local_strength = max(_f(q.get("score"), 0.0), _f(setup.get("score"), 0.0)) / 100.0
+        strength = _f(getattr(decision, "tp_strength", 0.0), local_strength)
+        if strength <= 0:
+            strength = local_strength
+        strength = max(0.0, min(1.0, strength))
+        tp_pct = min_tp_pct + (max_tp_pct - min_tp_pct) * strength
+        sl_mult = max(1.0, _f(settings.get("ai_scalping_sl_tp_multiplier"), _f(os.getenv("AI_SCALPING_SL_TP_MULTIPLIER"), 2.0)))
+        sl_pct = tp_pct * sl_mult
         return {
             "symbol": decision.symbol,
             "side": decision.decision,
@@ -757,6 +782,7 @@ class AIScalpingEngine:
             "atr_pct": atr,
             "ai_scalping_tp_pct": _r(tp_pct, 4),
             "ai_scalping_sl_pct": _r(sl_pct, 4),
+            "ai_scalping_tp_strength": _r(strength, 4),
             "risk_pct": _f(settings.get("risk_pct"), 0.005),
             "score_details": {"ai_reason": decision.reason, "ai_model": decision.model, "setup": setup, "quality_score": q, **clean_market},
         }

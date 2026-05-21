@@ -6,7 +6,11 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Cal
 import psutil
 
 from config import TELEGRAM_TOKEN, ADMIN_IDS, VERSION, DEFAULT_EXCHANGE
-from storage import Storage, DEFAULT_SETTINGS
+from storage import Storage
+try:
+    from storage import DEFAULT_SETTINGS
+except ImportError:
+    DEFAULT_SETTINGS = {}
 from keyboard import MAIN_MENU, settings_menu, choices_menu, api_menu, openai_menu, ai_stats_menu, format_duration_seconds
 from adaptive_engine import AdaptiveEngine
 from mirror_engine import MirrorEngine
@@ -153,11 +157,19 @@ async def send_trade_chart(app, ex, plan, settings: dict) -> None:
         chart_path = await asyncio.to_thread(render_trade_setup_chart, plan.symbol, candles, plan)
         if not chart_path:
             return
-        caption = (
-            "📊 Trade setup chart\n"
-            f"{plan.symbol} {plan.side} | {plan.strategy}\n"
-            f"Entry {plan.entry_price:.8g} | SL {plan.stop_price:.8g} | TP {plan.take_price:.8g}"
-        )
+        if bool(getattr(plan, "liquidation_stop_mode", False)):
+            liq_note = f"LIQ≈{getattr(plan, 'liquidation_estimated_distance_pct', 0):.3g}% via {getattr(plan, 'leverage', 0)}x"
+            caption = (
+                "📊 Trade setup chart\n"
+                f"{plan.symbol} {plan.side} | {plan.strategy}\n"
+                f"Entry {plan.entry_price:.8g} | {liq_note} | TP {plan.take_price:.8g}"
+            )
+        else:
+            caption = (
+                "📊 Trade setup chart\n"
+                f"{plan.symbol} {plan.side} | {plan.strategy}\n"
+                f"Entry {plan.entry_price:.8g} | SL {plan.stop_price:.8g} | TP {plan.take_price:.8g}"
+            )
         with open(chart_path, "rb") as img:
             await app.bot.send_photo(chat_id=chat_id, photo=img, caption=caption)
         try:
@@ -641,6 +653,14 @@ def format_position_event(ev: dict) -> str:
                 f"TP: {'OK' if tp_ok else 'MISSING'}",
                 "Protection is confirmed on MEXC."
             ]
+        elif protection_status == "TP + LIQUIDATION STOP" or protection_mode == "exchange_tp_liquidation_sl":
+            lines = [
+                "✅ TP ON EXCHANGE + LIQUIDATION STOP",
+                f"{symbol}",
+                "SL: LIQUIDATION MODE — no exchange SL by design",
+                f"TP: {'OK' if tp_ok else 'MISSING'}",
+                "Only take-profit is placed on MEXC; liquidation replaces the stop."
+            ]
         else:
             lines = [
                 "⚠️ LOCAL PROTECTION MODE",
@@ -857,7 +877,7 @@ ws_update_throttle_ms, ws_max_updates_per_batch, ws_queue_limit,
 symbol_refresh_sec, universe_mode, strategy_mode, mirror_mode,
 spot_confirmation_enabled, session_filter_enabled, america_short_bias_enabled, ws_enabled,
 mexc_order_leverage, mexc_order_open_type, mexc_recv_window, margin_allocation_enabled, require_exchange_protection, auto_close_on_protection_failed, total_positions_opened, ai_scalping_session_id, ai_scalping_session_reset_at,
-ai_scalping_symbols, ai_scalping_min_confidence, ai_scalping_tp_pct, ai_scalping_sl_pct, ai_scalping_btc_tp_pct, ai_scalping_btc_sl_pct, ai_scalping_eth_tp_pct, ai_scalping_eth_sl_pct, ai_scalping_max_spread_pct, ai_scalping_quality_filters_enabled, ai_scalping_quality_min_confidence, ai_scalping_quality_cooldown_sec, ai_scalping_quality_min_atr_pct, ai_scalping_quality_min_ema_gap_pct, ai_scalping_quality_min_ret_5m_abs_pct, ai_scalping_ai_cooldown_sec, ai_scalping_openai_fallback_enabled, ai_scalping_json_mode_enabled, ai_scalping_liquidation_stop_mode, ai_scalping_liq_margin_pct, ai_scalping_liq_buffer_pct, ai_scalping_liq_max_leverage,
+ai_scalping_symbols, ai_scalping_min_confidence, ai_scalping_ai_entry_filter_enabled, ai_scalping_tp_pct, ai_scalping_sl_pct, ai_scalping_btc_tp_pct, ai_scalping_btc_sl_pct, ai_scalping_eth_tp_pct, ai_scalping_eth_sl_pct, ai_scalping_btc_min_tp_pct, ai_scalping_btc_max_tp_pct, ai_scalping_eth_min_tp_pct, ai_scalping_eth_max_tp_pct, ai_scalping_sl_tp_multiplier, ai_scalping_max_spread_pct, ai_scalping_quality_filters_enabled, ai_scalping_quality_min_confidence, ai_scalping_quality_cooldown_sec, ai_scalping_quality_min_atr_pct, ai_scalping_quality_min_ema_gap_pct, ai_scalping_quality_min_ret_5m_abs_pct, ai_scalping_ai_cooldown_sec, ai_scalping_openai_fallback_enabled, ai_scalping_json_mode_enabled, ai_scalping_liquidation_stop_mode, ai_scalping_liq_margin_pct, ai_scalping_liq_buffer_pct, ai_scalping_liq_max_leverage,
 scan_market_source = binance_binance | mexc_mexc | mexc_binance.
 
 По умолчанию: mexc_binance = MEXC фьючи скан + Binance spot подтверждение.
@@ -1777,7 +1797,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "openai_analysis_enabled", "openai_model", "openai_check_strength", "openai_api_key",
         "openai_env_fallback", "openai_timeout_sec", "openai_fail_open", "openai_show_decisions",
         "trade_charts_enabled", "liquidity_runner_enabled",
-        "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct", "ai_scalping_ai_cooldown_sec", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled", "ai_scalping_liquidation_stop_mode", "ai_scalping_liq_margin_pct", "ai_scalping_liq_buffer_pct", "ai_scalping_liq_max_leverage",
+        "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_ai_entry_filter_enabled", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_btc_min_tp_pct", "ai_scalping_btc_max_tp_pct", "ai_scalping_eth_min_tp_pct", "ai_scalping_eth_max_tp_pct", "ai_scalping_sl_tp_multiplier", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct", "ai_scalping_ai_cooldown_sec", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled", "ai_scalping_liquidation_stop_mode", "ai_scalping_liq_margin_pct", "ai_scalping_liq_buffer_pct", "ai_scalping_liq_max_leverage",
     }
     if key not in allowed_keys:
         await reply(update, f"❌ Setting is not allowed through /set: {key}", reply_markup=MAIN_MENU)
@@ -1805,10 +1825,19 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "openai_analysis_enabled": True,
             "openai_show_decisions": True,
             "ai_scalping_symbols": "BTC_USDT,ETH_USDT",
-            "ai_scalping_btc_tp_pct": 0.18,
-            "ai_scalping_btc_sl_pct": 0.26,
-            "ai_scalping_eth_tp_pct": 0.22,
-            "ai_scalping_eth_sl_pct": 0.32,
+            "ai_scalping_btc_tp_pct": 0.09,
+            "ai_scalping_btc_sl_pct": 0.18,
+            "ai_scalping_eth_tp_pct": 0.12,
+            "ai_scalping_eth_sl_pct": 0.24,
+            "ai_scalping_btc_min_tp_pct": 0.08,
+            "ai_scalping_btc_max_tp_pct": 0.12,
+            "ai_scalping_eth_min_tp_pct": 0.10,
+            "ai_scalping_eth_max_tp_pct": 0.16,
+            "ai_scalping_sl_tp_multiplier": 2.0,
+            "ai_scalping_ai_entry_filter_enabled": True,
+            "ai_scalping_ai_cooldown_sec": 8,
+            "ai_scalping_quality_cooldown_sec": 20,
+            "scan_interval_sec": 8,
             "max_open_positions": 2,
             "auto_strategy_adaptation": False,
             "regime_adaptation": False,
@@ -1825,7 +1854,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if key in {"proxy_url", "proxy_enabled", "scan_market_source", "ws_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold"}:
         await reset_market_runtime()
     shown = mask_secret(str(parsed)) if key in {"mexc_api_key", "mexc_api_secret", "openai_api_key", "proxy_url"} else parsed
-    if key in {"scan_interval_sec", "scanner_concurrency", "strategy_mode", "universe_mode", "max_symbols", "scan_market_source", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "openai_check_strength", "openai_model", "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct", "liquidity_retest_quality_mode", "scanner_reject_log_enabled"}:
+    if key in {"scan_interval_sec", "scanner_concurrency", "strategy_mode", "universe_mode", "max_symbols", "scan_market_source", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "openai_check_strength", "openai_model", "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_ai_entry_filter_enabled", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_btc_min_tp_pct", "ai_scalping_btc_max_tp_pct", "ai_scalping_eth_min_tp_pct", "ai_scalping_eth_max_tp_pct", "ai_scalping_sl_tp_multiplier", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct", "liquidity_retest_quality_mode", "scanner_reject_log_enabled"}:
         trigger_scan_now(context.application, reason=f"setting:{key}")
     await reply(update, f"✅ Saved\n{key} = {shown}", reply_markup=MAIN_MENU)
 
@@ -1873,6 +1902,7 @@ async def ai_scalping_toggle_cmd(update: Update, context: ContextTypes.DEFAULT_T
     s = await storage.all_settings()
     enabled = str(s.get("strategy_mode", "hybrid")).lower() == "ai_scalping"
     if enabled:
+        restore_scan = int(float(s.get("ai_scalping_prev_scan_interval_sec", 0) or 0))
         updates = {
             "strategy_mode": "hybrid",
             "auto_strategy_adaptation": True,
@@ -1881,6 +1911,8 @@ async def ai_scalping_toggle_cmd(update: Update, context: ContextTypes.DEFAULT_T
             "session_filter_enabled": True,
             "openai_analysis_enabled": False,
         }
+        if restore_scan > 0:
+            updates["scan_interval_sec"] = restore_scan
         for k, v in updates.items():
             await storage.set(k, v, bump_revision=False)
         await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
@@ -1888,15 +1920,25 @@ async def ai_scalping_toggle_cmd(update: Update, context: ContextTypes.DEFAULT_T
         await reply(update, "○ AI BTC/ETH scalping OFF\nРежим возвращён на hybrid adaptive.", reply_markup=MAIN_MENU)
         return
 
+    prev_scan = int(float(s.get("scan_interval_sec", 5) or 5))
     updates = {
         "strategy_mode": "ai_scalping",
+        "ai_scalping_prev_scan_interval_sec": prev_scan,
         "ai_scalping_symbols": "BTC_USDT,ETH_USDT",
-        "ai_scalping_btc_tp_pct": 0.18,
-        "ai_scalping_btc_sl_pct": 0.26,
-        "ai_scalping_eth_tp_pct": 0.22,
-        "ai_scalping_eth_sl_pct": 0.32,
+        "ai_scalping_btc_tp_pct": 0.09,
+        "ai_scalping_btc_sl_pct": 0.18,
+        "ai_scalping_eth_tp_pct": 0.12,
+        "ai_scalping_eth_sl_pct": 0.24,
+        "ai_scalping_btc_min_tp_pct": 0.08,
+        "ai_scalping_btc_max_tp_pct": 0.12,
+        "ai_scalping_eth_min_tp_pct": 0.10,
+        "ai_scalping_eth_max_tp_pct": 0.16,
+        "ai_scalping_sl_tp_multiplier": 2.0,
+        "ai_scalping_ai_entry_filter_enabled": True,
+        "ai_scalping_ai_cooldown_sec": 8,
+        "ai_scalping_quality_cooldown_sec": 20,
         "max_open_positions": 2,
-        "scan_interval_sec": 60,
+        "scan_interval_sec": 8,
         "auto_strategy_adaptation": False,
         "regime_adaptation": False,
         "liquidity_runner_enabled": False,
@@ -1915,7 +1957,7 @@ async def ai_scalping_toggle_cmd(update: Update, context: ContextTypes.DEFAULT_T
     await reply(
         update,
         "✅ AI BTC/ETH scalping ON\n"
-        "Включено: только BTC/ETH, независимый AI-запрос по каждому символу после закрытия именно его позиции.\n"
+        "Включено: BTC/ETH micro-scalp, короткий AI JSON-фильтр, TP по силе сетапа, SL=TP×2.\n"
         "Отключено: scanner strategies, spot/session filters, mirror, regime/adaptive strategy.",
         reply_markup=MAIN_MENU,
     )
@@ -1969,9 +2011,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parsed = value
         await storage.set(key, parsed)
         if key == "strategy_mode" and str(parsed).lower() == "ai_scalping":
+            prev_scan = int(float(s.get("scan_interval_sec", 5) or 5))
             for k2, v2 in {
                 "openai_analysis_enabled": True, "openai_show_decisions": True,
                 "ai_scalping_symbols": "BTC_USDT,ETH_USDT", "max_open_positions": 2,
+                "scan_interval_sec": 8, "ai_scalping_prev_scan_interval_sec": prev_scan,
+                "ai_scalping_btc_tp_pct": 0.09, "ai_scalping_btc_sl_pct": 0.18,
+                "ai_scalping_eth_tp_pct": 0.12, "ai_scalping_eth_sl_pct": 0.24,
+                "ai_scalping_btc_min_tp_pct": 0.08, "ai_scalping_btc_max_tp_pct": 0.12,
+                "ai_scalping_eth_min_tp_pct": 0.10, "ai_scalping_eth_max_tp_pct": 0.16,
+                "ai_scalping_sl_tp_multiplier": 2.0, "ai_scalping_ai_entry_filter_enabled": True,
+                "ai_scalping_ai_cooldown_sec": 8, "ai_scalping_quality_cooldown_sec": 20,
                 "auto_strategy_adaptation": False, "regime_adaptation": False,
                 "liquidity_runner_enabled": False, "spot_confirmation_enabled": False,
                 "session_filter_enabled": False, "america_short_bias_enabled": False, "mirror_mode": "off",
@@ -1980,6 +2030,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif key == "strategy_mode" and str(s.get("strategy_mode", "hybrid")).lower() == "ai_scalping" and str(parsed).lower() != "ai_scalping":
             for k2 in ["auto_strategy_adaptation", "regime_adaptation", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "mirror_mode", "openai_analysis_enabled", "openai_show_decisions", "liquidity_runner_enabled", "max_open_positions"]:
                 await storage.set(k2, DEFAULT_SETTINGS.get(k2, s.get(k2)), bump_revision=False)
+            restore_scan = int(float(s.get("ai_scalping_prev_scan_interval_sec", 0) or 0))
+            if restore_scan > 0:
+                await storage.set("scan_interval_sec", restore_scan, bump_revision=False)
         if key in {"scan_market_source", "ws_enabled", "proxy_url", "proxy_enabled", "ws_stale_sec", "ws_update_throttle_ms", "ws_max_updates_per_batch", "ws_queue_limit", "ws_adaptive_slowdown_threshold"}:
             await reset_market_runtime()
         if key in {"universe_mode", "max_symbols", "scan_market_source"}:
@@ -1997,7 +2050,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif key == "scan_market_source":
             await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], new_rev, new_settings.get("scan_market_source", "mexc_binance")))
         elif key == "scan_interval_sec":
-            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("3s","3"),("5s default","5"),("10s","10"),("30s","30"),("1m","60"),("5m","300"),("15m","900"),("30m","1800"),("1h","3600"),("4h","14400")], new_rev, new_settings.get("scan_interval_sec")))
+            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("3s","3"),("5s default","5"),("8s scalp","8"),("10s","10"),("30s","30"),("1m","60"),("5m","300"),("15m","900"),("30m","1800"),("1h","3600"),("4h","14400")], new_rev, new_settings.get("scan_interval_sec")))
         elif key == "scanner_concurrency":
             await q.edit_message_text("🧵 Scanner concurrency", reply_markup=choices_menu("scanner_concurrency", [("3 requests","3"),("5 requests","5"),("8 requests","8"),("12 requests","12")], new_rev, new_settings.get("scanner_concurrency", 5)))
         elif key == "ws_update_throttle_ms":
@@ -2077,7 +2130,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif name == "marketsource":
             await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], rev, s.get("scan_market_source", "mexc_binance")))
         elif name == "scan":
-            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("3s","3"),("5s default","5"),("10s","10"),("30s","30"),("1m","60"),("5m","300"),("15m","900"),("30m","1800"),("1h","3600"),("4h","14400")], rev, s.get("scan_interval_sec")))
+            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("3s","3"),("5s default","5"),("8s scalp","8"),("10s","10"),("30s","30"),("1m","60"),("5m","300"),("15m","900"),("30m","1800"),("1h","3600"),("4h","14400")], rev, s.get("scan_interval_sec")))
         elif name == "concurrency":
             await q.edit_message_text("🧵 Scanner concurrency", reply_markup=choices_menu("scanner_concurrency", [("3 requests","3"),("5 requests","5"),("8 requests","8"),("12 requests","12")], rev, s.get("scanner_concurrency", 5)))
         elif name == "wsthrottle":
@@ -2464,7 +2517,13 @@ async def trading_loop(app):
                                     f"Conf: {decision.confidence:.2f}\n"
                                     f"Reason: {decision.reason or '-'}\n"
                                     f"TP: {plan.take_price:.6g}\n"
-                                    f"SL: {plan.stop_price:.6g}"
+                                    + (
+                                        f"SL: LIQUIDATION via {getattr(plan, 'leverage', 0)}x "
+                                        f"(target≈{getattr(plan, 'liquidation_target_distance_pct', 0):.3g}%, "
+                                        f"est≈{getattr(plan, 'liquidation_estimated_distance_pct', 0):.3g}%)"
+                                        if bool(getattr(plan, "liquidation_stop_mode", False))
+                                        else f"SL: {plan.stop_price:.6g}"
+                                    )
                                 ),
                                 key=f"ai_scalp_opened_{b}",
                             )

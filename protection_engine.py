@@ -118,7 +118,7 @@ class ProtectionEngine:
 
     async def reconcile(self, pos: dict, live: bool = True, reattach: bool = True) -> dict:
         out = await self.check(pos)
-        if out.get("protection_status") == "EXCHANGE PROTECTED" or not reattach or not live or not self.execution_engine:
+        if out.get("protection_status") in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP"} or not reattach or not live or not self.execution_engine:
             return out
         liq_mode = bool(pos.get("liquidation_stop_mode")) and str(pos.get("strategy") or "").lower() == "ai_scalping"
         try:

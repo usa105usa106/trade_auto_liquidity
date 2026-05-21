@@ -71,12 +71,18 @@ DEFAULT_SETTINGS = {
 
     "ai_scalping_symbols": DEFAULTS.ai_scalping_symbols,
     "ai_scalping_min_confidence": DEFAULTS.ai_scalping_min_confidence,
+    "ai_scalping_ai_entry_filter_enabled": DEFAULTS.ai_scalping_ai_entry_filter_enabled,
     "ai_scalping_tp_pct": DEFAULTS.ai_scalping_tp_pct,
     "ai_scalping_sl_pct": DEFAULTS.ai_scalping_sl_pct,
     "ai_scalping_btc_tp_pct": DEFAULTS.ai_scalping_btc_tp_pct,
     "ai_scalping_btc_sl_pct": DEFAULTS.ai_scalping_btc_sl_pct,
     "ai_scalping_eth_tp_pct": DEFAULTS.ai_scalping_eth_tp_pct,
     "ai_scalping_eth_sl_pct": DEFAULTS.ai_scalping_eth_sl_pct,
+    "ai_scalping_btc_min_tp_pct": DEFAULTS.ai_scalping_btc_min_tp_pct,
+    "ai_scalping_btc_max_tp_pct": DEFAULTS.ai_scalping_btc_max_tp_pct,
+    "ai_scalping_eth_min_tp_pct": DEFAULTS.ai_scalping_eth_min_tp_pct,
+    "ai_scalping_eth_max_tp_pct": DEFAULTS.ai_scalping_eth_max_tp_pct,
+    "ai_scalping_sl_tp_multiplier": DEFAULTS.ai_scalping_sl_tp_multiplier,
     "ai_scalping_max_spread_pct": DEFAULTS.ai_scalping_max_spread_pct,
     "ai_scalping_quality_filters_enabled": DEFAULTS.ai_scalping_quality_filters_enabled,
     "ai_scalping_quality_min_confidence": DEFAULTS.ai_scalping_quality_min_confidence,
@@ -92,6 +98,7 @@ DEFAULT_SETTINGS = {
     "ai_scalping_liq_margin_pct": DEFAULTS.ai_scalping_liq_margin_pct,
     "ai_scalping_liq_buffer_pct": DEFAULTS.ai_scalping_liq_buffer_pct,
     "ai_scalping_liq_max_leverage": DEFAULTS.ai_scalping_liq_max_leverage,
+    "trade_margin_pct": DEFAULTS.trade_margin_pct,
     "ai_scalping_protection_delay_sec": DEFAULTS.ai_scalping_protection_delay_sec,
     "proxy_enabled": DEFAULTS.proxy_enabled,
     "proxy_url": DEFAULTS.proxy_url,
@@ -125,6 +132,7 @@ DEFAULT_SETTINGS = {
     "total_positions_opened": int(os.getenv("TOTAL_POSITIONS_OPENED", "0") or 0),
     "ai_scalping_session_id": int(os.getenv("AI_SCALPING_SESSION_ID", "1") or 1),
     "ai_scalping_session_reset_at": float(os.getenv("AI_SCALPING_SESSION_RESET_AT", "0") or 0),
+    "ai_scalping_prev_scan_interval_sec": int(os.getenv("AI_SCALPING_PREV_SCAN_INTERVAL_SEC", "0") or 0),
 }
 
 class Storage:
