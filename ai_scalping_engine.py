@@ -171,20 +171,33 @@ def _local_scalp_setup(candles: list[list[Any]], side: str, price: float, atr_pc
         return {"valid": False, "reason": "setup: no side", "score": 0.0}
 
     rr = target_pct / max(0.01, stop_pct) if target_pct > 0 else 0.0
+    # v0145 aggressive BTC/ETH micro-scalp gate: sweep/reclaim is a bonus,
+    # not mandatory. Small 0% fee scalps can enter on fresh momentum + acceptable
+    # room because TP is only 0.08-0.16% and SL is fixed at TP*2.
+    momentum_abs = abs(ret3)
+    min_momentum = max(0.025, atr_pct * 0.28)
+    momentum_ok = momentum_abs >= min_momentum
+    volume_ok = vol_ratio >= 0.92
+    rr_min = 0.45
+    context_ok = bool(swept or reclaimed or near_edge or momentum_ok)
     score = 0.0
-    score += 30.0 if swept else 0.0
-    score += 25.0 if reclaimed else 0.0
-    score += 15.0 if near_edge else 0.0
-    score += 10.0 if impulse_ok else 0.0
-    score += min(10.0, max(0.0, vol_ratio - 1.0) * 8.0)
-    score += min(10.0, max(0.0, rr - 0.8) * 8.0)
-    valid = bool(swept and reclaimed and near_edge and impulse_ok and rr >= 0.85)
+    score += 22.0 if swept else 0.0
+    score += 18.0 if reclaimed else 0.0
+    score += 12.0 if near_edge else 0.0
+    score += 14.0 if impulse_ok else 0.0
+    score += 16.0 if momentum_ok else 0.0
+    score += min(10.0, max(0.0, vol_ratio - 0.85) * 12.0)
+    score += min(8.0, max(0.0, rr - rr_min) * 10.0)
+    valid = bool(context_ok and impulse_ok and volume_ok and rr >= rr_min)
     parts = []
+    if not context_ok: parts.append("no context")
     if not swept: parts.append("no sweep")
     if not reclaimed: parts.append("no reclaim")
-    if not near_edge: parts.append("mid range")
+    if not near_edge: parts.append("mid ok")
+    if not momentum_ok: parts.append("weak momentum")
     if not impulse_ok: parts.append("bad impulse")
-    if rr < 0.85: parts.append(f"RR {rr:.2f} < 0.85")
+    if not volume_ok: parts.append(f"vol {vol_ratio:.2f} < 0.92")
+    if rr < rr_min: parts.append(f"RR {rr:.2f} < {rr_min:.2f}")
     return {
         "valid": valid,
         "reason": "setup ok" if valid else "setup: " + ", ".join(parts),
@@ -602,19 +615,19 @@ class AIScalpingEngine:
                 self._decision_cache[base_key] = (now, dec)
                 return dec
             side, setup, q = max(valid_setups, key=lambda x: (_f(x[2].get("score"), 0.0), _f(x[1].get("structure_rr"), 0.0), _f(x[1].get("score"), 0.0)))
-            min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.58)
+            min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.52)
             strength = max(0.0, min(1.0, max(_f(q.get("score"), 0.0), _f(setup.get("score"), 0.0)) / 100.0))
             conf = max(min_conf, min(0.90, strength))
             reason = f"local setup {side}: score={_f(setup.get('score'),0):.1f} q={_f(q.get('score'),0):.1f} rr={_f(setup.get('structure_rr'),0):.2f}"
             return AIScalpDecision(ok=True, symbol=allowed_symbol, decision=side, confidence=conf, reason=reason[:180], raw="local_setup_gate_no_ai", model="local_setup_gate", market={"markets": markets}, tp_strength=strength)
 
         feature_payload = _compact_ai_setup_features(market, long_setup, short_setup)
-        min_conf = _f(settings.get("ai_scalping_quality_min_confidence" if quality_mode else "ai_scalping_min_confidence"), 0.72 if quality_mode else 0.58)
+        min_conf = _f(settings.get("ai_scalping_quality_min_confidence" if quality_mode else "ai_scalping_min_confidence"), 0.72 if quality_mode else 0.52)
         prompt_obj = {"s": base_key, "min": min_conf, "x": feature_payload}
         prompt = json.dumps(prompt_obj, separators=(",", ":"), ensure_ascii=False)
         system = (
             'BTC/ETH micro-scalp filter. JSON only. '
-            'Use only listed x.cand side. ENTER only if fresh momentum after sweep/reclaim, not flat, not late, not exhaustion. '
+            'Use only listed x.cand side. ENTER on fresh momentum; sweep/reclaim is bonus, not mandatory. Reject flat, late, exhaustion. '
             'Prefer quick 0% fee scalps. Return {"symbol":"BTCUSDT|ETHUSDT","decision":"LONG|SHORT|WAIT","confidence":0-1,"tp_strength":0-1,"reason":"max8w"}.'
         )
         timeout_sec = float(settings.get("openai_timeout_sec", os.getenv("OPENAI_TIMEOUT_SEC", "12")) or 12)
@@ -674,7 +687,7 @@ class AIScalpingEngine:
         if not decision.symbol:
             return "missing symbol"
         quality_mode = _b(settings, "ai_scalping_quality_filters_enabled", False)
-        min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.58)
+        min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.52)
         if quality_mode:
             min_conf = max(min_conf, _f(settings.get("ai_scalping_quality_min_confidence"), 0.72))
         if decision.confidence < min_conf:
@@ -695,7 +708,7 @@ class AIScalpingEngine:
         if not setup.get("valid"):
             return str(setup.get("reason") or "setup rejected")
         q = _quality_score(market, setup, decision.decision)
-        min_q = _f(settings.get("ai_scalping_setup_min_quality_score"), 58.0)
+        min_q = _f(settings.get("ai_scalping_setup_min_quality_score"), 42.0)
         if q.get("score", 0.0) < min_q:
             return f"quality score {q.get('score', 0):.1f} < {min_q:.1f}: {q.get('notes') or 'weak setup'}"
         if quality_mode:
@@ -715,7 +728,7 @@ class AIScalpingEngine:
         if not decision.ok or decision.decision not in {"LONG", "SHORT"} or not decision.symbol:
             return None
         quality_mode = _b(settings, "ai_scalping_quality_filters_enabled", False)
-        min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.58)
+        min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.52)
         if quality_mode:
             min_conf = max(min_conf, _f(settings.get("ai_scalping_quality_min_confidence"), 0.72))
         if decision.confidence < min_conf:
@@ -735,7 +748,7 @@ class AIScalpingEngine:
         if not setup.get("valid"):
             return None
         q = _quality_score(market, setup, decision.decision)
-        min_q = _f(settings.get("ai_scalping_setup_min_quality_score"), 58.0)
+        min_q = _f(settings.get("ai_scalping_setup_min_quality_score"), 42.0)
         if q.get("score", 0.0) < min_q:
             return None
         if quality_mode:

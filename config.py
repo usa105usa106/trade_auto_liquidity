@@ -8,7 +8,7 @@ load_dotenv()
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
-VERSION = os.getenv("BOT_VERSION", "0143 AI BTC/ETH MICRO SCALP PROMPT + TP2SL (0122 AI BTC/ETH)")
+VERSION = os.getenv("BOT_VERSION", "0145 AI BTC/ETH AGGRESSIVE MICRO SCALP (0122 AI BTC/ETH)")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -95,7 +95,7 @@ class Defaults:
     liquidity_runner_enabled: bool = env_bool("LIQUIDITY_RUNNER_ENABLED", False)
 
     ai_scalping_symbols: str = os.getenv("AI_SCALPING_SYMBOLS", "BTC_USDT,ETH_USDT")
-    ai_scalping_min_confidence: float = env_float("AI_SCALPING_MIN_CONFIDENCE", 0.58)
+    ai_scalping_min_confidence: float = env_float("AI_SCALPING_MIN_CONFIDENCE", 0.52)
     ai_scalping_ai_entry_filter_enabled: bool = env_bool("AI_SCALPING_AI_ENTRY_FILTER_ENABLED", True)
     ai_scalping_tp_pct: float = env_float("AI_SCALPING_TP_PCT", 0.10)
     ai_scalping_sl_pct: float = env_float("AI_SCALPING_SL_PCT", 0.22)
@@ -115,7 +115,7 @@ class Defaults:
     ai_scalping_quality_min_atr_pct: float = env_float("AI_SCALPING_QUALITY_MIN_ATR_PCT", 0.035)
     ai_scalping_quality_min_ema_gap_pct: float = env_float("AI_SCALPING_QUALITY_MIN_EMA_GAP_PCT", 0.015)
     ai_scalping_quality_min_ret_5m_abs_pct: float = env_float("AI_SCALPING_QUALITY_MIN_RET_5M_ABS_PCT", 0.035)
-    ai_scalping_setup_min_quality_score: float = env_float("AI_SCALPING_SETUP_MIN_QUALITY_SCORE", 58.0)
+    ai_scalping_setup_min_quality_score: float = env_float("AI_SCALPING_SETUP_MIN_QUALITY_SCORE", 42.0)
     ai_scalping_ai_cooldown_sec: int = env_int("AI_SCALPING_AI_COOLDOWN_SEC", 8)
     ai_scalping_openai_fallback_enabled: bool = env_bool("AI_SCALPING_OPENAI_FALLBACK_ENABLED", False)
     ai_scalping_json_mode_enabled: bool = env_bool("AI_SCALPING_JSON_MODE_ENABLED", False)
