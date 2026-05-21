@@ -100,6 +100,40 @@ async def notify_admin(app, text: str, min_interval_sec: int = 0, key: str = "no
     except Exception as e:
         log.warning("telegram notification failed: %s", e)
 
+
+async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", min_interval_sec: int = 0) -> None:
+    """Keep one live Telegram status message at the bottom of the chat.
+
+    Telegram edits do not move old messages down, so for noisy live updates
+    (watchdogs, protection checks, etc.) we delete the previous status message
+    and send a fresh one. Important lifecycle events should still use
+    notify_admin() so they remain in the history.
+    """
+    chat_id = first_admin_id()
+    if not chat_id:
+        return
+    now = time.time()
+    if min_interval_sec:
+        last_key = f"last_bottom_{key}"
+        last = float(app.bot_data.get(last_key, 0) or 0)
+        if now - last < min_interval_sec:
+            return
+        app.bot_data[last_key] = now
+
+    msg_key = f"bottom_msg_id_{key}"
+    old_msg_id = app.bot_data.get(msg_key)
+    if old_msg_id:
+        try:
+            await app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id))
+        except Exception as e:
+            # Message may already be gone or too old; continue and post a fresh one.
+            log.debug("telegram bottom status delete skipped: %s", e)
+    try:
+        msg = await app.bot.send_message(chat_id=chat_id, text=text)
+        app.bot_data[msg_key] = getattr(msg, "message_id", None)
+    except Exception as e:
+        log.warning("telegram bottom status failed: %s", e)
+
 async def send_trade_chart(app, ex, plan, settings: dict) -> None:
     """Send one clear setup chart after an auto-trade is opened.
 
@@ -589,6 +623,39 @@ def format_position_event(ev: dict) -> str:
         "protection_failed": "protection failed",
         "protection_local": "exchange protection failed; bot monitors TP/SL locally",
     }
+    label = reason_map.get(str(typ), str(typ))
+
+    # v0134 improved protection notifications
+    if typ == "protection_watchdog":
+        protection_status = str(ev.get("protection_status") or "UNKNOWN")
+        protection_mode = str(ev.get("protection_mode") or "")
+        stop_ok = bool(ev.get("stop_loss_ok"))
+        tp_ok = bool(ev.get("take_profit_ok"))
+        reattach = bool(ev.get("reattach_attempted"))
+
+        if protection_status == "EXCHANGE PROTECTED":
+            lines = [
+                "✅ EXCHANGE PROTECTED",
+                f"{symbol}",
+                f"SL: {'OK' if stop_ok else 'MISSING'}",
+                f"TP: {'OK' if tp_ok else 'MISSING'}",
+                "Protection is confirmed on MEXC."
+            ]
+        else:
+            lines = [
+                "⚠️ LOCAL PROTECTION MODE",
+                f"{symbol}",
+                f"SL: {'OK' if stop_ok else 'MISSING'}",
+                f"TP: {'OK' if tp_ok else 'MISSING'}",
+                "Exchange TP/SL not confirmed.",
+                "Bot monitors and can close the trade locally."
+            ]
+
+            if reattach:
+                lines.append("🔁 Bot is trying to restore TP/SL on exchange.")
+
+        return "\n".join(lines)
+
     label = reason_map.get(str(typ), str(typ))
     lines = [f"📌 Position event", f"{symbol}: {label}"]
     if "pnl_usdt" in result or "pnl_pct" in result:
@@ -2149,8 +2216,21 @@ async def trading_loop(app):
                 # 1) Position management ALWAYS runs first and is never blocked by entry gates.
                 events = await pos_manager.manage(lambda symbol: get_last_price(ex, symbol), live)
                 for ev in events:
-                    if ev.get("type") not in {"pending_sync_warning", "price_error"}:
-                        await notify_admin(app, format_position_event(ev), key="position_event")
+                    ev_type = str(ev.get("type") or "")
+                    if ev_type in {"pending_sync_warning", "price_error"}:
+                        continue
+                    text = format_position_event(ev)
+                    # Watchdog is a live status, not a trade event. Keep one message
+                    # at the bottom instead of spamming a new Telegram message each cycle.
+                    if ev_type == "protection_watchdog":
+                        symbol_key = str(ev.get("symbol") or "position").replace("/", "_").replace(":", "_")
+                        await notify_admin_bottom_replace(
+                            app,
+                            text,
+                            key=f"position_watchdog_{symbol_key}",
+                        )
+                    else:
+                        await notify_admin(app, text, key="position_event")
 
                 # 2) Refresh symbol universe for legacy scanner modes only.
                 # v0114: AI BTC/ETH scalping must not run the adaptive universe
