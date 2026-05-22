@@ -100,12 +100,38 @@ class ProtectionEngine:
                 # pseudo-orders.  Prefer a positionId match when available, but
                 # fall back to symbol-level matching because MEXC sometimes
                 # stores ids as strings or local rows may not have positionId.
-                local_pid = str(pos.get("position_id") or pos.get("positionId") or pos.get("id") or "")
-                row_pid = str(info.get("positionId") or info.get("position_id") or "")
+                # v0166: do NOT use generic pos["id"] for position matching.
+                # In this bot it can be a local/order id and will not match MEXC
+                # positionId, causing false LOCAL PROTECTION warnings even when
+                # /stoporder/open_orders shows active native TP/SL.  Only compare
+                # explicit exchange position ids; otherwise accept symbol/side +
+                # active native row with valid TP/SL prices.
+                raw_pos = pos.get("raw_exchange_position") if isinstance(pos.get("raw_exchange_position"), dict) else {}
+                raw_info = raw_pos.get("info") if isinstance(raw_pos.get("info"), dict) else {}
+                local_pid = str(
+                    pos.get("position_id")
+                    or pos.get("positionId")
+                    or pos.get("exchange_position_id")
+                    or raw_pos.get("positionId")
+                    or raw_pos.get("id")
+                    or raw_info.get("positionId")
+                    or raw_info.get("position_id")
+                    or ""
+                ).strip()
+                row_pid = str(info.get("positionId") or info.get("position_id") or "").strip()
                 pid_ok = (not local_pid) or (not row_pid) or (local_pid == row_pid)
-                if pid_ok and raw_tp > 0:
+                # If position ids differ but the native row is active and prices
+                # match the planned protection closely, still accept it.  This
+                # covers locally restored positions where local ids lag MEXC.
+                price_ok = True
+                if tp_price > 0 and raw_tp > 0:
+                    price_ok = price_ok and (abs(raw_tp - tp_price) / tp_price < 0.003)
+                if sl_price > 0 and raw_sl > 0:
+                    price_ok = price_ok and (abs(raw_sl - sl_price) / sl_price < 0.003)
+                native_row_ok = pid_ok or price_ok
+                if native_row_ok and raw_tp > 0:
                     found_tp = True; matched_tp_id = oid or row_pid or matched_tp_id
-                if pid_ok and raw_sl > 0:
+                if native_row_ok and raw_sl > 0:
                     found_sl = True; matched_sl_id = oid or row_pid or matched_sl_id
 
             if side_ok and (kind == "tp" or oid and oid == tp_id or "bot_tp" in txt or "take" in txt or "tp" in txt or "/tpsl/" in txt):
