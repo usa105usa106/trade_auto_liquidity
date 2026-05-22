@@ -1147,7 +1147,16 @@ class ExecutionEngine:
         entry = float(pos.get("entry_price") or 0)
         exit_price = float(exit_price or entry)
         pnl_pct = ((exit_price-entry)/entry*100) if str(pos.get("side")).upper()=="LONG" and entry else ((entry-exit_price)/entry*100 if entry else 0)
-        pnl_usdt = pnl_pct/100 * float(pos.get("qty") or 0) * entry
+        # MEXC futures qty can be contracts/holdVol after sync, not base BTC/ETH.
+        # Prefer stored USDT notional so tiny 0-fee scalps show real profit instead
+        # of 0.0000 when local qty is not base amount.
+        try:
+            notional = float(pos.get("notional_usdt") or pos.get("planned_notional_usdt") or pos.get("precheck_notional_usdt") or 0)
+        except Exception:
+            notional = 0.0
+        if notional <= 0 and entry > 0:
+            notional = abs(float(pos.get("qty") or 0) * entry)
+        pnl_usdt = pnl_pct / 100.0 * notional
         await self.storage.add_trade({
             "ts_open": pos.get("opened_at"),
             "ts_close": time.time(),

@@ -696,7 +696,7 @@ class AIScalpingEngine:
             self._decision_cache[base_key] = (now, dec)
             return dec
 
-        min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.52)
+        min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.72)
         # Use the existing global AI button as the on/off switch for optional confirmation.
         ai_confirm_enabled = bool(key) and _b(settings, "openai_analysis_enabled", False) and _b(settings, "ai_scalping_ai_entry_filter_enabled", True)
         spot_ratio = _f(ob_bias.get("ratio"), 0.0)
@@ -784,7 +784,7 @@ class AIScalpingEngine:
         if not decision.symbol:
             return "missing symbol"
         quality_mode = _b(settings, "ai_scalping_quality_filters_enabled", False)
-        min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.52)
+        min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.72)
         if quality_mode:
             min_conf = max(min_conf, _f(settings.get("ai_scalping_quality_min_confidence"), 0.72))
         if decision.confidence < min_conf:
@@ -824,7 +824,7 @@ class AIScalpingEngine:
         if not decision.ok or decision.decision not in {"LONG", "SHORT"} or not decision.symbol:
             return None
         quality_mode = _b(settings, "ai_scalping_quality_filters_enabled", False)
-        min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.52)
+        min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.72)
         if quality_mode:
             min_conf = max(min_conf, _f(settings.get("ai_scalping_quality_min_confidence"), 0.72))
         if decision.confidence < min_conf:

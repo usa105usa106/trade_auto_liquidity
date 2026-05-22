@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0166 MEXC NATIVE TPSL FALSE MISSING FIX")
+VERSION = os.getenv("BOT_VERSION", "0168 AI SCALPING CONF 072 AUDIT")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -96,7 +96,7 @@ class Defaults:
     liquidity_runner_enabled: bool = env_bool("LIQUIDITY_RUNNER_ENABLED", False)
 
     ai_scalping_symbols: str = os.getenv("AI_SCALPING_SYMBOLS", "BTC_USDT,ETH_USDT")
-    ai_scalping_min_confidence: float = env_float("AI_SCALPING_MIN_CONFIDENCE", 0.52)
+    ai_scalping_min_confidence: float = env_float("AI_SCALPING_MIN_CONFIDENCE", 0.72)
     ai_scalping_ai_entry_filter_enabled: bool = env_bool("AI_SCALPING_AI_ENTRY_FILTER_ENABLED", True)
     ai_scalping_tp_pct: float = env_float("AI_SCALPING_TP_PCT", 0.10)
     ai_scalping_sl_pct: float = env_float("AI_SCALPING_SL_PCT", 0.22)

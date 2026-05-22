@@ -49,6 +49,7 @@ started_at = time.time()
 exchange_client = None
 ws_supervisor = None
 trading_task = None
+position_task = None
 
 def admin_id_list() -> list[str]:
     return [x.strip() for x in str(ADMIN_IDS or os.getenv("ADMIN_IDS", "")).split(",") if x.strip()]
@@ -905,7 +906,7 @@ scan_market_source = binance_binance | mexc_mexc | mexc_binance.
 
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Regression marker: global running, trading_task
-    global running, entries_enabled, trading_task
+    global running, entries_enabled, trading_task, position_task
     if not allowed(update): return
     lock = context.application.bot_data.get("trading_start_lock")
     if lock is None:
@@ -923,6 +924,8 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             entries_enabled = True
             context.application.bot_data["recovery_checked_for_run"] = False
             trading_task = context.application.create_task(trading_loop(context.application))
+        if position_task is None or position_task.done():
+            position_task = context.application.create_task(position_management_loop(context.application))
 
     # v0079: one Run press must create exactly one Telegram message. Earlier
     # versions replied "started" and then immediately sent a separate scanner
@@ -938,7 +941,7 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trigger_scan_now(context.application, reason="run_button")
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global running, entries_enabled, trading_task
+    global running, entries_enabled, trading_task, position_task
     if not allowed(update): return
     entries_enabled = False
     # Keep the loop alive when it is already running so open positions continue
@@ -953,10 +956,13 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, "🟡 New entries stopped\n" + status + "\nUse /panic only for full emergency stop.", reply_markup=MAIN_MENU)
 
 async def panic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global running, entries_enabled
+    global running, entries_enabled, trading_task, position_task
     if not allowed(update): return
     entries_enabled = False
     running = False
+    for task in (trading_task, position_task):
+        if task and not task.done():
+            task.cancel()
     settings = await storage.all_settings()
     live = bool(settings.get("live_trading", False))
     closed_local = 0
@@ -2278,6 +2284,62 @@ async def account_equity_usdt(ex, default: float = 1000.0) -> float:
         log.debug("balance fetch failed, using default equity: %s", e)
         return float(default)
 
+
+def _boolish(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+async def emit_position_events(app, events: list[dict]) -> None:
+    """Send position notifications outside the critical trade management call.
+
+    PositionManager.manage() must be free to return quickly; Telegram delivery is
+    deliberately scheduled as background work so Telegram latency/rate limits do
+    not delay TP/SL checks or reduce-only market closes.
+    """
+    for ev in events or []:
+        ev_type = str(ev.get("type") or "")
+        if ev_type in {"pending_sync_warning", "price_error"}:
+            continue
+        text = format_position_event(ev)
+        if ev_type == "protection_watchdog":
+            symbol_key = str(ev.get("symbol") or "position").replace("/", "_").replace(":", "_")
+            app.create_task(notify_admin_bottom_replace(app, text, key=f"position_watchdog_{symbol_key}"))
+        else:
+            app.create_task(notify_admin(app, text, key="position_event"))
+
+async def position_management_loop(app):
+    """Fast execution/exit loop independent from Telegram and signal scanning.
+
+    This is the minimal separate execution loop: it only manages already-open
+    positions, checks local TP/SL against price, and sends close orders. New
+    entries, AI decisions, charts, scanner status and Telegram commands stay in
+    trading_loop / handlers.
+    """
+    global running, position_task
+    interval_default = os.getenv("EXECUTION_LOOP_INTERVAL_SEC", "0.25")
+    try:
+        while running:
+            try:
+                settings = await storage.all_settings()
+                live = bool(settings.get("live_trading", False))
+                ex = await get_exchange(settings)
+                exec_engine = ExecutionEngine(storage, ex)
+                pos_manager = PositionManager(storage, exec_engine)
+                events = await pos_manager.manage(lambda symbol: get_last_price(ex, symbol), live)
+                await emit_position_events(app, events)
+                interval = float(settings.get("execution_loop_interval_sec", interval_default) or interval_default)
+                await asyncio.sleep(max(0.05, min(interval, 2.0)))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.exception("position management loop error: %s", e)
+                await asyncio.sleep(1)
+    finally:
+        position_task = None
+
 async def trading_loop(app):
     global running, entries_enabled, trading_task
     try:
@@ -2295,24 +2357,11 @@ async def trading_loop(app):
                 exec_engine = ExecutionEngine(storage, ex)
                 pos_manager = PositionManager(storage, exec_engine)
 
-                # 1) Position management ALWAYS runs first and is never blocked by entry gates.
-                events = await pos_manager.manage(lambda symbol: get_last_price(ex, symbol), live)
-                for ev in events:
-                    ev_type = str(ev.get("type") or "")
-                    if ev_type in {"pending_sync_warning", "price_error"}:
-                        continue
-                    text = format_position_event(ev)
-                    # Watchdog is a live status, not a trade event. Keep one message
-                    # at the bottom instead of spamming a new Telegram message each cycle.
-                    if ev_type == "protection_watchdog":
-                        symbol_key = str(ev.get("symbol") or "position").replace("/", "_").replace(":", "_")
-                        await notify_admin_bottom_replace(
-                            app,
-                            text,
-                            key=f"position_watchdog_{symbol_key}",
-                        )
-                    else:
-                        await notify_admin(app, text, key="position_event")
+                # 1) Position management is handled by position_management_loop by default.
+                # Fallback to inline management only if explicitly disabled.
+                if not _boolish(settings.get("separate_execution_loop_enabled", os.getenv("SEPARATE_EXECUTION_LOOP_ENABLED", "true")), True):
+                    events = await pos_manager.manage(lambda symbol: get_last_price(ex, symbol), live)
+                    await emit_position_events(app, events)
 
                 # 2) Refresh symbol universe for legacy scanner modes only.
                 # v0114: AI BTC/ETH scalping must not run the adaptive universe
