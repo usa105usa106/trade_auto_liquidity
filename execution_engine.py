@@ -712,14 +712,30 @@ class ExecutionEngine:
         except Exception as e:
             return {"ok": False, "reason": str(e), "native_mexc_error": native_reason}
 
+    def _close_order_side_for_position(self, side: str) -> str:
+        """Return order side needed to close a position side.
+
+        Internal positions store side as LONG/SHORT, while MEXC native plan
+        orders expect close order side as buy/sell. Passing LONG/SHORT into the
+        native TP/SL layer made triggerType fallback to a wrong default and could
+        make SL/TP never place correctly.
+        """
+        s = str(side or "").strip().lower()
+        if s in {"long", "buy"}:
+            return "sell"
+        if s in {"short", "sell"}:
+            return "buy"
+        return s
+
     async def _create_trigger_market_order(self, symbol: str, side: str, qty: float, trigger_price: float, kind: str) -> dict:
         errors = []
+        close_side = self._close_order_side_for_position(side)
         try:
             native_name = "mexc_place_take_profit_market" if kind == "tp" else "mexc_place_stop_market"
             if hasattr(self.exchange_client, native_name):
                 fn = getattr(self.exchange_client, native_name)
                 return await fn(
-                    symbol=symbol, close_side=side, amount=qty, trigger_price=trigger_price,
+                    symbol=symbol, close_side=close_side, amount=qty, trigger_price=trigger_price,
                     client_order_id=f"bot_{kind}_{int(time.time()*1000)}",
                 )
         except Exception as e:
@@ -731,7 +747,7 @@ class ExecutionEngine:
         ]
         for type_, price, params in attempts:
             try:
-                return await self.exchange_client.create_order(symbol, type_, side, qty, price, params)
+                return await self.exchange_client.create_order(symbol, type_, close_side, qty, price, params)
             except Exception as e:
                 errors.append(f"{type_}: {e}")
         raise RuntimeError(f"{kind}-market protection failed: " + " | ".join(errors))

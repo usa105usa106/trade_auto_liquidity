@@ -1334,8 +1334,17 @@ class ExchangeClient:
         orders reject or never appear on MEXC.
         """
         msym = self._mexc_symbol(symbol)
-        side_l = str(close_side).lower()
+        side_l = str(close_side).lower().strip()
+        # Accept both position side (LONG/SHORT) and close order side (buy/sell).
+        # MEXC planorder fields need the close order side; LONG closes with sell,
+        # SHORT closes with buy.
+        if side_l == "long":
+            side_l = "sell"
+        elif side_l == "short":
+            side_l = "buy"
         kind_l = str(kind or "sl").lower()
+        if side_l not in {"buy", "sell"}:
+            raise ValueError(f"invalid MEXC close_side for trigger-market TP/SL: {close_side}")
         mexc_side = 2 if side_l == "buy" else 4
         trigger_type = self._mexc_plan_trigger_type(side_l, kind_l)
         ref = await self._mexc_reference_price(symbol, 0)

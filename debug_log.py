@@ -90,7 +90,6 @@ def tail_important(lines: int = 120, max_chars: int = 3500) -> str:
         "/api/v1/private/stoporder/place",
         "/api/v1/private/tpsl",
         "/api/v1/private/stoporder",
-        "/api/v1/private/position/open_positions",
     )
     important_kinds = (
         "error", "protection", "tpsl", "trigger", "opened", "closed",
