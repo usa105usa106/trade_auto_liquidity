@@ -448,25 +448,110 @@ def _extract_text(data: dict) -> str:
     return "\n".join(x.strip() for x in chunks if x and x.strip()).strip()
 
 
+def _first_json_object(text: str) -> str:
+    """Return the first balanced JSON object from messy LLM text."""
+    s = str(text or "")
+    start = s.find("{")
+    if start < 0:
+        return ""
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1]
+    return ""
+
+
+def _repair_ai_json_text(text: str) -> str:
+    """Best-effort repair for common non-strict JSON returned by chat models."""
+    s = str(text or "").strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.I).strip()
+    s = re.sub(r"\s*```$", "", s).strip()
+    obj = _first_json_object(s)
+    if obj:
+        s = obj
+    # Quote common unquoted keys and normalize Python/JS constants.
+    s = re.sub(r"([{,]\s*)(symbol|decision|side|confidence|tp_strength|reason)\s*:", r'\1"\2":', s, flags=re.I)
+    s = re.sub(r"\b(None|null)\b", "null", s, flags=re.I)
+    s = re.sub(r"\bTrue\b", "true", s)
+    s = re.sub(r"\bFalse\b", "false", s)
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    return s
+
+
+def _parse_ai_text_fallback(text: str, allowed_symbols: list[str], model: str) -> AIScalpDecision | None:
+    """Parse simple plain-text answers like 'BTC LONG 0.82' as a last resort.
+
+    This is only an anti-stall fallback for the optional AI filter. It does not
+    create a trade by itself: later code still requires the deterministic spot
+    orderbook side, futures momentum, min confidence and spread checks.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    up = raw.upper()
+    norm_allowed = {s.upper().replace("_", "").replace("/", "").replace(":USDT", ""): s for s in allowed_symbols}
+    symbol = ""
+    for k, v in norm_allowed.items():
+        if k in up or k.replace("USDT", "") in up:
+            symbol = v
+            break
+    if not symbol and allowed_symbols:
+        symbol = allowed_symbols[0]
+    decision = "WAIT"
+    if re.search(r"\b(LONG|BUY)\b", up):
+        decision = "LONG"
+    elif re.search(r"\b(SHORT|SELL)\b", up):
+        decision = "SHORT"
+    elif re.search(r"\b(WAIT|SKIP|NO\s*TRADE|HOLD)\b", up):
+        decision = "WAIT"
+    else:
+        return None
+    conf = 0.0
+    m = re.search(r"(?:CONF(?:IDENCE)?|C)\s*[:=]?\s*(0?\.\d+|1(?:\.0+)?|\d{1,3})", raw, flags=re.I)
+    if not m:
+        nums = [float(x) for x in re.findall(r"(?<![A-Za-z])(0?\.\d+|1(?:\.0+)?|\d{2,3})(?![A-Za-z])", raw)]
+        nums = [x / 100.0 if x > 1 else x for x in nums if 0 <= (x / 100.0 if x > 1 else x) <= 1]
+        conf = nums[0] if nums else 0.0
+    else:
+        conf = float(m.group(1)); conf = conf / 100.0 if conf > 1 else conf
+    tp = conf
+    mtp = re.search(r"TP[_\s-]*STRENGTH\s*[:=]?\s*(0?\.\d+|1(?:\.0+)?|\d{1,3})", raw, flags=re.I)
+    if mtp:
+        tp = float(mtp.group(1)); tp = tp / 100.0 if tp > 1 else tp
+    reason = _clean_reason(raw, 180) or "parsed non-strict AI text"
+    return AIScalpDecision(ok=True, symbol=symbol, decision=decision, confidence=max(0.0, min(1.0, conf)), reason=reason, raw=raw[:1000], model=model + "/text_fallback", tp_strength=max(0.0, min(1.0, tp)))
+
+
 def parse_ai_scalp_decision(text: str, allowed_symbols: list[str], model: str) -> AIScalpDecision:
     raw = (text or "").strip()
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I).strip()
-    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    cleaned = _repair_ai_json_text(raw)
     data = None
     try:
         data = json.loads(cleaned)
     except Exception:
-        m = re.search(r"\{.*\}", cleaned, flags=re.S)
-        if m:
-            try:
-                data = json.loads(m.group(0))
-            except Exception:
-                data = None
+        data = None
     if not isinstance(data, dict):
-        # v0148: strict AI JSON. Never infer LONG/SHORT from plain text and
-        # never inject fallback confidence such as 0.72. A malformed response is
-        # a WAIT/reject so the bot only enters on deterministic JSON.
-        return AIScalpDecision(ok=False, symbol=allowed_symbols[0] if allowed_symbols else "", decision="WAIT", confidence=0.0, error="AI did not return strict JSON", reason="malformed AI JSON", raw=raw[:1000], model=model)
+        fb = _parse_ai_text_fallback(raw, allowed_symbols, model)
+        if fb is not None:
+            return fb
+        return AIScalpDecision(ok=False, symbol=allowed_symbols[0] if allowed_symbols else "", decision="WAIT", confidence=0.0, error="AI JSON parse failed", reason="malformed AI JSON/text", raw=raw[:1000], model=model)
     symbol = str(data.get("symbol") or "").upper().replace("_", "").replace("/", "").replace(":USDT", "")
     norm_allowed = {s.upper().replace("_", "").replace("/", "").replace(":USDT", ""): s for s in allowed_symbols}
     if symbol not in norm_allowed:
@@ -750,7 +835,11 @@ class AIScalpingEngine:
                             parsed = _extract_text(json.loads(txt))
                             dec = parse_ai_scalp_decision(parsed, allowed, model)
                             dec.market = {"markets": markets}
-                            if dec.ok and dec.decision in {"LONG", "SHORT"} and dec.decision != side:
+                            if not dec.ok:
+                                # v0169: optional AI filter must not stall a valid deterministic scalp.
+                                # If JSON/text parsing fails, keep the local orderbook+momo side and mark it.
+                                dec = AIScalpDecision(ok=True, symbol=allowed_symbol, decision=side, confidence=local_conf, reason=(f"AI parse fallback; local {side}: {ob_bias.get('reason')}; {mom.get('reason')}")[:180], raw=parsed[:1000], model="spot_orderbook+ai_parse_fallback", market={"markets": markets}, tp_strength=local_strength)
+                            elif dec.decision in {"LONG", "SHORT"} and dec.decision != side:
                                 dec = AIScalpDecision(ok=True, symbol=allowed_symbol, decision="WAIT", confidence=0.0, reason=f"AI tried {dec.decision}, spot side is {side}", raw=parsed[:1000], model=model, market={"markets": markets})
                             if dec.ok and dec.decision == "WAIT":
                                 self._decision_cache[base_key] = (time.time(), dec)
@@ -768,6 +857,10 @@ class AIScalpingEngine:
                             parsed2 = _extract_text(json.loads(txt2))
                             dec = parse_ai_scalp_decision(parsed2, allowed, model)
                             dec.market = {"markets": markets}
+                            if not dec.ok:
+                                dec = AIScalpDecision(ok=True, symbol=allowed_symbol, decision=side, confidence=local_conf, reason=(f"AI fallback parse failed; local {side}: {ob_bias.get('reason')}; {mom.get('reason')}")[:180], raw=parsed2[:1000], model="spot_orderbook+ai_parse_fallback", market={"markets": markets}, tp_strength=local_strength)
+                            elif dec.decision in {"LONG", "SHORT"} and dec.decision != side:
+                                dec = AIScalpDecision(ok=True, symbol=allowed_symbol, decision="WAIT", confidence=0.0, reason=f"AI tried {dec.decision}, spot side is {side}", raw=parsed2[:1000], model=model, market={"markets": markets})
                             if dec.ok and dec.decision == "WAIT":
                                 self._decision_cache[base_key] = (time.time(), dec)
                             return dec
