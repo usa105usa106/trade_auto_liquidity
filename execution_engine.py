@@ -2,6 +2,7 @@ import time
 import asyncio
 import os
 from models import TradePlan
+from debug_log import log_event
 
 class ExecutionEngine:
     """
@@ -382,7 +383,14 @@ class ExecutionEngine:
             # orders; this is more reliable than opening first and trying to attach
             # protection a few seconds later. Liquidation-stop mode intentionally
             # has no exchange SL, so it still places TP after the position is live.
-            if str(getattr(plan, "strategy", "") or "").lower() == "ai_scalping" and not bool(getattr(plan, "liquidation_stop_mode", False)):
+            # v0155: do not attach TP/SL to the opening order by default.
+            # On MEXC, tiny scalp TP/SL attached to `/order/create` often returns
+            # code 5003 ("stop-limit order price error") before the position even
+            # exists.  The reliable flow is: open clean market entry -> wait until
+            # positionId/holdVol is visible -> place real exchange TP/SL/plan
+            # orders -> verify.  Re-enable only for manual testing.
+            attach_on_entry = os.getenv("MEXC_ATTACH_TPSL_ON_ENTRY", "false").lower() in {"1", "true", "yes", "on"}
+            if attach_on_entry and str(getattr(plan, "strategy", "") or "").lower() == "ai_scalping" and not bool(getattr(plan, "liquidation_stop_mode", False)):
                 try:
                     if float(getattr(plan, "take_price", 0) or 0) > 0 and float(getattr(plan, "stop_price", 0) or 0) > 0:
                         params.update({
@@ -819,7 +827,10 @@ class ExecutionEngine:
         history = []
         best = {"ok": False}
         for i in range(attempts):
+            tp = float(pos.get("take_price") or 0)
+            sl = float(pos.get("stop_price") or 0)
             out = {"ok": True, "attempt": i + 1}
+            log_event("protection_attempt_start", symbol=symbol, side=side, qty=qty, take_price=tp, stop_price=sl, liquidation_stop_mode=liquidation_stop_mode, attempt=i + 1)
             # Do NOT cancel all orders on early retries. In v0146 this could
             # remove an attached TP/SL leg that was actually accepted but not yet
             # visible in every endpoint. Only do destructive cleanup after several
@@ -830,8 +841,6 @@ class ExecutionEngine:
                 except Exception as e:
                     out["retry_cancel_error"] = str(e)[:240]
                 await asyncio.sleep(delay)
-            tp = float(pos.get("take_price") or 0)
-            sl = float(pos.get("stop_price") or 0)
             if liquidation_stop_mode:
                 try:
                     if tp > 0:
@@ -854,10 +863,12 @@ class ExecutionEngine:
                 try:
                     if tp <= 0 or sl <= 0:
                         raise RuntimeError("missing take_price/stop_price for position TP/SL")
+                    log_event("mexc_native_tpsl_request", symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp, attempt=i + 1)
                     order = await self.exchange_client.mexc_place_tpsl_by_position(
                         symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp,
                         client_order_id=f"bot_tpsl_{int(time.time()*1000)}",
                     )
+                    log_event("mexc_native_tpsl_response", symbol=symbol, side=side, attempt=i + 1, order=order, ok=True)
                     oid = str(order.get("id") or "")
                     out["tp_order_id"] = oid
                     out["sl_order_id"] = oid
@@ -876,6 +887,7 @@ class ExecutionEngine:
                         native_tpsl_ok = True
                     else:
                         out["tpsl_error"] = str(e)[:500]
+                        log_event("error_mexc_native_tpsl", symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp, attempt=i + 1, error=str(e), ok=False)
 
                 if native_tpsl_ok:
                     # A combined native TP/SL request was accepted. Give MEXC one
@@ -891,22 +903,28 @@ class ExecutionEngine:
                     # classify them by trigger price/kind.
                     try:
                         if tp > 0:
+                            log_event("mexc_trigger_tp_request", symbol=symbol, side=side, qty=qty, trigger_price=tp, attempt=i + 1)
                             order = await self._create_take_profit_market_order(symbol, side, qty, tp)
                             out["tp_order_id"] = order.get("id")
                             out["tp_raw"] = order
+                            log_event("mexc_trigger_tp_response", symbol=symbol, side=side, trigger_price=tp, attempt=i + 1, order=order, ok=True)
                         else:
                             out["tp_error"] = "missing take_price"
                     except Exception as e:
                         out["tp_error"] = str(e)[:500]
+                        log_event("error_mexc_trigger_tp", symbol=symbol, side=side, qty=qty, trigger_price=tp, attempt=i + 1, error=str(e), ok=False)
                     try:
                         if sl > 0:
+                            log_event("mexc_trigger_sl_request", symbol=symbol, side=side, qty=qty, trigger_price=sl, attempt=i + 1)
                             order = await self._create_stop_market_order(symbol, side, qty, sl)
                             out["sl_order_id"] = order.get("id")
                             out["sl_raw"] = order
+                            log_event("mexc_trigger_sl_response", symbol=symbol, side=side, trigger_price=sl, attempt=i + 1, order=order, ok=True)
                         else:
                             out["sl_error"] = "missing stop_price"
                     except Exception as e:
                         out["sl_error"] = str(e)[:500]
+                        log_event("error_mexc_trigger_sl", symbol=symbol, side=side, qty=qty, trigger_price=sl, attempt=i + 1, error=str(e), ok=False)
             else:
                 try:
                     if tp > 0:
@@ -947,6 +965,7 @@ class ExecutionEngine:
                 out["ok"] = bool(out.get("tp_exists") and out.get("sl_exists"))
                 out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
                 out["protection_mode"] = "exchange" if out["ok"] else "local_monitoring"
+            log_event("protection_attempt_result", symbol=symbol, side=side, attempt=i + 1, ok=out.get("ok"), tp_exists=out.get("tp_exists"), sl_exists=out.get("sl_exists"), tp_order_id=out.get("tp_order_id"), sl_order_id=out.get("sl_order_id"), tpsl_error=out.get("tpsl_error"), tp_error=out.get("tp_error"), sl_error=out.get("sl_error"), verify_error=out.get("verify_error"))
             history.append({k: v for k, v in out.items() if k not in {"tp_raw", "sl_raw"}})
             best = out
             if out["ok"]:
@@ -958,6 +977,7 @@ class ExecutionEngine:
         best["protection_mode"] = "local_monitoring"
         best["protection_attempts"] = history
         best["protection_warning"] = "exchange protection not confirmed after 3 attempts; caller must close unprotected position"
+        log_event("error_protection_failed_final", symbol=symbol, side=side, qty=qty, take_price=pos.get("take_price"), stop_price=pos.get("stop_price"), attempts=history, ok=False)
         return best
 
     async def cancel_entry(self, pos: dict, live: bool, reason: str = "limit_timeout"):

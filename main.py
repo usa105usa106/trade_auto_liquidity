@@ -31,6 +31,7 @@ from ai_scalping_engine import AIScalpingEngine
 from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
+from debug_log import tail_text
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
@@ -829,6 +830,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     await reply(update, f"🤖 Liquidity Bot v{VERSION}\nГлавное меню:", reply_markup=MAIN_MENU)
 
+
+async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    try:
+        n = 80
+        if context.args:
+            try:
+                n = max(20, min(300, int(context.args[0])))
+            except Exception:
+                n = 80
+        text = tail_text(lines=n, max_chars=3500)
+        # Telegram message limit is 4096. Keep it copyable and readable.
+        await reply(update, "🧾 Last bot logs:\n```\n" + text[-3400:] + "\n```", reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"/log error: {e}", reply_markup=MAIN_MENU)
+
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     await reply(update, f"""
@@ -837,6 +856,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Команды:
 /start - меню
 /help - помощь
+/log [lines] - последние MEXC/TP-SL ошибки
 /run - запустить торговлю
 /stop - остановить новые входы
 /panic - закрыть позиции и отменить ордера
@@ -2529,7 +2549,26 @@ async def trading_loop(app):
                             )
                             await send_trade_chart(app, ex, plan, settings)
                         else:
-                            waited.append(f"{b}:execution rejected {placed.get('reason', 'unknown')}")
+                            reason = str(placed.get('reason', 'unknown'))
+                            waited.append(f"{b}:execution rejected {reason}")
+                            # v0154 visibility: if the exchange entry was opened and then
+                            # immediately closed because TP/SL could not be confirmed, tell
+                            # the user explicitly. Otherwise balance changes look like
+                            # invisible phantom trades.
+                            if 'protection' in placed or 'position closed' in reason.lower():
+                                close = placed.get('close') or {}
+                                pnl = close.get('pnl_usdt')
+                                pp = close.get('pnl_pct')
+                                msg = (
+                                    "🛑 AI scalp aborted after entry\n"
+                                    f"{getattr(plan, 'symbol', b)} {getattr(plan, 'side', '-')}\n"
+                                    "Reason: exchange TP/SL not confirmed. Position was closed immediately.\n"
+                                    f"PnL: {pnl:.4f} USDT ({pp:.3f}%)" if isinstance(pnl, (int, float)) and isinstance(pp, (int, float)) else
+                                    "🛑 AI scalp aborted after entry\n"
+                                    f"{getattr(plan, 'symbol', b)} {getattr(plan, 'side', '-')}\n"
+                                    "Reason: exchange TP/SL not confirmed. Position was closed immediately."
+                                )
+                                await notify_admin(app, msg, key=f"ai_scalp_aborted_{b}")
 
                     scanner.last_ai_check_symbols = ai_checked
                     if opened:
@@ -2691,7 +2730,22 @@ async def trading_loop(app):
                         )
                         await send_trade_chart(app, ex, plan, settings)
                     else:
-                        scanner.last_reject_reason = f"{plan.symbol}: execution rejected: {placed.get('reason', 'unknown')}"
+                        reason = str(placed.get('reason', 'unknown'))
+                        scanner.last_reject_reason = f"{plan.symbol}: execution rejected: {reason}"
+                        if 'protection' in placed or 'position closed' in reason.lower():
+                            close = placed.get('close') or {}
+                            pnl = close.get('pnl_usdt')
+                            pp = close.get('pnl_pct')
+                            msg = (
+                                "🛑 Trade aborted after entry\n"
+                                f"{plan.symbol} {plan.side}\n"
+                                "Reason: exchange TP/SL not confirmed. Position was closed immediately.\n"
+                                f"PnL: {pnl:.4f} USDT ({pp:.3f}%)" if isinstance(pnl, (int, float)) and isinstance(pp, (int, float)) else
+                                "🛑 Trade aborted after entry\n"
+                                f"{plan.symbol} {plan.side}\n"
+                                "Reason: exchange TP/SL not confirmed. Position was closed immediately."
+                            )
+                            await notify_admin(app, msg, key=f"trade_aborted_{plan.symbol}")
 
                 if candidates and not opened_this_cycle:
                     await update_scanner_status(app, settings, status="signal rejected", force=True)
@@ -2731,6 +2785,7 @@ def build_app():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("log", log_cmd))
     app.add_handler(CommandHandler("run", run_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("panic", panic_cmd))

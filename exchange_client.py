@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 
 import aiohttp
 import ccxt.async_support as ccxt
+from debug_log import log_mexc
 
 try:
     from aiohttp_socks import ProxyConnector
@@ -652,6 +653,7 @@ class ExchangeClient:
                     out = json.loads(text)
                 except Exception:
                     out = {"raw": text}
+                log_mexc(method, path, request={"body": body, "query": query}, response=out, status=r.status)
                 if r.status == 401 or r.status == 403 or str(out.get("code")) in {"401", "403", "602", "603"}:
                     # One retry after syncing MEXC server time.
                     await self._sync_mexc_time(silent=True)
@@ -664,10 +666,13 @@ class ExchangeClient:
                             out = json.loads(text)
                         except Exception:
                             out = {"raw": text}
+                        log_mexc(method, path, request={"body": body, "query": query, "retry": True}, response=out, status=r2.status)
                         if r2.status >= 400 or out.get("success") is False:
+                            log_mexc(method, path, request={"body": body, "query": query, "retry": True}, response=out, status=r2.status, error=out)
                             raise RuntimeError(f"HTTP {r2.status}: {out}")
                         return out
                 if r.status >= 400 or out.get("success") is False:
+                    log_mexc(method, path, request={"body": body, "query": query}, response=out, status=r.status, error=out)
                     raise RuntimeError(f"HTTP {r.status}: {out}")
                 return out
 
@@ -1301,25 +1306,38 @@ class ExchangeClient:
             raise NotImplementedError("native close_all is MEXC only")
         return await self._mexc_private("POST", "/api/v1/private/position/close_all", body={})
 
+    def _mexc_plan_trigger_type(self, close_side: str, kind: str) -> int:
+        """Return MEXC plan triggerType for a close TP/SL order.
+
+        MEXC docs: triggerType=1 means price >= trigger, triggerType=2 means
+        price <= trigger. `trend` is NOT direction; it is the reference price
+        type (1 latest, 2 fair, 3 index).
+
+        Closing LONG uses sell orders: TP above current => >=, SL below => <=.
+        Closing SHORT uses buy orders: TP below current => <=, SL above => >=.
+        """
+        side_l = str(close_side or "").lower()
+        kind_l = str(kind or "sl").lower()
+        if side_l == "sell":  # close LONG
+            return 1 if kind_l == "tp" else 2
+        if side_l == "buy":   # close SHORT
+            return 2 if kind_l == "tp" else 1
+        return 1
+
     async def mexc_place_trigger_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, kind: str = "sl", client_order_id: str = "") -> dict:
         """Place a native MEXC futures trigger-market close order for TP or SL.
 
-        MEXC plan orders use numeric close sides: 2 closes a short position
-        (buy), 4 closes a long position (sell). The `trend` is the trigger
-        direction, not the order side:
-          - close short / buy: SL triggers upward, TP triggers downward
-          - close long / sell: SL triggers downward, TP triggers upward
-        Using trigger-market for both TP and SL avoids frozen reduce-only limit
-        orders and is more reliable after bot restarts.
+        This is the reliable fallback used by the bot after a position is live.
+        It sends a real MEXC plan order with market execution.  Important:
+        `triggerType` is the up/down condition; `trend` is only the reference
+        price type. Older versions mixed those two fields, which made TP/SL
+        orders reject or never appear on MEXC.
         """
         msym = self._mexc_symbol(symbol)
         side_l = str(close_side).lower()
         kind_l = str(kind or "sl").lower()
         mexc_side = 2 if side_l == "buy" else 4
-        if side_l == "buy":
-            trend = 1 if kind_l == "sl" else 2
-        else:
-            trend = 2 if kind_l == "sl" else 1
+        trigger_type = self._mexc_plan_trigger_type(side_l, kind_l)
         ref = await self._mexc_reference_price(symbol, 0)
         safe_trigger = self._mexc_safe_trigger_price_sync(symbol, close_side, kind_l, float(trigger_price), ref)
         body = {
@@ -1331,8 +1349,11 @@ class ExchangeClient:
             "triggerPrice": safe_trigger,
             "executePrice": 0,
             "orderType": 5,
-            "triggerType": 1,
-            "trend": trend,
+            "triggerType": trigger_type,
+            "trend": int(os.getenv("MEXC_PLAN_TREND", "1") or "1"),
+            "executeCycle": int(os.getenv("MEXC_PLAN_EXECUTE_CYCLE", "1") or "1"),
+            "reduceOnly": True,
+            "priceProtect": int(os.getenv("MEXC_PLAN_PRICE_PROTECT", "0") or "0"),
         }
         if client_order_id:
             body["externalOid"] = str(client_order_id)[:32]
@@ -1564,6 +1585,7 @@ class ExchangeClient:
         elif has_trigger_price or (has_attached_tpsl and reduce_only):
             # Native plan order. Used for SL/TP fallback only if ccxt fails.
             trigger_price = self._mexc_price_to_precision(symbol, float(params.get("triggerPrice") or params.get("stopPrice") or params.get("stopLossPrice") or params.get("takeProfitPrice")))
+            kind = "tp" if params.get("takeProfitPrice") else "sl"
             body = {
                 "symbol": self._mexc_symbol(symbol),
                 "vol": self._amount_to_mexc_vol(symbol, amount),
@@ -1573,8 +1595,11 @@ class ExchangeClient:
                 "triggerPrice": trigger_price,
                 "executePrice": 0,
                 "orderType": 5,
-                "triggerType": 1,
-                "trend": (1 if (str(side).lower() == "buy" and params.get("stopLossPrice")) or (str(side).lower() == "sell" and params.get("takeProfitPrice")) else 2),
+                "triggerType": self._mexc_plan_trigger_type(str(side).lower(), kind),
+                "trend": int(os.getenv("MEXC_PLAN_TREND", "1") or "1"),
+                "executeCycle": int(os.getenv("MEXC_PLAN_EXECUTE_CYCLE", "1") or "1"),
+                "reduceOnly": True,
+                "priceProtect": int(os.getenv("MEXC_PLAN_PRICE_PROTECT", "0") or "0"),
             }
             if params.get("clientOrderId"):
                 body["externalOid"] = str(params.get("clientOrderId"))[:32]

@@ -316,3 +316,17 @@ MARGIN_ALLOCATION_ENABLED=true
 - After entry, AI scalping waits longer before placing TP/SL (`AI_SCALPING_PROTECTION_DELAY_SEC=3.0`) and retries protection more times.
 - If exchange TP/SL is still not confirmed, the position remains under local monitoring: the bot closes on local `take_price` or `stop_price`, while the watchdog keeps trying to restore exchange protection.
 - A successful native MEXC TPSL response with an id is treated as protected even if open-order visibility lags.
+
+
+## v0156 FULL MEXC DEBUG LOGS
+- Version updated to `0156 FULL MEXC DEBUG LOGS`.
+- BTC spot orderbook imbalance threshold softened to `1.35`.
+- ETH spot orderbook imbalance threshold softened to `1.30`.
+- Old persisted generic `1.80` is treated as the old packaged default and no longer blocks BTC/ETH micro-scalp.
+
+
+## v0156 FULL MEXC DEBUG LOGS
+- MEXC TP/SL now uses clean entry first, then real exchange protection after positionId is visible.
+- Fixed planorder triggerType: TP/SL direction is now sent in triggerType, not trend.
+- Added executeCycle/reduceOnly/priceProtect fields to trigger-market plan orders.
+- Entry-attached TP/SL is disabled by default via MEXC_ATTACH_TPSL_ON_ENTRY=false.

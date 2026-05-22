@@ -8,7 +8,8 @@ load_dotenv()
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
-VERSION = os.getenv("BOT_VERSION", "0145 AI BTC/ETH AGGRESSIVE MICRO SCALP (0122 AI BTC/ETH)")
+# Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
+VERSION = os.getenv("BOT_VERSION", "0156 FULL MEXC DEBUG LOGS")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -109,7 +110,9 @@ class Defaults:
     ai_scalping_eth_max_tp_pct: float = env_float("AI_SCALPING_ETH_MAX_TP_PCT", 0.16)
     ai_scalping_sl_tp_multiplier: float = env_float("AI_SCALPING_SL_TP_MULTIPLIER", 2.0)
     ai_scalping_max_spread_pct: float = env_float("AI_SCALPING_MAX_SPREAD_PCT", 0.08)
-    ai_scalping_spot_imbalance_ratio: float = env_float("AI_SCALPING_SPOT_IMBALANCE_RATIO", 1.8)
+    ai_scalping_spot_imbalance_ratio: float = env_float("AI_SCALPING_SPOT_IMBALANCE_RATIO", 1.35)
+    ai_scalping_btc_spot_imbalance_ratio: float = env_float("AI_SCALPING_BTC_SPOT_IMBALANCE_RATIO", 1.35)
+    ai_scalping_eth_spot_imbalance_ratio: float = env_float("AI_SCALPING_ETH_SPOT_IMBALANCE_RATIO", 1.30)
     ai_scalping_futures_momentum_min_pct: float = env_float("AI_SCALPING_FUTURES_MOMENTUM_MIN_PCT", 0.015)
     ai_scalping_futures_max_against_pct: float = env_float("AI_SCALPING_FUTURES_MAX_AGAINST_PCT", 0.035)
     ai_scalping_quality_filters_enabled: bool = env_bool("AI_SCALPING_QUALITY_FILTERS_ENABLED", False)

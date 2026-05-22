@@ -85,6 +85,8 @@ DEFAULT_SETTINGS = {
     "ai_scalping_sl_tp_multiplier": DEFAULTS.ai_scalping_sl_tp_multiplier,
     "ai_scalping_max_spread_pct": DEFAULTS.ai_scalping_max_spread_pct,
     "ai_scalping_spot_imbalance_ratio": DEFAULTS.ai_scalping_spot_imbalance_ratio,
+    "ai_scalping_btc_spot_imbalance_ratio": DEFAULTS.ai_scalping_btc_spot_imbalance_ratio,
+    "ai_scalping_eth_spot_imbalance_ratio": DEFAULTS.ai_scalping_eth_spot_imbalance_ratio,
     "ai_scalping_futures_momentum_min_pct": DEFAULTS.ai_scalping_futures_momentum_min_pct,
     "ai_scalping_futures_max_against_pct": DEFAULTS.ai_scalping_futures_max_against_pct,
     "ai_scalping_quality_filters_enabled": DEFAULTS.ai_scalping_quality_filters_enabled,

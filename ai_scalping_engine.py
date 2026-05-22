@@ -273,21 +273,59 @@ def _depth_usdt_within(ob: dict, price: float, side: str, window_pct: float = 0.
     return total
 
 
+def _spot_orderbook_threshold(symbol: str, settings: dict) -> float:
+    """v0153: BTC/ETH use separate, softer SPOT imbalance thresholds.
+
+    Old v0152 default 1.80 was too rare for BTC/ETH micro-scalp.  The generic
+    key is still supported for manual override, but if an old DB still contains
+    1.80 we treat it as the old packaged default and use the new per-symbol
+    thresholds instead.
+    """
+    sym = str(symbol or "").upper().replace("_", "/")
+    generic = settings.get("ai_scalping_spot_imbalance_ratio")
+    try:
+        generic_f = float(generic) if generic is not None else None
+    except Exception:
+        generic_f = None
+    is_old_default = generic_f is None or abs(generic_f - 1.8) < 1e-9
+    if sym.startswith("BTC"):
+        default = _f(os.getenv("AI_SCALPING_BTC_SPOT_IMBALANCE_RATIO"), 1.35)
+        val = settings.get("ai_scalping_btc_spot_imbalance_ratio")
+    elif sym.startswith("ETH"):
+        default = _f(os.getenv("AI_SCALPING_ETH_SPOT_IMBALANCE_RATIO"), 1.30)
+        val = settings.get("ai_scalping_eth_spot_imbalance_ratio")
+    else:
+        default = _f(os.getenv("AI_SCALPING_SPOT_IMBALANCE_RATIO"), 1.35)
+        val = None
+    if val is None and not is_old_default:
+        val = generic_f
+    # v0154: old packages/settings could also persist 1.80 in the per-symbol
+    # keys. Treat exactly 1.80 as the obsolete default for BTC/ETH instead of
+    # letting stale DB settings make the new scalp mode silent again.
+    try:
+        val_f = float(val) if val is not None else None
+    except Exception:
+        val_f = None
+    if sym.startswith(("BTC", "ETH")) and val_f is not None and abs(val_f - 1.8) < 1e-9:
+        val = default
+    ratio_min = _f(val, default)
+    return max(1.05, ratio_min)
+
+
 def _spot_orderbook_bias(market: dict, settings: dict) -> dict:
     """Direction from SPOT liquidity only. No AI, no sweep logic."""
     bid_depth = _f(market.get("spot_bid_depth_usdt"), 0.0)
     ask_depth = _f(market.get("spot_ask_depth_usdt"), 0.0)
-    ratio_min = _f(settings.get("ai_scalping_spot_imbalance_ratio"), _f(os.getenv("AI_SCALPING_SPOT_IMBALANCE_RATIO"), 1.8))
-    ratio_min = max(1.05, ratio_min)
+    ratio_min = _spot_orderbook_threshold(str(market.get("symbol") or ""), settings)
     if bid_depth <= 0 or ask_depth <= 0:
-        return {"side": "WAIT", "ratio": 0.0, "reason": "spot depth missing"}
+        return {"side": "WAIT", "ratio": 0.0, "threshold": ratio_min, "reason": "spot depth missing"}
     bid_ask = bid_depth / max(1e-12, ask_depth)
     ask_bid = ask_depth / max(1e-12, bid_depth)
     if bid_ask >= ratio_min:
-        return {"side": "LONG", "ratio": _r(bid_ask, 3), "reason": f"spot bid/ask {bid_ask:.2f} >= {ratio_min:.2f}"}
+        return {"side": "LONG", "ratio": _r(bid_ask, 3), "threshold": ratio_min, "reason": f"spot bid/ask {bid_ask:.2f} >= {ratio_min:.2f}"}
     if ask_bid >= ratio_min:
-        return {"side": "SHORT", "ratio": _r(ask_bid, 3), "reason": f"spot ask/bid {ask_bid:.2f} >= {ratio_min:.2f}"}
-    return {"side": "WAIT", "ratio": _r(max(bid_ask, ask_bid), 3), "reason": f"spot imbalance {max(bid_ask, ask_bid):.2f} < {ratio_min:.2f}"}
+        return {"side": "SHORT", "ratio": _r(ask_bid, 3), "threshold": ratio_min, "reason": f"spot ask/bid {ask_bid:.2f} >= {ratio_min:.2f}"}
+    return {"side": "WAIT", "ratio": _r(max(bid_ask, ask_bid), 3), "threshold": ratio_min, "reason": f"spot imbalance {max(bid_ask, ask_bid):.2f} < {ratio_min:.2f}"}
 
 
 def _futures_micro_momentum(market: dict, side: str, settings: dict) -> dict:
@@ -640,7 +678,7 @@ class AIScalpingEngine:
             self._decision_cache[base_key] = (now, dec)
             return dec
 
-        # v0152 REAL orderbook scalp path:
+        # v0153 REAL orderbook scalp path with balanced BTC/ETH thresholds:
         # 1) SPOT orderbook chooses LONG/SHORT bias.
         # 2) FUTURES micro momentum confirms price is not moving against it.
         # 3) OpenAI is optional and can only reject; it no longer chooses direction.
