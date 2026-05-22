@@ -1276,8 +1276,8 @@ class ExchangeClient:
         # MEXC accounts those zero limit-price fields make the native TP/SL row
         # fail or not appear.  lossTrend/profitTrend are price source selectors,
         # not LONG/SHORT direction.
-        safe_sl = self._price_to_precision(symbol, safe_sl)
-        safe_tp = self._price_to_precision(symbol, safe_tp)
+        safe_sl = self._mexc_price_to_precision(symbol, safe_sl)
+        safe_tp = self._mexc_price_to_precision(symbol, safe_tp)
         try:
             vol = self._amount_to_mexc_vol(symbol, vol)
         except Exception:

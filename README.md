@@ -353,8 +353,13 @@ MARGIN_ALLOCATION_ENABLED=true
 - If direct native TP/SL fails, the old generic retry/fallback path still runs and the position is closed if protection is missing.
 
 
-## v0162 WORKING BOT MEXC TPSL PAYLOAD
+## v0163 MEXC TPSL PRECISION METHOD FIX
 - Compared against the working Railway/Ollama bot.
 - Native MEXC TP/SL now uses `/api/v1/private/stoporder/place` by `positionId` with `volType=2`, `profitLossVolType=SAME`, market TP/SL types, `takeProfitReverse=2`, `stopLossReverse=2`.
 - Removed zero `takeProfitOrderPrice` / `stopLossOrderPrice` fields from native market TP/SL payload.
 - Direct native TP/SL placement no longer depends on `strategy == ai_scalping`; any normal protected BTC/ETH scalp with TP+SL uses it.
+
+
+## v0163 MEXC TPSL PRECISION METHOD FIX
+- Fixed native TP/SL direct path calling non-existent `_price_to_precision`.
+- Native `/stoporder/place` now uses existing `_mexc_price_to_precision`, so TP/SL can actually be posted after entry.
