@@ -1,4 +1,8 @@
-## v0174 BOOST MAX AGGRESSION
+## v0179 REAL SYMBOL FAILOVER
+
+Preloaded 0-fee whitelist from user screenshots. `/boost_list` can still replace it and `/boost_list_del` clears it.
+
+## v0179 REAL SYMBOL FAILOVER
 
 - `/boost_start` starts autopilot: reserves `BOOST_BALANCE_SHARE=0.10` of current futures equity as the BOOST bank.
 - Target is `BOOST_TARGET_MULTIPLIER=20`; example 50 USDT balance -> 5 USDT bank -> 100 USDT target bank.
@@ -405,7 +409,7 @@ MARGIN_ALLOCATION_ENABLED=true
 - Watchdog notifications now use `tp_exists/sl_exists` aliases correctly.
 
 
-## v0174 BOOST MAX AGGRESSION
+## v0179 REAL SYMBOL FAILOVER
 
 - One live Telegram BOOST panel is edited instead of spamming messages.
 - Inline buttons: Rotation ON/OFF, Live panel ON/OFF, Refresh.
@@ -414,3 +418,10 @@ MARGIN_ALLOCATION_ENABLED=true
 - Defaults: rotation only if PnL >= 0.04%, strength multiplier 1.35x, score gap 5.0, cooldown 20s.
 
 Commands: `/boost_start`, `/boost_stop`, `/boost_status`, `/boost_rotation`.
+
+
+## v0179 REAL SYMBOL FAILOVER
+
+- `/boost_list BTC,ETH,SOL` sets trusted 0-fee BOOST whitelist. Lower/upper case and comma-separated lists are accepted. Tokens are normalized to `BTCUSDT`, `ETHUSDT`, etc.
+- `/boost_list` shows the current whitelist.
+- `/boost_list_del` clears all whitelist symbols and disables manual fee fallback.

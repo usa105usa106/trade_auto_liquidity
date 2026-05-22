@@ -2,13 +2,44 @@
 from __future__ import annotations
 
 import time
+import json
 from typing import Any
 
 from ai_scalping_engine import AIScalpDecision, AIScalpingEngine, _f, _r, _depth_usdt_within
 
 
+def _blocked_symbols_from_settings(settings: dict) -> set[str]:
+    """Return normalized symbols temporarily blacklisted by BOOST failover.
+
+    Stored format is JSON: {"BTCUSDT": {"until": 123, "reason": "..."}}.
+    Expired entries are ignored here; cleanup is handled by main/storage.
+    """
+    raw = settings.get("boost_blocked_symbols_json") or "{}"
+    now = time.time()
+    try:
+        data = json.loads(str(raw)) if raw else {}
+    except Exception:
+        return set()
+    out = set()
+    if not isinstance(data, dict):
+        return out
+    for sym, meta in data.items():
+        try:
+            until = float((meta or {}).get("until") or 0) if isinstance(meta, dict) else 0.0
+        except Exception:
+            until = 0.0
+        if until and until > now:
+            out.add(_norm_symbol(sym))
+    return out
+
+
 def _norm_symbol(x: str) -> str:
-    s = str(x or "").upper().replace("_", "/")
+    s = str(x or "").strip().upper().replace("_", "/")
+    # Accept easy Telegram input/storage formats: BTC, BTCUSDT, BTC_USDT, BTC/USDT.
+    if s and "/" not in s and not s.endswith("USDT"):
+        s = s + "/USDT"
+    elif s.endswith("USDT") and "/" not in s and len(s) > 4:
+        s = s[:-4] + "/USDT"
     if ":" not in s and s.endswith("/USDT"):
         s += ":USDT"
     return s
@@ -96,8 +127,11 @@ class BoostScalpingEngine:
 
     async def decide(self, exchange_client, settings: dict) -> AIScalpDecision:
         symbols = await self.zero_fee_symbols(exchange_client, settings)
+        blocked = _blocked_symbols_from_settings(settings)
+        if blocked:
+            symbols = [s for s in symbols if _norm_symbol(s) not in blocked]
         if not symbols:
-            return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason="BOOST: no API-verified 0-fee futures symbols", model="boost_zero_fee_scanner", market={"markets": []})
+            return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason="BOOST: no tradable 0-fee futures symbols after blacklist/filter", model="boost_zero_fee_scanner", market={"markets": []})
         best = None
         checked = []
         max_scan = int(float(settings.get("boost_max_symbols_scan", 300) or 300))

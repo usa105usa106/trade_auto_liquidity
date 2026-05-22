@@ -1,11 +1,11 @@
-import os, time, asyncio, logging
+import os, time, asyncio, logging, json
 from datetime import datetime, timezone, timedelta
 import aiohttp
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import psutil
 
-from config import TELEGRAM_TOKEN, ADMIN_IDS, VERSION, DEFAULT_EXCHANGE
+from config import TELEGRAM_TOKEN, ADMIN_IDS, VERSION, DEFAULT_EXCHANGE, DEFAULTS
 from storage import Storage
 try:
     from storage import DEFAULT_SETTINGS
@@ -285,6 +285,8 @@ def _scan_status_text(settings: dict, status: str = "scanning", last_signal: str
         f"🎯 Last setup: {signal}",
         f"🧠 Decision: {decision}",
     ]
+    if mode.lower() == "boost_scalping":
+        lines.append(f"🪙 Zero-fee DB: {_boost_zero_fee_count_from_settings(settings)} symbols")
     ai_candidates = int(getattr(scanner, "last_ai_candidates_count", 0) or 0)
     lines.append(f"🤖 AI candidates: {ai_candidates}")
     if ai_mode:
@@ -865,6 +867,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /boost_stop или кнопка 🛑 STOP BOOST - остановить BOOST и новые входы
 /boost_status или кнопка 📊 BOOST STATUS - статус BOOST банка/цели
 /boost_rotation - включить/выключить rotation while in profit
+/boost_list BTC,ETH,SOL - задать trusted 0-fee whitelist для BOOST
+/boost_list - показать whitelist
+/boost_list_del - очистить whitelist
 /stop - остановить новые входы
 /panic - закрыть позиции и отменить ордера
 /status - статус
@@ -888,7 +893,7 @@ Note: /positions checks MEXC exchange-first; /open_orders scans normal + plan + 
 /proxy on|off|test|set URL
 /api status|set KEY SECRET|clear|test - API биржи через чат
 /openai status|set KEY|clear|test - OpenAI ключ для ИИ проверки
-BOOST autopilot: /boost_start или кнопка 🚀 BOOST MODE включает режим boost_scalping, сам сканирует API-подтверждённые 0-fee futures пары, выбирает живую монету, LONG/SHORT и плечо, использует только boost-bank = 10% депозита и останавливается при x20 цели.
+BOOST autopilot: /boost_start или кнопка 🚀 BOOST MODE включает режим boost_scalping. Сначала использует API-подтверждённые 0-fee futures пары; если задан /boost_list BTC,ETH,SOL, то эти trusted пары тоже разрешены как 0-fee whitelist. Выбирает живую монету, LONG/SHORT и плечо, использует только boost-bank = 10% депозита и останавливается при x20 цели.
 AI scalping loop: кнопка 🤖 AI BTC/ETH scalping или /set strategy_mode ai_scalping. BTC и ETH независимы: AI-запрос только по символу без открытой позиции. После live-входа бот ждёт появления позиции на MEXC, затем ставит TP/SL. Если MEXC не подтвердил защиту после повторов, AI scalping позиция закрывается сразу: нет защиты на бирже = нет позиции. Доп. фильтры качества включаются отдельно: ai_scalping_quality_filters_enabled.
 /mexc_settings - показать MEXC параметры ордера
 /leverage 5 - плечо MEXC futures
@@ -1097,6 +1102,7 @@ async def boost_live_panel_update(app, settings: dict, snap: dict, *, status: st
         f"Bank: {float(snap.get('current_bank') or 0):.4f} / {float(snap.get('target_bank') or 0):.4f} USDT",
         f"Session PnL: {float(snap.get('pnl') or 0):+.4f} USDT | Trades: {snap.get('trades', 0)}",
         f"Rotation while profit: {rot}",
+        f"Blocked symbols: {_boost_blocked_count(settings)}",
     ]
     if position:
         try:
@@ -1141,6 +1147,186 @@ async def boost_live_panel_update(app, settings: dict, snap: dict, *, status: st
             log.warning("boost live panel resend failed: %s", e2)
 
 
+def _normalize_boost_whitelist_input(raw: str) -> list[str]:
+    """Accept user-friendly zero-fee list like 'btc, ETH sol' and store as BTCUSDT symbols."""
+    cleaned = str(raw or "").replace("\n", ",").replace(";", ",").replace("|", ",")
+    parts: list[str] = []
+    for chunk in cleaned.split(","):
+        for token in chunk.strip().split():
+            if token:
+                parts.append(token)
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in parts:
+        t = token.strip().upper()
+        if not t:
+            continue
+        # Strip common futures/swap formatting and leave BASE only.
+        t = t.replace(":USDT", "").replace("/USDT", "").replace("_USDT", "")
+        t = t.replace("-USDT", "")
+        if t.endswith("USDT") and len(t) > 4:
+            t = t[:-4]
+        # Keep only simple exchange symbols to avoid storing malformed values.
+        t = "".join(ch for ch in t if ch.isalnum())
+        if not t:
+            continue
+        sym = f"{t}USDT"
+        if sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    return out
+
+
+def _boost_zero_fee_count_from_settings(settings: dict) -> int:
+    raw = str(settings.get("boost_zero_fee_symbols") or DEFAULTS.boost_zero_fee_symbols or "")
+    return len({x.strip().upper() for x in raw.split(",") if x.strip()})
+
+
+def _boost_normalize_symbol_key(symbol: str) -> str:
+    """Canonical key for BOOST blacklist/whitelist comparisons."""
+    s = str(symbol or "").strip().upper().replace("/", "_").split(":")[0]
+    if not s:
+        return ""
+    if "_" in s:
+        return s
+    if s.endswith("USDT") and len(s) > 4:
+        return s[:-4] + "_USDT"
+    return s + "_USDT"
+
+
+def _boost_blocked_map(settings: dict) -> dict:
+    raw = settings.get("boost_blocked_symbols_json") or "{}"
+    now = time.time()
+    try:
+        data = json.loads(str(raw)) if raw else {}
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    clean = {}
+    for sym, meta in data.items():
+        if not isinstance(meta, dict):
+            continue
+        try:
+            until = float(meta.get("until") or 0)
+        except Exception:
+            until = 0.0
+        if until > now:
+            clean[_boost_normalize_symbol_key(sym)] = {"until": until, "reason": str(meta.get("reason") or "blocked")[:160]}
+    return clean
+
+
+def _boost_blocked_count(settings: dict) -> int:
+    return len(_boost_blocked_map(settings))
+
+
+def _boost_is_symbol_restriction_error(text: str) -> bool:
+    t = str(text or "").lower()
+    needles = [
+        "region", "restricted", "not tradable", "not_trade", "not support", "not supported",
+        "symbol disabled", "disabled", "contract not available", "contract unavailable",
+        "permission denied", "permission", "forbidden", "access denied", "not open",
+        "market is closed", "not in trading", "temporarily suspended", "suspended",
+        "reduce-only symbol", "8950",
+    ]
+    return any(n in t for n in needles)
+
+
+async def _boost_blacklist_symbol(symbol: str, reason: str, *, ttl_sec: int = 86400) -> int:
+    """Persist a failed BOOST symbol blacklist entry for ttl_sec seconds."""
+    key = _boost_normalize_symbol_key(symbol)
+    if not key:
+        return 0
+    settings = await storage.all_settings()
+    data = _boost_blocked_map(settings)
+    data[key] = {"until": time.time() + int(ttl_sec), "reason": str(reason or "entry failed")[:160]}
+    await storage.set("boost_blocked_symbols_json", json.dumps(data, separators=(",", ":")), bump_revision=False)
+    try:
+        boost_scalping_engine._fee_cache = (0.0, [])
+    except Exception:
+        pass
+    return len(data)
+
+
+async def _boost_handle_entry_failure(app, symbol: str, reason: str) -> bool:
+    """If an entry failure means the contract cannot be opened, block it for 24h and rescan."""
+    if not _boost_is_symbol_restriction_error(reason):
+        return False
+    count = await _boost_blacklist_symbol(symbol, reason, ttl_sec=86400)
+    msg = (
+        "⚠ SYMBOL BLOCKED 24H\n"
+        f"{_boost_normalize_symbol_key(symbol)}\n"
+        f"Reason: {str(reason)[:220]}\n"
+        f"Blocked total: {count}\n"
+        "Action: rescanning next strongest coin"
+    )
+    await notify_admin(app, msg, key=f"boost_symbol_blocked_{_boost_normalize_symbol_key(symbol)}", min_interval_sec=5)
+    trigger_scan_now(app, reason="boost_symbol_blacklisted")
+    return True
+
+
+async def boost_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set/show trusted manual zero-fee futures symbols for BOOST mode.
+
+    Usage: /boost_list BTC,ETH,SOL,doge
+    The command stores BTCUSDT,ETHUSDT,... and enables manual fee fallback so
+    BOOST can trade trusted symbols when MEXC does not expose promo 0% fees via API.
+    """
+    if not allowed(update):
+        return
+    raw = " ".join(context.args or []).strip()
+    if not raw:
+        s = await storage.all_settings()
+        current = [x.strip().upper() for x in str(s.get("boost_zero_fee_symbols") or "").split(",") if x.strip()]
+        text = "🪙 BOOST zero-fee whitelist\n"
+        if current:
+            bases = [x[:-4] if x.endswith("USDT") else x for x in current]
+            text += f"Zero-fee DB: {len(current)} symbols\n"
+            text += "Active: " + ", ".join(bases) + "\n"
+            text += "Stored: " + ", ".join(current) + "\n"
+            text += "Manual fallback: ON"
+        else:
+            text += "Empty. Add like:\n/boost_list BTC,ETH,SOL,DOGE,XRP,ZEC"
+        await reply(update, text, reply_markup=MAIN_MENU)
+        return
+    symbols = _normalize_boost_whitelist_input(raw)
+    if not symbols:
+        await reply(update, "⚠️ Не понял список. Пример: /boost_list BTC,ETH,SOL", reply_markup=MAIN_MENU)
+        return
+    await storage.set("boost_zero_fee_symbols", ",".join(symbols), bump_revision=False)
+    await storage.set("boost_allow_fee_fallback", True, bump_revision=False)
+    # Invalidate boost fee cache so the new manual list is used immediately.
+    try:
+        boost_scalping_engine._fee_cache = (0.0, [])
+    except Exception:
+        pass
+    trigger_scan_now(context.application, reason="boost_list:update")
+    bases = [x[:-4] if x.endswith("USDT") else x for x in symbols]
+    await reply(
+        update,
+        "✅ BOOST whitelist updated\n"
+        f"Zero-fee DB: {len(symbols)} symbols\n"
+        f"Trusted 0-fee: {', '.join(bases)}\n"
+        f"Stored: {', '.join(symbols)}\n"
+        "Manual fallback: ON",
+        reply_markup=MAIN_MENU,
+    )
+
+
+async def boost_list_del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear all trusted manual zero-fee futures symbols."""
+    if not allowed(update):
+        return
+    await storage.set("boost_zero_fee_symbols", "", bump_revision=False)
+    await storage.set("boost_allow_fee_fallback", False, bump_revision=False)
+    try:
+        boost_scalping_engine._fee_cache = (0.0, [])
+    except Exception:
+        pass
+    trigger_scan_now(context.application, reason="boost_list:clear")
+    await reply(update, "🗑 BOOST whitelist cleared. Manual fee fallback: OFF", reply_markup=MAIN_MENU)
+
+
 async def boost_rotation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     s = await storage.all_settings()
@@ -1164,6 +1350,9 @@ async def boost_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Balance share: {float(s.get('boost_balance_share', 0.10))*100:.1f}%\n"
         f"Auto leverage: {s.get('boost_auto_leverage')} {s.get('boost_min_leverage')}x–{s.get('boost_max_leverage')}x\n"
         f"0-fee required: {not bool(s.get('boost_allow_fee_fallback', False))}\n"
+        f"Zero-fee DB: {_boost_zero_fee_count_from_settings(s)} symbols\n"
+        f"Blocked symbols: {_boost_blocked_count(s)}\n"
+        f"Whitelist: {str(s.get('boost_zero_fee_symbols') or '-')}\n"
         f"Last: {scanner.last_reject_reason or '-'}"
     )
     await reply(update, text, reply_markup=_boost_rotation_keyboard(s))
@@ -1191,7 +1380,7 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await storage.set("boost_session_target_profit_usdt", bank * (target_mult - 1.0), bump_revision=False)
     await storage.set("scan_interval_sec", int(float(s.get("boost_scan_interval_sec", 3) or 3)), bump_revision=False)
     await storage.set("max_open_positions", 1)
-    # v0174 BOOST MAX AGGRESSION: pressing 🚀 BOOST MODE forces the aggressive autopilot defaults ON,
+    # v0179 REAL SYMBOL FAILOVER: pressing 🚀 BOOST MODE forces aggressive autopilot defaults ON,
     # even if an older Railway SQLite/settings state contains stale false/low values.
     await storage.set("boost_zero_fee_scanner_enabled", True, bump_revision=False)
     await storage.set("boost_balance_share", 0.10, bump_revision=False)
@@ -1203,9 +1392,16 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await storage.set("boost_auto_rotate_symbols", True, bump_revision=False)
     await storage.set("boost_stop_when_target_reached", True, bump_revision=False)
     await storage.set("boost_max_symbols_scan", 300, bump_revision=False)
-    await storage.set("boost_allow_fee_fallback", False, bump_revision=False)
+    manual_symbols = str(s.get("boost_zero_fee_symbols") or "").strip()
+    # v0176: if an old Railway DB has an empty manual whitelist, preload the confirmed 0-fee pool from screenshots.
+    if not manual_symbols:
+        manual_symbols = "AAPLUSDT,AAVEUSDT,ADAUSDT,AMDUSDT,ANTHROPICUSDT,APEUSDT,ARMUSDT,ASTERUSDT,ASTSUSDT,ATOMUSDT,AVAXUSDT,BCHUSDT,BEUSDT,BILLUSDT,BLESSUSDT,BNBUSDT,BRETTUSDT,BTCUSDT,BULLAUSDT,BUSDT,CBRSUSDT,CHIPUSDT,COAIUSDT,XCU_USDT,CVNAUSDT,DOGEUSDT,DOTUSDT,ENJUSDT,ETHFIUSDT,ETHUSDT,FLOKIUSDT,FLNCUSDT,FOLKSUSDT,FUTUUSDT,GALAUSDT,GASNGUSDT,GIGGLEUSDT,GOATUSDT,PAXG_USDT,XAUT_USDT,GOOGLUSDT,GRTUSDT,HBARUSDT,HYPEUSDT,IBMUSDT,ICPUSDT,INJUSDT,INTCUSDT,INTUUSDT,IONQUSDT,JASMYUSDT,JUPUSDT,LABUSDT,LAYERUSDT,LIGHTUSDT,LINKUSDT,LTCUSDT,LYNUSDT,MEGAUSDT,MSTRUSDT,MUUSDT,MUUUSDT,MYXUSDT,NAS100_USDT,NBISUSDT,NEARUSDT,XNI_USDT,NVDAUSDT,BRENT_USDT,WTI_USDT,ONDOUSDT,OPUSDT,ORDIUSDT,XPD_USDT,PENGUINUSDT,PENGUUSDT,PEPEUSDT,PIPPINUSDT,PIXELUSDT,XPT_USDT,PNUTUSDT,POLUSDT,POWERUSDT,PUMPUSDT,PYTHUSDT,QCOMUSDT,QQQUSDT,RENDERUSDT,RIVERUSDT,RKLBUSDT,SAMSUNGUSDT,SEIUSDT,SHIBUSDT,XAG_USDT,SKHYNIXUSDT,SKYAIUSDT,SNDKUSDT,SOLUSDT,SP500_USDT,SPACEXUSDT,SPCXUSDT,SPOTUSDT,STOUSDT,STRKUSDT,STXSTOCKUSDT,SUIUSDT,TAOUSDT,TONUSDT,TRUMPUSDT,TSLAUSDT,UNIUSDT,US30_USDT,VIRTUALUSDT,VVVUSDT,WDCUSDT,WIFUSDT,WLDUSDT,WLFIUSDT,XAIUSDT,XLMUSDT,XMRUSDT,XOMUSDT,XPLUSDT,XRPUSDT,ZECUSDT,ZROUSDT"
+        await storage.set("boost_zero_fee_symbols", manual_symbols, bump_revision=False)
+    await storage.set("boost_allow_fee_fallback", True, bump_revision=False)
     await storage.set("boost_parallel_scan_enabled", True, bump_revision=False)
     await storage.set("boost_live_panel_enabled", True, bump_revision=False)
+    # v0179 REAL: keep only non-expired failed symbols; scanner will skip them.
+    await storage.set("boost_blocked_symbols_json", json.dumps(_boost_blocked_map(await storage.all_settings()), separators=(",", ":")), bump_revision=False)
     await storage.set("boost_rotate_only_if_profit", True, bump_revision=False)
     await storage.set("boost_min_profit_to_rotate_pct", 0.04, bump_revision=False)
     await storage.set("boost_rotate_strength_multiplier", 1.35, bump_revision=False)
@@ -1218,7 +1414,7 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if position_task is None or position_task.done():
         position_task = context.application.create_task(position_management_loop(context.application))
     trigger_scan_now(context.application, reason="boost_start")
-    await reply(update, f"🚀 BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nMode: auto 0-fee scan + auto LONG/SHORT + auto leverage", reply_markup=_boost_rotation_keyboard(await storage.all_settings()))
+    await reply(update, f"🚀 BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: auto 0-fee scan + auto LONG/SHORT + auto leverage", reply_markup=_boost_rotation_keyboard(await storage.all_settings()))
 
 async def boost_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -2847,9 +3043,15 @@ async def trading_loop(app):
                     try:
                         placed = await exec_engine.place_entry(plan, live)
                     except Exception as e:
-                        scanner.last_reject_reason = f"BOOST execution exception {e}"
-                        await notify_admin(app, f"⚠️ BOOST execution exception: {e}", min_interval_sec=60, key="boost_exec_error")
-                        await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                        err = str(e)
+                        blocked = await _boost_handle_entry_failure(app, getattr(plan, "symbol", ""), err)
+                        scanner.last_reject_reason = f"BOOST execution exception {err}"
+                        if blocked:
+                            await boost_live_panel_update(app, settings, {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}, status="symbol blocked; rescanning", decision=decision, note=scanner.last_reject_reason, force=True)
+                            await sleep_until_next_scan(app, 1)
+                        else:
+                            await notify_admin(app, f"⚠️ BOOST execution exception: {err}", min_interval_sec=60, key="boost_exec_error")
+                            await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
                         continue
                     if placed.get("ok"):
                         scanner.last_signal_summary = f"BOOST opened {plan.symbol} {plan.side} margin≈{plan.expected_margin_usdt:.2f} TP={plan.take_price:.6g} SL={plan.stop_price:.6g}"
@@ -2867,8 +3069,13 @@ async def trading_loop(app):
                         await notify_admin(app, boost_msg, key="boost_opened")
                         await boost_live_panel_update(app, settings, {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}, status="opened", decision=decision, note=scanner.last_signal_summary, force=True)
                     else:
-                        scanner.last_reject_reason = f"BOOST execution rejected {placed.get('reason', 'unknown')}"
-                        await boost_live_panel_update(app, settings, {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}, status="rejected", decision=decision, note=scanner.last_reject_reason, force=True)
+                        rej_reason = str(placed.get('reason', 'unknown'))
+                        scanner.last_reject_reason = f"BOOST execution rejected {rej_reason}"
+                        blocked = await _boost_handle_entry_failure(app, getattr(plan, "symbol", ""), rej_reason)
+                        await boost_live_panel_update(app, settings, {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}, status=("symbol blocked; rescanning" if blocked else "rejected"), decision=decision, note=scanner.last_reject_reason, force=True)
+                        if blocked:
+                            await sleep_until_next_scan(app, 1)
+                            continue
                     await update_scanner_status(app, settings, status="boost opened" if placed.get("ok") else "boost rejected", force=True)
                     await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
                     continue
@@ -3247,6 +3454,8 @@ def build_app():
     app.add_handler(CommandHandler("boost_stop", boost_stop_cmd))
     app.add_handler(CommandHandler("boost_status", boost_status_cmd))
     app.add_handler(CommandHandler("boost_rotation", boost_rotation_cmd))
+    app.add_handler(CommandHandler("boost_list", boost_list_cmd))
+    app.add_handler(CommandHandler("boost_list_del", boost_list_del_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("panic", panic_cmd))
     app.add_handler(CommandHandler("status", status_cmd))

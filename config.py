@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0174 BOOST MAX AGGRESSION")
+VERSION = os.getenv("BOT_VERSION", "0179 REAL SYMBOL FAILOVER")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -132,7 +132,7 @@ class Defaults:
     ai_scalping_protection_delay_sec: float = env_float("AI_SCALPING_PROTECTION_DELAY_SEC", 3.0)
     trade_margin_pct: float = env_float("TRADE_MARGIN_PCT", 0.10)
 
-    # v0174 Boost Max Aggression: main-menu autonomous boost, 10x-50x auto leverage, live panel and profit-only rotation ON by default.
+    # v0175 Boost Whitelist Commands: /boost_list accepts BTC,ETH,SOL format and /boost_list_del clears trusted zero-fee symbols.
     boost_zero_fee_scanner_enabled: bool = env_bool("BOOST_ZERO_FEE_SCANNER_ENABLED", True)
     boost_balance_share: float = env_float("BOOST_BALANCE_SHARE", 0.10)
     boost_target_multiplier: float = env_float("BOOST_TARGET_MULTIPLIER", 20.0)
@@ -157,9 +157,10 @@ class Defaults:
     boost_max_tp_pct: float = env_float("BOOST_MAX_TP_PCT", 0.18)
     boost_sl_tp_multiplier: float = env_float("BOOST_SL_TP_MULTIPLIER", 1.15)
     boost_scan_interval_sec: int = env_int("BOOST_SCAN_INTERVAL_SEC", 3)
-    boost_allow_fee_fallback: bool = env_bool("BOOST_ALLOW_FEE_FALLBACK", False)
-    boost_zero_fee_symbols: str = os.getenv("BOOST_ZERO_FEE_SYMBOLS", "")
+    boost_allow_fee_fallback: bool = env_bool("BOOST_ALLOW_FEE_FALLBACK", True)
+    boost_zero_fee_symbols: str = os.getenv("BOOST_ZERO_FEE_SYMBOLS", "AAPLUSDT,AAVEUSDT,ADAUSDT,AMDUSDT,ANTHROPICUSDT,APEUSDT,ARMUSDT,ASTERUSDT,ASTSUSDT,ATOMUSDT,AVAXUSDT,BCHUSDT,BEUSDT,BILLUSDT,BLESSUSDT,BNBUSDT,BRETTUSDT,BTCUSDT,BULLAUSDT,BUSDT,CBRSUSDT,CHIPUSDT,COAIUSDT,XCU_USDT,CVNAUSDT,DOGEUSDT,DOTUSDT,ENJUSDT,ETHFIUSDT,ETHUSDT,FLOKIUSDT,FLNCUSDT,FOLKSUSDT,FUTUUSDT,GALAUSDT,GASNGUSDT,GIGGLEUSDT,GOATUSDT,PAXG_USDT,XAUT_USDT,GOOGLUSDT,GRTUSDT,HBARUSDT,HYPEUSDT,IBMUSDT,ICPUSDT,INJUSDT,INTCUSDT,INTUUSDT,IONQUSDT,JASMYUSDT,JUPUSDT,LABUSDT,LAYERUSDT,LIGHTUSDT,LINKUSDT,LTCUSDT,LYNUSDT,MEGAUSDT,MSTRUSDT,MUUSDT,MUUUSDT,MYXUSDT,NAS100_USDT,NBISUSDT,NEARUSDT,XNI_USDT,NVDAUSDT,BRENT_USDT,WTI_USDT,ONDOUSDT,OPUSDT,ORDIUSDT,XPD_USDT,PENGUINUSDT,PENGUUSDT,PEPEUSDT,PIPPINUSDT,PIXELUSDT,XPT_USDT,PNUTUSDT,POLUSDT,POWERUSDT,PUMPUSDT,PYTHUSDT,QCOMUSDT,QQQUSDT,RENDERUSDT,RIVERUSDT,RKLBUSDT,SAMSUNGUSDT,SEIUSDT,SHIBUSDT,XAG_USDT,SKHYNIXUSDT,SKYAIUSDT,SNDKUSDT,SOLUSDT,SP500_USDT,SPACEXUSDT,SPCXUSDT,SPOTUSDT,STOUSDT,STRKUSDT,STXSTOCKUSDT,SUIUSDT,TAOUSDT,TONUSDT,TRUMPUSDT,TSLAUSDT,UNIUSDT,US30_USDT,VIRTUALUSDT,VVVUSDT,WDCUSDT,WIFUSDT,WLDUSDT,WLFIUSDT,XAIUSDT,XLMUSDT,XMRUSDT,XOMUSDT,XPLUSDT,XRPUSDT,ZECUSDT,ZROUSDT")
 
+    boost_blocked_symbols_json: str = os.getenv("BOOST_BLOCKED_SYMBOLS_JSON", "{}")
     boost_live_panel_enabled: bool = env_bool("BOOST_LIVE_PANEL_ENABLED", True)
     boost_live_panel_interval_sec: int = env_int("BOOST_LIVE_PANEL_INTERVAL_SEC", 5)
     boost_parallel_scan_enabled: bool = env_bool("BOOST_PARALLEL_SCAN_ENABLED", True)
