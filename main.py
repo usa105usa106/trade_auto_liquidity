@@ -271,10 +271,11 @@ def _scan_status_text(settings: dict, status: str = "scanning", last_signal: str
         loaded = 2
     else:
         effective = str(scanner.last_effective_strategy or mode)
-        universe = str(settings.get("universe_mode", "adaptive"))
+        boost_mode = mode.lower() == "boost_scalping"
+        universe = "full" if boost_mode else str(settings.get("universe_mode", "adaptive"))
         checked = int(getattr(scanner, "last_cycle_scanned", 0) or 0)
         errors = int(getattr(scanner, "last_cycle_errors", 0) or 0)
-        loaded = len(getattr(scanner, "hot_symbols", []) or [])
+        loaded = int(getattr(scanner, "last_available_markets", 0) or 0) if boost_mode else len(getattr(scanner, "hot_symbols", []) or [])
     scan_every = format_duration_seconds(settings.get("scan_interval_sec", 5))
     icon = "🟢" if status_label in {"scanning", "universe ready"} else ("🟡" if "blocked" not in status_label and "paused" not in status_label else "🛑")
     lines = [
@@ -1380,18 +1381,29 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await storage.set("boost_session_target_profit_usdt", bank * (target_mult - 1.0), bump_revision=False)
     await storage.set("scan_interval_sec", int(float(s.get("boost_scan_interval_sec", 3) or 3)), bump_revision=False)
     await storage.set("max_open_positions", 1)
-    # v0179 REAL SYMBOL FAILOVER: pressing 🚀 BOOST MODE forces aggressive autopilot defaults ON,
+    # v0180 FULL UNIVERSE AGGRESSIVE ROTATION: pressing 🚀 BOOST MODE forces aggressive autopilot defaults ON,
     # even if an older Railway SQLite/settings state contains stale false/low values.
     await storage.set("boost_zero_fee_scanner_enabled", True, bump_revision=False)
     await storage.set("boost_balance_share", 0.10, bump_revision=False)
     await storage.set("boost_target_multiplier", 20.0, bump_revision=False)
+    await storage.set("boost_max_consecutive_losses", 999, bump_revision=False)
     await storage.set("boost_auto_leverage", True, bump_revision=False)
     await storage.set("boost_min_leverage", 10, bump_revision=False)
     await storage.set("boost_max_leverage", 50, bump_revision=False)
     await storage.set("boost_use_full_bank_per_trade", True, bump_revision=False)
     await storage.set("boost_auto_rotate_symbols", True, bump_revision=False)
     await storage.set("boost_stop_when_target_reached", True, bump_revision=False)
-    await storage.set("boost_max_symbols_scan", 300, bump_revision=False)
+    await storage.set("boost_max_symbols_scan", 126, bump_revision=False)
+    await storage.set("boost_min_checked_per_cycle", 40, bump_revision=False)
+    await storage.set("boost_max_checked_per_cycle", 100, bump_revision=False)
+    await storage.set("universe_mode", "full", bump_revision=False)
+    await storage.set("boost_min_tp_pct", 0.03, bump_revision=False)
+    await storage.set("boost_max_tp_pct", 0.05, bump_revision=False)
+    await storage.set("boost_min_quote_volume_usdt", 0.0, bump_revision=False)
+    await storage.set("boost_min_atr_pct", 0.04, bump_revision=False)
+    await storage.set("boost_max_spread_pct", 0.12, bump_revision=False)
+    await storage.set("boost_spot_imbalance_ratio", 1.30, bump_revision=False)
+    await storage.set("boost_futures_momentum_min_pct", 0.015, bump_revision=False)
     manual_symbols = str(s.get("boost_zero_fee_symbols") or "").strip()
     # v0176: if an old Railway DB has an empty manual whitelist, preload the confirmed 0-fee pool from screenshots.
     if not manual_symbols:
@@ -1403,9 +1415,10 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # v0179 REAL: keep only non-expired failed symbols; scanner will skip them.
     await storage.set("boost_blocked_symbols_json", json.dumps(_boost_blocked_map(await storage.all_settings()), separators=(",", ":")), bump_revision=False)
     await storage.set("boost_rotate_only_if_profit", True, bump_revision=False)
-    await storage.set("boost_min_profit_to_rotate_pct", 0.04, bump_revision=False)
-    await storage.set("boost_rotate_strength_multiplier", 1.35, bump_revision=False)
-    await storage.set("boost_rotate_cooldown_sec", 20, bump_revision=False)
+    await storage.set("boost_min_profit_to_rotate_pct", 0.03, bump_revision=False)
+    await storage.set("boost_rotate_strength_multiplier", 1.05, bump_revision=False)
+    await storage.set("boost_rotate_min_score_gap", 0.0, bump_revision=False)
+    await storage.set("boost_rotate_cooldown_sec", 3, bump_revision=False)
     if trading_task and not trading_task.done():
         running = True; entries_enabled = True
     else:
@@ -1414,7 +1427,7 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if position_task is None or position_task.done():
         position_task = context.application.create_task(position_management_loop(context.application))
     trigger_scan_now(context.application, reason="boost_start")
-    await reply(update, f"🚀 BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: auto 0-fee scan + auto LONG/SHORT + auto leverage", reply_markup=_boost_rotation_keyboard(await storage.all_settings()))
+    await reply(update, f"🚀 BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: full 126 scan + aggressive rotation + micro TP 0.03-0.05%", reply_markup=_boost_rotation_keyboard(await storage.all_settings()))
 
 async def boost_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -2775,6 +2788,31 @@ async def position_management_loop(app):
     finally:
         position_task = None
 
+
+
+def _record_boost_decision_metrics(decision) -> None:
+    """v0180: make Telegram scanner card show the real BOOST universe/depth.
+
+    BOOST uses its own scanner, so the generic scanner counters stayed at
+    loaded=5/checked=2 before. These counters are now sourced from the BOOST
+    decision payload: full zero-fee DB loaded, 40-100 checked per cycle, and
+    candidate count.
+    """
+    try:
+        m = getattr(decision, "market", None) or {}
+        checked = m.get("checked") or m.get("markets") or []
+        loaded = int(m.get("loaded") or m.get("universe_total") or 0)
+        scanner.last_effective_strategy = "boost_scalping"
+        scanner.last_available_markets = loaded
+        scanner.last_total_markets = loaded
+        scanner.last_filtered_markets = loaded
+        scanner.last_cycle_scanned = len(checked) if isinstance(checked, list) else 0
+        scanner.last_cycle_errors = len([c for c in checked if isinstance(c, dict) and str(c.get("reason", "")).lower().startswith(("error", "exception"))]) if isinstance(checked, list) else 0
+        scanner.last_ai_candidates_count = int(m.get("ai_candidates") or len(m.get("top_candidates") or []))
+        scanner.hot_symbols = [_short_symbol(x) for x in (m.get("top_candidates") or [])[:20]] if isinstance(m.get("top_candidates"), list) else []
+    except Exception:
+        pass
+
 async def trading_loop(app):
     global running, entries_enabled, trading_task
     try:
@@ -2978,6 +3016,7 @@ async def trading_loop(app):
                                 cd = float(settings.get("boost_rotate_cooldown_sec", 20) or 20)
                                 if (not only_profit or pos_pnl >= min_profit) and time.time() - last_rot >= cd:
                                     candidate_decision = await boost_scalping_engine.decide(ex, settings)
+                                    _record_boost_decision_metrics(candidate_decision)
                                     new_sym = str(candidate_decision.symbol or "")
                                     cur_sym = str(active_pos.get("symbol") or "")
                                     new_market = ((candidate_decision.market or {}).get("markets") or [{}])[0]
@@ -3009,6 +3048,7 @@ async def trading_loop(app):
                         continue
 
                     decision = await boost_scalping_engine.decide(ex, settings)
+                    _record_boost_decision_metrics(decision)
                     if not decision.ok or decision.decision == "WAIT":
                         scanner.last_reject_reason = decision.reason or "BOOST wait"
                         scanner.last_signal_summary = f"BOOST scan bank={current_bank:.2f}/{target_bank:.2f} pnl={pnl:.4f}"
@@ -3060,6 +3100,7 @@ async def trading_loop(app):
                             f"🚀 BOOST opened\n"
                             f"{plan.symbol} {plan.side}\n"
                             f"Margin≈{plan.expected_margin_usdt:.2f} USDT ({balance_share*100:.1f}% balance)\n"
+                            f"Leverage: x{getattr(plan, 'leverage', '-') }\n"
                             f"Bank target: {bank:.2f} → {bank*target_mult:.2f} USDT\n"
                             f"Conf: {decision.confidence:.2f}\n"
                             f"Reason: {decision.reason}\n"

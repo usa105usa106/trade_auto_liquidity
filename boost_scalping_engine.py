@@ -56,6 +56,7 @@ class BoostScalpingEngine:
     def __init__(self):
         self._base = AIScalpingEngine()
         self._fee_cache: tuple[float, list[str]] = (0.0, [])
+        self._scan_cursor: int = 0
 
     async def zero_fee_symbols(self, exchange_client, settings: dict) -> list[str]:
         ttl = 600.0
@@ -134,8 +135,18 @@ class BoostScalpingEngine:
             return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason="BOOST: no tradable 0-fee futures symbols after blacklist/filter", model="boost_zero_fee_scanner", market={"markets": []})
         best = None
         checked = []
-        max_scan = int(float(settings.get("boost_max_symbols_scan", 300) or 300))
-        for sym in symbols[:max_scan]:
+        max_symbols = int(float(settings.get("boost_max_symbols_scan", len(symbols)) or len(symbols)))
+        universe = list(symbols[:max_symbols])
+        total = len(universe)
+        min_checks = max(1, int(float(settings.get("boost_min_checked_per_cycle", 40) or 40)))
+        max_checks = max(min_checks, int(float(settings.get("boost_max_checked_per_cycle", 100) or 100)))
+        check_count = min(total, max_checks)
+        # v0180: scan a large rotating slice from the FULL zero-fee universe every cycle.
+        # This keeps replacement choices coming from all 126 symbols, not a tiny adaptive set of 5.
+        start = self._scan_cursor % max(1, total)
+        scan_symbols = (universe[start:] + universe[:start])[:check_count]
+        self._scan_cursor = (start + check_count) % max(1, total)
+        for sym in scan_symbols:
             try:
                 market = await self._snapshot(exchange_client, sym)
                 res = self._side_and_score(market, settings)
@@ -146,12 +157,14 @@ class BoostScalpingEngine:
                 checked.append({"symbol": sym, "ok": False, "reason": str(e)[:120]})
         if not best:
             why = "; ".join(f"{c.get('symbol')}:{c.get('reason')}" for c in checked[:5])
-            return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason=("BOOST wait: " + why)[:220], model="boost_zero_fee_scanner", market={"markets": checked})
+            return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason=("BOOST wait: " + why)[:220], model="boost_zero_fee_scanner", market={"markets": checked, "checked": checked, "universe_total": len(symbols), "loaded": len(symbols), "ai_candidates": 0})
         res, market = best
         market["boost_score"] = _r(_f(res.get("score"), 0.0), 4)
         market["boost_strength"] = _r(_f(res.get("strength"), 0.0), 4)
         conf = max(0.72, min(0.96, 0.72 + _f(res.get("strength"), 0.0) * 0.24))
-        return AIScalpDecision(ok=True, symbol=market.get("symbol"), decision=res.get("side"), confidence=conf, reason=res.get("reason"), model="boost_zero_fee_scanner", market={"markets": [market], "checked": checked}, tp_strength=_f(res.get("strength"), 0.0))
+        ok_candidates = [c for c in checked if c.get("ok")]
+        ok_candidates = sorted(ok_candidates, key=lambda c: _f(c.get("score"), 0.0), reverse=True)[:20]
+        return AIScalpDecision(ok=True, symbol=market.get("symbol"), decision=res.get("side"), confidence=conf, reason=res.get("reason"), model="boost_zero_fee_scanner", market={"markets": [market], "checked": checked, "universe_total": len(symbols), "loaded": len(symbols), "ai_candidates": len(ok_candidates), "top_candidates": ok_candidates}, tp_strength=_f(res.get("strength"), 0.0))
 
     def _auto_leverage(self, market: dict, strength: float, settings: dict) -> int:
         min_lev = max(1, int(float(settings.get("boost_min_leverage", 10) or 10)))

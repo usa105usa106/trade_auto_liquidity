@@ -111,6 +111,8 @@ DEFAULT_SETTINGS = {
     "boost_max_session_loss_pct": DEFAULTS.boost_max_session_loss_pct,
     "boost_max_consecutive_losses": DEFAULTS.boost_max_consecutive_losses,
     "boost_max_symbols_scan": DEFAULTS.boost_max_symbols_scan,
+    "boost_min_checked_per_cycle": 40,
+    "boost_max_checked_per_cycle": 100,
     "boost_min_quote_volume_usdt": DEFAULTS.boost_min_quote_volume_usdt,
     "boost_min_atr_pct": DEFAULTS.boost_min_atr_pct,
     "boost_max_spread_pct": DEFAULTS.boost_max_spread_pct,
