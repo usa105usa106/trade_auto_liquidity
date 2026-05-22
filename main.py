@@ -857,11 +857,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /recovery - восстановить позиции MEXC после рестарта и проверить TP/SL
 /mexc_debug_state [SYMBOL] - raw debug MEXC positions/orders/symbol variants
 
-Note: /positions checks MEXC exchange-first; /open_orders scans normal + plan + stop + TP/SL endpoints. If exchange TP/SL is missing, local monitor protects positions kept in bot cache.
+Note: /positions checks MEXC exchange-first; /open_orders scans normal + plan + stop + TP/SL endpoints. If exchange TP/SL is missing after retries, new AI scalping entries are closed immediately.
 /proxy on|off|test|set URL
 /api status|set KEY SECRET|clear|test - API биржи через чат
 /openai status|set KEY|clear|test - OpenAI ключ для ИИ проверки
-AI scalping loop: кнопка 🤖 AI BTC/ETH scalping или /set strategy_mode ai_scalping. BTC и ETH независимы: AI-запрос только по символу без открытой позиции. После live-входа бот ждёт появления позиции на MEXC, затем ставит TP/SL. Если MEXC не подтвердил защиту сразу, позиция НЕ закрывается: бот ведёт TP/SL локально и watchdog повторяет установку защиты. Доп. фильтры качества включаются отдельно: ai_scalping_quality_filters_enabled.
+AI scalping loop: кнопка 🤖 AI BTC/ETH scalping или /set strategy_mode ai_scalping. BTC и ETH независимы: AI-запрос только по символу без открытой позиции. После live-входа бот ждёт появления позиции на MEXC, затем ставит TP/SL. Если MEXC не подтвердил защиту после повторов, AI scalping позиция закрывается сразу: нет защиты на бирже = нет позиции. Доп. фильтры качества включаются отдельно: ai_scalping_quality_filters_enabled.
 /mexc_settings - показать MEXC параметры ордера
 /leverage 5 - плечо MEXC futures
 /open_type 1 - 1 isolated, 2 cross

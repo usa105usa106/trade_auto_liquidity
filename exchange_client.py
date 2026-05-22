@@ -207,9 +207,22 @@ class ExchangeClient:
         return default
 
     def _mexc_price_to_precision(self, symbol: str, price: float) -> float:
+        """Round MEXC contract prices to a valid tick.
+
+        MEXC is strict for plan/TP/SL trigger prices and may reject raw Python
+        values such as 2138.2175 with code 5003.  Prefer the contract tick
+        (priceUnit/tickSize) and use conservative BTC/ETH fallbacks when market
+        metadata is incomplete.
+        """
         price = float(price or 0)
         if price <= 0:
             return 0.0
+        import math
+        tick = self._mexc_price_tick(symbol)
+        if tick and tick > 0:
+            decimals = max(0, min(12, int(round(-math.log10(tick))) if tick < 1 else 0))
+            rounded = round(price / tick) * tick
+            return float(f"{rounded:.{decimals}f}")
         try:
             return float(self.exchange.price_to_precision(self.normalize_symbol(symbol), price))
         except Exception:
@@ -281,7 +294,40 @@ class ExchangeClient:
                 return f if 0 < f < 1 else 10 ** (-int(f))
         except Exception:
             pass
+        # Conservative fallbacks for MEXC USDT perpetual majors when CCXT
+        # metadata is missing/stale.  This prevents 5003 from long float tails.
+        try:
+            ms = self._mexc_symbol(symbol).upper()
+            if ms.startswith("BTC_"):
+                return 0.1
+            if ms.startswith("ETH_"):
+                return 0.01
+        except Exception:
+            pass
         return 0.0
+
+    def _mexc_safe_trigger_price_sync(self, symbol: str, close_side: str, kind: str, trigger_price: float, reference_price: float = 0.0) -> float:
+        """Round and keep a trigger on the correct side of a reference price.
+
+        No minimum-distance strategy is applied here; this only prevents already
+        crossed triggers and invalid precision.  close_side is the order side
+        used to close the position: sell closes LONG, buy closes SHORT.
+        """
+        ref = float(reference_price or 0)
+        px = self._mexc_price_to_precision(symbol, float(trigger_price or 0))
+        if px <= 0 or ref <= 0:
+            return px
+        tick = self._mexc_price_tick(symbol) or max(ref * 0.000001, 1e-12)
+        side_l = str(close_side or "").lower()
+        kind_l = str(kind or "").lower()
+        # LONG close is sell: TP above ref, SL below ref. SHORT close is buy:
+        # TP below ref, SL above ref.
+        want_above = (side_l == "sell" and kind_l == "tp") or (side_l == "buy" and kind_l == "sl")
+        if want_above and px <= ref:
+            px = ref + tick
+        elif (not want_above) and px >= ref:
+            px = ref - tick
+        return self._mexc_price_to_precision(symbol, px)
 
     async def mexc_safe_tpsl_prices(self, symbol: str, side: str, stop_price: float, take_price: float, entry_price: float) -> tuple[float, float, str]:
         """Move TP/SL away from mark/last so MEXC accepts native position TP/SL.
@@ -293,8 +339,11 @@ class ExchangeClient:
         ref = await self._mexc_reference_price(symbol, entry_price)
         ref = float(ref or entry_price or 0)
         tick = self._mexc_price_tick(symbol) or max(ref * 0.00001, 1e-12)
-        min_pct = float(os.getenv("MEXC_TPSL_MIN_TRIGGER_PCT", os.getenv("PROTECTION_MIN_TRIGGER_PCT", "0.12"))) / 100.0
-        min_ticks = int(float(os.getenv("MEXC_TPSL_MIN_TRIGGER_TICKS", os.getenv("PROTECTION_MIN_TRIGGER_TICKS", "5"))))
+        # v0149: do not enforce a strategy-level minimum distance here.  Only
+        # keep triggers one tick on the valid side unless env explicitly asks
+        # for a larger safety buffer.
+        min_pct = float(os.getenv("MEXC_TPSL_MIN_TRIGGER_PCT", os.getenv("PROTECTION_MIN_TRIGGER_PCT", "0"))) / 100.0
+        min_ticks = int(float(os.getenv("MEXC_TPSL_MIN_TRIGGER_TICKS", os.getenv("PROTECTION_MIN_TRIGGER_TICKS", "1"))))
         min_dist = max(ref * min_pct, tick * max(1, min_ticks))
         close_side = str(side or "").lower()
         is_long = close_side == "sell"  # closing LONG is sell; closing SHORT is buy
@@ -361,6 +410,43 @@ class ExchangeClient:
 
     async def fetch_order_book(self, symbol, limit=20):
         return await self.exchange.fetch_order_book(self.normalize_symbol(symbol), limit=limit)
+
+    async def fetch_spot_order_book(self, symbol, limit=20):
+        """Public SPOT orderbook for BTC/ETH orderbook-imbalance scalping.
+
+        The bot may trade futures, but this method reads MEXC spot depth
+        (BTCUSDT/ETHUSDT).  It is intentionally public/no-auth so it does not
+        touch private spot endpoints that can fail on restricted accounts.
+        """
+        base, quote = self._split_symbol_parts(symbol)
+        spot_id = f"{base}{quote}".upper()
+        lim = max(5, min(int(limit or 20), 100))
+        if self.exchange_id == "mexc":
+            url = f"https://api.mexc.com/api/v3/depth?symbol={spot_id}&limit={lim}"
+            timeout = aiohttp.ClientTimeout(total=6)
+            connector = None
+            if self.proxy_enabled and self.proxy_url and ProxyConnector:
+                try:
+                    connector = ProxyConnector.from_url(self.proxy_url)
+                except Exception:
+                    connector = None
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as r:
+                    txt = await r.text()
+                    if r.status != 200:
+                        raise RuntimeError(f"MEXC spot depth error {r.status}: {txt[:160]}")
+                    data = json.loads(txt)
+            def rows(key):
+                out = []
+                for row in data.get(key) or []:
+                    try:
+                        out.append([float(row[0]), float(row[1])])
+                    except Exception:
+                        continue
+                return out
+            return {"bids": rows("bids"), "asks": rows("asks"), "symbol": spot_id, "spot": True}
+        # Generic fallback if another exchange supports spot symbols in ccxt.
+        return await self.exchange.fetch_order_book(f"{base}/{quote}", limit=lim)
 
     async def fetch_ticker(self, symbol, params=None):
         return await self.exchange.fetch_ticker(self.normalize_symbol(symbol), params or {})
@@ -1234,13 +1320,15 @@ class ExchangeClient:
             trend = 1 if kind_l == "sl" else 2
         else:
             trend = 2 if kind_l == "sl" else 1
+        ref = await self._mexc_reference_price(symbol, 0)
+        safe_trigger = self._mexc_safe_trigger_price_sync(symbol, close_side, kind_l, float(trigger_price), ref)
         body = {
             "symbol": msym,
             "vol": self._amount_to_mexc_vol(symbol, amount),
             "side": mexc_side,
             "openType": int(os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or "1"),
             "leverage": int(os.getenv("MEXC_ORDER_LEVERAGE", "5") or "5"),
-            "triggerPrice": self._mexc_price_to_precision(symbol, float(trigger_price)),
+            "triggerPrice": safe_trigger,
             "executePrice": 0,
             "orderType": 5,
             "triggerType": 1,
@@ -1258,7 +1346,7 @@ class ExchangeClient:
             "side": close_side,
             "amount": amount,
             "price": None,
-            "info": {"native_mexc_trigger": True, "_protection_kind": kind_l, **(out if isinstance(out, dict) else {"raw": out})},
+            "info": {"native_mexc_trigger": True, "_protection_kind": kind_l, "safe_trigger_price": safe_trigger, "reference_price": ref, **(out if isinstance(out, dict) else {"raw": out})},
         }
 
     async def mexc_place_stop_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, client_order_id: str = "") -> dict:

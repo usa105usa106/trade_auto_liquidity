@@ -13,7 +13,7 @@ class ExecutionEngine:
     - open positions + pending entries count as occupied slots
     - limit entries are tracked as pending and later confirmed via fetch_order
     - market entries rebase entry/SL/TP from the actual reported fill price
-    - exchange-side TP/SL is required by default for live entries
+    - exchange-side TP/SL is required by default for live entries; AUTO_CLOSE_ON_PROTECTION_FAILED defaults to true for new configs
     """
 
     _symbol_locks: dict[str, asyncio.Lock] = {}
@@ -400,19 +400,40 @@ class ExecutionEngine:
                         })
                 except Exception:
                     pass
+            attached_tpsl_requested = bool(params.get("takeProfitPrice") or params.get("stopLossPrice"))
+            attached_tpsl_failed = False
             try:
                 order = await self._create_order_retry(plan.symbol, order_type, side, plan.qty, price, params, attempts=2)
             except Exception as e:
-                if self._is_mexc_opening_restricted_error(e):
+                msg = str(e)
+                # MEXC sometimes rejects opening orders with attached TP/SL as
+                # code 5003 / stop-limit price error when trigger formatting is
+                # strict.  Do not lose the scalp: retry the entry without attached
+                # TP/SL, then the exchange-protection step below will immediately
+                # place trigger-market TP/SL and verify them.
+                if attached_tpsl_requested and ("5003" in msg or "stop-limit order" in msg.lower()):
+                    attached_tpsl_failed = True
+                    clean_params = {k: v for k, v in params.items() if k not in {
+                        "takeProfitPrice", "stopLossPrice", "profitTrend", "lossTrend",
+                        "priceProtect", "takeProfitType", "stopLossType",
+                        "takeProfitOrderPrice", "stopLossOrderPrice",
+                        "takeProfitReverse", "stopLossReverse",
+                    }}
+                    order = await self._create_order_retry(plan.symbol, order_type, side, plan.qty, price, clean_params, attempts=2)
+                    params = clean_params
+                elif self._is_mexc_opening_restricted_error(e):
                     await self.storage.set_lock(plan.symbol, int(os.getenv("MEXC_RESTRICTED_SYMBOL_LOCK_SEC", "86400")), "mexc_opening_restricted_8950")
                     return {"ok": False, "reason": "mexc opening restricted / reduce-only symbol (code 8950)"}
-                raise
+                else:
+                    raise
 
             # For market orders, sync the real exchange position immediately.
             # This prevents the bot from losing state when MEXC accepted the order
             # but the raw order response does not include a filled quantity/price.
             pos = plan.__dict__.copy()
             pos["status"] = "pending" if order_type == "limit" else "open"
+            if attached_tpsl_failed:
+                pos["entry_attached_tpsl_error"] = "MEXC 5003 stop-limit price error; entry retried without attached TP/SL"
             pos["initial_stop_price"] = plan.stop_price
             pos["initial_take_price"] = plan.take_price
             if bool(getattr(plan, "liquidation_stop_mode", False)):
@@ -520,21 +541,18 @@ class ExecutionEngine:
                 pos.update(protection)
                 await self.storage.upsert_position(pos)
                 if not protection.get("ok"):
-                    # v0066: do NOT delete local state when MEXC fails to place
-                    # exchange-side TP/SL. The position is already live; losing
-                    # local state is worse than running local TP/SL monitoring.
-                    pos["protection_mode"] = "local_monitoring"
-                    pos["protection_warning"] = "exchange protection failed; bot monitors TP/SL locally"
+                    # v0148 hard rule for live scalping: no confirmed exchange TP/SL
+                    # means no position.  Do not run ordinary AI scalps in LOCAL
+                    # PROTECTION; retry happened inside place_protection_orders().
+                    reason = "protection_failed_no_exchange_tpsl"
+                    if bool(pos.get("liquidation_stop_mode")):
+                        reason = "protection_failed_no_exchange_tp_liq_mode"
+                    pos["protection_mode"] = "closing_unprotected"
+                    pos["protection_warning"] = "exchange protection missing after retries; closing position"
                     pos["updated_at"] = time.time()
                     await self.storage.upsert_position(pos)
-                    # Never force-close an already-open live position only because
-                    # exchange TP/SL was not confirmed. This was the behaviour that
-                    # choked scalps into repeated small losses. The bot keeps local
-                    # TP/SL monitoring active and the watchdog keeps reattaching
-                    # native MEXC position TP/SL in the background loop.
-                    pos["auto_close_on_protection_failed_ignored"] = True
-                    await self.storage.upsert_position(pos)
-                    return {"ok": True, "order": order, "position": pos, "warning": "exchange protection failed; bot monitors TP/SL locally"}
+                    close_res = await self.close_position(pos, reason=reason, live=True)
+                    return {"ok": False, "order": order, "position": pos, "reason": "exchange protection missing; position closed", "protection": protection, "close": close_res}
             return {"ok": True, "order": order, "position": pos}
 
 
@@ -916,12 +934,6 @@ class ExecutionEngine:
                 # position just because there is no SL order.
                 verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), "")
                 out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})
-                if not out.get("tp_exists") and out.get("tp_order_id"):
-                    # Some MEXC trigger orders are not immediately visible in
-                    # merged open-order endpoints; a non-empty native id is the
-                    # best available confirmation after successful create.
-                    out["tp_exists"] = True
-                    out["tp_verify_note"] = "accepted by MEXC but not yet visible in open orders"
                 out["sl_exists"] = True
                 out["sl_order_id"] = "LIQUIDATION_STOP"
                 out["ok"] = bool(out.get("tp_exists"))
@@ -930,26 +942,8 @@ class ExecutionEngine:
             else:
                 verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), str(out.get("sl_order_id") or ""))
                 out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})
-                if out.get("tpsl_raw") and (out.get("tp_order_id") or out.get("sl_order_id")):
-                    # MEXC position TP/SL may be accepted by stoporder/place but
-                    # appear in open-orders/plan endpoints with a delay. Treat a
-                    # successful native TPSL response with an id as exchange
-                    # protected, while the watchdog continues periodic reconcile.
-                    out["tp_exists"] = True
-                    out["sl_exists"] = True
-                    out["tpsl_verify_note"] = "accepted by MEXC but not yet visible in open orders"
-                # MEXC plan/stop orders can be accepted and return ids before they
-                # become visible through the open-order/plan-order list endpoints.
-                # For normal AI scalping, do not downgrade a successfully accepted
-                # TP+SL pair to LOCAL PROTECTION just because the visibility check
-                # lags for a few seconds.  The watchdog still reconciles later.
-                if str(pos.get("strategy") or "").lower() == "ai_scalping":
-                    if out.get("tp_order_id") and not out.get("tp_exists"):
-                        out["tp_exists"] = True
-                        out["tp_verify_note"] = "accepted by MEXC but not yet visible in open orders"
-                    if out.get("sl_order_id") and not out.get("sl_exists"):
-                        out["sl_exists"] = True
-                        out["sl_verify_note"] = "accepted by MEXC but not yet visible in open orders"
+                # v0148 strict exchange-first check: a returned id is not enough.
+                # TP/SL must be visible through MEXC open/plan/stop/TP-SL endpoints.
                 out["ok"] = bool(out.get("tp_exists") and out.get("sl_exists"))
                 out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
                 out["protection_mode"] = "exchange" if out["ok"] else "local_monitoring"
@@ -963,7 +957,7 @@ class ExecutionEngine:
         best["protection_status"] = "LOCAL BOT PROTECTED"
         best["protection_mode"] = "local_monitoring"
         best["protection_attempts"] = history
-        best["protection_warning"] = "exchange protection not confirmed after delayed position sync and distance expansion"
+        best["protection_warning"] = "exchange protection not confirmed after 3 attempts; caller must close unprotected position"
         return best
 
     async def cancel_entry(self, pos: dict, live: bool, reason: str = "limit_timeout"):

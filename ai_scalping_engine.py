@@ -253,6 +253,74 @@ def _quality_score(market: dict, setup: dict, side: str) -> dict:
 
 
 
+
+def _depth_usdt_within(ob: dict, price: float, side: str, window_pct: float = 0.15, fallback_levels: int = 10) -> float:
+    rows = ob.get("bids") if side == "bid" else ob.get("asks")
+    rows = rows or []
+    if price <= 0:
+        return sum(_f(p) * _f(q) for p, q, *_ in rows[:fallback_levels])
+    if side == "bid":
+        lo, hi = price * (1.0 - window_pct / 100.0), price
+    else:
+        lo, hi = price, price * (1.0 + window_pct / 100.0)
+    total = 0.0
+    for p, q, *_ in rows:
+        pp, qq = _f(p), _f(q)
+        if lo <= pp <= hi:
+            total += pp * qq
+    if total <= 0:
+        total = sum(_f(p) * _f(q) for p, q, *_ in rows[:fallback_levels])
+    return total
+
+
+def _spot_orderbook_bias(market: dict, settings: dict) -> dict:
+    """Direction from SPOT liquidity only. No AI, no sweep logic."""
+    bid_depth = _f(market.get("spot_bid_depth_usdt"), 0.0)
+    ask_depth = _f(market.get("spot_ask_depth_usdt"), 0.0)
+    ratio_min = _f(settings.get("ai_scalping_spot_imbalance_ratio"), _f(os.getenv("AI_SCALPING_SPOT_IMBALANCE_RATIO"), 1.8))
+    ratio_min = max(1.05, ratio_min)
+    if bid_depth <= 0 or ask_depth <= 0:
+        return {"side": "WAIT", "ratio": 0.0, "reason": "spot depth missing"}
+    bid_ask = bid_depth / max(1e-12, ask_depth)
+    ask_bid = ask_depth / max(1e-12, bid_depth)
+    if bid_ask >= ratio_min:
+        return {"side": "LONG", "ratio": _r(bid_ask, 3), "reason": f"spot bid/ask {bid_ask:.2f} >= {ratio_min:.2f}"}
+    if ask_bid >= ratio_min:
+        return {"side": "SHORT", "ratio": _r(ask_bid, 3), "reason": f"spot ask/bid {ask_bid:.2f} >= {ratio_min:.2f}"}
+    return {"side": "WAIT", "ratio": _r(max(bid_ask, ask_bid), 3), "reason": f"spot imbalance {max(bid_ask, ask_bid):.2f} < {ratio_min:.2f}"}
+
+
+def _futures_micro_momentum(market: dict, side: str, settings: dict) -> dict:
+    """Tiny futures confirmation after spot orderbook chose direction.
+
+    This is intentionally simple and fast: it only checks that futures price is
+    not moving against the spot bias and preferably has a tiny push in the same
+    direction.
+    """
+    side = str(side or "").upper()
+    r1 = _f(market.get("ret_1m_pct"), 0.0)
+    r3 = _f(market.get("ret_3m_pct"), 0.0)
+    atr = _f(market.get("atr_1m_pct"), 0.0)
+    min_move = _f(settings.get("ai_scalping_futures_momentum_min_pct"), _f(os.getenv("AI_SCALPING_FUTURES_MOMENTUM_MIN_PCT"), 0.015))
+    max_against = _f(settings.get("ai_scalping_futures_max_against_pct"), _f(os.getenv("AI_SCALPING_FUTURES_MAX_AGAINST_PCT"), 0.035))
+    min_move = max(0.0, min_move)
+    max_against = max(0.0, max_against)
+    if side == "LONG":
+        hard_against = r1 < -max_against and r3 < -max_against
+        ok = (not hard_against) and (r1 >= min_move or r3 >= min_move or (r1 >= 0 and r3 >= 0))
+        same_move = max(r1, r3)
+    elif side == "SHORT":
+        hard_against = r1 > max_against and r3 > max_against
+        ok = (not hard_against) and (r1 <= -min_move or r3 <= -min_move or (r1 <= 0 and r3 <= 0))
+        same_move = max(-r1, -r3)
+    else:
+        return {"ok": False, "strength": 0.0, "reason": "no side"}
+    strength = 0.0
+    if ok:
+        strength = min(1.0, max(0.15, (same_move + min_move) / max(0.04, atr * 0.7, min_move * 4)))
+    reason = f"futures r1={r1:.3f}% r3={r3:.3f}%" + (" ok" if ok else " against/weak")
+    return {"ok": bool(ok), "strength": _r(strength, 4), "reason": reason}
+
 def _compact_ai_setup_features(market: dict, long_setup: dict, short_setup: dict) -> dict:
     """Build a tiny ready-feature payload for OpenAI.
 
@@ -357,41 +425,10 @@ def parse_ai_scalp_decision(text: str, allowed_symbols: list[str], model: str) -
             except Exception:
                 data = None
     if not isinstance(data, dict):
-        # Some providers/models may still return plain text or malformed JSON
-        # despite strict instructions, e.g. "WAIT No reliable market data",
-        # "LONG confidence 0.82 ...", or a truncated object containing only
-        # decision text. Do not convert LONG/SHORT without a parsed confidence
-        # to 0.00: that creates false local rejects. Use a conservative fallback
-        # and mark it in the reason/log so the operator can see what happened.
-        plain = re.sub(r"^```(?:json|text)?\s*", "", raw, flags=re.I).strip()
-        plain = re.sub(r"\s*```$", "", plain).strip()
-        m_dec = re.search(r"\b(LONG|SHORT|WAIT)\b", plain, flags=re.I)
-        if m_dec:
-            decision = m_dec.group(1).upper()
-            m_conf = re.search(r"(?:confidence|conf)\s*[:=]?\s*(0(?:\.\d+)?|1(?:\.0+)?|\d{1,3}(?:\.\d+)?)", plain, flags=re.I)
-            inferred = False
-            if m_conf:
-                conf = _f(m_conf.group(1), 0.0)
-                if conf > 1:
-                    conf /= 100.0
-            else:
-                # Missing confidence must not become 0.00 for LONG/SHORT.
-                # 0.72 is intentionally conservative: it passes normal mode
-                # and meets the default quality gate, but is still visible in logs.
-                conf = 0.72 if decision in {"LONG", "SHORT"} else 0.65
-                inferred = True
-            m_tp = re.search(r"(?:tp_strength|tp|strength)\s*[:=]?\s*(0(?:\.\d+)?|1(?:\.0+)?|\d{1,3}(?:\.\d+)?)", plain, flags=re.I)
-            tp_strength = _f(m_tp.group(1), conf) if m_tp else conf
-            if tp_strength > 1:
-                tp_strength /= 100.0
-            m_reason = re.search(r'"reason"\s*:\s*"([^"{}]{0,220})', plain, flags=re.I)
-            reason = _clean_reason(m_reason.group(1) if m_reason else plain[m_dec.end():], 180)
-            if inferred:
-                reason = ("confidence missing -> fallback %.2f; %s" % (conf, reason)).strip(" ;")[:220]
-            # In decide_symbol() there is exactly one allowed symbol, so use it.
-            symbol = allowed_symbols[0] if allowed_symbols else ""
-            return AIScalpDecision(ok=True, symbol=symbol, decision=decision, confidence=max(0.0, min(1.0, conf)), reason=reason, raw=raw[:1000], model=model, confidence_inferred=inferred, tp_strength=max(0.0, min(1.0, tp_strength)))
-        return AIScalpDecision(ok=False, error="AI did not return JSON", raw=raw[:1000], model=model)
+        # v0148: strict AI JSON. Never infer LONG/SHORT from plain text and
+        # never inject fallback confidence such as 0.72. A malformed response is
+        # a WAIT/reject so the bot only enters on deterministic JSON.
+        return AIScalpDecision(ok=False, symbol=allowed_symbols[0] if allowed_symbols else "", decision="WAIT", confidence=0.0, error="AI did not return strict JSON", reason="malformed AI JSON", raw=raw[:1000], model=model)
     symbol = str(data.get("symbol") or "").upper().replace("_", "").replace("/", "").replace(":USDT", "")
     norm_allowed = {s.upper().replace("_", "").replace("/", "").replace(":USDT", ""): s for s in allowed_symbols}
     if symbol not in norm_allowed:
@@ -400,19 +437,20 @@ def parse_ai_scalp_decision(text: str, allowed_symbols: list[str], model: str) -
     if decision not in {"LONG", "SHORT", "WAIT"}:
         decision = "WAIT"
     inferred = False
+    reason = _clean_reason(data.get("reason") or "", 180)
     if data.get("confidence") is None:
-        conf = 0.72 if decision in {"LONG", "SHORT"} else 0.65
-        inferred = True
+        if decision in {"LONG", "SHORT"}:
+            return AIScalpDecision(ok=True, symbol=norm_allowed.get(symbol, ""), decision="WAIT", confidence=0.0, reason=("AI JSON missing confidence; " + reason).strip(" ;")[:220], raw=raw[:1000], model=model, confidence_inferred=False, tp_strength=0.0)
+        conf = 0.0
     else:
         conf = _f(data.get("confidence"), 0.0)
         if conf > 1:
             conf /= 100.0
+    if data.get("tp_strength") is None and decision in {"LONG", "SHORT"}:
+        return AIScalpDecision(ok=True, symbol=norm_allowed.get(symbol, ""), decision="WAIT", confidence=0.0, reason=("AI JSON missing tp_strength; " + reason).strip(" ;")[:220], raw=raw[:1000], model=model, confidence_inferred=False, tp_strength=0.0)
     tp_strength = _f(data.get("tp_strength"), conf)
     if tp_strength > 1:
         tp_strength /= 100.0
-    reason = _clean_reason(data.get("reason") or "", 180)
-    if inferred:
-        reason = ("confidence missing -> fallback %.2f; %s" % (conf, reason)).strip(" ;")[:220]
     return AIScalpDecision(
         ok=True,
         symbol=norm_allowed[symbol],
@@ -439,7 +477,7 @@ def ai_scalp_json_schema(symbol: str) -> dict:
             "tp_strength": {"type": "number", "minimum": 0, "maximum": 1},
             "reason": {"type": "string", "maxLength": 80},
         },
-        "required": ["symbol", "decision", "confidence", "reason"],
+        "required": ["symbol", "decision", "confidence", "tp_strength", "reason"],
     }
 
 
@@ -485,6 +523,10 @@ class AIScalpingEngine:
         c15 = await exchange_client.fetch_ohlcv(symbol, timeframe="15m", limit=50) if quality_mode else []
         ticker = await exchange_client.fetch_ticker(symbol)
         ob = await exchange_client.fetch_order_book(symbol, limit=10)
+        try:
+            spot_ob = await exchange_client.fetch_spot_order_book(symbol, limit=50)
+        except Exception as e:
+            spot_ob = {"bids": [], "asks": [], "error": str(e)[:120]}
         closes1 = [_f(c[4]) for c in c1]
         closes5 = [_f(c[4]) for c in c5]
         closes15 = [_f(c[4]) for c in c15]
@@ -494,7 +536,14 @@ class AIScalpingEngine:
         spread_pct = ((ask - bid) / price * 100.0) if price > 0 and ask > bid else 0.0
         bid_depth = sum(_f(p) * _f(q) for p, q, *_ in (ob.get("bids") or [])[:5])
         ask_depth = sum(_f(p) * _f(q) for p, q, *_ in (ob.get("asks") or [])[:5])
+        spot_window = _f(os.getenv("AI_SCALPING_SPOT_DEPTH_WINDOW_PCT"), 0.15)
+        spot_mid = price
+        if (spot_ob.get("bids") or []) and (spot_ob.get("asks") or []):
+            spot_mid = (_f(spot_ob["bids"][0][0]) + _f(spot_ob["asks"][0][0])) / 2.0
+        spot_bid_depth = _depth_usdt_within(spot_ob, spot_mid, "bid", spot_window, 10)
+        spot_ask_depth = _depth_usdt_within(spot_ob, spot_mid, "ask", spot_window, 10)
         ret_1m = ((closes1[-1] - closes1[-2]) / closes1[-2] * 100.0) if len(closes1) > 2 and closes1[-2] else 0.0
+        ret_3m = ((closes1[-1] - closes1[-4]) / closes1[-4] * 100.0) if len(closes1) > 4 and closes1[-4] else 0.0
         ret_5m = ((closes1[-1] - closes1[-6]) / closes1[-6] * 100.0) if len(closes1) > 6 and closes1[-6] else 0.0
         ema9 = _ema(closes1[-40:], 9)
         ema21 = _ema(closes1[-50:], 21)
@@ -508,6 +557,7 @@ class AIScalpingEngine:
             "price": _r(price, 4),
             "_candles1": c1,
             "ret_1m_pct": _r(ret_1m, 4),
+            "ret_3m_pct": _r(ret_3m, 4),
             "ret_5m_pct": _r(ret_5m, 4),
             "rsi_1m": _r(_rsi(closes1, 14), 2),
             "ema9_1m": _r(ema9, 4),
@@ -521,6 +571,10 @@ class AIScalpingEngine:
             "top5_bid_depth_usdt": _r(bid_depth, 2),
             "top5_ask_depth_usdt": _r(ask_depth, 2),
             "imbalance": _r((bid_depth - ask_depth) / max(1.0, bid_depth + ask_depth), 4),
+            "spot_bid_depth_usdt": _r(spot_bid_depth, 2),
+            "spot_ask_depth_usdt": _r(spot_ask_depth, 2),
+            "spot_imbalance": _r((spot_bid_depth - spot_ask_depth) / max(1.0, spot_bid_depth + spot_ask_depth), 4),
+            "spot_depth_error": spot_ob.get("error", ""),
         }
 
     async def decide(self, exchange_client, settings: dict) -> AIScalpDecision:
@@ -586,49 +640,52 @@ class AIScalpingEngine:
             self._decision_cache[base_key] = (now, dec)
             return dec
 
-        atr_pct = _f(market.get("atr_1m_pct"), 0.0)
-        price = _f(market.get("price"), 0.0)
-        long_setup = _local_scalp_setup(market.get("_candles1") or [], "LONG", price, atr_pct)
-        short_setup = _local_scalp_setup(market.get("_candles1") or [], "SHORT", price, atr_pct)
-
-        # Do not spend OpenAI tokens when the deterministic liquidity setup gate
-        # has no valid LONG/SHORT candidate. This is the main token saver.
-        if not long_setup.get("valid") and not short_setup.get("valid"):
-            reason = f"local: no setup L={long_setup.get('reason','')}; S={short_setup.get('reason','')}"
-            dec = AIScalpDecision(ok=True, symbol=allowed_symbol, decision="WAIT", confidence=0.0, reason=reason[:220], model=model, market={"markets": markets})
+        # v0152 REAL orderbook scalp path:
+        # 1) SPOT orderbook chooses LONG/SHORT bias.
+        # 2) FUTURES micro momentum confirms price is not moving against it.
+        # 3) OpenAI is optional and can only reject; it no longer chooses direction.
+        ob_bias = _spot_orderbook_bias(market, settings)
+        if ob_bias.get("side") not in {"LONG", "SHORT"}:
+            dec = AIScalpDecision(ok=True, symbol=allowed_symbol, decision="WAIT", confidence=0.0, reason="local: " + str(ob_bias.get("reason", "no spot bias"))[:190], model="spot_orderbook_bias", market={"markets": markets})
             self._decision_cache[base_key] = (now, dec)
             return dec
 
-        # v0143: ETH/BTC scalp mode uses a tiny AI prompt when API key exists.
-        # Local setup gate still runs first, so tokens are spent only on real candidates.
-        # If OpenAI is disabled/missing, keep safe local fallback.
-        if not quality_mode and (not key or not _b(settings, "ai_scalping_ai_entry_filter_enabled", True)):
-            valid_setups = []
-            if long_setup.get("valid"):
-                ql = _quality_score(market, long_setup, "LONG")
-                valid_setups.append(("LONG", long_setup, ql))
-            if short_setup.get("valid"):
-                qs = _quality_score(market, short_setup, "SHORT")
-                valid_setups.append(("SHORT", short_setup, qs))
-            if not valid_setups:
-                dec = AIScalpDecision(ok=True, symbol=allowed_symbol, decision="WAIT", confidence=0.0, reason="local: no valid setup", model="local_setup_gate", market={"markets": markets})
-                self._decision_cache[base_key] = (now, dec)
-                return dec
-            side, setup, q = max(valid_setups, key=lambda x: (_f(x[2].get("score"), 0.0), _f(x[1].get("structure_rr"), 0.0), _f(x[1].get("score"), 0.0)))
-            min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.52)
-            strength = max(0.0, min(1.0, max(_f(q.get("score"), 0.0), _f(setup.get("score"), 0.0)) / 100.0))
-            conf = max(min_conf, min(0.90, strength))
-            reason = f"local setup {side}: score={_f(setup.get('score'),0):.1f} q={_f(q.get('score'),0):.1f} rr={_f(setup.get('structure_rr'),0):.2f}"
-            return AIScalpDecision(ok=True, symbol=allowed_symbol, decision=side, confidence=conf, reason=reason[:180], raw="local_setup_gate_no_ai", model="local_setup_gate", market={"markets": markets}, tp_strength=strength)
+        side = str(ob_bias.get("side"))
+        mom = _futures_micro_momentum(market, side, settings)
+        if not mom.get("ok"):
+            reason = f"local: {side} spot bias but {mom.get('reason', 'no futures momentum')}"
+            dec = AIScalpDecision(ok=True, symbol=allowed_symbol, decision="WAIT", confidence=0.0, reason=reason[:220], model="spot_orderbook_bias", market={"markets": markets})
+            self._decision_cache[base_key] = (now, dec)
+            return dec
 
-        feature_payload = _compact_ai_setup_features(market, long_setup, short_setup)
-        min_conf = _f(settings.get("ai_scalping_quality_min_confidence" if quality_mode else "ai_scalping_min_confidence"), 0.72 if quality_mode else 0.52)
-        prompt_obj = {"s": base_key, "min": min_conf, "x": feature_payload}
+        min_conf = _f(settings.get("ai_scalping_min_confidence"), 0.52)
+        # Use the existing global AI button as the on/off switch for optional confirmation.
+        ai_confirm_enabled = bool(key) and _b(settings, "openai_analysis_enabled", False) and _b(settings, "ai_scalping_ai_entry_filter_enabled", True)
+        spot_ratio = _f(ob_bias.get("ratio"), 0.0)
+        mom_strength = _f(mom.get("strength"), 0.0)
+        local_strength = max(0.0, min(1.0, (min(spot_ratio, 3.0) - 1.0) / 2.0 * 0.65 + mom_strength * 0.35))
+        local_conf = max(min_conf, min(0.92, 0.50 + local_strength * 0.42))
+
+        if not ai_confirm_enabled:
+            reason = f"spot {side}: {ob_bias.get('reason')}; {mom.get('reason')}"
+            return AIScalpDecision(ok=True, symbol=allowed_symbol, decision=side, confidence=local_conf, reason=reason[:180], raw="spot_orderbook_no_ai", model="spot_orderbook", market={"markets": markets}, tp_strength=local_strength)
+
+        # Optional anti-fake AI prompt. Direction is already fixed by code.
+        # AI may only return the same side or WAIT; if it returns the opposite side,
+        # parse_ai_scalp_decision accepts it but we reject it below before candidate creation.
+        prompt_obj = {
+            "s": base_key,
+            "side": side,
+            "min": min_conf,
+            "spot": {"bid": _r(market.get("spot_bid_depth_usdt"), 0), "ask": _r(market.get("spot_ask_depth_usdt"), 0), "ratio": _r(spot_ratio, 3)},
+            "fut": {"r1": market.get("ret_1m_pct", 0), "r3": market.get("ret_3m_pct", 0), "sp": market.get("spread_pct", 0), "atr": market.get("atr_1m_pct", 0)},
+        }
         prompt = json.dumps(prompt_obj, separators=(",", ":"), ensure_ascii=False)
         system = (
-            'BTC/ETH micro-scalp filter. JSON only. '
-            'Use only listed x.cand side. ENTER on fresh momentum; sweep/reclaim is bonus, not mandatory. Reject flat, late, exhaustion. '
-            'Prefer quick 0% fee scalps. Return {"symbol":"BTCUSDT|ETHUSDT","decision":"LONG|SHORT|WAIT","confidence":0-1,"tp_strength":0-1,"reason":"max8w"}.'
+            'BTC/ETH micro-scalp anti-fake filter. JSON only. '
+            'Direction is already chosen by SPOT orderbook. Do NOT choose another side. '
+            'Reject only if flat, late entry, exhaustion candle, spread spike, or futures momentum is fake. '
+            'Return {"symbol":"BTCUSDT|ETHUSDT","decision":"SAME_SIDE_OR_WAIT","confidence":0-1,"tp_strength":0-1,"reason":"max8w"}.'
         )
         timeout_sec = float(settings.get("openai_timeout_sec", os.getenv("OPENAI_TIMEOUT_SEC", "12")) or 12)
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
@@ -642,7 +699,7 @@ class AIScalpingEngine:
                         "model": model,
                         "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
                     }
-                    if _b(settings, "ai_scalping_json_mode_enabled", False):
+                    if _b(settings, "ai_scalping_json_mode_enabled", True):
                         chat_body["response_format"] = _json_object_payload()
                     if str(model).lower().startswith(("gpt-5", "o1", "o3", "o4")):
                         chat_body["max_completion_tokens"] = 40
@@ -655,6 +712,8 @@ class AIScalpingEngine:
                             parsed = _extract_text(json.loads(txt))
                             dec = parse_ai_scalp_decision(parsed, allowed, model)
                             dec.market = {"markets": markets}
+                            if dec.ok and dec.decision in {"LONG", "SHORT"} and dec.decision != side:
+                                dec = AIScalpDecision(ok=True, symbol=allowed_symbol, decision="WAIT", confidence=0.0, reason=f"AI tried {dec.decision}, spot side is {side}", raw=parsed[:1000], model=model, market={"markets": markets})
                             if dec.ok and dec.decision == "WAIT":
                                 self._decision_cache[base_key] = (time.time(), dec)
                             return dec
@@ -704,13 +763,12 @@ class AIScalpingEngine:
         spread = _f(market.get("spread_pct"), 0.0)
         if spread > max_spread:
             return f"spread {spread:.3f}% > max {max_spread:.3f}%"
-        setup = _local_scalp_setup(market.get("_candles1") or [], decision.decision, price, _f(market.get("atr_1m_pct"), 0.0))
-        if not setup.get("valid"):
-            return str(setup.get("reason") or "setup rejected")
-        q = _quality_score(market, setup, decision.decision)
-        min_q = _f(settings.get("ai_scalping_setup_min_quality_score"), 42.0)
-        if q.get("score", 0.0) < min_q:
-            return f"quality score {q.get('score', 0):.1f} < {min_q:.1f}: {q.get('notes') or 'weak setup'}"
+        ob_bias = _spot_orderbook_bias(market, settings)
+        if ob_bias.get("side") != decision.decision:
+            return f"spot bias {ob_bias.get('side')} != {decision.decision}: {ob_bias.get('reason')}"
+        mom = _futures_micro_momentum(market, decision.decision, settings)
+        if not mom.get("ok"):
+            return str(mom.get("reason") or "futures momentum rejected")
         if quality_mode:
             min_atr = _f(settings.get("ai_scalping_quality_min_atr_pct"), 0.035)
             min_gap = _f(settings.get("ai_scalping_quality_min_ema_gap_pct"), 0.015)
@@ -744,12 +802,11 @@ class AIScalpingEngine:
         max_spread = _f(settings.get("ai_scalping_max_spread_pct"), _f(settings.get("max_spread_pct"), 0.20))
         if _f(market.get("spread_pct"), 0.0) > max_spread:
             return None
-        setup = _local_scalp_setup(market.get("_candles1") or [], decision.decision, price, _f(market.get("atr_1m_pct"), 0.0))
-        if not setup.get("valid"):
+        ob_bias = _spot_orderbook_bias(market, settings)
+        if ob_bias.get("side") != decision.decision:
             return None
-        q = _quality_score(market, setup, decision.decision)
-        min_q = _f(settings.get("ai_scalping_setup_min_quality_score"), 42.0)
-        if q.get("score", 0.0) < min_q:
+        mom = _futures_micro_momentum(market, decision.decision, settings)
+        if not mom.get("ok"):
             return None
         if quality_mode:
             min_atr = _f(settings.get("ai_scalping_quality_min_atr_pct"), 0.035)
@@ -778,7 +835,8 @@ class AIScalpingEngine:
             max_tp_pct = _f(settings.get("ai_scalping_max_tp_pct"), _f(os.getenv("AI_SCALPING_MAX_TP_PCT"), 0.14))
         min_tp_pct = max(0.01, min_tp_pct)
         max_tp_pct = max(min_tp_pct, max_tp_pct)
-        local_strength = max(_f(q.get("score"), 0.0), _f(setup.get("score"), 0.0)) / 100.0
+        spot_ratio = _f(ob_bias.get("ratio"), 0.0)
+        local_strength = max(0.0, min(1.0, (min(spot_ratio, 3.0) - 1.0) / 2.0 * 0.65 + _f(mom.get("strength"), 0.0) * 0.35))
         strength = _f(getattr(decision, "tp_strength", 0.0), local_strength)
         if strength <= 0:
             strength = local_strength
@@ -797,5 +855,5 @@ class AIScalpingEngine:
             "ai_scalping_sl_pct": _r(sl_pct, 4),
             "ai_scalping_tp_strength": _r(strength, 4),
             "risk_pct": _f(settings.get("risk_pct"), 0.005),
-            "score_details": {"ai_reason": decision.reason, "ai_model": decision.model, "setup": setup, "quality_score": q, **clean_market},
+            "score_details": {"ai_reason": decision.reason, "ai_model": decision.model, "spot_bias": ob_bias, "futures_momentum": mom, **clean_market},
         }
