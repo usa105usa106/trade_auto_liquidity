@@ -7,7 +7,9 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["💰 Balance", "🏓 Ping"],
     ["⚙️ Settings", "🔐 API"],
     ["🤖 AI BTC/ETH scalping"],
-    ["📊 AI Stats", "⚙️ MEXC"],
+    ["🚀 BOOST MODE", "🛑 STOP BOOST"],
+    ["📊 BOOST STATUS", "📊 AI Stats"],
+    ["⚙️ MEXC"],
 ], resize_keyboard=True)
 
 def _onoff(settings: dict | None, key: str) -> str:
@@ -46,6 +48,7 @@ def settings_menu(revision: int, settings: dict | None = None):
         [InlineKeyboardButton(f"🧠 Auto Strategy: {_onoff(settings, 'auto_strategy_adaptation')}", callback_data=f"toggle:auto_strategy_adaptation:{r}")],
         [InlineKeyboardButton(f"🤖 ИИ анализ: {_onoff(settings, 'openai_analysis_enabled')} | {_value(settings, 'openai_model', 'gpt-5.4-mini')}", callback_data=f"menu:openai:{r}")],
         [InlineKeyboardButton(f"🛡 AI scalp quality: {_onoff(settings, 'ai_scalping_quality_filters_enabled')}", callback_data=f"toggle:ai_scalping_quality_filters_enabled:{r}")],
+        [InlineKeyboardButton(f"🚀 Boost rotation: {_onoff(settings, 'boost_parallel_scan_enabled')}", callback_data=f"toggle:boost_parallel_scan_enabled:{r}")],
         [InlineKeyboardButton(f"⚠️ AI liq stop: {_onoff(settings, 'ai_scalping_liquidation_stop_mode')}", callback_data=f"toggle:ai_scalping_liquidation_stop_mode:{r}")],
         [InlineKeyboardButton(f"📊 Графики сделок: {_onoff(settings, 'trade_charts_enabled')}", callback_data=f"toggle:trade_charts_enabled:{r}")],
         [InlineKeyboardButton(f"🏃 Liquidity Runner: {_onoff(settings, 'liquidity_runner_enabled')}", callback_data=f"toggle:liquidity_runner_enabled:{r}")],

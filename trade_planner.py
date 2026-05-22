@@ -65,6 +65,14 @@ class TradePlanner:
                 "tp_mult": 1.0,
                 "sl_mult": 1.0,
             },
+            "boost_scalping": {
+                "min_tp": float(os.getenv("BOOST_MIN_TP_PCT", "0.08")),
+                "max_tp": float(os.getenv("BOOST_MAX_TP_PCT", "0.18")),
+                "min_sl": float(os.getenv("BOOST_MIN_SL_PCT", "0.09")),
+                "max_sl": float(os.getenv("BOOST_MAX_SL_PCT", "0.22")),
+                "tp_mult": 1.0,
+                "sl_mult": 1.0,
+            },
             "liquidity_retest": {
                 # v0082: not a scalp profile. SL comes from the liquidity zone/wick,
                 # TP is adaptive RR (2R/3R/4R). These bands are safety clamps only.
@@ -135,7 +143,7 @@ class TradePlanner:
                         tp_pct = clamp(target_pct, float(profile["min_tp"]), float(profile["max_tp"]))
                         rr = clamp(target_rr, 2.0, 4.0)
             candidate["liquidity_retest_rr"] = rr
-        elif strategy == "ai_scalping":
+        elif strategy in {"ai_scalping", "boost_scalping"}:
             # v0126: AI no longer opens on direction alone. The engine attaches
             # structure/ATR based distances after a sweep/reclaim setup gate.
             # Keep old fixed env/settings only as fallback for legacy candidates.
@@ -169,7 +177,7 @@ class TradePlanner:
                 # band. Do not open; better no trade than a negative-expectancy setup.
                 return None
         max_positions = max(1, int(candidate.get("max_open_positions", settings.get("max_open_positions", 5)) or 5))
-        leverage = max(1, int(float(settings.get("mexc_order_leverage", os.getenv("MEXC_ORDER_LEVERAGE", "5")) or 5)))
+        leverage = max(1, int(float(candidate.get("leverage", settings.get("mexc_order_leverage", os.getenv("MEXC_ORDER_LEVERAGE", "5"))) or 5)))
 
         liq_stop_mode = (strategy == "ai_scalping") and self._bool_setting(settings, "ai_scalping_liquidation_stop_mode", False)
         if liq_stop_mode:
@@ -193,7 +201,7 @@ class TradePlanner:
         # v0064 safety: fixed margin allocation per slot.
         # Example: 50 USDT balance / 5 max positions = 10 USDT max margin.
         # With 5x leverage, max notional for one trade = 50 USDT.
-        trade_margin_pct = max(0.001, min(1.0, float(settings.get("trade_margin_pct", os.getenv("TRADE_MARGIN_PCT", "0.10")) or 0.10)))
+        trade_margin_pct = max(0.001, min(1.0, float(candidate.get("trade_margin_pct", settings.get("trade_margin_pct", os.getenv("TRADE_MARGIN_PCT", "0.10"))) or 0.10)))
         # Per user requirement: one trade may use at most this share of account balance as isolated margin.
         # Default is 10%; max_positions no longer silently raises/lower the single-trade allocation.
         max_margin_per_position = equity * trade_margin_pct
@@ -241,7 +249,7 @@ class TradePlanner:
             stop = price * (1 + sl_pct / 100.0)
             take = price * (1 - tp_pct / 100.0)
 
-        order_type = "market" if strategy in {"momentum", "ai_scalping"} else "limit"
+        order_type = "market" if strategy in {"momentum", "ai_scalping", "boost_scalping"} else "limit"
         lr_rr = float(candidate.get("liquidity_retest_rr") or (details.get("adaptive_rr") if isinstance(details, dict) else 0) or 0)
         lr_zone_low = float(details.get("zone_low") or 0) if isinstance(details, dict) else 0.0
         lr_zone_high = float(details.get("zone_high") or 0) if isinstance(details, dict) else 0.0

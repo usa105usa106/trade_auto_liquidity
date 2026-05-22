@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0169 AI JSON FALLBACK SCALP FIX")
+VERSION = os.getenv("BOT_VERSION", "0174 BOOST MAX AGGRESSION")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -131,6 +131,43 @@ class Defaults:
     ai_scalping_liq_max_leverage: int = env_int("AI_SCALPING_LIQ_MAX_LEVERAGE", 200)
     ai_scalping_protection_delay_sec: float = env_float("AI_SCALPING_PROTECTION_DELAY_SEC", 3.0)
     trade_margin_pct: float = env_float("TRADE_MARGIN_PCT", 0.10)
+
+    # v0174 Boost Max Aggression: main-menu autonomous boost, 10x-50x auto leverage, live panel and profit-only rotation ON by default.
+    boost_zero_fee_scanner_enabled: bool = env_bool("BOOST_ZERO_FEE_SCANNER_ENABLED", True)
+    boost_balance_share: float = env_float("BOOST_BALANCE_SHARE", 0.10)
+    boost_target_multiplier: float = env_float("BOOST_TARGET_MULTIPLIER", 20.0)
+    boost_session_hours: float = env_float("BOOST_SESSION_HOURS", 6.0)
+    boost_max_session_loss_pct: float = env_float("BOOST_MAX_SESSION_LOSS_PCT", 80.0)
+    boost_max_consecutive_losses: int = env_int("BOOST_MAX_CONSECUTIVE_LOSSES", 3)
+    boost_auto_leverage: bool = env_bool("BOOST_AUTO_LEVERAGE", True)
+    boost_min_leverage: int = env_int("BOOST_MIN_LEVERAGE", 10)
+    boost_max_leverage: int = env_int("BOOST_MAX_LEVERAGE", 50)
+    boost_use_full_bank_per_trade: bool = env_bool("BOOST_USE_FULL_BANK_PER_TRADE", True)
+    boost_risk_pct_per_trade: float = env_float("BOOST_RISK_PCT_PER_TRADE", 0.12)
+    boost_auto_rotate_symbols: bool = env_bool("BOOST_AUTO_ROTATE_SYMBOLS", True)
+    boost_stop_when_target_reached: bool = env_bool("BOOST_STOP_WHEN_TARGET_REACHED", True)
+    boost_max_symbols_scan: int = env_int("BOOST_MAX_SYMBOLS_SCAN", 300)
+    boost_min_quote_volume_usdt: float = env_float("BOOST_MIN_QUOTE_VOLUME_USDT", 5000000.0)
+    boost_min_atr_pct: float = env_float("BOOST_MIN_ATR_PCT", 0.08)
+    boost_max_spread_pct: float = env_float("BOOST_MAX_SPREAD_PCT", 0.08)
+    boost_spot_imbalance_ratio: float = env_float("BOOST_SPOT_IMBALANCE_RATIO", 2.0)
+    boost_futures_momentum_min_pct: float = env_float("BOOST_FUTURES_MOMENTUM_MIN_PCT", 0.03)
+    boost_futures_max_against_pct: float = env_float("BOOST_FUTURES_MAX_AGAINST_PCT", 0.01)
+    boost_min_tp_pct: float = env_float("BOOST_MIN_TP_PCT", 0.08)
+    boost_max_tp_pct: float = env_float("BOOST_MAX_TP_PCT", 0.18)
+    boost_sl_tp_multiplier: float = env_float("BOOST_SL_TP_MULTIPLIER", 1.15)
+    boost_scan_interval_sec: int = env_int("BOOST_SCAN_INTERVAL_SEC", 3)
+    boost_allow_fee_fallback: bool = env_bool("BOOST_ALLOW_FEE_FALLBACK", False)
+    boost_zero_fee_symbols: str = os.getenv("BOOST_ZERO_FEE_SYMBOLS", "")
+
+    boost_live_panel_enabled: bool = env_bool("BOOST_LIVE_PANEL_ENABLED", True)
+    boost_live_panel_interval_sec: int = env_int("BOOST_LIVE_PANEL_INTERVAL_SEC", 5)
+    boost_parallel_scan_enabled: bool = env_bool("BOOST_PARALLEL_SCAN_ENABLED", True)
+    boost_rotate_only_if_profit: bool = env_bool("BOOST_ROTATE_ONLY_IF_PROFIT", True)
+    boost_min_profit_to_rotate_pct: float = env_float("BOOST_MIN_PROFIT_TO_ROTATE_PCT", 0.04)
+    boost_rotate_strength_multiplier: float = env_float("BOOST_ROTATE_STRENGTH_MULTIPLIER", 1.35)
+    boost_rotate_min_score_gap: float = env_float("BOOST_ROTATE_MIN_SCORE_GAP", 5.0)
+    boost_rotate_cooldown_sec: int = env_int("BOOST_ROTATE_COOLDOWN_SEC", 20)
 
 DEFAULTS = Defaults()
 DB_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")

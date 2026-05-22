@@ -1,7 +1,7 @@
 import os, time, asyncio, logging
 from datetime import datetime, timezone, timedelta
 import aiohttp
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import psutil
 
@@ -28,6 +28,7 @@ from ws_engine import WebSocketSupervisor, futures_source_from_mode
 from trade_planner import TradePlanner
 from openai_signal_engine import OpenAISignalEngine
 from ai_scalping_engine import AIScalpingEngine
+from boost_scalping_engine import BoostScalpingEngine
 from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
@@ -40,6 +41,7 @@ storage = Storage()
 scanner = Scanner()
 ai_signal_engine = OpenAISignalEngine()
 ai_scalping_engine = AIScalpingEngine()
+boost_scalping_engine = BoostScalpingEngine()
 ai_stats_manager = AIStatsManager(storage)
 running = False
 # New-entry switch is intentionally separate from the loop switch.
@@ -859,6 +861,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /help - помощь
 /log [lines] - последние MEXC/TP-SL ошибки
 /run - запустить торговлю
+/boost_start или кнопка 🚀 BOOST MODE - запустить BOOST autopilot: 10% депозита → x20 цель
+/boost_stop или кнопка 🛑 STOP BOOST - остановить BOOST и новые входы
+/boost_status или кнопка 📊 BOOST STATUS - статус BOOST банка/цели
+/boost_rotation - включить/выключить rotation while in profit
 /stop - остановить новые входы
 /panic - закрыть позиции и отменить ордера
 /status - статус
@@ -882,6 +888,7 @@ Note: /positions checks MEXC exchange-first; /open_orders scans normal + plan + 
 /proxy on|off|test|set URL
 /api status|set KEY SECRET|clear|test - API биржи через чат
 /openai status|set KEY|clear|test - OpenAI ключ для ИИ проверки
+BOOST autopilot: /boost_start или кнопка 🚀 BOOST MODE включает режим boost_scalping, сам сканирует API-подтверждённые 0-fee futures пары, выбирает живую монету, LONG/SHORT и плечо, использует только boost-bank = 10% депозита и останавливается при x20 цели.
 AI scalping loop: кнопка 🤖 AI BTC/ETH scalping или /set strategy_mode ai_scalping. BTC и ETH независимы: AI-запрос только по символу без открытой позиции. После live-входа бот ждёт появления позиции на MEXC, затем ставит TP/SL. Если MEXC не подтвердил защиту после повторов, AI scalping позиция закрывается сразу: нет защиты на бирже = нет позиции. Доп. фильтры качества включаются отдельно: ai_scalping_quality_filters_enabled.
 /mexc_settings - показать MEXC параметры ордера
 /leverage 5 - плечо MEXC futures
@@ -1033,6 +1040,192 @@ async def panic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if failures:
         text += "\n⚠️ Failures:\n" + "\n".join(failures[:10])
     await reply(update, text, reply_markup=MAIN_MENU)
+
+
+async def _boost_session_snapshot(settings: dict) -> dict:
+    now_ts = time.time()
+    start_ts = float(settings.get("boost_session_start_ts", 0) or 0)
+    equity = float(settings.get("boost_session_start_equity", 0) or 0)
+    bank = float(settings.get("boost_session_bank_usdt", 0) or 0)
+    target_mult = max(1.0, float(settings.get("boost_target_multiplier", 20.0) or 20.0))
+    if start_ts <= 0 or bank <= 0:
+        return {"active": False, "start_ts": start_ts, "bank": bank, "pnl": 0.0, "current_bank": bank, "target_bank": bank * target_mult, "target_mult": target_mult, "age_sec": 0, "equity": equity}
+    trades = [t for t in await storage.trade_rows(since=start_ts) if str(t.get("strategy", "")).lower() == "boost_scalping"]
+    pnl = sum(float(t.get("pnl_usdt") or 0) for t in trades)
+    current_bank = max(0.0, bank + pnl)
+    return {"active": True, "start_ts": start_ts, "bank": bank, "pnl": pnl, "current_bank": current_bank, "target_bank": bank * target_mult, "target_mult": target_mult, "age_sec": max(0, now_ts - start_ts), "equity": equity, "trades": len(trades)}
+
+
+
+def _bool_setting(settings: dict, key: str, default: bool = False) -> bool:
+    val = settings.get(key, default)
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _boost_rotation_keyboard(settings: dict) -> InlineKeyboardMarkup:
+    rev = int(settings.get("settings_revision", 1) or 1)
+    rot_on = _bool_setting(settings, "boost_parallel_scan_enabled", True)
+    live_on = _bool_setting(settings, "boost_live_panel_enabled", True)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(("✅ Rotation ON" if rot_on else "○ Rotation OFF"), callback_data=f"boost:rotation:{rev}")],
+        [InlineKeyboardButton(("✅ Live panel ON" if live_on else "○ Live panel OFF"), callback_data=f"boost:panel:{rev}")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data=f"boost:refresh:{rev}")],
+    ])
+
+
+def _short_symbol(symbol: str) -> str:
+    return str(symbol or "-").replace("/", "_").replace(":USDT", "")
+
+
+async def boost_live_panel_update(app, settings: dict, snap: dict, *, status: str = "scan", decision=None, position: dict | None = None, note: str = "", force: bool = False) -> None:
+    """Edit one BOOST live Telegram message instead of spamming the chat."""
+    if not _bool_setting(settings, "boost_live_panel_enabled", True):
+        return
+    chat_id = first_admin_id()
+    if not chat_id:
+        return
+    interval = max(1, int(float(settings.get("boost_live_panel_interval_sec", 5) or 5)))
+    now = time.time()
+    if not force and now - float(app.bot_data.get("boost_panel_last_edit", 0) or 0) < interval:
+        return
+    rot = "ON" if _bool_setting(settings, "boost_parallel_scan_enabled", True) else "OFF"
+    lines = [
+        "🚀 BOOST AUTOPILOT LIVE",
+        f"Status: {status}",
+        f"Bank: {float(snap.get('current_bank') or 0):.4f} / {float(snap.get('target_bank') or 0):.4f} USDT",
+        f"Session PnL: {float(snap.get('pnl') or 0):+.4f} USDT | Trades: {snap.get('trades', 0)}",
+        f"Rotation while profit: {rot}",
+    ]
+    if position:
+        try:
+            sym = _short_symbol(position.get("symbol"))
+            side = str(position.get("side") or "-").upper()
+            entry = float(position.get("entry_price") or 0)
+            lev = position.get("leverage") or position.get("mexc_order_leverage") or "-"
+            lines += ["", "Open trade:", f"{sym} {side} | lev {lev}x | entry {entry:.8g}"]
+        except Exception:
+            pass
+    if decision is not None:
+        try:
+            mk = ((getattr(decision, "market", None) or {}).get("markets") or [{}])[0]
+            lines += [
+                "",
+                "Scanner:",
+                f"Best: {_short_symbol(getattr(decision, 'symbol', '') or mk.get('symbol'))} {getattr(decision, 'decision', '-')}",
+                f"Conf: {float(getattr(decision, 'confidence', 0) or 0):.2f}",
+                f"Reason: {str(getattr(decision, 'reason', '') or '-')[:130]}",
+            ]
+        except Exception:
+            pass
+    if note:
+        lines += ["", f"Note: {note[:220]}"]
+    lines.append(datetime.now(timezone(timedelta(hours=3))).strftime("\nUpdated: %H:%M:%S MSK"))
+    text = "\n".join(lines)
+    msg_id = app.bot_data.get("boost_live_panel_message_id")
+    try:
+        if msg_id:
+            await app.bot.edit_message_text(chat_id=chat_id, message_id=int(msg_id), text=text, reply_markup=_boost_rotation_keyboard(settings))
+        else:
+            msg = await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=_boost_rotation_keyboard(settings))
+            app.bot_data["boost_live_panel_message_id"] = getattr(msg, "message_id", None)
+        app.bot_data["boost_panel_last_edit"] = now
+    except Exception as e:
+        log.warning("boost live panel update failed: %s", e)
+        try:
+            msg = await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=_boost_rotation_keyboard(settings))
+            app.bot_data["boost_live_panel_message_id"] = getattr(msg, "message_id", None)
+            app.bot_data["boost_panel_last_edit"] = now
+        except Exception as e2:
+            log.warning("boost live panel resend failed: %s", e2)
+
+
+async def boost_rotation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    new_value = not _bool_setting(s, "boost_parallel_scan_enabled", True)
+    await storage.set("boost_parallel_scan_enabled", new_value)
+    ns = await storage.all_settings()
+    await reply(update, f"✅ BOOST rotation while in profit = {new_value}", reply_markup=_boost_rotation_keyboard(ns))
+
+async def boost_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    snap = await _boost_session_snapshot(s)
+    text = (
+        f"🚀 BOOST AUTOPILOT\n"
+        f"Mode: {s.get('strategy_mode')}\n"
+        f"Running: {running} | Entries: {entries_enabled}\n"
+        f"Bank: {snap['bank']:.4f} → target {snap['target_bank']:.4f} USDT (x{snap['target_mult']:.0f})\n"
+        f"Current boost bank: {snap['current_bank']:.4f} USDT\n"
+        f"Session PnL: {snap['pnl']:+.4f} USDT\n"
+        f"Trades: {snap.get('trades', 0)}\n"
+        f"Balance share: {float(s.get('boost_balance_share', 0.10))*100:.1f}%\n"
+        f"Auto leverage: {s.get('boost_auto_leverage')} {s.get('boost_min_leverage')}x–{s.get('boost_max_leverage')}x\n"
+        f"0-fee required: {not bool(s.get('boost_allow_fee_fallback', False))}\n"
+        f"Last: {scanner.last_reject_reason or '-'}"
+    )
+    await reply(update, text, reply_markup=_boost_rotation_keyboard(s))
+
+async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    global running, entries_enabled, trading_task, position_task
+    s = await storage.all_settings()
+    equity = 0.0
+    try:
+        ex = await get_exchange(s)
+        bal = await ex.fetch_balance()
+        usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
+        equity = float(usdt.get("total") or usdt.get("free") or ((bal or {}).get("total", {}) or {}).get("USDT") or 0)
+    except Exception:
+        equity = float(s.get("boost_session_start_equity", 0) or 0)
+    share = max(0.001, min(1.0, float(s.get("boost_balance_share", 0.10) or 0.10)))
+    bank = max(0.0, equity * share)
+    target_mult = max(1.0, float(s.get("boost_target_multiplier", 20.0) or 20.0))
+    now_ts = time.time()
+    await storage.set("strategy_mode", "boost_scalping", bump_revision=False)
+    await storage.set("boost_session_start_ts", now_ts, bump_revision=False)
+    await storage.set("boost_session_start_equity", equity, bump_revision=False)
+    await storage.set("boost_session_bank_usdt", bank, bump_revision=False)
+    await storage.set("boost_session_target_profit_usdt", bank * (target_mult - 1.0), bump_revision=False)
+    await storage.set("scan_interval_sec", int(float(s.get("boost_scan_interval_sec", 3) or 3)), bump_revision=False)
+    await storage.set("max_open_positions", 1)
+    # v0174 BOOST MAX AGGRESSION: pressing 🚀 BOOST MODE forces the aggressive autopilot defaults ON,
+    # even if an older Railway SQLite/settings state contains stale false/low values.
+    await storage.set("boost_zero_fee_scanner_enabled", True, bump_revision=False)
+    await storage.set("boost_balance_share", 0.10, bump_revision=False)
+    await storage.set("boost_target_multiplier", 20.0, bump_revision=False)
+    await storage.set("boost_auto_leverage", True, bump_revision=False)
+    await storage.set("boost_min_leverage", 10, bump_revision=False)
+    await storage.set("boost_max_leverage", 50, bump_revision=False)
+    await storage.set("boost_use_full_bank_per_trade", True, bump_revision=False)
+    await storage.set("boost_auto_rotate_symbols", True, bump_revision=False)
+    await storage.set("boost_stop_when_target_reached", True, bump_revision=False)
+    await storage.set("boost_max_symbols_scan", 300, bump_revision=False)
+    await storage.set("boost_allow_fee_fallback", False, bump_revision=False)
+    await storage.set("boost_parallel_scan_enabled", True, bump_revision=False)
+    await storage.set("boost_live_panel_enabled", True, bump_revision=False)
+    await storage.set("boost_rotate_only_if_profit", True, bump_revision=False)
+    await storage.set("boost_min_profit_to_rotate_pct", 0.04, bump_revision=False)
+    await storage.set("boost_rotate_strength_multiplier", 1.35, bump_revision=False)
+    await storage.set("boost_rotate_cooldown_sec", 20, bump_revision=False)
+    if trading_task and not trading_task.done():
+        running = True; entries_enabled = True
+    else:
+        running = True; entries_enabled = True
+        trading_task = context.application.create_task(trading_loop(context.application))
+    if position_task is None or position_task.done():
+        position_task = context.application.create_task(position_management_loop(context.application))
+    trigger_scan_now(context.application, reason="boost_start")
+    await reply(update, f"🚀 BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nMode: auto 0-fee scan + auto LONG/SHORT + auto leverage", reply_markup=_boost_rotation_keyboard(await storage.all_settings()))
+
+async def boost_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    global running, entries_enabled
+    entries_enabled = False
+    await storage.set("strategy_mode", "hybrid")
+    await reply(update, "🛑 BOOST stopped. New entries disabled. Open positions are still managed; use /close_all if you want to close immediately.", reply_markup=MAIN_MENU)
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -1823,7 +2016,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "openai_analysis_enabled", "openai_model", "openai_check_strength", "openai_api_key",
         "openai_env_fallback", "openai_timeout_sec", "openai_fail_open", "openai_show_decisions",
         "trade_charts_enabled", "liquidity_runner_enabled",
-        "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_ai_entry_filter_enabled", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_btc_min_tp_pct", "ai_scalping_btc_max_tp_pct", "ai_scalping_eth_min_tp_pct", "ai_scalping_eth_max_tp_pct", "ai_scalping_sl_tp_multiplier", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct", "ai_scalping_ai_cooldown_sec", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled", "ai_scalping_liquidation_stop_mode", "ai_scalping_liq_margin_pct", "ai_scalping_liq_buffer_pct", "ai_scalping_liq_max_leverage",
+        "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_ai_entry_filter_enabled", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_btc_min_tp_pct", "ai_scalping_btc_max_tp_pct", "ai_scalping_eth_min_tp_pct", "ai_scalping_eth_max_tp_pct", "ai_scalping_sl_tp_multiplier", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct", "ai_scalping_ai_cooldown_sec", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled", "ai_scalping_liquidation_stop_mode", "ai_scalping_liq_margin_pct", "ai_scalping_liq_buffer_pct", "ai_scalping_liq_max_leverage", "boost_zero_fee_scanner_enabled", "boost_balance_share", "boost_target_multiplier", "boost_session_hours", "boost_max_session_loss_pct", "boost_max_consecutive_losses", "boost_auto_leverage", "boost_min_leverage", "boost_max_leverage", "boost_use_full_bank_per_trade", "boost_risk_pct_per_trade", "boost_auto_rotate_symbols", "boost_stop_when_target_reached", "boost_max_symbols_scan", "boost_min_quote_volume_usdt", "boost_min_atr_pct", "boost_max_spread_pct", "boost_spot_imbalance_ratio", "boost_futures_momentum_min_pct", "boost_futures_max_against_pct", "boost_min_tp_pct", "boost_max_tp_pct", "boost_sl_tp_multiplier", "boost_scan_interval_sec", "boost_allow_fee_fallback", "boost_zero_fee_symbols", "boost_live_panel_enabled", "boost_live_panel_interval_sec", "boost_parallel_scan_enabled", "boost_rotate_only_if_profit", "boost_min_profit_to_rotate_pct", "boost_rotate_strength_multiplier", "boost_rotate_min_score_gap", "boost_rotate_cooldown_sec",
     }
     if key not in allowed_keys:
         await reply(update, f"❌ Setting is not allowed through /set: {key}", reply_markup=MAIN_MENU)
@@ -1994,7 +2187,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mapping = {
         "▶️ Run": run_cmd, "⏹ Stop": stop_cmd, "📊 Status": status_cmd, "🚨 Panic": panic_cmd,
         "📈 Positions": positions_cmd, "📉 Stats": stats_cmd, "💰 Balance": balance_cmd,
-        "🏓 Ping": ping_cmd, "⚙️ Settings": settings_cmd, "🔐 API": api_cmd, "📊 AI Stats": ai_stats_cmd, "🤖 AI BTC/ETH scalping": ai_scalping_toggle_cmd, "⚙️ MEXC": mexc_settings_cmd,
+        "🏓 Ping": ping_cmd, "⚙️ Settings": settings_cmd, "🔐 API": api_cmd, "📊 AI Stats": ai_stats_cmd, "🤖 AI BTC/ETH scalping": ai_scalping_toggle_cmd, "🚀 BOOST MODE": boost_start_cmd, "🛑 STOP BOOST": boost_stop_cmd, "📊 BOOST STATUS": boost_status_cmd, "🚀 Boost": boost_status_cmd, "⚙️ MEXC": mexc_settings_cmd,
     }
     fn = mapping.get(text)
     if fn: await fn(update, context)
@@ -2017,6 +2210,32 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⚠️ Старое меню. Открой Settings заново.")
         return
 
+    if data[0] == "boost":
+        action = data[1] if len(data) > 1 else "refresh"
+        if action == "rotation":
+            new_value = not _bool_setting(s, "boost_parallel_scan_enabled", True)
+            await storage.set("boost_parallel_scan_enabled", new_value)
+            ns = await storage.all_settings()
+            snap = await _boost_session_snapshot(ns)
+            await q.edit_message_text(
+                f"🚀 BOOST controls\nRotation while in profit = {new_value}\nBank: {snap['current_bank']:.4f} / {snap['target_bank']:.4f} USDT",
+                reply_markup=_boost_rotation_keyboard(ns),
+            )
+            return
+        if action == "panel":
+            new_value = not _bool_setting(s, "boost_live_panel_enabled", True)
+            await storage.set("boost_live_panel_enabled", new_value)
+            ns = await storage.all_settings()
+            await q.edit_message_text(f"🚀 BOOST live panel = {new_value}", reply_markup=_boost_rotation_keyboard(ns))
+            return
+        ns = await storage.all_settings()
+        snap = await _boost_session_snapshot(ns)
+        await q.edit_message_text(
+            f"🚀 BOOST controls\nBank: {snap['current_bank']:.4f} / {snap['target_bank']:.4f} USDT\nRotation: {_bool_setting(ns, 'boost_parallel_scan_enabled', True)}",
+            reply_markup=_boost_rotation_keyboard(ns),
+        )
+        return
+
     if data[0] == "toggle":
         key = data[1]
         new_value = not bool(s.get(key, False))
@@ -2025,7 +2244,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reset_market_runtime()
         new_settings = await storage.all_settings()
         new_rev = int(new_settings.get("settings_revision", current_rev + 1))
-        if key in {"live_trading", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "ws_enabled", "ai_scalping_quality_filters_enabled", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled", "ai_scalping_liquidation_stop_mode"}:
+        if key in {"live_trading", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "ws_enabled", "ai_scalping_quality_filters_enabled", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled", "ai_scalping_liquidation_stop_mode", "boost_parallel_scan_enabled", "boost_live_panel_enabled"}:
             trigger_scan_now(context.application, reason=f"toggle:{key}")
         await q.edit_message_text(f"✅ {key} = {new_value}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
     elif data[0] == "set":
@@ -2036,6 +2255,26 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             parsed = value
         await storage.set(key, parsed)
+        if key == "strategy_mode" and str(parsed).lower() == "boost_scalping":
+            prev_scan = int(float(s.get("scan_interval_sec", 5) or 5))
+            for k2, v2 in {
+                "strategy_mode": "boost_scalping",
+                "max_open_positions": 1,
+                "scan_interval_sec": int(float(s.get("boost_scan_interval_sec", 3) or 3)),
+                "boost_prev_scan_interval_sec": prev_scan,
+                "boost_session_start_ts": 0.0,
+                "trade_margin_pct": float(s.get("boost_balance_share", 0.10) or 0.10),
+                "margin_allocation_enabled": True,
+                "auto_strategy_adaptation": False,
+                "regime_adaptation": False,
+                "liquidity_runner_enabled": False,
+                "spot_confirmation_enabled": False,
+                "session_filter_enabled": False,
+                "america_short_bias_enabled": False,
+                "mirror_mode": "off",
+            }.items():
+                await storage.set(k2, v2, bump_revision=False)
+
         if key == "strategy_mode" and str(parsed).lower() == "ai_scalping":
             prev_scan = int(float(s.get("scan_interval_sec", 5) or 5))
             for k2, v2 in {
@@ -2072,7 +2311,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key == "universe_mode":
             await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], new_rev, new_settings.get("universe_mode")))
         elif key == "strategy_mode":
-            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("AI BTC/ETH scalp","ai_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], new_rev, new_settings.get("strategy_mode")))
+            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("AI BTC/ETH scalp","ai_scalping"),("🚀 Boost 0-fee","boost_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], new_rev, new_settings.get("strategy_mode")))
         elif key == "scan_market_source":
             await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], new_rev, new_settings.get("scan_market_source", "mexc_binance")))
         elif key == "scan_interval_sec":
@@ -2152,7 +2391,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif name == "universe":
             await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], rev, s.get("universe_mode")))
         elif name == "strategy":
-            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("AI BTC/ETH scalp","ai_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], rev, s.get("strategy_mode")))
+            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("AI BTC/ETH scalp","ai_scalping"),("🚀 Boost 0-fee","boost_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], rev, s.get("strategy_mode")))
         elif name == "marketsource":
             await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], rev, s.get("scan_market_source", "mexc_binance")))
         elif name == "scan":
@@ -2346,7 +2585,9 @@ async def trading_loop(app):
         while running:
             try:
                 settings = await storage.all_settings()
-                ai_mode = str(settings.get("strategy_mode", "hybrid")).lower() == "ai_scalping"
+                mode_name = str(settings.get("strategy_mode", "hybrid")).lower()
+                ai_mode = mode_name == "ai_scalping"
+                boost_mode = mode_name == "boost_scalping"
                 live = bool(settings.get("live_trading", False))
                 ex = await get_exchange(settings)
                 ws = await get_ws(settings)
@@ -2367,7 +2608,7 @@ async def trading_loop(app):
                 # v0114: AI BTC/ETH scalping must not run the adaptive universe
                 # scanner at all. It uses direct BTC_USDT/ETH_USDT market data and
                 # should not emit websocket empty-cache errors from the legacy scanner.
-                if not ai_mode and time.time() - scanner.last_refresh > int(settings.get("symbol_refresh_sec", 300)):
+                if not (ai_mode or boost_mode) and time.time() - scanner.last_refresh > int(settings.get("symbol_refresh_sec", 300)):
                     await update_scanner_status(app, settings, status="refreshing universe", force=True)
                     await scanner.refresh_symbols(ex, settings, ws_supervisor=ws)
                     if scanner.last_refresh_error:
@@ -2382,10 +2623,10 @@ async def trading_loop(app):
                     else:
                         scanner.last_reject_reason = "universe refreshed"
                     await update_scanner_status(app, settings, status="universe ready", force=True)
-                elif ai_mode:
+                elif ai_mode or boost_mode:
                     # Clear stale legacy scanner state so status is not displayed as
                     # ai_scalping -> reversal/adaptive loaded 110.
-                    scanner.last_effective_strategy = "ai_scalping"
+                    scanner.last_effective_strategy = "boost_scalping" if boost_mode else "ai_scalping"
                     scanner.last_refresh_error = ""
                     scanner.last_cycle_scanned = 2
                     scanner.last_cycle_errors = 0
@@ -2423,7 +2664,7 @@ async def trading_loop(app):
                 # WS is an acceleration source, not a hard entry dependency.
                 # If WS is temporarily stale but scanner market data is fresh or REST fallback
                 # has been used recently, entries must not be blocked by WS health alone.
-                market_data_ok = True if ai_mode else scanner_market_data_fresh(max_age_sec=max(900, int(settings.get("symbol_refresh_sec", 300)) * 3))
+                market_data_ok = True if (ai_mode or boost_mode) else scanner_market_data_fresh(max_age_sec=max(900, int(settings.get("symbol_refresh_sec", 300)) * 3))
                 if not market_data_ok:
                     scanner.last_reject_reason = (
                         f"market data blocked: stale/weak scanner data "
@@ -2464,6 +2705,172 @@ async def trading_loop(app):
                     if "websocket" not in str(gate_reason).lower():
                         await notify_admin(app, f"⚠️ Входы заблокированы: {gate_reason}", min_interval_sec=300, key="gate_blocked")
                     await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
+                    continue
+
+                # 6b) v0170 BOOST mode: find API-verified 0-fee coin, use only a fixed
+                # session bank share (default 10% of account equity), and target a 20x
+                # bank run. This is high-risk by design; it refuses to trade if 0-fee
+                # symbols are not verified by API unless BOOST_ALLOW_FEE_FALLBACK=true.
+                if boost_mode:
+                    now_ts = time.time()
+                    start_ts = float(settings.get("boost_session_start_ts", 0) or 0)
+                    session_hours = float(settings.get("boost_session_hours", 6) or 6)
+                    balance_share = max(0.001, min(1.0, float(settings.get("boost_balance_share", 0.10) or 0.10)))
+                    target_mult = max(1.0, float(settings.get("boost_target_multiplier", 20.0) or 20.0))
+                    if start_ts <= 0 or now_ts - start_ts > session_hours * 3600:
+                        bank = max(0.0, equity * balance_share)
+                        await storage.set("boost_session_start_ts", now_ts, bump_revision=False)
+                        await storage.set("boost_session_start_equity", equity, bump_revision=False)
+                        await storage.set("boost_session_bank_usdt", bank, bump_revision=False)
+                        await storage.set("boost_session_target_profit_usdt", bank * (target_mult - 1.0), bump_revision=False)
+                        settings = await storage.all_settings()
+                        start_ts = now_ts
+                    bank = float(settings.get("boost_session_bank_usdt", equity * balance_share) or 0)
+                    target_profit = float(settings.get("boost_session_target_profit_usdt", bank * (target_mult - 1.0)) or 0)
+                    max_loss = bank * max(0.0, float(settings.get("boost_max_session_loss_pct", 80.0) or 80.0)) / 100.0
+                    trades = [t for t in await storage.trade_rows(since=start_ts) if str(t.get("strategy", "")).lower() == "boost_scalping"]
+                    pnl = sum(float(t.get("pnl_usdt") or 0) for t in trades)
+                    current_bank = max(0.0, bank + pnl)
+                    target_bank = bank * target_mult
+                    recent_losses = 0
+                    for t in sorted(trades, key=lambda x: float(x.get("ts_close") or x.get("ts") or 0), reverse=True):
+                        if float(t.get("pnl_usdt") or 0) < 0:
+                            recent_losses += 1
+                        else:
+                            break
+                    max_losses = int(float(settings.get("boost_max_consecutive_losses", 3) or 3))
+                    if target_profit > 0 and (pnl >= target_profit or current_bank >= target_bank):
+                        scanner.last_reject_reason = f"BOOST target reached: bank={current_bank:.4f} / {target_bank:.4f} USDT"
+                        if str(settings.get("boost_stop_when_target_reached", True)).lower() in {"1", "true", "yes", "on"}:
+                            await storage.set("strategy_mode", "hybrid")
+                        await notify_admin(app, f"🏁 BOOST target reached. Bank {current_bank:.4f} / {target_bank:.4f} USDT. Entries stopped.", key="boost_target_reached")
+                        await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
+                        continue
+                    if current_bank <= 0 or (max_loss > 0 and pnl <= -max_loss):
+                        scanner.last_reject_reason = f"BOOST loss limit: bank={current_bank:.4f}, pnl={pnl:.4f} / -{max_loss:.4f} USDT"
+                        await storage.set("strategy_mode", "hybrid")
+                        await notify_admin(app, f"🛑 BOOST loss limit. PnL {pnl:.4f} USDT. Entries stopped.", key="boost_loss_limit")
+                        await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
+                        continue
+                    if max_losses > 0 and recent_losses >= max_losses:
+                        scanner.last_reject_reason = f"BOOST {recent_losses} losses in a row; stopped"
+                        await storage.set("strategy_mode", "hybrid")
+                        await notify_admin(app, f"🛑 BOOST stopped after {recent_losses} consecutive losses.", key="boost_loss_streak")
+                        await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
+                        continue
+
+                    active_pos = None
+                    try:
+                        for _p in await storage.positions():
+                            if str(_p.get("status", "open")).lower() in {"open", "pending"}:
+                                active_pos = _p
+                                break
+                    except Exception:
+                        active_pos = None
+                    if active_pos:
+                        scanner.last_reject_reason = "BOOST: active position; parallel scan"
+                        snap_now = {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}
+                        rotation_enabled = _bool_setting(settings, "boost_parallel_scan_enabled", True)
+                        rotate_note = "active; rotation disabled"
+                        if rotation_enabled:
+                            try:
+                                price = await get_last_price(ex, active_pos.get("symbol"))
+                                pos_pnl = pos_manager.pnl_pct(active_pos, price) if price else 0.0
+                                min_profit = float(settings.get("boost_min_profit_to_rotate_pct", 0.04) or 0.04)
+                                only_profit = _bool_setting(settings, "boost_rotate_only_if_profit", True)
+                                last_rot = float(app.bot_data.get("boost_last_rotation_ts", 0) or 0)
+                                cd = float(settings.get("boost_rotate_cooldown_sec", 20) or 20)
+                                if (not only_profit or pos_pnl >= min_profit) and time.time() - last_rot >= cd:
+                                    candidate_decision = await boost_scalping_engine.decide(ex, settings)
+                                    new_sym = str(candidate_decision.symbol or "")
+                                    cur_sym = str(active_pos.get("symbol") or "")
+                                    new_market = ((candidate_decision.market or {}).get("markets") or [{}])[0]
+                                    new_score = float(new_market.get("boost_score") or 0)
+                                    cur_score = float(((active_pos.get("score_details") or {}).get("boost_score")) or 0)
+                                    mult = float(settings.get("boost_rotate_strength_multiplier", 1.35) or 1.35)
+                                    gap = float(settings.get("boost_rotate_min_score_gap", 5.0) or 5.0)
+                                    stronger = bool(candidate_decision.ok and candidate_decision.decision != "WAIT" and new_sym and new_sym != cur_sym and new_score >= max(cur_score * mult, cur_score + gap))
+                                    rotate_note = f"pnl={pos_pnl:+.3f}% best={_short_symbol(new_sym)} score={new_score:.1f} cur_score={cur_score:.1f}"
+                                    if stronger:
+                                        res = await exec_engine.close_position(active_pos, "boost_rotate_to_stronger", live, price)
+                                        app.bot_data["boost_last_rotation_ts"] = time.time()
+                                        scanner.last_reject_reason = f"BOOST rotate: closed {_short_symbol(cur_sym)} at {pos_pnl:+.3f}%, next {_short_symbol(new_sym)}"
+                                        await notify_admin(app, f"🔄 BOOST rotation\nClosed {_short_symbol(cur_sym)} at {pos_pnl:+.3f}%\nStronger: {_short_symbol(new_sym)} {candidate_decision.decision} score {new_score:.1f} > {cur_score:.1f}\nResult: {res.get('ok') if isinstance(res, dict) else res}", key="boost_rotation")
+                                        await boost_live_panel_update(app, settings, snap_now, status="rotated; rescanning", decision=candidate_decision, position=active_pos, note=scanner.last_reject_reason, force=True)
+                                        await sleep_until_next_scan(app, 1)
+                                        continue
+                                    await boost_live_panel_update(app, settings, snap_now, status="active; scanning stronger", decision=candidate_decision, position=active_pos, note=rotate_note, force=False)
+                                else:
+                                    rotate_note = f"active pnl={pos_pnl:+.3f}%; need {min_profit:.3f}% and cooldown ok"
+                                    await boost_live_panel_update(app, settings, snap_now, status="active", position=active_pos, note=rotate_note, force=False)
+                            except Exception as e:
+                                rotate_note = f"rotation scan warning: {str(e)[:160]}"
+                                await boost_live_panel_update(app, settings, snap_now, status="active", position=active_pos, note=rotate_note, force=False)
+                        else:
+                            await boost_live_panel_update(app, settings, snap_now, status="active", position=active_pos, note=rotate_note, force=False)
+                        await update_scanner_status(app, settings, status="boost active", force=False)
+                        await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                        continue
+
+                    decision = await boost_scalping_engine.decide(ex, settings)
+                    if not decision.ok or decision.decision == "WAIT":
+                        scanner.last_reject_reason = decision.reason or "BOOST wait"
+                        scanner.last_signal_summary = f"BOOST scan bank={current_bank:.2f}/{target_bank:.2f} pnl={pnl:.4f}"
+                        await boost_live_panel_update(app, settings, {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}, status="waiting impulse", decision=decision, note=scanner.last_reject_reason, force=False)
+                        await update_scanner_status(app, settings, status="boost wait", force=False)
+                        await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                        continue
+                    cand = boost_scalping_engine.make_candidate(decision, settings)
+                    # Plan sizing is based only on the compounding BOOST bank, not the full account.
+                    # With BOOST_BALANCE_SHARE=0.10 and balance=50, first bank is 5 USDT;
+                    # after closed profits it becomes bank+pnl and compounds until x20.
+                    plan = TradePlanner().make_plan(cand, settings, equity_usdt=current_bank) if cand else None
+                    if not plan:
+                        scanner.last_reject_reason = "BOOST planner rejected"
+                        await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                        continue
+                    plan.session = f"boost_{int(start_ts)}"
+                    if live:
+                        try:
+                            bal = await ex.fetch_balance()
+                            usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
+                            free = float(usdt.get("free") or ((bal or {}).get("free", {}) or {}).get("USDT") or 0)
+                            need = float(getattr(plan, "expected_margin_usdt", 0.0) or 0.0)
+                            if need > 0 and free < need * 1.05 + 0.5:
+                                scanner.last_reject_reason = f"BOOST balance free={free:.2f} need≈{need*1.05+0.5:.2f}"
+                                await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                                continue
+                        except Exception as e:
+                            scanner.last_reject_reason = f"BOOST balance precheck warning {e}"
+                            await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                            continue
+                    try:
+                        placed = await exec_engine.place_entry(plan, live)
+                    except Exception as e:
+                        scanner.last_reject_reason = f"BOOST execution exception {e}"
+                        await notify_admin(app, f"⚠️ BOOST execution exception: {e}", min_interval_sec=60, key="boost_exec_error")
+                        await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                        continue
+                    if placed.get("ok"):
+                        scanner.last_signal_summary = f"BOOST opened {plan.symbol} {plan.side} margin≈{plan.expected_margin_usdt:.2f} TP={plan.take_price:.6g} SL={plan.stop_price:.6g}"
+                        scanner.last_reject_reason = f"BOOST bank={bank:.2f}, session pnl={pnl:.4f}, target profit={target_profit:.2f}"
+                        boost_msg = (
+                            f"🚀 BOOST opened\n"
+                            f"{plan.symbol} {plan.side}\n"
+                            f"Margin≈{plan.expected_margin_usdt:.2f} USDT ({balance_share*100:.1f}% balance)\n"
+                            f"Bank target: {bank:.2f} → {bank*target_mult:.2f} USDT\n"
+                            f"Conf: {decision.confidence:.2f}\n"
+                            f"Reason: {decision.reason}\n"
+                            f"TP: {plan.take_price:.6g}\n"
+                            f"SL: {plan.stop_price:.6g}"
+                        )
+                        await notify_admin(app, boost_msg, key="boost_opened")
+                        await boost_live_panel_update(app, settings, {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}, status="opened", decision=decision, note=scanner.last_signal_summary, force=True)
+                    else:
+                        scanner.last_reject_reason = f"BOOST execution rejected {placed.get('reason', 'unknown')}"
+                        await boost_live_panel_update(app, settings, {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}, status="rejected", decision=decision, note=scanner.last_reject_reason, force=True)
+                    await update_scanner_status(app, settings, status="boost opened" if placed.get("ok") else "boost rejected", force=True)
+                    await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
                     continue
 
                 # 6) AI BTC/ETH dual scalping loop. In this mode the bot does not run the
@@ -2836,6 +3243,10 @@ def build_app():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("log", log_cmd))
     app.add_handler(CommandHandler("run", run_cmd))
+    app.add_handler(CommandHandler("boost_start", boost_start_cmd))
+    app.add_handler(CommandHandler("boost_stop", boost_stop_cmd))
+    app.add_handler(CommandHandler("boost_status", boost_status_cmd))
+    app.add_handler(CommandHandler("boost_rotation", boost_rotation_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("panic", panic_cmd))
     app.add_handler(CommandHandler("status", status_cmd))

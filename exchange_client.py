@@ -394,6 +394,79 @@ class ExchangeClient:
                 continue
         return out
 
+
+    async def mexc_fetch_fee_rates(self) -> dict:
+        """Best-effort personal MEXC futures fee discovery.
+
+        Returns {"BTC/USDT:USDT": {"maker": 0.0, "taker": 0.0, "source": "..."}}.
+        If MEXC changes/blocks the endpoint, returns an empty dict; boost mode
+        will then refuse to trade unless BOOST_ALLOW_FEE_FALLBACK=true.
+        """
+        if self.exchange_id != "mexc":
+            return {}
+        endpoints = [
+            "/api/v1/private/account/tiered_fee_rate",
+            "/api/v1/private/account/fee_rate",
+            "/api/v1/private/account/feeRate",
+        ]
+        out_rates = {}
+        for ep in endpoints:
+            try:
+                out = await self._mexc_private_read_any_base(ep, query={})
+                rows = self._mexc_rows(out.get("data"))
+                if not rows and isinstance(out.get("data"), dict):
+                    rows = [out.get("data")]
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    sym_raw = r.get("symbol") or r.get("contract") or r.get("contractName") or r.get("currency") or ""
+                    maker = r.get("makerFeeRate", r.get("makerFee", r.get("maker", r.get("openMakerFee"))))
+                    taker = r.get("takerFeeRate", r.get("takerFee", r.get("taker", r.get("openTakerFee"))))
+                    try:
+                        maker_f = float(maker)
+                        taker_f = float(taker)
+                    except Exception:
+                        continue
+                    sym = self._mexc_id_to_symbol(str(sym_raw)) if sym_raw else ""
+                    if not sym or "/USDT" not in sym:
+                        continue
+                    out_rates[self.normalize_symbol(sym)] = {"maker": maker_f, "taker": taker_f, "source": ep, "raw": r}
+                if out_rates:
+                    return out_rates
+            except Exception:
+                continue
+        return out_rates
+
+    async def mexc_verified_zero_fee_symbols(self, max_symbols: int = 80, allow_fallback: bool = False, manual_symbols: str = "") -> list[str]:
+        """Return symbols whose personal futures taker+maker fees are verified as zero.
+
+        Manual symbols are accepted only as a fallback when allowed explicitly;
+        by default boost mode requires API-confirmed zero fee and will stay idle
+        if the exchange does not expose fee details.
+        """
+        rates = await self.mexc_fetch_fee_rates()
+        zeros = []
+        for sym, fr in rates.items():
+            try:
+                if abs(float(fr.get("maker", 1))) <= 1e-12 and abs(float(fr.get("taker", 1))) <= 1e-12:
+                    zeros.append(self.normalize_symbol(sym))
+            except Exception:
+                pass
+        if zeros:
+            return sorted(set(zeros))[:max(1, int(max_symbols or 80))]
+        if allow_fallback:
+            out = []
+            for x in str(manual_symbols or "").split(","):
+                x = x.strip()
+                if not x:
+                    continue
+                try:
+                    out.append(self.normalize_symbol(x))
+                except Exception:
+                    pass
+            return sorted(set(out))[:max(1, int(max_symbols or 80))]
+        return []
+
     async def close(self):
         if self.exchange:
             await self.exchange.close()

@@ -1,11 +1,28 @@
-## v0169 AI JSON FALLBACK SCALP FIX
+## v0174 BOOST MAX AGGRESSION
+
+- `/boost_start` starts autopilot: reserves `BOOST_BALANCE_SHARE=0.10` of current futures equity as the BOOST bank.
+- Target is `BOOST_TARGET_MULTIPLIER=20`; example 50 USDT balance -> 5 USDT bank -> 100 USDT target bank.
+- Sizing compounds only the BOOST bank (`bank + closed BOOST PnL`), not the full account.
+- It scans API-verified zero-fee futures, chooses the most active symbol, direction and leverage automatically, then rescans after each closed trade.
+- `/boost_status` shows current bank, target and session PnL. `/boost_stop` disables new BOOST entries.
+- High risk: this mode can lose the entire BOOST bank. No profit is guaranteed.
+
+## v0170 BOOST ZERO FEE SCANNER
+
+- Added `boost_scalping` strategy mode.
+- Scans API-verified 0% fee MEXC futures symbols first; if fees cannot be verified it stays idle by default.
+- Uses `BOOST_BALANCE_SHARE=0.10`, so a 50 USDT account starts a session bank around 5 USDT.
+- Session target is `BOOST_TARGET_MULTIPLIER=20`, so 5 USDT bank target is 100 USDT.
+- Stops on target, loss limit, or consecutive losses. This is a high-risk booster mode, not guaranteed profit.
+
+## v0170 BOOST ZERO FEE SCANNER
 
 - Default `AI_SCALPING_MIN_CONFIDENCE` is now `0.72` for aggressive BTC/ETH micro-scalping.
 - BTC/ETH scalping TP is dynamic: BTC `0.08–0.12%`, ETH `0.10–0.16%`, based on setup strength.
 - SL is dynamic too: `SL = TP * AI_SCALPING_SL_TP_MULTIPLIER` with default multiplier `2.0`.
 - Separate position-management loop remains enabled by default for faster local TP/SL handling.
 
-## v0169 AI JSON FALLBACK SCALP FIX
+## v0170 BOOST ZERO FEE SCANNER
 - Fixed false LOCAL PROTECTION MODE when MEXC native stoporder is active.
 - Native stoporder rows with state=1/isFinished=0/errorCode=0 and TP/SL prices are accepted even if local generic id differs from MEXC positionId.
 - Generic local pos["id"] is no longer used as exchange positionId.
@@ -365,24 +382,35 @@ MARGIN_ALLOCATION_ENABLED=true
 - If direct native TP/SL fails, the old generic retry/fallback path still runs and the position is closed if protection is missing.
 
 
-## v0169 AI JSON FALLBACK SCALP FIX
+## v0170 BOOST ZERO FEE SCANNER
 - Compared against the working Railway/Ollama bot.
 - Native MEXC TP/SL now uses `/api/v1/private/stoporder/place` by `positionId` with `volType=2`, `profitLossVolType=SAME`, market TP/SL types, `takeProfitReverse=2`, `stopLossReverse=2`.
 - Removed zero `takeProfitOrderPrice` / `stopLossOrderPrice` fields from native market TP/SL payload.
 - Direct native TP/SL placement no longer depends on `strategy == ai_scalping`; any normal protected BTC/ETH scalp with TP+SL uses it.
 
 
-## v0169 AI JSON FALLBACK SCALP FIX
+## v0170 BOOST ZERO FEE SCANNER
 - Fixed native TP/SL direct path calling non-existent `_price_to_precision`.
 - Native `/stoporder/place` now uses existing `_mexc_price_to_precision`, so TP/SL can actually be posted after entry.
 
 
-## v0169 AI JSON FALLBACK SCALP FIX
+## v0170 BOOST ZERO FEE SCANNER
 - Native MEXC `/stoporder/place` rows with `state=1`, `isFinished=0`, `errorCode=0`, `takeProfitPrice` and `stopLossPrice` are now treated as confirmed exchange TP/SL.
 - Fixes false `LOCAL PROTECTION MODE` / `MISSING` messages when MEXC has already accepted position TP/SL.
 
 
-## v0169 AI JSON FALLBACK SCALP FIX
+## v0170 BOOST ZERO FEE SCANNER
 - Fixed false LOCAL PROTECTION warnings for active MEXC native stoporder rows.
 - Active `state=1`, `isFinished=0`, `errorCode=0` rows with TP/SL prices now count as confirmed exchange protection.
 - Watchdog notifications now use `tp_exists/sl_exists` aliases correctly.
+
+
+## v0174 BOOST MAX AGGRESSION
+
+- One live Telegram BOOST panel is edited instead of spamming messages.
+- Inline buttons: Rotation ON/OFF, Live panel ON/OFF, Refresh.
+- While a BOOST trade is open, the bot keeps scanning in the background.
+- If the open trade is already in profit and a stronger 0-fee impulse appears, the bot closes the current trade and rotates to the stronger coin on the next cycle.
+- Defaults: rotation only if PnL >= 0.04%, strength multiplier 1.35x, score gap 5.0, cooldown 20s.
+
+Commands: `/boost_start`, `/boost_stop`, `/boost_status`, `/boost_rotation`.
