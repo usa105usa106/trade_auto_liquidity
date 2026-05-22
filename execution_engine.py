@@ -530,6 +530,55 @@ class ExecutionEngine:
                                     pass
                         pos["exchange_synced"] = True
                         pos["updated_at"] = time.time()
+
+                        # v0161: do not wait for the generic protection routine to
+                        # rediscover the same just-opened MEXC position.  We already
+                        # have the live position row with positionId/holdVol here,
+                        # so place native exchange TP/SL immediately.  Previous
+                        # builds could open and then close because the protection
+                        # routine never reached /stoporder/place; /log then showed
+                        # only entry and close market orders.  This direct call must
+                        # produce a POST /api/v1/private/stoporder/place line.
+                        if (
+                            str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc"
+                            and hasattr(self.exchange_client, "mexc_place_tpsl_by_position")
+                            and not bool(pos.get("liquidation_stop_mode"))
+                            and float(pos.get("take_price") or 0) > 0
+                            and float(pos.get("stop_price") or 0) > 0
+                        ):
+                            try:
+                                tp0 = float(pos.get("take_price") or 0)
+                                sl0 = float(pos.get("stop_price") or 0)
+                                if tp0 > 0 and sl0 > 0:
+                                    close_side0 = "sell" if str(pos.get("side")).upper() == "LONG" else "buy"
+                                    from debug_log import log_event
+                                    log_event("mexc_native_tpsl_direct_before_generic", symbol=pos.get("symbol"), side=close_side0, qty=pos.get("qty"), stop_price=sl0, take_price=tp0)
+                                    native = await self.exchange_client.mexc_place_tpsl_by_position(
+                                        symbol=pos.get("symbol"),
+                                        side=close_side0,
+                                        qty=float(pos.get("qty") or 0),
+                                        stop_price=sl0,
+                                        take_price=tp0,
+                                        client_order_id=f"bot_direct_tpsl_{int(time.time()*1000)}",
+                                        live_position=ep,
+                                    )
+                                    pos["tp_order_id"] = native.get("id") or "MEXC_NATIVE_TPSL"
+                                    pos["sl_order_id"] = native.get("id") or "MEXC_NATIVE_TPSL"
+                                    pos["tpsl_native_direct_raw"] = native
+                                    pos["tpsl_native_direct_posted"] = True
+                                    pos["tp_exists"] = True
+                                    pos["sl_exists"] = True
+                                    pos["protection_status"] = "EXCHANGE PROTECTED"
+                                    pos["protection_mode"] = "exchange"
+                                    pos["ok"] = True
+                                    log_event("mexc_native_tpsl_direct_success", symbol=pos.get("symbol"), side=close_side0, order=native, ok=True)
+                            except Exception as e:
+                                pos["tpsl_native_direct_error"] = str(e)[:1000]
+                                try:
+                                    from debug_log import log_event
+                                    log_event("error_mexc_native_tpsl_direct", symbol=pos.get("symbol"), side=pos.get("side"), error=str(e), ok=False)
+                                except Exception:
+                                    pass
                 except Exception as e:
                     pos["exchange_sync_warning"] = str(e)
             pos = self._sanitize_position_for_exchange(self._decorate_position_metrics(pos))
@@ -545,7 +594,19 @@ class ExecutionEngine:
                     pos["open_counter_warning"] = str(e)[:160]
 
             if pos["status"] == "open":
-                protection = await self.place_protection_orders(pos, live=True)
+                if pos.get("tpsl_native_direct_posted") and pos.get("tp_exists") and pos.get("sl_exists"):
+                    protection = {
+                        "ok": True,
+                        "tp_exists": True,
+                        "sl_exists": True,
+                        "tp_order_id": pos.get("tp_order_id"),
+                        "sl_order_id": pos.get("sl_order_id"),
+                        "protection_status": "EXCHANGE PROTECTED",
+                        "protection_mode": "exchange",
+                        "protection_note": "v0162 working-bot style MEXC native TP/SL posted before generic protection",
+                    }
+                else:
+                    protection = await self.place_protection_orders(pos, live=True)
                 pos.update(protection)
                 await self.storage.upsert_position(pos)
                 if not protection.get("ok"):

@@ -332,14 +332,29 @@ MARGIN_ALLOCATION_ENABLED=true
 - Entry-attached TP/SL is disabled by default via MEXC_ATTACH_TPSL_ON_ENTRY=false.
 
 
-## v0160 MEXC TPSL LIVE POSITION FIX
+## v0161 MEXC DIRECT NATIVE TPSL FIX
 - MEXC protection now places explicit trigger-market TP and SL plan orders first.
 - Native by-position TP/SL is fallback, not the hidden first path.
 - `/log` now filters out huge balance snapshots and shows TP/SL/order/protection payloads.
 - Version updated to `0159 MEXC NATIVE TPSL FIRST FIX`.
 
 
-## v0160 MEXC TPSL LIVE POSITION FIX
+## v0161 MEXC DIRECT NATIVE TPSL FIX
 - Native `/stoporder/place` now uses the already confirmed live position row.
 - Prevents TP/SL protection from closing before an actual native TP/SL POST is attempted.
 - `/log` includes `mexc_stoporder_place_body` and longer output.
+
+
+## v0161 MEXC DIRECT NATIVE TPSL FIX
+
+- Places MEXC native TP/SL immediately after the live position row is found.
+- Uses the same live position row with positionId/holdVol, avoiding the generic protection rediscovery race.
+- /log must now show POST /api/v1/private/stoporder/place for every protected normal scalp entry.
+- If direct native TP/SL fails, the old generic retry/fallback path still runs and the position is closed if protection is missing.
+
+
+## v0162 WORKING BOT MEXC TPSL PAYLOAD
+- Compared against the working Railway/Ollama bot.
+- Native MEXC TP/SL now uses `/api/v1/private/stoporder/place` by `positionId` with `volType=2`, `profitLossVolType=SAME`, market TP/SL types, `takeProfitReverse=2`, `stopLossReverse=2`.
+- Removed zero `takeProfitOrderPrice` / `stopLossOrderPrice` fields from native market TP/SL payload.
+- Direct native TP/SL placement no longer depends on `strategy == ai_scalping`; any normal protected BTC/ETH scalp with TP+SL uses it.

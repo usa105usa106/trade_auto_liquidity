@@ -1270,29 +1270,36 @@ class ExchangeClient:
         except Exception:
             entry = 0.0
         safe_sl, safe_tp, safe_msg = await self.mexc_safe_tpsl_prices(symbol, side, float(stop_price), float(take_price), entry)
-        # For /stoporder/place, MEXC lossTrend/profitTrend are trigger price
-        # reference types (1 latest price, 2 fair price, 3 index price), not the
-        # trigger direction. Use latest price by default for fast scalping.
-        loss_trend = int(os.getenv("MEXC_TPSL_LOSS_TREND", "1") or "1")
-        profit_trend = int(os.getenv("MEXC_TPSL_PROFIT_TREND", "1") or "1")
+        # v0162: mirror the working bot's MEXC native TP/SL payload.
+        # Use stoporder/place by positionId with market TP/SL. Do NOT send
+        # takeProfitOrderPrice/stopLossOrderPrice for market TP/SL; on some
+        # MEXC accounts those zero limit-price fields make the native TP/SL row
+        # fail or not appear.  lossTrend/profitTrend are price source selectors,
+        # not LONG/SHORT direction.
+        safe_sl = self._price_to_precision(symbol, safe_sl)
+        safe_tp = self._price_to_precision(symbol, safe_tp)
+        try:
+            vol = self._amount_to_mexc_vol(symbol, vol)
+        except Exception:
+            pass
         body = {
             "symbol": self._mexc_symbol(symbol),
-            "positionId": int(pid),
-            "vol": vol,
-            "lossTrend": loss_trend,
-            "profitTrend": profit_trend,
-            "stopLossPrice": safe_sl,
-            "takeProfitPrice": safe_tp,
-            "priceProtect": 0,
-            "profitLossVolType": "SAME",
+            "positionId": int(float(pid)),
+            "vol": str(vol),
+            "lossTrend": 1,
+            "profitTrend": 1,
             "volType": 2,
+            "profitLossVolType": "SAME",
             "takeProfitType": 0,
             "stopLossType": 0,
-            "takeProfitOrderPrice": 0,
-            "stopLossOrderPrice": 0,
             "takeProfitReverse": 2,
             "stopLossReverse": 2,
+            "priceProtect": 0,
         }
+        if float(safe_sl or 0) > 0:
+            body["stopLossPrice"] = str(safe_sl)
+        if float(safe_tp or 0) > 0:
+            body["takeProfitPrice"] = str(safe_tp)
         try:
             from debug_log import log_event
             log_event("mexc_stoporder_place_body", symbol=self._mexc_symbol(symbol), side=side, positionId=pid, vol=vol, body=body)
