@@ -70,6 +70,36 @@ class ProtectionEngine:
                 except Exception:
                     pass
             kind = str(info.get("_protection_kind") or "").lower()
+
+            # v0164: MEXC native /stoporder/place exposes one active row for a
+            # position with BOTH takeProfitPrice and stopLossPrice.  In that row
+            # vol/realityVol can be 0 because volType=2 means "same as position".
+            # Treat such active native rows as valid exchange protection even
+            # when pseudo-order ids or parsed amount are not normal order-like.
+            src = str(info.get("_source_endpoint") or "").lower()
+            is_active_native_tpsl = (
+                "stoporder" in src
+                and str(info.get("state", 1)) in {"1", ""}
+                and str(info.get("isFinished", info.get("is_finished", 0))) in {"0", "False", "false", ""}
+                and str(info.get("errorCode", 0)) in {"0", ""}
+            )
+            if is_active_native_tpsl:
+                try:
+                    raw_tp = float(info.get("takeProfitPrice") or 0)
+                except Exception:
+                    raw_tp = 0.0
+                try:
+                    raw_sl = float(info.get("stopLossPrice") or 0)
+                except Exception:
+                    raw_sl = 0.0
+                # If local prices are present, require rough price agreement;
+                # otherwise any non-zero native TP/SL on the active position is
+                # enough to avoid a false LOCAL PROTECTION warning.
+                if raw_tp > 0 and (tp_price <= 0 or abs(raw_tp - tp_price) / max(tp_price, 1e-9) < 0.005):
+                    found_tp = True; matched_tp_id = oid or matched_tp_id
+                if raw_sl > 0 and (sl_price <= 0 or abs(raw_sl - sl_price) / max(sl_price, 1e-9) < 0.005):
+                    found_sl = True; matched_sl_id = oid or matched_sl_id
+
             if side_ok and (kind == "tp" or oid and oid == tp_id or "bot_tp" in txt or "take" in txt or "tp" in txt or "/tpsl/" in txt):
                 found_tp = True; matched_tp_id = oid or matched_tp_id
             if side_ok and (kind == "sl" or oid and oid == sl_id or "bot_sl" in txt or "stop" in txt or "sl" in txt or "planorder" in txt or "stoporder" in txt):
