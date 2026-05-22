@@ -353,18 +353,24 @@ MARGIN_ALLOCATION_ENABLED=true
 - If direct native TP/SL fails, the old generic retry/fallback path still runs and the position is closed if protection is missing.
 
 
-## v0164 MEXC TPSL CONFIRM FIX
+## v0165 MEXC NATIVE TPSL WATCHDOG CONFIRM
 - Compared against the working Railway/Ollama bot.
 - Native MEXC TP/SL now uses `/api/v1/private/stoporder/place` by `positionId` with `volType=2`, `profitLossVolType=SAME`, market TP/SL types, `takeProfitReverse=2`, `stopLossReverse=2`.
 - Removed zero `takeProfitOrderPrice` / `stopLossOrderPrice` fields from native market TP/SL payload.
 - Direct native TP/SL placement no longer depends on `strategy == ai_scalping`; any normal protected BTC/ETH scalp with TP+SL uses it.
 
 
-## v0164 MEXC TPSL CONFIRM FIX
+## v0165 MEXC NATIVE TPSL WATCHDOG CONFIRM
 - Fixed native TP/SL direct path calling non-existent `_price_to_precision`.
 - Native `/stoporder/place` now uses existing `_mexc_price_to_precision`, so TP/SL can actually be posted after entry.
 
 
-## v0164 MEXC TPSL CONFIRM FIX
+## v0165 MEXC NATIVE TPSL WATCHDOG CONFIRM
 - Native MEXC `/stoporder/place` rows with `state=1`, `isFinished=0`, `errorCode=0`, `takeProfitPrice` and `stopLossPrice` are now treated as confirmed exchange TP/SL.
 - Fixes false `LOCAL PROTECTION MODE` / `MISSING` messages when MEXC has already accepted position TP/SL.
+
+
+## v0165 MEXC NATIVE TPSL WATCHDOG CONFIRM
+- Fixed false LOCAL PROTECTION warnings for active MEXC native stoporder rows.
+- Active `state=1`, `isFinished=0`, `errorCode=0` rows with TP/SL prices now count as confirmed exchange protection.
+- Watchdog notifications now use `tp_exists/sl_exists` aliases correctly.

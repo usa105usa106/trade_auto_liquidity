@@ -184,11 +184,17 @@ class PositionManager:
             state = await pe.reconcile(pos, live=True, reattach=True)
             pos.update(state)
             pos["protection_checked_at"] = now
-            if state.get("protection_status") != "EXCHANGE PROTECTED":
+            # v0165: native MEXC stoporder rows expose tp_exists/sl_exists;
+            # mirror them to notification fields and do not downgrade a valid
+            # exchange/native protection row to local monitoring.
+            state.setdefault("take_profit_ok", bool(state.get("tp_exists")))
+            state.setdefault("stop_loss_ok", bool(state.get("sl_exists")))
+            protected = state.get("protection_status") in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP"}
+            if not protected:
                 pos["protection_mode"] = "local_monitoring"
                 pos["protection_warning"] = "exchange TP/SL not confirmed; bot monitors TP/SL locally"
             else:
-                pos["protection_mode"] = "exchange"
+                pos["protection_mode"] = state.get("protection_mode") or "exchange"
                 pos.pop("protection_warning", None)
             await self.storage.upsert_position(pos)
             if state.get("reattach_attempted") or state.get("protection_status") != "EXCHANGE PROTECTED":

@@ -80,7 +80,7 @@ class ProtectionEngine:
             is_active_native_tpsl = (
                 "stoporder" in src
                 and str(info.get("state", 1)) in {"1", ""}
-                and str(info.get("isFinished", info.get("is_finished", 0))) in {"0", "False", "false", ""}
+                and str(info.get("isFinished", info.get("is_finished", 0))).lower() in {"0", "false", ""}
                 and str(info.get("errorCode", 0)) in {"0", ""}
             )
             if is_active_native_tpsl:
@@ -92,13 +92,21 @@ class ProtectionEngine:
                     raw_sl = float(info.get("stopLossPrice") or 0)
                 except Exception:
                     raw_sl = 0.0
-                # If local prices are present, require rough price agreement;
-                # otherwise any non-zero native TP/SL on the active position is
-                # enough to avoid a false LOCAL PROTECTION warning.
-                if raw_tp > 0 and (tp_price <= 0 or abs(raw_tp - tp_price) / max(tp_price, 1e-9) < 0.005):
-                    found_tp = True; matched_tp_id = oid or matched_tp_id
-                if raw_sl > 0 and (sl_price <= 0 or abs(raw_sl - sl_price) / max(sl_price, 1e-9) < 0.005):
-                    found_sl = True; matched_sl_id = oid or matched_sl_id
+                # v0165: MEXC native /stoporder/place may return a combined row
+                # with vol=0 because volType=2 means SAME/full position.  If the
+                # row is active and has non-zero TP/SL prices, it is valid
+                # exchange protection.  Do not reject it just because local
+                # planned prices differ slightly or the row was expanded into
+                # pseudo-orders.  Prefer a positionId match when available, but
+                # fall back to symbol-level matching because MEXC sometimes
+                # stores ids as strings or local rows may not have positionId.
+                local_pid = str(pos.get("position_id") or pos.get("positionId") or pos.get("id") or "")
+                row_pid = str(info.get("positionId") or info.get("position_id") or "")
+                pid_ok = (not local_pid) or (not row_pid) or (local_pid == row_pid)
+                if pid_ok and raw_tp > 0:
+                    found_tp = True; matched_tp_id = oid or row_pid or matched_tp_id
+                if pid_ok and raw_sl > 0:
+                    found_sl = True; matched_sl_id = oid or row_pid or matched_sl_id
 
             if side_ok and (kind == "tp" or oid and oid == tp_id or "bot_tp" in txt or "take" in txt or "tp" in txt or "/tpsl/" in txt):
                 found_tp = True; matched_tp_id = oid or matched_tp_id
@@ -118,6 +126,8 @@ class ProtectionEngine:
             return {
                 "tp_exists": found_tp,
                 "sl_exists": True,
+                "take_profit_ok": found_tp,
+                "stop_loss_ok": True,
                 "tp_order_id": matched_tp_id or pos.get("tp_order_id"),
                 "sl_order_id": "LIQUIDATION_STOP",
                 "protection_status": status,
@@ -129,6 +139,8 @@ class ProtectionEngine:
         return {
             "tp_exists": found_tp,
             "sl_exists": found_sl,
+            "take_profit_ok": found_tp,
+            "stop_loss_ok": found_sl,
             "tp_order_id": matched_tp_id or pos.get("tp_order_id"),
             "sl_order_id": matched_sl_id or pos.get("sl_order_id"),
             "protection_status": status,

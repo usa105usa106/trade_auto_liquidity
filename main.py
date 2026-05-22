@@ -642,8 +642,8 @@ def format_position_event(ev: dict) -> str:
     if typ == "protection_watchdog":
         protection_status = str(ev.get("protection_status") or "UNKNOWN")
         protection_mode = str(ev.get("protection_mode") or "")
-        stop_ok = bool(ev.get("stop_loss_ok"))
-        tp_ok = bool(ev.get("take_profit_ok"))
+        stop_ok = bool(ev.get("stop_loss_ok", ev.get("sl_exists", False)))
+        tp_ok = bool(ev.get("take_profit_ok", ev.get("tp_exists", False)))
         reattach = bool(ev.get("reattach_attempted"))
 
         if protection_status == "EXCHANGE PROTECTED":
