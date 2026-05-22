@@ -1004,7 +1004,6 @@ class ExchangeClient:
                 ("/api/v1/private/stoporder/open_orders", {"symbol": msym}),
                 ("/api/v1/private/stoporder/list/orders", {"symbol": msym, "state": 1, "is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/stoporder/list/orders", {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100}),
-                ("/api/v1/private/tpsl/list/orders", {"symbol": msym, "state": 1, "is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/position/stop_orders", {"symbol": msym}),
             ])
         else:
@@ -1015,7 +1014,6 @@ class ExchangeClient:
                 ("/api/v1/private/stoporder/open_orders", {}),
                 ("/api/v1/private/stoporder/list/orders", {"state": 1, "is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/stoporder/list/orders", {"is_finished": 0, "page_num": 1, "page_size": 100}),
-                ("/api/v1/private/tpsl/list/orders", {"state": 1, "is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/position/stop_orders", {}),
             ])
         orders = []

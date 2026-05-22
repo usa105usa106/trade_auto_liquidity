@@ -332,8 +332,8 @@ MARGIN_ALLOCATION_ENABLED=true
 - Entry-attached TP/SL is disabled by default via MEXC_ATTACH_TPSL_ON_ENTRY=false.
 
 
-## v0158 MEXC TPSL CLOSE SIDE FIX
+## v0159 MEXC NATIVE TPSL FIRST FIX
 - MEXC protection now places explicit trigger-market TP and SL plan orders first.
 - Native by-position TP/SL is fallback, not the hidden first path.
 - `/log` now filters out huge balance snapshots and shows TP/SL/order/protection payloads.
-- Version updated to `0158 MEXC TPSL CLOSE SIDE FIX`.
+- Version updated to `0159 MEXC NATIVE TPSL FIRST FIX`.

@@ -78,7 +78,7 @@ def tail_text(files: list[str] | None = None, lines: int = 80, max_chars: int = 
     return text or "Логи пустые."
 
 
-def tail_important(lines: int = 120, max_chars: int = 3500) -> str:
+def tail_important(lines: int = 160, max_chars: int = 7000) -> str:
     """Return only actionable trading/protection logs for Telegram /log.
 
     Balance snapshots are huge and hide the important TP/SL payloads. This
@@ -88,8 +88,7 @@ def tail_important(lines: int = 120, max_chars: int = 3500) -> str:
         "/api/v1/private/order/create",
         "/api/v1/private/planorder/place",
         "/api/v1/private/stoporder/place",
-        "/api/v1/private/tpsl",
-        "/api/v1/private/stoporder",
+                "/api/v1/private/stoporder",
     )
     important_kinds = (
         "error", "protection", "tpsl", "trigger", "opened", "closed",
