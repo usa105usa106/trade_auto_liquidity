@@ -31,7 +31,7 @@ from ai_scalping_engine import AIScalpingEngine
 from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
-from debug_log import tail_text
+from debug_log import tail_text, tail_important
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
@@ -841,7 +841,7 @@ async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 n = max(20, min(300, int(context.args[0])))
             except Exception:
                 n = 80
-        text = tail_text(lines=n, max_chars=3500)
+        text = tail_important(lines=n, max_chars=3500)
         # Telegram message limit is 4096. Keep it copyable and readable.
         await reply(update, "🧾 Last bot logs:\n```\n" + text[-3400:] + "\n```", reply_markup=MAIN_MENU)
     except Exception as e:

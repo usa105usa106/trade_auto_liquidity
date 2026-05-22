@@ -76,3 +76,53 @@ def tail_text(files: list[str] | None = None, lines: int = 80, max_chars: int = 
     if len(text) > max_chars:
         text = text[-max_chars:]
     return text or "Логи пустые."
+
+
+def tail_important(lines: int = 120, max_chars: int = 3500) -> str:
+    """Return only actionable trading/protection logs for Telegram /log.
+
+    Balance snapshots are huge and hide the important TP/SL payloads. This
+    filter keeps MEXC order/protection endpoints plus errors/trade events.
+    """
+    important_paths = (
+        "/api/v1/private/order/create",
+        "/api/v1/private/planorder/place",
+        "/api/v1/private/stoporder/place",
+        "/api/v1/private/tpsl",
+        "/api/v1/private/stoporder",
+        "/api/v1/private/position/open_positions",
+    )
+    important_kinds = (
+        "error", "protection", "tpsl", "trigger", "opened", "closed",
+        "mexc_native", "mexc_trigger",
+    )
+    records: list[str] = []
+    for name in ("errors.log", "trade.log", "mexc_raw.log"):
+        path = LOG_DIR / name
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines()[-max(lines * 4, 200):]:
+                keep = False
+                try:
+                    rec = json.loads(line)
+                    kind = str(rec.get("kind", "")).lower()
+                    rec_path = str(rec.get("path", ""))
+                    if any(k in kind for k in important_kinds) or any(rec_path.startswith(p) for p in important_paths):
+                        keep = True
+                    # Drop massive non-actionable reads unless they are near protection.
+                    if rec_path.endswith("/account/assets") or "account/assets" in rec_path:
+                        keep = False
+                except Exception:
+                    low = line.lower()
+                    keep = any(k in low for k in important_kinds)
+                if keep:
+                    records.append(f"== {name} == {line}")
+        except Exception as e:
+            records.append(f"== {name} == read error: {e}")
+    if not records:
+        return "Нет важных ошибок TP/SL/ордеров в логах. Попробуй /log после следующей сделки."
+    text = "\n".join(records[-max(1, lines):])
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    return text

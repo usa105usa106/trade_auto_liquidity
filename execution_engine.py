@@ -855,76 +855,70 @@ class ExecutionEngine:
                 except Exception as e:
                     out["tp_error"] = str(e)[:500]
             elif str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc" and hasattr(self.exchange_client, "mexc_place_tpsl_by_position"):
-                # v0135: MEXC sometimes rejects/does not expose by-position TP/SL.
-                # First try native attached TP/SL; if it is missing or returns no id,
-                # immediately fall back to two reduce-only trigger-market plan orders
-                # (one TP and one SL). Do not leave the trade protected only locally.
-                native_tpsl_ok = False
+                # v0157: for micro-scalp, create REAL exchange-side protection as
+                # separate trigger-market close orders FIRST. The previous flow tried
+                # by-position/native TP-SL first; on some MEXC accounts it returned no
+                # usable order id and the bot could close the position before any
+                # visible TP/SL POST appeared in logs. From now on every live entry
+                # must produce explicit /planorder/place requests for TP and SL.
+                trigger_pair_ok = False
                 try:
-                    if tp <= 0 or sl <= 0:
-                        raise RuntimeError("missing take_price/stop_price for position TP/SL")
-                    log_event("mexc_native_tpsl_request", symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp, attempt=i + 1)
-                    order = await self.exchange_client.mexc_place_tpsl_by_position(
-                        symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp,
-                        client_order_id=f"bot_tpsl_{int(time.time()*1000)}",
-                    )
-                    log_event("mexc_native_tpsl_response", symbol=symbol, side=side, attempt=i + 1, order=order, ok=True)
-                    oid = str(order.get("id") or "")
-                    out["tp_order_id"] = oid
-                    out["sl_order_id"] = oid
-                    out["tpsl_raw"] = order
-                    native_tpsl_ok = bool(oid)
-                    if not native_tpsl_ok:
-                        out["tpsl_error"] = "MEXC by-position TP/SL returned empty id; falling back to trigger-market TP+SL"
-                except Exception as e:
-                    if self._is_mexc_tpsl_already_exists_error(e):
-                        out["tp_order_id"] = "MEXC_TPSL_ALREADY_EXISTS"
-                        out["sl_order_id"] = "MEXC_TPSL_ALREADY_EXISTS"
-                        out["tp_exists"] = True
-                        out["sl_exists"] = True
-                        out["tpsl_already_exists"] = True
-                        out["tpsl_note"] = "MEXC says native position TP/SL already exists; treating as protected"
-                        native_tpsl_ok = True
+                    if tp > 0:
+                        log_event("mexc_trigger_tp_request", symbol=symbol, side=side, qty=qty, trigger_price=tp, attempt=i + 1)
+                        order = await self._create_take_profit_market_order(symbol, side, qty, tp)
+                        out["tp_order_id"] = order.get("id")
+                        out["tp_raw"] = order
+                        log_event("mexc_trigger_tp_response", symbol=symbol, side=side, trigger_price=tp, attempt=i + 1, order=order, ok=True)
                     else:
-                        out["tpsl_error"] = str(e)[:500]
-                        log_event("error_mexc_native_tpsl", symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp, attempt=i + 1, error=str(e), ok=False)
+                        out["tp_error"] = "missing take_price"
+                except Exception as e:
+                    out["tp_error"] = str(e)[:800]
+                    log_event("error_mexc_trigger_tp", symbol=symbol, side=side, qty=qty, trigger_price=tp, attempt=i + 1, error=str(e), ok=False)
+                try:
+                    if sl > 0:
+                        log_event("mexc_trigger_sl_request", symbol=symbol, side=side, qty=qty, trigger_price=sl, attempt=i + 1)
+                        order = await self._create_stop_market_order(symbol, side, qty, sl)
+                        out["sl_order_id"] = order.get("id")
+                        out["sl_raw"] = order
+                        log_event("mexc_trigger_sl_response", symbol=symbol, side=side, trigger_price=sl, attempt=i + 1, order=order, ok=True)
+                    else:
+                        out["sl_error"] = "missing stop_price"
+                except Exception as e:
+                    out["sl_error"] = str(e)[:800]
+                    log_event("error_mexc_trigger_sl", symbol=symbol, side=side, qty=qty, trigger_price=sl, attempt=i + 1, error=str(e), ok=False)
+                trigger_pair_ok = bool(out.get("tp_order_id") and out.get("sl_order_id"))
 
-                if native_tpsl_ok:
-                    # A combined native TP/SL request was accepted. Give MEXC one
-                    # visibility delay; if endpoints still do not show protection,
-                    # the generic verification block below will still treat the
-                    # accepted id as protected for fast AI scalps while watchdog
-                    # keeps reconciling.
-                    pass
-                else:
-                    # Fallback: create separate trigger-market reduce-only close
-                    # orders. This is the second layer after attached-entry and
-                    # by-position TP/SL. Place both legs; verification below will
-                    # classify them by trigger price/kind.
+                # If explicit plan TP/SL failed, try native by-position TP/SL as the
+                # backup. This keeps the old MEXC path but never hides the real
+                # trigger-market attempt from /log.
+                if not trigger_pair_ok:
                     try:
-                        if tp > 0:
-                            log_event("mexc_trigger_tp_request", symbol=symbol, side=side, qty=qty, trigger_price=tp, attempt=i + 1)
-                            order = await self._create_take_profit_market_order(symbol, side, qty, tp)
-                            out["tp_order_id"] = order.get("id")
-                            out["tp_raw"] = order
-                            log_event("mexc_trigger_tp_response", symbol=symbol, side=side, trigger_price=tp, attempt=i + 1, order=order, ok=True)
+                        if tp <= 0 or sl <= 0:
+                            raise RuntimeError("missing take_price/stop_price for position TP/SL")
+                        log_event("mexc_native_tpsl_request", symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp, attempt=i + 1)
+                        order = await self.exchange_client.mexc_place_tpsl_by_position(
+                            symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp,
+                            client_order_id=f"bot_tpsl_{int(time.time()*1000)}",
+                        )
+                        log_event("mexc_native_tpsl_response", symbol=symbol, side=side, attempt=i + 1, order=order, ok=True)
+                        oid = str(order.get("id") or "")
+                        if oid:
+                            out.setdefault("tp_order_id", oid)
+                            out.setdefault("sl_order_id", oid)
+                            out["tpsl_raw"] = order
                         else:
-                            out["tp_error"] = "missing take_price"
+                            out["tpsl_error"] = "MEXC by-position TP/SL returned empty id"
                     except Exception as e:
-                        out["tp_error"] = str(e)[:500]
-                        log_event("error_mexc_trigger_tp", symbol=symbol, side=side, qty=qty, trigger_price=tp, attempt=i + 1, error=str(e), ok=False)
-                    try:
-                        if sl > 0:
-                            log_event("mexc_trigger_sl_request", symbol=symbol, side=side, qty=qty, trigger_price=sl, attempt=i + 1)
-                            order = await self._create_stop_market_order(symbol, side, qty, sl)
-                            out["sl_order_id"] = order.get("id")
-                            out["sl_raw"] = order
-                            log_event("mexc_trigger_sl_response", symbol=symbol, side=side, trigger_price=sl, attempt=i + 1, order=order, ok=True)
+                        if self._is_mexc_tpsl_already_exists_error(e):
+                            out["tp_order_id"] = "MEXC_TPSL_ALREADY_EXISTS"
+                            out["sl_order_id"] = "MEXC_TPSL_ALREADY_EXISTS"
+                            out["tp_exists"] = True
+                            out["sl_exists"] = True
+                            out["tpsl_already_exists"] = True
+                            out["tpsl_note"] = "MEXC says native position TP/SL already exists; treating as protected"
                         else:
-                            out["sl_error"] = "missing stop_price"
-                    except Exception as e:
-                        out["sl_error"] = str(e)[:500]
-                        log_event("error_mexc_trigger_sl", symbol=symbol, side=side, qty=qty, trigger_price=sl, attempt=i + 1, error=str(e), ok=False)
+                            out["tpsl_error"] = str(e)[:800]
+                            log_event("error_mexc_native_tpsl", symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp, attempt=i + 1, error=str(e), ok=False)
             else:
                 try:
                     if tp > 0:

@@ -330,3 +330,10 @@ MARGIN_ALLOCATION_ENABLED=true
 - Fixed planorder triggerType: TP/SL direction is now sent in triggerType, not trend.
 - Added executeCycle/reduceOnly/priceProtect fields to trigger-market plan orders.
 - Entry-attached TP/SL is disabled by default via MEXC_ATTACH_TPSL_ON_ENTRY=false.
+
+
+## v0157 REAL TPSL FIRST + FILTERED LOGS
+- MEXC protection now places explicit trigger-market TP and SL plan orders first.
+- Native by-position TP/SL is fallback, not the hidden first path.
+- `/log` now filters out huge balance snapshots and shows TP/SL/order/protection payloads.
+- Version updated to `0157 REAL TPSL FIRST + FILTERED LOGS`.
