@@ -1238,7 +1238,7 @@ class ExchangeClient:
                 return p
         raise RuntimeError(f"live MEXC position not found for {symbol} side={side or '*'} last_seen={last_seen}")
 
-    async def mexc_place_tpsl_by_position(self, symbol: str, side: str, qty: float, stop_price: float, take_price: float, client_order_id: str = "") -> dict:
+    async def mexc_place_tpsl_by_position(self, symbol: str, side: str, qty: float, stop_price: float, take_price: float, client_order_id: str = "", live_position: dict | None = None) -> dict:
         """Place real MEXC TP/SL attached to an existing position.
 
         This uses the documented `/api/v1/private/stoporder/place` endpoint,
@@ -1250,7 +1250,15 @@ class ExchangeClient:
         if self.exchange_id != "mexc":
             raise NotImplementedError("native MEXC TP/SL-by-position is MEXC only")
         side_l = str(side or "").lower()
-        live_pos = await self.mexc_find_open_position(symbol, "long" if side_l == "sell" else "short")
+        # v0160: use the already confirmed live position row from execution_engine
+        # when available.  The previous code re-fetched the position here; on MEXC
+        # that extra fetch can race the just-opened position and fail before any
+        # /stoporder/place request is sent, so the bot immediately closed without
+        # ever trying native TP/SL.  Passing live_position makes the native TP/SL
+        # POST deterministic and visible in /log.
+        live_pos = live_position if isinstance(live_position, dict) and live_position else None
+        if not live_pos:
+            live_pos = await self.mexc_find_open_position(symbol, "long" if side_l == "sell" else "short")
         info = live_pos.get("info") if isinstance(live_pos.get("info"), dict) else {}
         pid = info.get("positionId") or info.get("id")
         vol = self._mexc_position_qty_contracts_from_parsed(live_pos)
@@ -1285,6 +1293,11 @@ class ExchangeClient:
             "takeProfitReverse": 2,
             "stopLossReverse": 2,
         }
+        try:
+            from debug_log import log_event
+            log_event("mexc_stoporder_place_body", symbol=self._mexc_symbol(symbol), side=side, positionId=pid, vol=vol, body=body)
+        except Exception:
+            pass
         out = await self._mexc_private("POST", "/api/v1/private/stoporder/place", body=body)
         data = out.get("data") if isinstance(out, dict) else None
         oid = data.get("id") if isinstance(data, dict) else data

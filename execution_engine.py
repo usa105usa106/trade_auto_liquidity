@@ -871,7 +871,7 @@ class ExecutionEngine:
                 except Exception as e:
                     out["tp_error"] = str(e)[:500]
             elif str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc" and hasattr(self.exchange_client, "mexc_place_tpsl_by_position"):
-                # v0159: MEXC native by-position TP/SL FIRST.
+                # v0160: MEXC native by-position TP/SL FIRST, using confirmed live position row.
                 # Use /api/v1/private/stoporder/place with positionId + holdVol;
                 # standalone plan orders remain only as fallback.
                 native_ok = False
@@ -882,6 +882,7 @@ class ExecutionEngine:
                     order = await self.exchange_client.mexc_place_tpsl_by_position(
                         symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp,
                         client_order_id=f"bot_tpsl_{int(time.time()*1000)}",
+                        live_position=live_row,
                     )
                     log_event("mexc_native_tpsl_response", symbol=symbol, side=side, attempt=i + 1, order=order, ok=True)
                     oid = str(order.get("id") or "")
