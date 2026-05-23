@@ -891,6 +891,31 @@ async def _safe_delete_bot_message(app, chat_id: int, message_id: int):
         log.debug("telegram delete timeout/error: %s", e)
         return None
 
+
+async def _safe_edit_message_text(message, text: str, **kwargs):
+    """Edit Telegram message with timeout; never block update queue."""
+    try:
+        return await asyncio.wait_for(message.edit_text(str(text)[:3900], **kwargs), timeout=5)
+    except Exception as e:
+        log.warning("telegram edit timeout/error: %s", e)
+        return None
+
+async def _await_with_timeout(coro, timeout_sec: float, label: str):
+    """Small wrapper used by command handlers and BOOST so one slow MEXC call cannot freeze buttons."""
+    try:
+        return await asyncio.wait_for(coro, timeout=float(timeout_sec))
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"{label} timeout after {timeout_sec}s")
+
+def _boost_disarm_runtime(app) -> None:
+    """Hard runtime disarm: prevents stale BOOST state and repeated button presses from re-arming it."""
+    try:
+        app.bot_data["boost_armed_runtime"] = False
+        app.bot_data["boost_start_in_progress"] = False
+        app.bot_data["boost_last_action"] = "disarmed"
+    except Exception:
+        pass
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     await reply(update, f"🤖 Liquidity Bot v{VERSION}\nГлавное меню:", reply_markup=MAIN_MENU)
@@ -1021,8 +1046,7 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running, entries_enabled, trading_task, position_task
     if not allowed(update): return
     entries_enabled = False
-    context.application.bot_data["boost_armed_runtime"] = False
-    context.application.bot_data["boost_start_in_progress"] = False
+    _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
     # Keep the loop alive when it is already running so open positions continue
@@ -1041,8 +1065,7 @@ async def panic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     entries_enabled = False
     running = False
-    context.application.bot_data["boost_armed_runtime"] = False
-    context.application.bot_data["boost_start_in_progress"] = False
+    _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
     for task in (trading_task, position_task):
@@ -1469,10 +1492,11 @@ async def boost_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     global running, entries_enabled, trading_task, position_task
-    if context.application.bot_data.get("boost_start_in_progress"):
-        await reply(update, "⏳ BOOST start is already in progress. Use /boost_status or /boost_stop.", reply_markup=MAIN_MENU)
+    if context.application.bot_data.get("boost_start_in_progress") or context.application.bot_data.get("boost_armed_runtime"):
+        await reply(update, "⏳ BOOST уже запущен/запускается. Повторный запуск заблокирован. Use /boost_status or /boost_stop.", reply_markup=MAIN_MENU)
         return
     context.application.bot_data["boost_start_in_progress"] = True
+    context.application.bot_data["boost_armed_runtime"] = True
 
     # Acknowledge immediately. Network balance/API calls can take a few seconds,
     # and Telegram users were seeing BOOST as hung while it was arming.
@@ -1529,8 +1553,8 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     equity = 0.0
     balance_note = ""
     try:
-        ex = await get_exchange(s)
-        bal = await asyncio.wait_for(ex.fetch_balance(), timeout=5)
+        ex = await _await_with_timeout(get_exchange(s), 6, "exchange init")
+        bal = await _await_with_timeout(ex.fetch_balance(), 8, "fetch_balance")
         usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
         equity = float(usdt.get("total") or usdt.get("free") or ((bal or {}).get("total", {}) or {}).get("USDT") or 0)
     except Exception as e:
@@ -1586,8 +1610,7 @@ async def boost_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     global running, entries_enabled
     entries_enabled = False
-    context.application.bot_data["boost_armed_runtime"] = False
-    context.application.bot_data["boost_start_in_progress"] = False
+    _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("strategy_mode", "hybrid")
     await reply(update, "🛑 BOOST stopped. New BOOST entries disabled. Open positions are still managed; use /close_all if you want to close immediately.", reply_markup=MAIN_MENU)
@@ -1687,8 +1710,8 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance_error = ""
     free = total = "n/a"
     try:
-        ex = await get_exchange(s)
-        bal = await asyncio.wait_for(ex.fetch_balance(), timeout=5)
+        ex = await _await_with_timeout(get_exchange(s), 6, "exchange init")
+        bal = await _await_with_timeout(ex.fetch_balance(), 8, "fetch_balance")
         usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
         free = usdt.get("free", "n/a") if isinstance(usdt, dict) else "n/a"
         total = usdt.get("total", "n/a") if isinstance(usdt, dict) else "n/a"
@@ -1705,9 +1728,9 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exchange_positions = []
         try:
             if hasattr(ex, "_mexc_fetch_positions"):
-                exchange_positions = await asyncio.wait_for(ex._mexc_fetch_positions(), timeout=5)
+                exchange_positions = await _await_with_timeout(ex._mexc_fetch_positions(), 6, "fetch_positions")
             else:
-                exchange_positions = await asyncio.wait_for(ex.fetch_positions(), timeout=5)
+                exchange_positions = await _await_with_timeout(ex.fetch_positions(), 6, "fetch_positions")
         except Exception:
             exchange_positions = []
         est_pm, est_count = _estimate_exchange_position_margin(
@@ -2171,15 +2194,14 @@ async def cancel_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global entries_enabled
     if not allowed(update): return
     entries_enabled = False
-    context.application.bot_data["boost_armed_runtime"] = False
-    context.application.bot_data["boost_start_in_progress"] = False
+    _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
     await reply(update, "⏳ Cancel all orders: command received. BOOST/new entries are OFF.", reply_markup=MAIN_MENU)
     s = await storage.all_settings()
     try:
-        ex = await get_exchange(s)
-        res = await asyncio.wait_for(ex.cancel_all_orders(), timeout=25)
+        ex = await _await_with_timeout(get_exchange(s), 6, "exchange init")
+        res = await _await_with_timeout(ex.cancel_all_orders(), 25, "cancel_all_orders")
         await reply(update, f"🧹 Cancel all orders sent\n{str(res)[:1200]}", reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"🧹 Cancel all failed: {e}", reply_markup=MAIN_MENU)
@@ -2188,20 +2210,19 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global entries_enabled
     if not allowed(update): return
     entries_enabled = False
-    context.application.bot_data["boost_armed_runtime"] = False
-    context.application.bot_data["boost_start_in_progress"] = False
+    _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
     await reply(update, "⏳ Close all positions: command received. BOOST/new entries are OFF.", reply_markup=MAIN_MENU)
     s = await storage.all_settings()
     try:
-        ex = await get_exchange(s)
+        ex = await _await_with_timeout(get_exchange(s), 6, "exchange init")
         exec_engine = ExecutionEngine(storage, ex)
-        positions = [p for p in (await asyncio.wait_for(ex.fetch_positions(), timeout=10) or []) if exec_engine.exchange_position_qty(p) > 0]
+        positions = [p for p in (await _await_with_timeout(ex.fetch_positions(), 10, "fetch_positions") or []) if exec_engine.exchange_position_qty(p) > 0]
         failures = []
         closed = 0
         for p in positions:
-            res = await exec_engine.close_exchange_position(p, "manual_close_all")
+            res = await _await_with_timeout(exec_engine.close_exchange_position(p, "manual_close_all"), 20, "close_exchange_position")
             if res.get("ok"):
                 closed += 1
             else:
@@ -2209,7 +2230,7 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         native_res = None
         cancel_res = None
         try:
-            cancel_res = await asyncio.wait_for(ex.cancel_all_orders(), timeout=10)
+            cancel_res = await _await_with_timeout(ex.cancel_all_orders(), 10, "cancel_all_orders")
         except Exception as e:
             failures.append(f"cancel_all: {e}")
         # Extra safety: call native close_all only when nothing was listed and
@@ -2218,7 +2239,7 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # real failure and only confuses the operator.
         if hasattr(ex, "mexc_close_all_positions_native"):
             try:
-                native_res = await ex.mexc_close_all_positions_native()
+                native_res = await _await_with_timeout(ex.mexc_close_all_positions_native(), 15, "native_close_all")
             except Exception as e:
                 if "2009" not in str(e) and "nonexistent or closed" not in str(e).lower():
                     failures.append(f"native_close_all: {e}")
@@ -2666,23 +2687,45 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     raw_text = (update.message.text or "").strip()
-    fn = _button_mapping().get(_button_text_key(raw_text))
-    if fn:
-        try:
-            await fn(update, context)
-        except Exception as e:
-            log.exception("button command failed: %s", raw_text)
-            await reply(update, f"❌ Command failed: {raw_text}\n{str(e)[:500]}", reply_markup=MAIN_MENU)
-    else:
+    key = _button_text_key(raw_text)
+    fn = _button_mapping().get(key)
+    if not fn:
         await reply(update, "Неизвестная команда. Нажми /help.", reply_markup=MAIN_MENU)
+        return
+
+    # Hard isolation: BOOST can be started only by exact BOOST button text.
+    # Balance/Close/Cancel/etc. cannot fall through into boost_start_cmd even if
+    # old Telegram updates arrive while BOOST is running.
+    if fn is not boost_start_cmd and key not in {_button_text_key("🚀 BOOST MODE"), _button_text_key("BOOST MODE")}:
+        context.application.bot_data["last_non_boost_button"] = raw_text
+
+    try:
+        await asyncio.wait_for(fn(update, context), timeout=45)
+    except asyncio.TimeoutError:
+        log.exception("button command timeout: %s", raw_text)
+        await reply(update, f"⏱ Команда зависла и остановлена по timeout: {raw_text}. Интерфейс не заблокирован.", reply_markup=MAIN_MENU)
+    except Exception as e:
+        log.exception("button command failed: %s", raw_text)
+        await reply(update, f"❌ Command failed: {raw_text}\n{str(e)[:500]}", reply_markup=MAIN_MENU)
 
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not allowed(update):
-        await q.answer("Access denied", show_alert=True)
+        try:
+            await asyncio.wait_for(q.answer("Access denied", show_alert=True), timeout=3)
+        except Exception:
+            pass
         return
-    await q.answer()
-    data = q.data.split(":")
+    try:
+        await asyncio.wait_for(q.answer(), timeout=3)
+    except Exception:
+        pass
+    raw_data = str(q.data or "")
+    data = raw_data.split(":")
+    allowed_prefixes = {"boost", "toggle", "set", "menu", "api", "aistats", "openai", "noop"}
+    if not data or data[0] not in allowed_prefixes:
+        log.warning("ignored unknown callback_data: %s", raw_data[:120])
+        return
     s = await storage.all_settings()
     current_rev = int(s.get("settings_revision", 1))
     try:
@@ -2690,7 +2733,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         rev = current_rev
     if rev != current_rev and data[0] != "menu":
-        await q.edit_message_text("⚠️ Старое меню. Открой Settings заново.")
+        await _safe_edit_message_text(q.message, "⚠️ Старое меню. Открой Settings заново.")
         return
 
     if data[0] == "boost":
@@ -2700,7 +2743,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await storage.set("boost_parallel_scan_enabled", new_value)
             ns = await storage.all_settings()
             snap = await _boost_session_snapshot(ns)
-            await q.edit_message_text(
+            await _safe_edit_message_text(q.message, 
                 f"🚀 BOOST controls\nRotation while in profit = {new_value}\nBank: {snap['current_bank']:.4f} / {snap['target_bank']:.4f} USDT",
                 reply_markup=_boost_rotation_keyboard(ns),
             )
@@ -2709,11 +2752,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_value = not _bool_setting(s, "boost_live_panel_enabled", True)
             await storage.set("boost_live_panel_enabled", new_value)
             ns = await storage.all_settings()
-            await q.edit_message_text(f"🚀 BOOST live panel = {new_value}", reply_markup=_boost_rotation_keyboard(ns))
+            await _safe_edit_message_text(q.message, f"🚀 BOOST live panel = {new_value}", reply_markup=_boost_rotation_keyboard(ns))
             return
         ns = await storage.all_settings()
         snap = await _boost_session_snapshot(ns)
-        await q.edit_message_text(
+        await _safe_edit_message_text(q.message, 
             f"🚀 BOOST controls\nBank: {snap['current_bank']:.4f} / {snap['target_bank']:.4f} USDT\nRotation: {_bool_setting(ns, 'boost_parallel_scan_enabled', True)}",
             reply_markup=_boost_rotation_keyboard(ns),
         )
@@ -2729,7 +2772,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_rev = int(new_settings.get("settings_revision", current_rev + 1))
         if key in {"live_trading", "spot_confirmation_enabled", "session_filter_enabled", "america_short_bias_enabled", "openai_analysis_enabled", "ws_enabled", "ai_scalping_quality_filters_enabled", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled", "ai_scalping_liquidation_stop_mode", "boost_parallel_scan_enabled", "boost_live_panel_enabled"}:
             trigger_scan_now(context.application, reason=f"toggle:{key}")
-        await q.edit_message_text(f"✅ {key} = {new_value}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
+        await _safe_edit_message_text(q.message, f"✅ {key} = {new_value}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
     elif data[0] == "set":
         key, value = data[1], data[2]
         parsed = value
@@ -2795,33 +2838,33 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             trigger_scan_now(context.application, reason=f"menu:{key}")
         # Stay inside the same submenu so the selected value is immediately visible with ✅.
         if key == "universe_mode":
-            await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], new_rev, new_settings.get("universe_mode")))
+            await _safe_edit_message_text(q.message, "🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], new_rev, new_settings.get("universe_mode")))
         elif key == "strategy_mode":
-            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("AI BTC/ETH scalp","ai_scalping"),("🚀 Boost 0-fee","boost_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], new_rev, new_settings.get("strategy_mode")))
+            await _safe_edit_message_text(q.message, "📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("AI BTC/ETH scalp","ai_scalping"),("🚀 Boost 0-fee","boost_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], new_rev, new_settings.get("strategy_mode")))
         elif key == "scan_market_source":
-            await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], new_rev, new_settings.get("scan_market_source", "mexc_binance")))
+            await _safe_edit_message_text(q.message, "📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], new_rev, new_settings.get("scan_market_source", "mexc_binance")))
         elif key == "scan_interval_sec":
-            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("3s","3"),("5s default","5"),("8s scalp","8"),("10s","10"),("30s","30"),("1m","60"),("5m","300"),("15m","900"),("30m","1800"),("1h","3600"),("4h","14400")], new_rev, new_settings.get("scan_interval_sec")))
+            await _safe_edit_message_text(q.message, "⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("3s","3"),("5s default","5"),("8s scalp","8"),("10s","10"),("30s","30"),("1m","60"),("5m","300"),("15m","900"),("30m","1800"),("1h","3600"),("4h","14400")], new_rev, new_settings.get("scan_interval_sec")))
         elif key == "scanner_concurrency":
-            await q.edit_message_text("🧵 Scanner concurrency", reply_markup=choices_menu("scanner_concurrency", [("3 requests","3"),("5 requests","5"),("8 requests","8"),("12 requests","12")], new_rev, new_settings.get("scanner_concurrency", 5)))
+            await _safe_edit_message_text(q.message, "🧵 Scanner concurrency", reply_markup=choices_menu("scanner_concurrency", [("3 requests","3"),("5 requests","5"),("8 requests","8"),("12 requests","12")], new_rev, new_settings.get("scanner_concurrency", 5)))
         elif key == "ws_update_throttle_ms":
-            await q.edit_message_text("🌊 WS throttle", reply_markup=choices_menu("ws_update_throttle_ms", [("250ms","250"),("500ms","500"),("1000ms","1000"),("1500ms","1500")], new_rev, new_settings.get("ws_update_throttle_ms", 500)))
+            await _safe_edit_message_text(q.message, "🌊 WS throttle", reply_markup=choices_menu("ws_update_throttle_ms", [("250ms","250"),("500ms","500"),("1000ms","1000"),("1500ms","1500")], new_rev, new_settings.get("ws_update_throttle_ms", 500)))
         elif key == "symbol_refresh_sec":
-            await q.edit_message_text("🔄 Refresh", reply_markup=choices_menu("symbol_refresh_sec", [("60s","60"),("180s","180"),("300s","300"),("600s","600"),("1200s","1200")], new_rev, new_settings.get("symbol_refresh_sec")))
+            await _safe_edit_message_text(q.message, "🔄 Refresh", reply_markup=choices_menu("symbol_refresh_sec", [("60s","60"),("180s","180"),("300s","300"),("600s","600"),("1200s","1200")], new_rev, new_settings.get("symbol_refresh_sec")))
         elif key == "risk_pct":
-            await q.edit_message_text("📊 Risk", reply_markup=choices_menu("risk_pct", [("0.25%","0.0025"),("0.50%","0.005"),("1%","0.01"),("3%","0.03"),("5%","0.05")], new_rev, new_settings.get("risk_pct")))
+            await _safe_edit_message_text(q.message, "📊 Risk", reply_markup=choices_menu("risk_pct", [("0.25%","0.0025"),("0.50%","0.005"),("1%","0.01"),("3%","0.03"),("5%","0.05")], new_rev, new_settings.get("risk_pct")))
         elif key == "max_open_positions":
-            await q.edit_message_text("🔥 Max positions", reply_markup=choices_menu("max_open_positions", [("1","1"),("2","2"),("3","3"),("5","5"),("10","10"),("15","15"),("20","20")], new_rev, new_settings.get("max_open_positions")))
+            await _safe_edit_message_text(q.message, "🔥 Max positions", reply_markup=choices_menu("max_open_positions", [("1","1"),("2","2"),("3","3"),("5","5"),("10","10"),("15","15"),("20","20")], new_rev, new_settings.get("max_open_positions")))
         elif key == "mirror_mode":
-            await q.edit_message_text("🪞 Mirror", reply_markup=choices_menu("mirror_mode", [("OFF","off"),("ON","on"),("AUTO","auto")], new_rev, new_settings.get("mirror_mode")))
+            await _safe_edit_message_text(q.message, "🪞 Mirror", reply_markup=choices_menu("mirror_mode", [("OFF","off"),("ON","on"),("AUTO","auto")], new_rev, new_settings.get("mirror_mode")))
         elif key == "openai_model":
-            await q.edit_message_text("🧠 OpenAI model", reply_markup=choices_menu("openai_model", [("gpt-5.4-mini default","gpt-5.4-mini"),("gpt-4o-mini","gpt-4o-mini"),("gpt-5.5","gpt-5.5"),("gpt-5.5-pro","gpt-5.5-pro"),("gpt-4.1","gpt-4.1")], new_rev, new_settings.get("openai_model", "gpt-5.4-mini")))
+            await _safe_edit_message_text(q.message, "🧠 OpenAI model", reply_markup=choices_menu("openai_model", [("gpt-5.4-mini default","gpt-5.4-mini"),("gpt-4o-mini","gpt-4o-mini"),("gpt-5.5","gpt-5.5"),("gpt-5.5-pro","gpt-5.5-pro"),("gpt-4.1","gpt-4.1")], new_rev, new_settings.get("openai_model", "gpt-5.4-mini")))
         elif key == "openai_check_strength":
-            await q.edit_message_text("🛡 OpenAI check strength", reply_markup=choices_menu("openai_check_strength", [("Weak","weak"),("Medium default","medium"),("Strong","strong")], new_rev, new_settings.get("openai_check_strength", "medium")))
+            await _safe_edit_message_text(q.message, "🛡 OpenAI check strength", reply_markup=choices_menu("openai_check_strength", [("Weak","weak"),("Medium default","medium"),("Strong","strong")], new_rev, new_settings.get("openai_check_strength", "medium")))
         elif key == "liquidity_retest_quality_mode":
-            await q.edit_message_text("💧 Liquidity retest quality", reply_markup=choices_menu("liquidity_retest_quality_mode", [("A+ only (strict/current)","a_plus"),("Normal","normal"),("Aggressive","aggressive")], new_rev, new_settings.get("liquidity_retest_quality_mode", "a_plus")))
+            await _safe_edit_message_text(q.message, "💧 Liquidity retest quality", reply_markup=choices_menu("liquidity_retest_quality_mode", [("A+ only (strict/current)","a_plus"),("Normal","normal"),("Aggressive","aggressive")], new_rev, new_settings.get("liquidity_retest_quality_mode", "a_plus")))
         else:
-            await q.edit_message_text(f"✅ {key} = {parsed}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
+            await _safe_edit_message_text(q.message, f"✅ {key} = {parsed}\n\n⚙️ Settings", reply_markup=settings_menu(new_rev, new_settings))
     elif data[0] == "api":
         action = data[1] if len(data) > 1 else "status"
         if action == "clear":
@@ -2830,11 +2873,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reset_exchange()
             new_settings = await storage.all_settings()
             new_rev = int(new_settings.get("settings_revision", current_rev + 1))
-            await q.edit_message_text("🗑 API keys cleared from bot storage", reply_markup=api_menu(new_rev, new_settings))
+            await _safe_edit_message_text(q.message, "🗑 API keys cleared from bot storage", reply_markup=api_menu(new_rev, new_settings))
         elif action == "test":
             api_key, api_secret = _api_creds(s)
             if not api_key or not api_secret:
-                await q.edit_message_text("❌ API missing. Use /api set API_KEY API_SECRET", reply_markup=api_menu(current_rev, s))
+                await _safe_edit_message_text(q.message, "❌ API missing. Use /api set API_KEY API_SECRET", reply_markup=api_menu(current_rev, s))
             else:
                 try:
                     ex = await get_exchange(s)
@@ -2842,68 +2885,68 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
                     free = usdt.get("free", "n/a") if isinstance(usdt, dict) else "n/a"
                     total = usdt.get("total", "n/a") if isinstance(usdt, dict) else "n/a"
-                    await q.edit_message_text(f"✅ API test OK\nUSDT free: {free}\nUSDT total: {total}", reply_markup=api_menu(current_rev, s))
+                    await _safe_edit_message_text(q.message, f"✅ API test OK\nUSDT free: {free}\nUSDT total: {total}", reply_markup=api_menu(current_rev, s))
                 except Exception as e:
-                    await q.edit_message_text(f"❌ API test failed: {e}", reply_markup=api_menu(current_rev, s))
+                    await _safe_edit_message_text(q.message, f"❌ API test failed: {e}", reply_markup=api_menu(current_rev, s))
         else:
-            await q.edit_message_text("🔐 API menu\nUse /api set API_KEY API_SECRET to save keys.", reply_markup=api_menu(current_rev, s))
+            await _safe_edit_message_text(q.message, "🔐 API menu\nUse /api set API_KEY API_SECRET to save keys.", reply_markup=api_menu(current_rev, s))
     elif data[0] == "aistats":
         action = data[1] if len(data) > 1 else "current"
         if action == "reset":
             sid = await ai_stats_manager.reset_session()
             new_settings = await storage.all_settings()
             new_rev = int(new_settings.get("settings_revision", current_rev + 1))
-            await q.edit_message_text(f"♻ AI scalping session reset\nNew session ID: {sid}", reply_markup=ai_stats_menu(new_rev))
+            await _safe_edit_message_text(q.message, f"♻ AI scalping session reset\nNew session ID: {sid}", reply_markup=ai_stats_menu(new_rev))
         elif action == "lifetime":
-            await q.edit_message_text(AIStatsManager.format(await ai_stats_manager.summary("lifetime")), reply_markup=ai_stats_menu(current_rev))
+            await _safe_edit_message_text(q.message, AIStatsManager.format(await ai_stats_manager.summary("lifetime")), reply_markup=ai_stats_menu(current_rev))
         else:
-            await q.edit_message_text(AIStatsManager.format(await ai_stats_manager.summary("current")), reply_markup=ai_stats_menu(current_rev))
+            await _safe_edit_message_text(q.message, AIStatsManager.format(await ai_stats_manager.summary("current")), reply_markup=ai_stats_menu(current_rev))
     elif data[0] == "openai":
         action = data[1] if len(data) > 1 else "status"
         if action == "clear":
             await storage.set("openai_api_key", "")
             new_settings = await storage.all_settings()
             new_rev = int(new_settings.get("settings_revision", current_rev + 1))
-            await q.edit_message_text("🗑 OpenAI API key cleared", reply_markup=openai_menu(new_rev, new_settings))
+            await _safe_edit_message_text(q.message, "🗑 OpenAI API key cleared", reply_markup=openai_menu(new_rev, new_settings))
         else:
-            await q.edit_message_text("🔑 OpenAI API key\nUse: /openai set YOUR_OPENAI_API_KEY", reply_markup=openai_menu(current_rev, s))
+            await _safe_edit_message_text(q.message, "🔑 OpenAI API key\nUse: /openai set YOUR_OPENAI_API_KEY", reply_markup=openai_menu(current_rev, s))
     elif data[0] == "noop":
         await q.answer("Use /api set API_KEY API_SECRET", show_alert=True)
     elif data[0] == "menu":
         name = data[1]
         rev = current_rev
         if name == "settings":
-            await q.edit_message_text("⚙️ Settings", reply_markup=settings_menu(rev, s))
+            await _safe_edit_message_text(q.message, "⚙️ Settings", reply_markup=settings_menu(rev, s))
         elif name == "universe":
-            await q.edit_message_text("🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], rev, s.get("universe_mode")))
+            await _safe_edit_message_text(q.message, "🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], rev, s.get("universe_mode")))
         elif name == "strategy":
-            await q.edit_message_text("📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("AI BTC/ETH scalp","ai_scalping"),("🚀 Boost 0-fee","boost_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], rev, s.get("strategy_mode")))
+            await _safe_edit_message_text(q.message, "📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("AI BTC/ETH scalp","ai_scalping"),("🚀 Boost 0-fee","boost_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], rev, s.get("strategy_mode")))
         elif name == "marketsource":
-            await q.edit_message_text("📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], rev, s.get("scan_market_source", "mexc_binance")))
+            await _safe_edit_message_text(q.message, "📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], rev, s.get("scan_market_source", "mexc_binance")))
         elif name == "scan":
-            await q.edit_message_text("⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("3s","3"),("5s default","5"),("8s scalp","8"),("10s","10"),("30s","30"),("1m","60"),("5m","300"),("15m","900"),("30m","1800"),("1h","3600"),("4h","14400")], rev, s.get("scan_interval_sec")))
+            await _safe_edit_message_text(q.message, "⏱ Scan speed", reply_markup=choices_menu("scan_interval_sec", [("3s","3"),("5s default","5"),("8s scalp","8"),("10s","10"),("30s","30"),("1m","60"),("5m","300"),("15m","900"),("30m","1800"),("1h","3600"),("4h","14400")], rev, s.get("scan_interval_sec")))
         elif name == "concurrency":
-            await q.edit_message_text("🧵 Scanner concurrency", reply_markup=choices_menu("scanner_concurrency", [("3 requests","3"),("5 requests","5"),("8 requests","8"),("12 requests","12")], rev, s.get("scanner_concurrency", 5)))
+            await _safe_edit_message_text(q.message, "🧵 Scanner concurrency", reply_markup=choices_menu("scanner_concurrency", [("3 requests","3"),("5 requests","5"),("8 requests","8"),("12 requests","12")], rev, s.get("scanner_concurrency", 5)))
         elif name == "wsthrottle":
-            await q.edit_message_text("🌊 WS throttle", reply_markup=choices_menu("ws_update_throttle_ms", [("250ms","250"),("500ms","500"),("1000ms","1000"),("1500ms","1500")], rev, s.get("ws_update_throttle_ms", 500)))
+            await _safe_edit_message_text(q.message, "🌊 WS throttle", reply_markup=choices_menu("ws_update_throttle_ms", [("250ms","250"),("500ms","500"),("1000ms","1000"),("1500ms","1500")], rev, s.get("ws_update_throttle_ms", 500)))
         elif name == "refresh":
-            await q.edit_message_text("🔄 Refresh", reply_markup=choices_menu("symbol_refresh_sec", [("60s","60"),("180s","180"),("300s","300"),("600s","600"),("1200s","1200")], rev, s.get("symbol_refresh_sec")))
+            await _safe_edit_message_text(q.message, "🔄 Refresh", reply_markup=choices_menu("symbol_refresh_sec", [("60s","60"),("180s","180"),("300s","300"),("600s","600"),("1200s","1200")], rev, s.get("symbol_refresh_sec")))
         elif name == "risk":
-            await q.edit_message_text("📊 Risk", reply_markup=choices_menu("risk_pct", [("0.25%","0.0025"),("0.50%","0.005"),("1%","0.01"),("3%","0.03"),("5%","0.05")], rev, s.get("risk_pct")))
+            await _safe_edit_message_text(q.message, "📊 Risk", reply_markup=choices_menu("risk_pct", [("0.25%","0.0025"),("0.50%","0.005"),("1%","0.01"),("3%","0.03"),("5%","0.05")], rev, s.get("risk_pct")))
         elif name == "maxpos":
-            await q.edit_message_text("🔥 Max positions", reply_markup=choices_menu("max_open_positions", [("1","1"),("2","2"),("3","3"),("5","5"),("10","10"),("15","15"),("20","20")], rev, s.get("max_open_positions")))
+            await _safe_edit_message_text(q.message, "🔥 Max positions", reply_markup=choices_menu("max_open_positions", [("1","1"),("2","2"),("3","3"),("5","5"),("10","10"),("15","15"),("20","20")], rev, s.get("max_open_positions")))
         elif name == "mirror":
-            await q.edit_message_text("🪞 Mirror", reply_markup=choices_menu("mirror_mode", [("OFF","off"),("ON","on"),("AUTO","auto")], rev, s.get("mirror_mode")))
+            await _safe_edit_message_text(q.message, "🪞 Mirror", reply_markup=choices_menu("mirror_mode", [("OFF","off"),("ON","on"),("AUTO","auto")], rev, s.get("mirror_mode")))
         elif name == "openai":
-            await q.edit_message_text("🤖 ИИ анализ OpenAI", reply_markup=openai_menu(rev, s))
+            await _safe_edit_message_text(q.message, "🤖 ИИ анализ OpenAI", reply_markup=openai_menu(rev, s))
         elif name == "openai_model":
-            await q.edit_message_text("🧠 OpenAI model", reply_markup=choices_menu("openai_model", [("gpt-5.4-mini default","gpt-5.4-mini"),("gpt-4o-mini","gpt-4o-mini"),("gpt-5.5","gpt-5.5"),("gpt-5.5-pro","gpt-5.5-pro"),("gpt-4.1","gpt-4.1")], rev, s.get("openai_model", "gpt-5.4-mini")))
+            await _safe_edit_message_text(q.message, "🧠 OpenAI model", reply_markup=choices_menu("openai_model", [("gpt-5.4-mini default","gpt-5.4-mini"),("gpt-4o-mini","gpt-4o-mini"),("gpt-5.5","gpt-5.5"),("gpt-5.5-pro","gpt-5.5-pro"),("gpt-4.1","gpt-4.1")], rev, s.get("openai_model", "gpt-5.4-mini")))
         elif name == "openai_strength":
-            await q.edit_message_text("🛡 OpenAI check strength", reply_markup=choices_menu("openai_check_strength", [("Weak","weak"),("Medium default","medium"),("Strong","strong")], rev, s.get("openai_check_strength", "medium")))
+            await _safe_edit_message_text(q.message, "🛡 OpenAI check strength", reply_markup=choices_menu("openai_check_strength", [("Weak","weak"),("Medium default","medium"),("Strong","strong")], rev, s.get("openai_check_strength", "medium")))
         elif name == "liquidity_quality":
-            await q.edit_message_text("💧 Liquidity retest quality", reply_markup=choices_menu("liquidity_retest_quality_mode", [("A+ only (strict/current)","a_plus"),("Normal","normal"),("Aggressive","aggressive")], rev, s.get("liquidity_retest_quality_mode", "a_plus")))
+            await _safe_edit_message_text(q.message, "💧 Liquidity retest quality", reply_markup=choices_menu("liquidity_retest_quality_mode", [("A+ only (strict/current)","a_plus"),("Normal","normal"),("Aggressive","aggressive")], rev, s.get("liquidity_retest_quality_mode", "a_plus")))
         elif name == "api":
-            await q.edit_message_text("🔐 API menu\nUse /api set API_KEY API_SECRET to save keys.", reply_markup=api_menu(rev, s))
+            await _safe_edit_message_text(q.message, "🔐 API menu\nUse /api set API_KEY API_SECRET to save keys.", reply_markup=api_menu(rev, s))
 
 
 async def get_last_price(ex, symbol: str) -> float:
@@ -3050,7 +3093,7 @@ async def position_management_loop(app):
             try:
                 settings = await storage.all_settings()
                 live = bool(settings.get("live_trading", False))
-                ex = await get_exchange(settings)
+                ex = await _await_with_timeout(get_exchange(settings), 8, "exchange init")
                 exec_engine = ExecutionEngine(storage, ex)
                 pos_manager = PositionManager(storage, exec_engine)
                 events = await pos_manager.manage(lambda symbol: get_last_price(ex, symbol), live)
@@ -3100,7 +3143,7 @@ async def trading_loop(app):
                 ai_mode = mode_name == "ai_scalping"
                 boost_mode = mode_name == "boost_scalping" and _is_boost_runtime_armed(app, settings)
                 live = bool(settings.get("live_trading", False))
-                ex = await get_exchange(settings)
+                ex = await _await_with_timeout(get_exchange(settings), 8, "exchange init")
                 ws = await get_ws(settings)
 
                 if bool(settings.get("ws_enabled", True)) and not ws.status.running:
@@ -3201,7 +3244,7 @@ async def trading_loop(app):
                 sync_ok = True
                 if live:
                     try:
-                        await ex.fetch_balance()
+                        await _await_with_timeout(ex.fetch_balance(), 8, "live balance probe")
                     except Exception as e:
                         log.warning("live balance/API probe failed: %s", e)
                         sync_ok = False
@@ -3301,7 +3344,7 @@ async def trading_loop(app):
                                 last_rot = float(app.bot_data.get("boost_last_rotation_ts", 0) or 0)
                                 cd = float(settings.get("boost_rotate_cooldown_sec", 20) or 20)
                                 if (not only_profit or pos_pnl >= min_profit) and time.time() - last_rot >= cd:
-                                    candidate_decision = await boost_scalping_engine.decide(ex, settings)
+                                    candidate_decision = await _await_with_timeout(boost_scalping_engine.decide(ex, settings), 12, "boost rotation decide")
                                     _record_boost_decision_metrics(candidate_decision)
                                     new_sym = str(candidate_decision.symbol or "")
                                     cur_sym = str(active_pos.get("symbol") or "")
@@ -3338,7 +3381,7 @@ async def trading_loop(app):
                                                 rot_plan = TradePlanner().make_plan(rot_cand, settings, equity_usdt=current_bank) if rot_cand else None
                                                 if rot_plan:
                                                     rot_plan.session = f"boost_{int(start_ts)}"
-                                                    placed2 = await exec_engine.place_entry(rot_plan, live)
+                                                    placed2 = await _await_with_timeout(exec_engine.place_entry(rot_plan, live), 20, "boost rotation place_entry")
                                                     if placed2.get("ok"):
                                                         scanner.last_signal_summary = f"BOOST rotated/opened {rot_plan.symbol} {rot_plan.side} margin≈{rot_plan.expected_margin_usdt:.2f} TP={rot_plan.take_price:.6g} SL={rot_plan.stop_price:.6g}"
                                                         await notify_admin(app, (
@@ -3377,7 +3420,7 @@ async def trading_loop(app):
                         await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                         continue
 
-                    decision = await boost_scalping_engine.decide(ex, settings)
+                    decision = await _await_with_timeout(boost_scalping_engine.decide(ex, settings), 15, "boost decide")
                     _record_boost_decision_metrics(decision)
                     if not decision.ok or decision.decision == "WAIT":
                         scanner.last_reject_reason = decision.reason or "BOOST wait"
@@ -3398,7 +3441,7 @@ async def trading_loop(app):
                     plan.session = f"boost_{int(start_ts)}"
                     if live:
                         try:
-                            bal = await ex.fetch_balance()
+                            bal = await _await_with_timeout(ex.fetch_balance(), 8, "boost balance precheck")
                             usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
                             free = float(usdt.get("free") or ((bal or {}).get("free", {}) or {}).get("USDT") or 0)
                             need = float(getattr(plan, "expected_margin_usdt", 0.0) or 0.0)
@@ -3411,7 +3454,7 @@ async def trading_loop(app):
                             await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                             continue
                     try:
-                        placed = await exec_engine.place_entry(plan, live)
+                        placed = await _await_with_timeout(exec_engine.place_entry(plan, live), 25, "boost place_entry")
                     except Exception as e:
                         err = str(e)
                         blocked = await _boost_handle_entry_failure(app, getattr(plan, "symbol", ""), err)
@@ -3542,7 +3585,7 @@ async def trading_loop(app):
                             continue
                         if live:
                             try:
-                                bal = await ex.fetch_balance()
+                                bal = await _await_with_timeout(ex.fetch_balance(), 8, "boost balance precheck")
                                 usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
                                 free = float(usdt.get("free") or ((bal or {}).get("free", {}) or {}).get("USDT") or 0)
                                 need = float(getattr(plan, "expected_margin_usdt", 0.0) or 0.0)
@@ -3555,7 +3598,7 @@ async def trading_loop(app):
                                 waited.append(f"{b}:balance precheck warning {e}")
                                 continue
                         try:
-                            placed = await exec_engine.place_entry(plan, live)
+                            placed = await _await_with_timeout(exec_engine.place_entry(plan, live), 25, "boost place_entry")
                         except Exception as e:
                             errors.append(f"{b}:execution exception {e}")
                             continue
@@ -3749,7 +3792,7 @@ async def trading_loop(app):
                         cand["openai_reason"] = ai_verdict.reason
 
                     try:
-                        placed = await exec_engine.place_entry(plan, live)
+                        placed = await _await_with_timeout(exec_engine.place_entry(plan, live), 25, "boost place_entry")
                     except Exception as e:
                         scanner.last_reject_reason = f"{plan.symbol}: execution exception: {e}"
                         continue
@@ -3806,7 +3849,7 @@ async def on_startup(app):
         if str(settings.get("live_trading", False)).lower() in {"1", "true", "yes", "on"}:
             api_key, api_secret = _api_creds(settings)
             if api_key and api_secret:
-                ex = await get_exchange(settings)
+                ex = await _await_with_timeout(get_exchange(settings), 8, "exchange init")
                 exec_engine = ExecutionEngine(storage, ex)
                 report = await RecoveryEngine(storage, ex, exec_engine).recover(
                     reattach=str(os.getenv("RECOVERY_REATTACH_PROTECTION", "true")).lower() in {"1", "true", "yes", "on"}

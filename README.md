@@ -1,4 +1,4 @@
-## v0190 BOOST COMMAND ISOLATION LIVE PANEL FIX
+## v0191 REAL ASYNC BOOST COMMAND FIX
 
 - Restored fast BOOST live panel as one bottom Telegram message.
 - Full zero-fee universe scan stays aggressive.
