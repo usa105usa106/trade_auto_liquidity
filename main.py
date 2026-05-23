@@ -1380,7 +1380,7 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     equity = 0.0
     try:
         ex = await get_exchange(s)
-        bal = await ex.fetch_balance()
+        bal = await asyncio.wait_for(ex.fetch_balance(), timeout=8)
         usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
         equity = float(usdt.get("total") or usdt.get("free") or ((bal or {}).get("total", {}) or {}).get("USDT") or 0)
     except Exception:
@@ -1549,14 +1549,14 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     proxy_enabled = bool(s.get("proxy_enabled", False))
     proxy_url = str(s.get("proxy_url", "") or "")
 
-    direct_ip = await fetch_public_ip(use_proxy=False)
-    proxy_ip = await fetch_public_ip(use_proxy=True, proxy_url=proxy_url) if proxy_enabled and proxy_url else {"ok": False, "ip": "not configured", "error": "proxy off or missing"}
+    direct_ip = await fetch_public_ip(use_proxy=False, timeout_sec=2)
+    proxy_ip = await fetch_public_ip(use_proxy=True, proxy_url=proxy_url, timeout_sec=2) if proxy_enabled and proxy_url else {"ok": False, "ip": "not configured", "error": "proxy off or missing"}
 
     balance_error = ""
     free = total = "n/a"
     try:
         ex = await get_exchange(s)
-        bal = await ex.fetch_balance()
+        bal = await asyncio.wait_for(ex.fetch_balance(), timeout=8)
         usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
         free = usdt.get("free", "n/a") if isinstance(usdt, dict) else "n/a"
         total = usdt.get("total", "n/a") if isinstance(usdt, dict) else "n/a"
@@ -1573,9 +1573,9 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exchange_positions = []
         try:
             if hasattr(ex, "_mexc_fetch_positions"):
-                exchange_positions = await ex._mexc_fetch_positions()
+                exchange_positions = await asyncio.wait_for(ex._mexc_fetch_positions(), timeout=8)
             else:
-                exchange_positions = await ex.fetch_positions()
+                exchange_positions = await asyncio.wait_for(ex.fetch_positions(), timeout=8)
         except Exception:
             exchange_positions = []
         est_pm, est_count = _estimate_exchange_position_margin(
@@ -2020,7 +2020,7 @@ async def open_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         positions = []
         try:
             exec_engine = ExecutionEngine(storage, ex)
-            positions = [p for p in (await ex.fetch_positions() or []) if exec_engine.exchange_position_qty(p) > 0]
+            positions = [p for p in (await asyncio.wait_for(ex.fetch_positions(), timeout=10) or []) if exec_engine.exchange_position_qty(p) > 0]
         except Exception:
             positions = []
         if not orders:
@@ -2037,21 +2037,23 @@ async def open_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
+    await reply(update, "⏳ Cancel all orders: command received...", reply_markup=MAIN_MENU)
     s = await storage.all_settings()
     try:
         ex = await get_exchange(s)
-        res = await ex.cancel_all_orders()
+        res = await asyncio.wait_for(ex.cancel_all_orders(), timeout=10)
         await reply(update, f"🧹 Cancel all orders sent\n{str(res)[:1200]}", reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"🧹 Cancel all failed: {e}", reply_markup=MAIN_MENU)
 
 async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
+    await reply(update, "⏳ Close all positions: command received...", reply_markup=MAIN_MENU)
     s = await storage.all_settings()
     try:
         ex = await get_exchange(s)
         exec_engine = ExecutionEngine(storage, ex)
-        positions = [p for p in (await ex.fetch_positions() or []) if exec_engine.exchange_position_qty(p) > 0]
+        positions = [p for p in (await asyncio.wait_for(ex.fetch_positions(), timeout=10) or []) if exec_engine.exchange_position_qty(p) > 0]
         failures = []
         closed = 0
         for p in positions:
@@ -2063,7 +2065,7 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         native_res = None
         cancel_res = None
         try:
-            cancel_res = await ex.cancel_all_orders()
+            cancel_res = await asyncio.wait_for(ex.cancel_all_orders(), timeout=10)
         except Exception as e:
             failures.append(f"cancel_all: {e}")
         # Extra safety: call native close_all only when nothing was listed and
@@ -2085,12 +2087,12 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_pm = post_used = None
         try:
             await asyncio.sleep(float(os.getenv("POST_CLOSE_BALANCE_CHECK_DELAY_SEC", "0.8")))
-            bal = await ex.fetch_balance()
+            bal = await asyncio.wait_for(ex.fetch_balance(), timeout=8)
             usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
             post_pm = float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
             post_used = float(usdt.get("used") or ((bal or {}).get("used", {}) or {}).get("USDT") or 0)
             try:
-                post_positions = [p for p in (await ex.fetch_positions() or []) if exec_engine.exchange_position_qty(p) > 0]
+                post_positions = [p for p in (await asyncio.wait_for(ex.fetch_positions(), timeout=10) or []) if exec_engine.exchange_position_qty(p) > 0]
             except Exception:
                 post_positions = []
             # Balance.used/frozen can stay non-zero because of leftover orders.
@@ -2403,8 +2405,8 @@ async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         proxy_enabled = bool(s.get("proxy_enabled", False))
         proxy_url = str(s.get("proxy_url", "") or "")
         # fetch_public_ip uses aiohttp.ClientSession internally, reads PROXY_TEST_URL, and supports HTTP/SOCKS proxy paths.
-        direct_ip = await fetch_public_ip(use_proxy=False)
-        proxy_ip = await fetch_public_ip(use_proxy=True, proxy_url=proxy_url) if proxy_enabled and proxy_url else {"ok": False, "ip": "not configured", "error": "proxy off or missing"}
+        direct_ip = await fetch_public_ip(use_proxy=False, timeout_sec=2)
+        proxy_ip = await fetch_public_ip(use_proxy=True, proxy_url=proxy_url, timeout_sec=2) if proxy_enabled and proxy_url else {"ok": False, "ip": "not configured", "error": "proxy off or missing"}
         text = (
             "🌐 Proxy/IP test\n"
             f"Direct IP: {direct_ip.get('ip')}" + (f" ({direct_ip.get('error')})" if direct_ip.get('error') else "") + "\n"
@@ -2482,17 +2484,51 @@ async def ai_scalping_toggle_cmd(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=MAIN_MENU,
     )
 
+def _button_text_key(text: str) -> str:
+    """Normalize Telegram reply-keyboard text.
+
+    Telegram clients may send emoji with or without the variation selector (FE0F),
+    and sometimes extra spaces. v0185 matched exact strings, so buttons like
+    Balance/Settings could be ignored on some clients.
+    """
+    return " ".join(str(text or "").replace("\ufe0f", "").split()).strip().casefold()
+
+
+def _button_mapping():
+    pairs = [
+        ("▶️ Run", run_cmd), ("▶ Run", run_cmd), ("Run", run_cmd),
+        ("⏹ Stop", stop_cmd), ("Stop", stop_cmd),
+        ("📊 Status", status_cmd), ("Status", status_cmd),
+        ("🚨 Panic", panic_cmd), ("Panic", panic_cmd),
+        ("📈 Positions", positions_cmd), ("Positions", positions_cmd),
+        ("📉 Stats", stats_cmd), ("Stats", stats_cmd),
+        ("💰 Balance", balance_cmd), ("Balance", balance_cmd),
+        ("🏓 Ping", ping_cmd), ("Ping", ping_cmd),
+        ("⚙️ Settings", settings_cmd), ("⚙ Settings", settings_cmd), ("Settings", settings_cmd),
+        ("🔐 API", api_cmd), ("API", api_cmd),
+        ("📊 AI Stats", ai_stats_cmd), ("AI Stats", ai_stats_cmd),
+        ("🤖 AI BTC/ETH scalping", ai_scalping_toggle_cmd), ("AI BTC/ETH scalping", ai_scalping_toggle_cmd),
+        ("🚀 BOOST MODE", boost_start_cmd), ("BOOST MODE", boost_start_cmd),
+        ("🛑 STOP BOOST", boost_stop_cmd), ("STOP BOOST", boost_stop_cmd),
+        ("📊 BOOST STATUS", boost_status_cmd), ("BOOST STATUS", boost_status_cmd),
+        ("⚙️ MEXC", mexc_settings_cmd), ("⚙ MEXC", mexc_settings_cmd), ("MEXC", mexc_settings_cmd),
+    ]
+    return {_button_text_key(k): v for k, v in pairs}
+
+
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return
-    text = (update.message.text or "").strip()
-    mapping = {
-        "▶️ Run": run_cmd, "⏹ Stop": stop_cmd, "📊 Status": status_cmd, "🚨 Panic": panic_cmd,
-        "📈 Positions": positions_cmd, "📉 Stats": stats_cmd, "💰 Balance": balance_cmd,
-        "🏓 Ping": ping_cmd, "⚙️ Settings": settings_cmd, "🔐 API": api_cmd, "📊 AI Stats": ai_stats_cmd, "🤖 AI BTC/ETH scalping": ai_scalping_toggle_cmd, "🚀 BOOST MODE": boost_start_cmd, "🛑 STOP BOOST": boost_stop_cmd, "📊 BOOST STATUS": boost_status_cmd, "⚙️ MEXC": mexc_settings_cmd,
-    }
-    fn = mapping.get(text)
-    if fn: await fn(update, context)
-    else: await reply(update, "Неизвестная команда. Нажми /help.", reply_markup=MAIN_MENU)
+    if not allowed(update):
+        return
+    raw_text = (update.message.text or "").strip()
+    fn = _button_mapping().get(_button_text_key(raw_text))
+    if fn:
+        try:
+            await fn(update, context)
+        except Exception as e:
+            log.exception("button command failed: %s", raw_text)
+            await reply(update, f"❌ Command failed: {raw_text}\n{str(e)[:500]}", reply_markup=MAIN_MENU)
+    else:
+        await reply(update, "Неизвестная команда. Нажми /help.", reply_markup=MAIN_MENU)
 
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2818,7 +2854,7 @@ async def ensure_recovery_before_entries(app, settings: dict, ex, exec_engine, l
 
 async def account_equity_usdt(ex, default: float = 1000.0) -> float:
     try:
-        bal = await ex.fetch_balance()
+        bal = await asyncio.wait_for(ex.fetch_balance(), timeout=8)
         usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
         total = usdt.get("total") if isinstance(usdt, dict) else None
         free = usdt.get("free") if isinstance(usdt, dict) else None
@@ -3630,46 +3666,59 @@ async def on_startup(app):
     except Exception as e:
         app.bot_data["startup_recovery_error"] = str(e)
 
+def _wrap_command(fn, name: str):
+    async def _inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            return await fn(update, context)
+        except Exception as e:
+            log.exception("telegram command failed: %s", name)
+            try:
+                await reply(update, f"❌ Command failed: {name}\n{str(e)[:500]}", reply_markup=MAIN_MENU)
+            except Exception:
+                pass
+    return _inner
+
+
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("log", log_cmd))
-    app.add_handler(CommandHandler("run", run_cmd))
-    app.add_handler(CommandHandler("boost_start", boost_start_cmd))
-    app.add_handler(CommandHandler("boost_stop", boost_stop_cmd))
-    app.add_handler(CommandHandler("boost_status", boost_status_cmd))
-    app.add_handler(CommandHandler("boost_rotation", boost_rotation_cmd))
-    app.add_handler(CommandHandler("boost_list", boost_list_cmd))
-    app.add_handler(CommandHandler("boost_list_del", boost_list_del_cmd))
-    app.add_handler(CommandHandler("stop", stop_cmd))
-    app.add_handler(CommandHandler("panic", panic_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("ping", ping_cmd))
-    app.add_handler(CommandHandler("balance", balance_cmd))
-    app.add_handler(CommandHandler("positions", positions_cmd))
-    app.add_handler(CommandHandler("mexc_debug_state", mexc_debug_state_cmd))
-    app.add_handler(CommandHandler("open_orders", open_orders_cmd))
-    app.add_handler(CommandHandler("cancel_all", cancel_all_cmd))
-    app.add_handler(CommandHandler("close_all", close_all_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("ai_stats", ai_stats_cmd))
-    app.add_handler(CommandHandler("ai_stats_current", ai_stats_current_cmd))
-    app.add_handler(CommandHandler("ai_stats_lifetime", ai_stats_lifetime_cmd))
-    app.add_handler(CommandHandler("ai_stats_reset", ai_stats_reset_cmd))
-    app.add_handler(CommandHandler("sync", sync_cmd))
-    app.add_handler(CommandHandler("sync_positions", sync_positions_cmd))
-    app.add_handler(CommandHandler("recovery", recovery_cmd))
-    app.add_handler(CommandHandler("settings", settings_cmd))
-    app.add_handler(CommandHandler("mexc_settings", mexc_settings_cmd))
-    app.add_handler(CommandHandler("leverage", leverage_cmd))
-    app.add_handler(CommandHandler("open_type", open_type_cmd))
-    app.add_handler(CommandHandler("recv_window", recv_window_cmd))
-    app.add_handler(CommandHandler("set", set_cmd))
-    app.add_handler(CommandHandler("proxy", proxy_cmd))
-    app.add_handler(CommandHandler("api", api_cmd))
-    app.add_handler(CommandHandler("openai", openai_cmd))
-    app.add_handler(CallbackQueryHandler(callback_router))
+    app.add_handler(CommandHandler("start", _wrap_command(start, "/start")))
+    app.add_handler(CommandHandler("help", _wrap_command(help_cmd, "/help")))
+    app.add_handler(CommandHandler("log", _wrap_command(log_cmd, "/log")))
+    app.add_handler(CommandHandler("run", _wrap_command(run_cmd, "/run")))
+    app.add_handler(CommandHandler("boost_start", _wrap_command(boost_start_cmd, "/boost_start")))
+    app.add_handler(CommandHandler("boost_stop", _wrap_command(boost_stop_cmd, "/boost_stop")))
+    app.add_handler(CommandHandler("boost_status", _wrap_command(boost_status_cmd, "/boost_status")))
+    app.add_handler(CommandHandler("boost_rotation", _wrap_command(boost_rotation_cmd, "/boost_rotation")))
+    app.add_handler(CommandHandler("boost_list", _wrap_command(boost_list_cmd, "/boost_list")))
+    app.add_handler(CommandHandler("boost_list_del", _wrap_command(boost_list_del_cmd, "/boost_list_del")))
+    app.add_handler(CommandHandler("stop", _wrap_command(stop_cmd, "/stop")))
+    app.add_handler(CommandHandler("panic", _wrap_command(panic_cmd, "/panic")))
+    app.add_handler(CommandHandler("status", _wrap_command(status_cmd, "/status")))
+    app.add_handler(CommandHandler("ping", _wrap_command(ping_cmd, "/ping")))
+    app.add_handler(CommandHandler("balance", _wrap_command(balance_cmd, "/balance")))
+    app.add_handler(CommandHandler("positions", _wrap_command(positions_cmd, "/positions")))
+    app.add_handler(CommandHandler("mexc_debug_state", _wrap_command(mexc_debug_state_cmd, "/mexc_debug_state")))
+    app.add_handler(CommandHandler("open_orders", _wrap_command(open_orders_cmd, "/open_orders")))
+    app.add_handler(CommandHandler("cancel_all", _wrap_command(cancel_all_cmd, "/cancel_all")))
+    app.add_handler(CommandHandler("close_all", _wrap_command(close_all_cmd, "/close_all")))
+    app.add_handler(CommandHandler("stats", _wrap_command(stats_cmd, "/stats")))
+    app.add_handler(CommandHandler("ai_stats", _wrap_command(ai_stats_cmd, "/ai_stats")))
+    app.add_handler(CommandHandler("ai_stats_current", _wrap_command(ai_stats_current_cmd, "/ai_stats_current")))
+    app.add_handler(CommandHandler("ai_stats_lifetime", _wrap_command(ai_stats_lifetime_cmd, "/ai_stats_lifetime")))
+    app.add_handler(CommandHandler("ai_stats_reset", _wrap_command(ai_stats_reset_cmd, "/ai_stats_reset")))
+    app.add_handler(CommandHandler("sync", _wrap_command(sync_cmd, "/sync")))
+    app.add_handler(CommandHandler("sync_positions", _wrap_command(sync_positions_cmd, "/sync_positions")))
+    app.add_handler(CommandHandler("recovery", _wrap_command(recovery_cmd, "/recovery")))
+    app.add_handler(CommandHandler("settings", _wrap_command(settings_cmd, "/settings")))
+    app.add_handler(CommandHandler("mexc_settings", _wrap_command(mexc_settings_cmd, "/mexc_settings")))
+    app.add_handler(CommandHandler("leverage", _wrap_command(leverage_cmd, "/leverage")))
+    app.add_handler(CommandHandler("open_type", _wrap_command(open_type_cmd, "/open_type")))
+    app.add_handler(CommandHandler("recv_window", _wrap_command(recv_window_cmd, "/recv_window")))
+    app.add_handler(CommandHandler("set", _wrap_command(set_cmd, "/set")))
+    app.add_handler(CommandHandler("proxy", _wrap_command(proxy_cmd, "/proxy")))
+    app.add_handler(CommandHandler("api", _wrap_command(api_cmd, "/api")))
+    app.add_handler(CommandHandler("openai", _wrap_command(openai_cmd, "/openai")))
+    app.add_handler(CallbackQueryHandler(_wrap_command(callback_router, "callback")))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     return app
 
