@@ -137,9 +137,7 @@ class BoostScalpingEngine:
         if side is None:
             return {"ok": False, "reason": f"no live edge: need≈{min_edge:.3f}% spread={spread:.3f}% bid/ask={long_ratio:.2f} ask/bid={short_ratio:.2f} r1={r1:.3f}% r3={r3:.3f}%"}
         strength = max(0.0, min(1.0, ((min(ratio, 4.0) - ratio_min) / max(0.1, 4.0 - ratio_min)) * 0.55 + min(1.0, momo / max(min_momo * 4.0, 0.01)) * 0.45))
-        accel = max(0.0, abs(r1) * 3.0 + abs(r3) * 1.4)
-        persistence = 1.0 if abs(r1) > (abs(r3) * 0.18) else 0.65
-        score = ratio * 10.0 + momo * 120.0 + atr * 18.0 + accel * 25.0 + persistence * 8.0 - spread * 55.0
+        score = ratio * 12.0 + momo * 90.0 + atr * 20.0 - spread * 80.0
         return {"ok": True, "side": side, "score": score, "strength": strength, "ratio": ratio, "momo": momo, "reason": f"{side} ratio={ratio:.2f} r1={r1:.3f}% r3={r3:.3f}% atr={atr:.3f}%"}
 
     async def _fast_contract_tickers(self, exchange_client) -> list[dict]:
@@ -292,10 +290,10 @@ class BoostScalpingEngine:
         spread = _f(market.get("spread_pct"), 999.0)
         ratio = _f(base.get("ratio"), 0.0)
         vol = _f(market.get("quote_volume_usdt"), 0.0)
-        min_r3 = _f(settings.get("boost_hunter_min_move_3m_pct"), 0.22)
-        min_accel = _f(settings.get("boost_hunter_min_accel_pct"), 0.05)
-        min_score = _f(settings.get("boost_hunter_min_score"), 105.0)
-        max_wick = _f(settings.get("boost_hunter_max_wick_pct"), 0.42)
+        min_r3 = _f(settings.get("boost_hunter_min_move_3m_pct"), 0.095)
+        min_accel = _f(settings.get("boost_hunter_min_accel_pct"), 0.012)
+        min_score = _f(settings.get("boost_hunter_min_score"), 82.0)
+        max_wick = _f(settings.get("boost_hunter_max_wick_pct"), 0.68)
         # acceleration: last minute must confirm the 3m move, not fade against it.
         if side == "LONG":
             move = r3
@@ -310,7 +308,7 @@ class BoostScalpingEngine:
         # Anti-chop: do not enter when the 1m candle is tiny versus spread/ATR.
         # This blocks fake hotlist coins where the 3m move already happened and
         # the current impulse is no longer paying for live spread/slippage.
-        min_live_1m = max(spread * 2.0 + _f(settings.get("boost_live_slippage_buffer_pct"), 0.018), atr * 0.25)
+        min_live_1m = max(spread * 1.25 + _f(settings.get("boost_live_slippage_buffer_pct"), 0.018), atr * 0.14)
         if abs(r1) < min_live_1m:
             return {**base, "ok": False, "reason": f"HUNTER no-trade: live 1m {abs(r1):.3f}% < {min_live_1m:.3f}% cost/ATR gate"}
         if move < min_r3:
@@ -326,7 +324,7 @@ class BoostScalpingEngine:
         hunter_score = _f(base.get("score"), 0.0) + move * 110.0 + max(0.0, accel) * 160.0 + ratio * 8.0 + vol_bonus - spread * 160.0
         if hunter_score < min_score:
             return {**base, "ok": False, "reason": f"HUNTER no-trade: score {hunter_score:.1f} < {min_score:.1f} move={move:.3f}% accel={accel:.3f}%"}
-        strength = max(_f(base.get("strength"), 0.0), min(1.0, (hunter_score - min_score) / max(1.0, _f(settings.get("boost_hunter_extreme_score"), 145.0) - min_score)))
+        strength = max(_f(base.get("strength"), 0.0), min(1.0, (hunter_score - min_score) / max(1.0, _f(settings.get("boost_hunter_extreme_score"), 128.0) - min_score)))
         return {**base, "ok": True, "score": hunter_score, "strength": strength, "hunter_score": hunter_score, "accel": accel, "move": move, "reason": f"HUNTER {side} score={hunter_score:.1f} move={move:.3f}% accel={accel:.3f}% ratio={ratio:.2f} atr={atr:.3f}%"}
 
     async def _hot_symbols(self, exchange_client, settings: dict, symbols: list[str]) -> tuple[list[str], list[dict]]:
@@ -500,13 +498,13 @@ class BoostScalpingEngine:
         spread = max(0.0, _f(market.get("spread_pct"), 0.0))
         atr = max(0.01, _f(market.get("atr_1m_pct"), 0.10))
         # TP must cover spread + expected live slippage. Strong impulse waits longer.
-        edge_tp = spread * _f(settings.get("boost_tp_spread_mult"), 3.2) + _f(settings.get("boost_live_slippage_buffer_pct"), 0.018)
+        edge_tp = spread * _f(settings.get("boost_tp_spread_mult"), 2.2) + _f(settings.get("boost_live_slippage_buffer_pct"), 0.018)
         atr_tp = atr * _f(settings.get("boost_tp_atr_mult"), 0.70)
         raw_tp = min_tp + (max_tp - min_tp) * strength
         tp = min(max_tp, max(min_tp, edge_tp, atr_tp, raw_tp))
         if str(settings.get("boost_hunter_mode", True)).lower() in {"1", "true", "yes", "on"}:
             # HUNTER lets strong impulses breathe more; exits can still be earlier by momentum decay.
-            tp = min(max_tp, max(tp, atr * 0.95, spread * 4.5 + _f(settings.get("boost_live_slippage_buffer_pct"), 0.018)))
+            tp = min(max_tp, max(tp, atr * 0.95, spread * 3.0 + _f(settings.get("boost_live_slippage_buffer_pct"), 0.018)))
         # Emergency stop only. It is wider than TP so the bot does not harvest
         # normal noise as repeated losses. Local/rotation logic still refuses
         # to close minus positions for convenience.
