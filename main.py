@@ -1714,98 +1714,133 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_MENU,
     )
 
+
+def _fmt_money_value(v):
+    try:
+        if v in (None, "", "n/a"):
+            return "n/a"
+        f = float(v)
+        return f"{f:.8f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(v)
+
+
+def _extract_mexc_usdt_balance(payload: dict) -> dict:
+    """Extract USDT futures balance from several native MEXC response shapes."""
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data", payload)
+    rows = []
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        for key in ("assets", "list", "rows", "items", "result"):
+            if isinstance(data.get(key), list):
+                rows = data.get(key)
+                break
+        if not rows:
+            rows = [data]
+    best = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ccy = str(row.get("currency") or row.get("asset") or row.get("coin") or "USDT").upper()
+        if ccy and ccy != "USDT":
+            continue
+        def pick(*keys, default=0):
+            for k in keys:
+                val = row.get(k)
+                if val not in (None, ""):
+                    return val
+            return default
+        total = pick("equity", "totalEquity", "balance", "cashBalance", "walletBalance", "marginBalance")
+        free = pick("availableBalance", "available", "availableOpen", "availableCash", "cashBalance", default=total)
+        frozen = pick("frozenBalance", "frozen", "hold", default=0)
+        pos_margin = pick("positionMargin", "position_margin", "im", "initialMargin", default=0)
+        unreal = pick("unrealized", "unrealizedPnl", "unrealisedPnl", "unrealizedProfit", default=0)
+        try:
+            used = max(0.0, float(total or 0) - float(free or 0))
+        except Exception:
+            used = pick("used", "usedBalance", default=0)
+        best = {"free": free, "total": total, "used": used, "positionMargin": pos_margin, "frozenBalance": frozen, "unrealized": unreal, "raw": row}
+        break
+    return best
+
+
+async def _direct_mexc_balance(settings: dict) -> tuple[dict, str]:
+    """Fast balance path for the Telegram Balance button.
+
+    This deliberately avoids get_exchange(), ccxt.load_markets(), positions,
+    and public IP checks. The button must answer even when public MEXC endpoints
+    or market loading are slow. We try futures private read hosts with a small
+    per-request timeout and return either parsed USDT values or the last error.
+    """
+    api_key, api_secret = _api_creds(settings)
+    proxy_enabled = bool(settings.get("proxy_enabled", False))
+    proxy_url = str(settings.get("proxy_url", "") or "")
+    ex = ExchangeClient(DEFAULT_EXCHANGE, proxy_url, proxy_enabled)
+    ex.api_key = api_key
+    ex.api_secret = api_secret
+    bases = []
+    env_base = os.getenv("MEXC_REST_BASE", "").strip().rstrip("/")
+    for b in (env_base, "https://contract.mexc.com", "https://api.mexc.com"):
+        if b and b not in bases:
+            bases.append(b)
+    endpoints = [
+        "/api/v1/private/account/assets",
+        "/api/v1/private/account/asset/USDT",
+    ]
+    errors = []
+    for base in bases:
+        for ep in endpoints:
+            try:
+                out = await _await_with_timeout(ex._mexc_private("GET", ep, query={}, base_url=base), 4, f"{base}{ep}")
+                parsed = _extract_mexc_usdt_balance(out)
+                if parsed:
+                    parsed["source"] = f"{base}{ep}"
+                    return parsed, ""
+                errors.append(f"{base}{ep}: empty/unknown response")
+            except Exception as e:
+                errors.append(f"{base}{ep}: {str(e)[:160]}")
+    return {}, " | ".join(errors[-4:])[:700]
+
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     chat_id = update.effective_chat.id if update.effective_chat else 0
     lock = balance_locks.setdefault(chat_id, asyncio.Lock())
     if lock.locked():
-        await reply(update, "💰 Balance уже проверяется. Подожди финальный ответ, я не запускаю второй запрос параллельно.", reply_markup=MAIN_MENU)
+        await reply(update, "💰 Баланс уже проверяется. Жду ответ MEXC, второй запрос не запускаю.", reply_markup=MAIN_MENU)
         return
+
     async with lock:
-        try:
-            await reply(update, "💰 Balance: проверяю MEXC/IP, кнопки не блокируются...", reply_markup=MAIN_MENU)
-        except Exception:
-            pass
         s = await storage.all_settings()
         proxy_enabled = bool(s.get("proxy_enabled", False))
         proxy_url = str(s.get("proxy_url", "") or "")
-
-        direct_task = asyncio.create_task(fetch_public_ip(use_proxy=False, timeout_sec=2))
-        proxy_task = asyncio.create_task(fetch_public_ip(use_proxy=True, proxy_url=proxy_url, timeout_sec=2)) if proxy_enabled and proxy_url else None
-
-        balance_error = ""
-        free = total = used = position_margin = frozen_balance = unrealized = "n/a"
-        ex = None
+        started = time.perf_counter()
         try:
-            api_key, api_secret = _api_creds(s)
-            # Balance must not depend on ccxt.load_markets(): that public MEXC call can hang
-            # on some Railway/VPS IPs and made every button look frozen.  Native futures
-            # balance/positions endpoints do not need market loading.
-            ex = ExchangeClient(DEFAULT_EXCHANGE, proxy_url, proxy_enabled)
-            ex.api_key = api_key
-            ex.api_secret = api_secret
-            # Do not call load_markets or a separate time-sync here.  The native request retries
-            # with time sync only if MEXC asks for it; this keeps Balance under a hard deadline.
-            bal = await _await_with_timeout(ex.fetch_balance(), 5, "native MEXC futures balance")
-            usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
-            free = usdt.get("free", "n/a") if isinstance(usdt, dict) else "n/a"
-            total = usdt.get("total", "n/a") if isinstance(usdt, dict) else "n/a"
-            used = usdt.get("used", "n/a") if isinstance(usdt, dict) else "n/a"
-            position_margin = usdt.get("positionMargin", "n/a") if isinstance(usdt, dict) else "n/a"
-            frozen_balance = usdt.get("frozenBalance", "n/a") if isinstance(usdt, dict) else "n/a"
-            unrealized = usdt.get("unrealized", "n/a") if isinstance(usdt, dict) else "n/a"
-            try:
-                raw_pm = float(position_margin or 0)
-            except Exception:
-                raw_pm = 0.0
-            exchange_positions = []
-            try:
-                exchange_positions = await _await_with_timeout(ex._mexc_fetch_positions(), 2, "fetch_positions")
-            except Exception:
-                exchange_positions = []
-            est_pm, est_count = _estimate_exchange_position_margin(
-                exchange_positions,
-                int(float(s.get("mexc_order_leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or 5)),
-            )
-            if raw_pm <= 0 and est_pm > 0:
-                position_margin = f"~{est_pm:.6f} estimated ({est_count} open position; MEXC raw=0)"
+            bal, err = await _direct_mexc_balance(s)
+            if bal:
+                text = (
+                    "💰 Futures Balance MEXC\n"
+                    f"USDT free: {_fmt_money_value(bal.get('free'))}\n"
+                    f"USDT total/equity: {_fmt_money_value(bal.get('total'))}\n"
+                    f"USDT used: {_fmt_money_value(bal.get('used'))}\n"
+                    f"Position margin: {_fmt_money_value(bal.get('positionMargin'))}\n"
+                    f"Frozen balance: {_fmt_money_value(bal.get('frozenBalance'))}\n"
+                    f"Unrealized PnL: {_fmt_money_value(bal.get('unrealized'))}\n"
+                    f"Proxy: {'ON' if proxy_enabled and proxy_url else 'OFF'}\n"
+                    f"Time: {(time.perf_counter() - started):.1f}s"
+                )
+            else:
+                text = (
+                    "❌ Balance: MEXC не вернул баланс.\n"
+                    "Кнопка работает, но private futures API не отвечает/отклоняет запрос.\n\n"
+                    f"Proxy: {'ON' if proxy_enabled and proxy_url else 'OFF'}\n"
+                    f"Error: {err or 'unknown'}"
+                )
         except Exception as e:
-            balance_error = str(e)[:240]
-        finally:
-            try:
-                if ex:
-                    await _await_with_timeout(ex.close(), 2, "exchange close")
-            except Exception:
-                pass
-
-        try:
-            direct_ip = await _await_with_timeout(direct_task, 3, "direct IP")
-        except Exception as e:
-            direct_ip = {"ok": False, "ip": "unavailable", "error": str(e)[:120]}
-        if proxy_task:
-            try:
-                proxy_ip = await _await_with_timeout(proxy_task, 3, "proxy IP")
-            except Exception as e:
-                proxy_ip = {"ok": False, "ip": "unavailable", "error": str(e)[:120]}
-        else:
-            proxy_ip = {"ok": False, "ip": "not configured", "error": "proxy off or missing"}
-        proxy_line = f"{proxy_ip.get('ip')}" if proxy_ip.get("ok") else f"{proxy_ip.get('ip')} ({proxy_ip.get('error')})"
-        direct_line = f"{direct_ip.get('ip')}" if direct_ip.get("ok") else f"{direct_ip.get('ip')} ({direct_ip.get('error')})"
-        text = (
-            "💰 Futures Balance\n"
-            f"USDT free: {free}\n"
-            f"USDT total: {total}\n"
-            f"USDT used: {used}\n"
-            f"Position margin: {position_margin}\n"
-            f"Frozen balance: {frozen_balance}\n"
-            f"Unrealized PnL: {unrealized}\n"
-            f"Balance error: {balance_error or '-'}\n\n"
-            "🌍 IP diagnostics\n"
-            f"Direct IP: {direct_line}\n"
-            f"Proxy enabled: {proxy_enabled}\n"
-            f"Proxy IP: {proxy_line}"
-        )
-        await reply(update, text, reply_markup=MAIN_MENU)
+            text = f"❌ Balance failed: {str(e)[:900]}"
+        await reply(update, text[:3900], reply_markup=MAIN_MENU)
 
 
 
