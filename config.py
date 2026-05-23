@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0199 BOOST NORMAL RESCUE ROTATION")
+VERSION = os.getenv("BOT_VERSION", "0200 BOOST EXCHANGE POSITION SYNC FIX")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -138,7 +138,7 @@ class Defaults:
     boost_target_multiplier: float = env_float("BOOST_TARGET_MULTIPLIER", 20.0)
     boost_session_hours: float = env_float("BOOST_SESSION_HOURS", 6.0)
     boost_max_session_loss_pct: float = env_float("BOOST_MAX_SESSION_LOSS_PCT", 80.0)
-    boost_max_consecutive_losses: int = env_int("BOOST_MAX_CONSECUTIVE_LOSSES", 3)
+    boost_max_consecutive_losses: int = env_int("BOOST_MAX_CONSECUTIVE_LOSSES", 1)
     boost_auto_leverage: bool = env_bool("BOOST_AUTO_LEVERAGE", True)
     boost_min_leverage: int = env_int("BOOST_MIN_LEVERAGE", 30)
     boost_max_leverage: int = env_int("BOOST_MAX_LEVERAGE", 50)
@@ -173,7 +173,7 @@ class Defaults:
     boost_rotate_strength_multiplier: float = env_float("BOOST_ROTATE_STRENGTH_MULTIPLIER", 1.35)
     boost_rotate_min_score_gap: float = env_float("BOOST_ROTATE_MIN_SCORE_GAP", 5.0)
     boost_rotate_cooldown_sec: int = env_int("BOOST_ROTATE_COOLDOWN_SEC", 1)
-    boost_rescue_rotation_enabled: bool = env_bool("BOOST_RESCUE_ROTATION_ENABLED", True)
+    boost_rescue_rotation_enabled: bool = env_bool("BOOST_RESCUE_ROTATION_ENABLED", False)
     boost_rescue_min_score_multiplier: float = env_float("BOOST_RESCUE_MIN_SCORE_MULTIPLIER", 1.70)
     boost_rescue_min_score_gap: float = env_float("BOOST_RESCUE_MIN_SCORE_GAP", 18.0)
     boost_rescue_expected_move_loss_mult: float = env_float("BOOST_RESCUE_EXPECTED_MOVE_LOSS_MULT", 2.50)

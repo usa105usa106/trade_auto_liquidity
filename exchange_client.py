@@ -237,7 +237,11 @@ class ExchangeClient:
         try:
             return float(self.exchange.price_to_precision(self.normalize_symbol(symbol), price))
         except Exception:
-            digits = self._precision_digits_from_market(symbol, "price", 8)
+            digits = self._precision_digits_from_market(symbol, "price", self._mexc_fallback_price_digits(price))
+            # If market metadata is missing, never send 8-decimal high-price triggers
+            # to MEXC stoporder/place; that caused code 2015 precision errors.
+            if digits >= 8 and price >= 1:
+                digits = self._mexc_fallback_price_digits(price)
             return float(f"{price:.{digits}f}")
 
     def _mexc_amount_to_precision(self, symbol: str, amount: float) -> float:
@@ -315,7 +319,25 @@ class ExchangeClient:
                 return 0.01
         except Exception:
             pass
+        # Generic safe fallback when markets were not loaded (BOOST avoids load_markets
+        # to stay responsive). MEXC rejects long float tails with code 2015; two
+        # decimals for high-priced contracts and four decimals for cheaper ones
+        # is safer than sending raw Python floats like 260.03963536.
+        try:
+            px = float(symbol if False else 0)
+        except Exception:
+            pass
         return 0.0
+
+    def _mexc_fallback_price_digits(self, price: float) -> int:
+        price = abs(float(price or 0))
+        if price >= 1000:
+            return 1
+        if price >= 100:
+            return 2
+        if price >= 1:
+            return 4
+        return 6
 
     def _mexc_safe_trigger_price_sync(self, symbol: str, close_side: str, kind: str, trigger_price: float, reference_price: float = 0.0) -> float:
         """Round and keep a trigger on the correct side of a reference price.
@@ -1516,7 +1538,7 @@ class ExchangeClient:
             return 2 if kind_l == "tp" else 1
         return 1
 
-    async def mexc_place_trigger_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, kind: str = "sl", client_order_id: str = "") -> dict:
+    async def mexc_place_trigger_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, kind: str = "sl", client_order_id: str = "", leverage: int | None = None) -> dict:
         """Place a native MEXC futures trigger-market close order for TP or SL.
 
         This is the reliable fallback used by the bot after a position is live.
@@ -1546,7 +1568,7 @@ class ExchangeClient:
             "vol": self._amount_to_mexc_vol(symbol, amount),
             "side": mexc_side,
             "openType": int(os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or "1"),
-            "leverage": int(os.getenv("MEXC_ORDER_LEVERAGE", "5") or "5"),
+            "leverage": int(leverage or os.getenv("MEXC_ORDER_LEVERAGE", "5") or "5"),
             "triggerPrice": safe_trigger,
             "executePrice": 0,
             "orderType": 5,
@@ -1571,11 +1593,11 @@ class ExchangeClient:
             "info": {"native_mexc_trigger": True, "_protection_kind": kind_l, "safe_trigger_price": safe_trigger, "reference_price": ref, **(out if isinstance(out, dict) else {"raw": out})},
         }
 
-    async def mexc_place_stop_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, client_order_id: str = "") -> dict:
-        return await self.mexc_place_trigger_market(symbol, close_side, amount, trigger_price, kind="sl", client_order_id=client_order_id)
+    async def mexc_place_stop_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, client_order_id: str = "", leverage: int | None = None) -> dict:
+        return await self.mexc_place_trigger_market(symbol, close_side, amount, trigger_price, kind="sl", client_order_id=client_order_id, leverage=leverage)
 
-    async def mexc_place_take_profit_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, client_order_id: str = "") -> dict:
-        return await self.mexc_place_trigger_market(symbol, close_side, amount, trigger_price, kind="tp", client_order_id=client_order_id)
+    async def mexc_place_take_profit_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, client_order_id: str = "", leverage: int | None = None) -> dict:
+        return await self.mexc_place_trigger_market(symbol, close_side, amount, trigger_price, kind="tp", client_order_id=client_order_id, leverage=leverage)
 
     async def mexc_debug_state(self, symbol: str | None = None) -> dict:
         """Compact raw diagnostics for MEXC state without exposing credentials."""

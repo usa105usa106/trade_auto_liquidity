@@ -85,7 +85,20 @@ class ExecutionEngine:
         if await self.occupied_slots() >= int(max_open_positions):
             return False, "max positions reached"
         if live:
-            # fail-safe: if exchange order check fails, block live entry
+            # fail-safe: if exchange order/position check fails, block live entry.
+            # v0200: BOOST could keep scanning while MEXC had a live position that
+            # was not present in local storage yet. That allowed new candidates to
+            # appear in logs while the old symbol (for example PNUT) was still being
+            # monitored by the position loop. In live with max_open_positions=1, any
+            # exchange position must block a new entry until it is closed/rotated.
+            try:
+                rows = await self.exchange_client.fetch_positions()
+                for row in rows or []:
+                    if self.exchange_position_qty(row) > 0:
+                        row_sym = str(row.get("symbol") or row.get("mexc_symbol") or "")
+                        return False, f"exchange position already open: {row_sym or 'unknown'}"
+            except Exception as e:
+                return False, f"cannot verify exchange positions: {e}"
             try:
                 orders = await self.exchange_client.fetch_open_orders(symbol)
                 if orders:
@@ -813,6 +826,16 @@ class ExecutionEngine:
             return "buy"
         return s
 
+    async def _stored_position_leverage(self, symbol: str) -> int | None:
+        try:
+            for p in await self.storage.positions():
+                if str(p.get("symbol") or "") == str(symbol or ""):
+                    lev = int(float(p.get("leverage") or 0))
+                    return lev if lev > 0 else None
+        except Exception:
+            return None
+        return None
+
     async def _create_trigger_market_order(self, symbol: str, side: str, qty: float, trigger_price: float, kind: str) -> dict:
         errors = []
         close_side = self._close_order_side_for_position(side)
@@ -820,9 +843,10 @@ class ExecutionEngine:
             native_name = "mexc_place_take_profit_market" if kind == "tp" else "mexc_place_stop_market"
             if hasattr(self.exchange_client, native_name):
                 fn = getattr(self.exchange_client, native_name)
+                lev = await self._stored_position_leverage(symbol)
                 return await fn(
                     symbol=symbol, close_side=close_side, amount=qty, trigger_price=trigger_price,
-                    client_order_id=f"bot_{kind}_{int(time.time()*1000)}",
+                    client_order_id=f"bot_{kind}_{int(time.time()*1000)}", leverage=lev,
                 )
         except Exception as e:
             errors.append(f"native_{kind}_plan: {e}")
@@ -995,7 +1019,11 @@ class ExecutionEngine:
                         out["tpsl_error"] = str(e)[:800]
                         log_event("error_mexc_native_tpsl", symbol=symbol, side=side, qty=qty, stop_price=sl, take_price=tp, attempt=i + 1, error=str(e), ok=False)
 
-                if not native_ok:
+                if not native_ok and strategy_name_for_protection == "boost_scalping":
+                    out["tp_error"] = out.get("tp_error") or "BOOST native position TP/SL failed; standalone planorder fallback disabled to prevent instant wrong-side loss"
+                    out["sl_error"] = out.get("sl_error") or "BOOST native position TP/SL failed; local positive-exit monitor only"
+                    log_event("boost_planorder_fallback_disabled", symbol=symbol, side=side, qty=qty, take_price=tp, stop_price=sl, attempt=i + 1, ok=False, reason="native_tpsl_failed_no_standalone_planorder")
+                elif not native_ok:
                     try:
                         if tp > 0:
                             log_event("mexc_trigger_tp_request", symbol=symbol, side=side, qty=qty, trigger_price=tp, attempt=i + 1)

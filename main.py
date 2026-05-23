@@ -1566,13 +1566,13 @@ async def _boost_start_worker(app):
             "boost_rotate_min_score_gap": 0.0,
             "boost_rotate_cooldown_sec": 1,
             # v0199: automatic two-mode rotation. NORMAL rotates only from profit;
-            # RESCUE may close a losing position only for an extreme signal that
-            # statistically has enough expected move to cover the loss + buffer.
-            "boost_rescue_rotation_enabled": True,
+            # RESCUE is OFF by default in live: BOOST must not harvest losses.
+            # It can be enabled manually only after testing, with strict limits.
+            "boost_rescue_rotation_enabled": False,
             "boost_rescue_min_score_multiplier": 1.70,
             "boost_rescue_min_score_gap": 18.0,
             "boost_rescue_expected_move_loss_mult": 2.50,
-            "boost_rescue_max_loss_pct": 0.70,
+            "boost_rescue_max_loss_pct": 0.20,
             "boost_rescue_cooldown_sec": 180,
             "boost_rescue_max_per_hour": 2,
             "scan_interval_sec": 1,
@@ -3262,6 +3262,102 @@ def _record_boost_decision_metrics(decision) -> None:
     except Exception:
         pass
 
+
+
+def _boost_local_position_from_exchange(row: dict) -> dict:
+    """Build a local BOOST position from an exchange-only MEXC position row.
+
+    This is used when MEXC has a live position but local storage missed it after
+    a restart/race. BOOST must then manage/rotate the real exchange position
+    instead of pretending the slot is free.
+    """
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
+    symbol = row.get("symbol") or row.get("mexc_symbol") or info.get("symbol") or info.get("contract")
+    side = str(row.get("side") or "").upper()
+    if side not in {"LONG", "SHORT"}:
+        raw_side = str(info.get("positionType") or info.get("holdSide") or info.get("side") or "").lower()
+        side = "SHORT" if raw_side in {"2", "short", "sell"} else "LONG"
+    entry = 0.0
+    for key in ("entryPrice", "entry_price", "holdAvgPrice", "openAvgPrice", "avgPrice"):
+        try:
+            val = row.get(key, info.get(key))
+            if val not in (None, ""):
+                entry = float(val); break
+        except Exception:
+            pass
+    mark = 0.0
+    for key in ("markPrice", "mark_price", "fairPrice", "lastPrice"):
+        try:
+            val = row.get(key, info.get(key))
+            if val not in (None, ""):
+                mark = float(val); break
+        except Exception:
+            pass
+    qty = 0.0
+    for key in ("amount", "qty", "size", "contracts"):
+        try:
+            val = row.get(key, info.get(key))
+            if val not in (None, ""):
+                qty = abs(float(val)); break
+        except Exception:
+            pass
+    leverage = 0
+    for key in ("leverage", "leverageLevel"):
+        try:
+            val = row.get(key, info.get(key))
+            if val not in (None, ""):
+                leverage = int(float(val)); break
+        except Exception:
+            pass
+    notional = 0.0
+    try:
+        notional = abs(float(info.get("im") or info.get("positionMargin") or 0) * float(leverage or 1))
+    except Exception:
+        notional = 0.0
+    if notional <= 0 and entry > 0 and qty > 0:
+        notional = abs(entry * qty)
+    return {
+        "id": f"boost_exchange_sync_{str(symbol).replace('/', '_').replace(':', '_')}",
+        "symbol": symbol,
+        "side": side,
+        "strategy": "boost_scalping",
+        "status": "open",
+        "entry_price": entry or mark,
+        "qty": qty,
+        "leverage": leverage or 30,
+        "opened_at": time.time(),
+        "updated_at": time.time(),
+        "notional_usdt": notional,
+        "planned_notional_usdt": notional,
+        "score_details": {"boost_score": 0.0, "synced_from_exchange": True},
+        "raw_exchange_position": row,
+        "exchange_contracts": row.get("contracts") or info.get("holdVol") or info.get("vol"),
+    }
+
+async def _boost_find_active_position(ex, exec_engine) -> dict | None:
+    """Return local or exchange live BOOST position and sync exchange-only rows."""
+    try:
+        for _p in await storage.positions():
+            if str(_p.get("status", "open")).lower() in {"open", "pending", "closing"}:
+                return _p
+    except Exception:
+        pass
+    try:
+        rows = await _await_with_timeout(ex.fetch_positions(), 4, "boost exchange active position scan")
+        for row in rows or []:
+            try:
+                if exec_engine.exchange_position_qty(row) <= 0:
+                    continue
+            except Exception:
+                continue
+            pos = _boost_local_position_from_exchange(row)
+            await storage.upsert_position(pos)
+            log_event("boost_exchange_position_synced", stage="active_position", ok=True, symbol=str(pos.get("symbol") or ""), side=str(pos.get("side") or ""), qty=float(pos.get("qty") or 0), entry=float(pos.get("entry_price") or 0))
+            return pos
+    except Exception as e:
+        log_event("boost_exchange_position_sync_error", stage="active_position", ok=False, error=str(e)[:500])
+    return None
+
 async def trading_loop(app):
     global running, entries_enabled, trading_task
     try:
@@ -3467,14 +3563,7 @@ async def trading_loop(app):
                         await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
                         continue
 
-                    active_pos = None
-                    try:
-                        for _p in await storage.positions():
-                            if str(_p.get("status", "open")).lower() in {"open", "pending"}:
-                                active_pos = _p
-                                break
-                    except Exception:
-                        active_pos = None
+                    active_pos = await _boost_find_active_position(ex, exec_engine)
                     if active_pos:
                         scanner.last_reject_reason = "BOOST: active position; parallel scan"
                         snap_now = {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}
@@ -3519,7 +3608,7 @@ async def trading_loop(app):
 
                                     rescue_rotate = False
                                     rescue_reason = ""
-                                    if not normal_rotate and pos_pnl < 0 and _bool_setting(settings, "boost_rescue_rotation_enabled", True):
+                                    if not normal_rotate and pos_pnl < 0 and _bool_setting(settings, "boost_rescue_rotation_enabled", False):
                                         rescue_last = float(app.bot_data.get("boost_last_rescue_rotation_ts", 0) or 0)
                                         rescue_cd = float(settings.get("boost_rescue_cooldown_sec", 180) or 180)
                                         rescue_max_loss = abs(float(settings.get("boost_rescue_max_loss_pct", 0.70) or 0.70))
