@@ -115,13 +115,13 @@ DEFAULT_SETTINGS = {
     # v0219: HUNTER fast profit extraction. These are PRICE-move pct,
     # not leveraged ROE. Exchange uPnL must still confirm real profit.
     "boost_fast_profit_enabled": True,
-    "boost_fast_profit_min_pct": 0.018,
-    "boost_fast_profit_exchange_min_pct": 0.004,
-    "boost_fast_profit_min_age_sec": 3,
-    "boost_fast_profit_max_hold_sec": 24,
-    "boost_fast_trailing_start_pct": 0.030,
-    "boost_fast_trailing_giveback_pct": 0.010,
-    "boost_momentum_decay_profit_pct": 0.010,
+    "boost_fast_profit_min_pct": 0.012,
+    "boost_fast_profit_exchange_min_pct": 0.002,
+    "boost_fast_profit_min_age_sec": 2,
+    "boost_fast_profit_max_hold_sec": 12,
+    "boost_fast_trailing_start_pct": 0.022,
+    "boost_fast_trailing_giveback_pct": 0.007,
+    "boost_momentum_decay_profit_pct": 0.006,
     "boost_target_multiplier": DEFAULTS.boost_target_multiplier,
     "boost_session_hours": DEFAULTS.boost_session_hours,
     "boost_max_session_loss_pct": DEFAULTS.boost_max_session_loss_pct,
@@ -283,6 +283,24 @@ class Storage:
                 await self.set("ws_max_updates_per_batch", 1000, bump_revision=False)
             if int(await self.get("ws_stale_sec", 20) or 20) < 20:
                 await self.set("ws_stale_sec", 20, bump_revision=False)
+        except Exception:
+            pass
+
+        # v0222 migration: force the real fast-profit extraction values into
+        # existing SQLite settings, otherwise old DB values keep overriding code
+        # defaults and the bot still waits too long in profitable HUNTER positions.
+        try:
+            if await self.get("v0222_fast_profit_real_migrated") is None:
+                await self.set("boost_fast_profit_enabled", True, bump_revision=False)
+                await self.set("boost_fast_profit_min_pct", 0.012, bump_revision=False)
+                await self.set("boost_fast_profit_exchange_min_pct", 0.002, bump_revision=False)
+                await self.set("boost_fast_profit_min_age_sec", 2, bump_revision=False)
+                await self.set("boost_fast_profit_max_hold_sec", 12, bump_revision=False)
+                await self.set("boost_fast_trailing_start_pct", 0.022, bump_revision=False)
+                await self.set("boost_fast_trailing_giveback_pct", 0.007, bump_revision=False)
+                await self.set("boost_momentum_decay_profit_pct", 0.006, bump_revision=False)
+                await self.set("boost_fast_profit_wait_event_cooldown_sec", 999999, bump_revision=False)
+                await self.set("v0222_fast_profit_real_migrated", True, bump_revision=False)
         except Exception:
             pass
 

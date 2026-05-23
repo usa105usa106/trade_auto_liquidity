@@ -496,9 +496,24 @@ class PositionManager:
                                 continue
                             else:
                                 pos["boost_fast_profit_skip_reason"] = why_profit
+                                # v0222 REAL silent wait mode:
+                                # Tell Telegram only once per opened position that local
+                                # fast-profit is waiting for real exchange profit. After
+                                # that, keep updating storage silently until one of the
+                                # real state changes happens: profit confirmed -> close,
+                                # momentum decay/trailing exit, rotation, unsafe, or exit.
+                                wait_key = f"{symbol}:{pos.get('opened_at')}:boost_fast_profit_wait_exchange_profit"
+                                last_wait_key = str(pos.get("boost_fast_profit_wait_event_key") or "")
+                                emit_wait = last_wait_key != wait_key
+                                pos["boost_fast_profit_wait_event_key"] = wait_key
+                                pos["boost_fast_profit_wait_reason"] = str(why_profit)
+                                pos["boost_fast_profit_wait_silent"] = True
+                                if emit_wait:
+                                    pos["boost_fast_profit_wait_event_ts"] = now
                                 pos["updated_at"] = now
                                 await self.storage.upsert_position(pos)
-                                events.append({"type":"boost_fast_profit_wait_exchange_profit", "symbol": symbol, "reason": why_profit, "local_pnl_pct": pnl, "best_pnl_pct": best})
+                                if emit_wait:
+                                    events.append({"type":"boost_fast_profit_wait_exchange_profit", "symbol": symbol, "reason": why_profit, "local_pnl_pct": pnl, "best_pnl_pct": best})
                 except Exception as e:
                     events.append({"type":"boost_fast_profit_error", "symbol": symbol, "error": str(e)[:160]})
 
@@ -509,8 +524,16 @@ class PositionManager:
                         ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, min_profit)
                         if not ok_profit:
                             pos["boost_tp_skip_reason"] = why_profit
+                            last_reason = str(pos.get("boost_tp_wait_reason") or "")
+                            last_ts = float(pos.get("boost_tp_wait_event_ts") or 0)
+                            cooldown = float(await self._setting("boost_tp_wait_event_cooldown_sec", 30) or 30)
+                            emit_wait = (str(why_profit) != last_reason) or (now - last_ts >= cooldown)
+                            pos["boost_tp_wait_reason"] = str(why_profit)
+                            if emit_wait:
+                                pos["boost_tp_wait_event_ts"] = now
                             await self.storage.upsert_position(pos)
-                            events.append({"type":"boost_tp_wait_exchange_profit", "symbol": symbol, "reason": why_profit})
+                            if emit_wait:
+                                events.append({"type":"boost_tp_wait_exchange_profit", "symbol": symbol, "reason": why_profit})
                             continue
                     ev = await self._close_and_event(pos, "tp", "take_profit", live, price)
                     if ev: events.append(ev)
@@ -532,8 +555,16 @@ class PositionManager:
                         ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, min_profit)
                         if not ok_profit:
                             pos["boost_tp_skip_reason"] = why_profit
+                            last_reason = str(pos.get("boost_tp_wait_reason") or "")
+                            last_ts = float(pos.get("boost_tp_wait_event_ts") or 0)
+                            cooldown = float(await self._setting("boost_tp_wait_event_cooldown_sec", 30) or 30)
+                            emit_wait = (str(why_profit) != last_reason) or (now - last_ts >= cooldown)
+                            pos["boost_tp_wait_reason"] = str(why_profit)
+                            if emit_wait:
+                                pos["boost_tp_wait_event_ts"] = now
                             await self.storage.upsert_position(pos)
-                            events.append({"type":"boost_tp_wait_exchange_profit", "symbol": symbol, "reason": why_profit})
+                            if emit_wait:
+                                events.append({"type":"boost_tp_wait_exchange_profit", "symbol": symbol, "reason": why_profit})
                             continue
                     ev = await self._close_and_event(pos, "tp", "take_profit", live, price)
                     if ev: events.append(ev)

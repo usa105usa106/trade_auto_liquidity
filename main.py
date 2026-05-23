@@ -2320,7 +2320,11 @@ async def _boost_hunter_manage_active_position(app, ex, exec_engine, settings: d
         if not sym or side not in {"LONG", "SHORT"}:
             return False
         price = await get_last_price(ex, sym)
-        local_pnl = pos_manager.pnl_pct(active_pos, price) if price else 0.0
+        # v0221: this helper runs outside the main loop scope where pos_manager
+        # exists.  Use a local PositionManager instance so HUNTER active-position
+        # management cannot crash with: name 'pos_manager' is not defined.
+        _boost_pm = PositionManager(storage, exec_engine)
+        local_pnl = _boost_pm.pnl_pct(active_pos, price) if price else 0.0
         ex_pnl, ex_upnl, ex_mark = (None, None, None)
         if live:
             ex_pnl, ex_upnl, ex_mark = await boost_exchange_pnl_snapshot(ex, active_pos)
