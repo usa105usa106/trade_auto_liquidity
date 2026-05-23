@@ -63,6 +63,11 @@ class BoostScalpingEngine:
         # v0205: HUNTER uses confirmation memory so a single noisy tick does not enter,
         # while a real impulse is armed then fired on the next fast cycle.
         self._confirm_cache: dict[str, dict] = {}
+        # v0210: MEXC public API was being hammered by per-symbol snapshots.
+        # Cache/throttle public data so HUNTER searches often without triggering code 510.
+        self._snapshot_cache: dict[str, tuple[float, dict]] = {}
+        self._bulk_ticker_cache: tuple[float, dict[str, dict]] = (0.0, {})
+        self._public_cooldown_until: float = 0.0
 
     async def zero_fee_symbols(self, exchange_client, settings: dict) -> list[str]:
         ttl = 600.0
@@ -79,15 +84,8 @@ class BoostScalpingEngine:
         self._fee_cache = (now, [_norm_symbol(s) for s in syms][:max_symbols])
         return self._fee_cache[1]
 
-    async def _snapshot(self, exchange_client, symbol: str) -> dict:
-        m = await self._base.market_snapshot(exchange_client, symbol, quality_mode=False)
-        try:
-            t = await exchange_client.fetch_ticker(symbol)
-            qv = _f(t.get("quoteVolume") or t.get("quoteVolume24h") or (t.get("info") or {}).get("amount24") or (t.get("info") or {}).get("volume24"), 0.0)
-        except Exception:
-            qv = 0.0
-        m["quote_volume_usdt"] = _r(qv, 2)
-        return m
+    async def _snapshot(self, exchange_client, symbol: str, settings: dict | None = None) -> dict:
+        return await self._light_snapshot(exchange_client, symbol, settings or {})
 
     def _side_and_score(self, market: dict, settings: dict) -> dict:
         price = _f(market.get("price"), 0.0)
@@ -111,6 +109,11 @@ class BoostScalpingEngine:
         ratio_min = _f(settings.get("boost_spot_imbalance_ratio"), 2.0)
         long_ratio = spot_bid / max(1.0, spot_ask)
         short_ratio = spot_ask / max(1.0, spot_bid)
+        # v0210 lightweight scan may skip depth to protect MEXC rate limits.
+        # In that case use momentum/volume gate without forcing imbalance.
+        if abs(spot_bid - 1000.0) < 1e-9 and abs(spot_ask - 1000.0) < 1e-9:
+            ratio_min = min(ratio_min, 1.0)
+            long_ratio = short_ratio = 1.01
         r1 = _f(market.get("ret_1m_pct"), 0.0)
         r3 = _f(market.get("ret_3m_pct"), 0.0)
         min_momo = _f(settings.get("boost_futures_momentum_min_pct"), 0.045)
@@ -143,13 +146,111 @@ class BoostScalpingEngine:
             if getattr(exchange_client, "exchange_id", "") == "mexc" and getattr(exchange_client, "exchange", None) is None and hasattr(exchange_client, "_mexc_public"):
                 resp = await asyncio.wait_for(exchange_client._mexc_public("GET", "/api/v1/contract/ticker"), timeout=4.0)
                 data = resp.get("data") if isinstance(resp, dict) else resp
+                rows = []
                 if isinstance(data, list):
-                    return [x for x in data if isinstance(x, dict)]
-                if isinstance(data, dict):
-                    return [data]
+                    rows = [x for x in data if isinstance(x, dict)]
+                elif isinstance(data, dict):
+                    rows = [data]
+                if rows:
+                    self._bulk_ticker_cache = (time.time(), {self._ticker_symbol_key(r): r for r in rows if self._ticker_symbol_key(r)})
+                    return rows
         except Exception as e:
             log_event("boost_hotlist_error", stage="all_tickers", ok=False, error=str(e)[:300])
         return []
+
+    def _bulk_ticker_row(self, symbol: str, max_age: float = 8.0) -> dict:
+        ts, data = self._bulk_ticker_cache
+        if data and time.time() - ts <= max_age:
+            return data.get(_norm_symbol(symbol), {}) or {}
+        return {}
+
+    def _atr_from_ohlcv_pct(self, candles: list, n: int = 7) -> float:
+        try:
+            rows = list(candles or [])[-max(2, n+1):]
+            if len(rows) < 2:
+                return 0.0
+            trs = []
+            prev_close = _f(rows[0][4], 0.0)
+            for r in rows[1:]:
+                h = _f(r[2], 0.0); l = _f(r[3], 0.0); c = _f(r[4], 0.0)
+                if h <= 0 or l <= 0 or c <= 0:
+                    continue
+                trs.append(max(h-l, abs(h-prev_close), abs(l-prev_close)))
+                prev_close = c
+            last = _f(rows[-1][4], 0.0)
+            return (sum(trs[-n:]) / max(1, len(trs[-n:])) / last * 100.0) if last > 0 and trs else 0.0
+        except Exception:
+            return 0.0
+
+    async def _light_snapshot(self, exchange_client, symbol: str, settings: dict | None = None) -> dict:
+        """Rate-limit safe HUNTER snapshot.
+
+        Old path used full market_snapshot per symbol: 1m+5m klines, futures depth,
+        spot depth and ticker. At 18 symbols every second it caused MEXC code 510.
+        This path uses cached bulk ticker + one short 1m kline request + optional
+        shallow futures depth. No spot-depth spam; futures imbalance is used as a
+        lightweight confirmation.
+        """
+        settings = settings or {}
+        sym = _norm_symbol(symbol)
+        ttl = max(1.0, float(settings.get("boost_snapshot_cache_ttl_sec", 4.0) or 4.0))
+        cached = self._snapshot_cache.get(sym)
+        if cached and time.time() - cached[0] <= ttl:
+            return dict(cached[1])
+        row = self._bulk_ticker_row(sym)
+        if not row:
+            try:
+                # Refresh all tickers once; much cheaper than N single ticker calls.
+                await self._fast_contract_tickers(exchange_client)
+                row = self._bulk_ticker_row(sym)
+            except Exception:
+                row = {}
+        metr = self._ticker_rank_score(row) if row else {}
+        price = _f(metr.get("last"), 0.0)
+        if price <= 0:
+            try:
+                t = await exchange_client.fetch_ticker(sym)
+                price = _f(t.get("last") or t.get("close"), 0.0)
+                bid = _f(t.get("bid"), price); ask = _f(t.get("ask"), price)
+                qv = _f(t.get("quoteVolume") or (t.get("info") or {}).get("amount24"), 0.0)
+                spread = ((ask - bid) / price * 100.0) if price > 0 and ask > bid else 0.0
+                metr = {"last": price, "spread_pct": spread, "quote_volume_usdt": qv}
+            except Exception as e:
+                raise RuntimeError(str(e)[:160])
+        # One short kline request is enough for HUNTER 1m/3m acceleration.
+        c1 = await exchange_client.fetch_ohlcv(sym, timeframe="1m", limit=8)
+        closes = [_f(c[4], 0.0) for c in c1 if len(c) > 4]
+        ret_1m = ((closes[-1] - closes[-2]) / closes[-2] * 100.0) if len(closes) >= 2 and closes[-2] else 0.0
+        ret_3m = ((closes[-1] - closes[-4]) / closes[-4] * 100.0) if len(closes) >= 4 and closes[-4] else 0.0
+        ret_5m = ((closes[-1] - closes[-6]) / closes[-6] * 100.0) if len(closes) >= 6 and closes[-6] else 0.0
+        bid_depth = ask_depth = 0.0
+        try:
+            if str(settings.get("boost_fetch_depth_in_scan", False)).lower() in {"1", "true", "yes", "on"}:
+                ob = await exchange_client.fetch_order_book(sym, limit=5)
+                bid_depth = sum(_f(p) * _f(q) for p, q, *_ in (ob.get("bids") or [])[:5])
+                ask_depth = sum(_f(p) * _f(q) for p, q, *_ in (ob.get("asks") or [])[:5])
+        except Exception:
+            bid_depth = ask_depth = 0.0
+        # If no depth request, do not block signal on imbalance: set neutral synthetic depths.
+        if bid_depth <= 0 and ask_depth <= 0:
+            bid_depth = ask_depth = 1000.0
+        out = {
+            "symbol": sym,
+            "price": _r(price, 6),
+            "ret_1m_pct": _r(ret_1m, 4),
+            "ret_3m_pct": _r(ret_3m, 4),
+            "ret_5m_pct": _r(ret_5m, 4),
+            "atr_1m_pct": _r(self._atr_from_ohlcv_pct(c1, 7), 4),
+            "spread_pct": _r(_f(metr.get("spread_pct"), 0.0), 4),
+            "quote_volume_usdt": _r(_f(metr.get("quote_volume_usdt"), 0.0), 2),
+            "top5_bid_depth_usdt": _r(bid_depth, 2),
+            "top5_ask_depth_usdt": _r(ask_depth, 2),
+            "spot_bid_depth_usdt": _r(bid_depth, 2),
+            "spot_ask_depth_usdt": _r(ask_depth, 2),
+            "spot_imbalance": _r((bid_depth - ask_depth) / max(1.0, bid_depth + ask_depth), 4),
+        }
+        self._snapshot_cache[sym] = (time.time(), out)
+        return dict(out)
 
     def _ticker_symbol_key(self, row: dict) -> str:
         raw = row.get("symbol") or row.get("contract") or row.get("id") or row.get("symbolName") or ""
@@ -261,6 +362,10 @@ class BoostScalpingEngine:
         return hot, ranked[:hot_n]
 
     async def decide(self, exchange_client, settings: dict) -> AIScalpDecision:
+        now0 = time.time()
+        if self._public_cooldown_until and now0 < self._public_cooldown_until:
+            wait = max(1.0, self._public_cooldown_until - now0)
+            return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason=f"HUNTER API cooldown: MEXC rate-limit protection {wait:.1f}s", model="boost_hunter_autopilot", market={"markets": [], "suggested_pause_sec": wait})
         symbols = await self.zero_fee_symbols(exchange_client, settings)
         blocked = _blocked_symbols_from_settings(settings)
         if blocked:
@@ -285,26 +390,25 @@ class BoostScalpingEngine:
         checked = []
         log_event("boost_deep_scan_start", stage="deep_scan", ok=True, hot_total=total, check_count=check_count, symbols=scan_symbols[:40])
         async def check_one(sym: str):
-            # With parallel fetch (asyncio.gather in market_snapshot), all 4-5 requests
-            # complete in ~max(single latency) instead of sum. 3.5s is generous but
-            # still fast enough for 1-3s scalp cycles, and stops false timeouts.
-            timeout = max(1.0, float(settings.get("boost_symbol_snapshot_timeout_sec", 3.5) or 3.5))
-            market = await asyncio.wait_for(self._snapshot(exchange_client, sym), timeout=timeout)
+            timeout = max(0.3, float(settings.get("boost_symbol_snapshot_timeout_sec", 0.9) or 0.9))
+            market = await asyncio.wait_for(self._snapshot(exchange_client, sym, settings), timeout=timeout)
             res = self._side_and_score(market, settings)
             res = self._hunter_score(market, res, settings)
             return sym, market, res
 
         # Parallel scan is critical for 1-3 second BOOST loops. Limit concurrency to avoid API ban.
-        # Keep concurrency low: 3 parallel symbols x 4 parallel requests each = 12 req/s,
-        # safely under MEXC's public limit. Higher values trigger code 510 bans.
-        conc = max(1, min(10, int(float(settings.get("boost_scan_concurrency", 3) or 3))))
+        conc = max(1, min(10, int(float(settings.get("boost_scan_concurrency", 6) or 6))))
         sem = asyncio.Semaphore(conc)
         async def guarded(sym: str):
             async with sem:
                 try:
                     return await check_one(sym)
                 except Exception as e:
-                    return sym, None, {"ok": False, "reason": str(e)[:120]}
+                    err = str(e)[:180]
+                    low = err.lower()
+                    if "510" in err or "too frequent" in low or "rate" in low:
+                        self._public_cooldown_until = max(self._public_cooldown_until, time.time() + float(settings.get("boost_mexc_rate_cooldown_sec", 8) or 8))
+                    return sym, None, {"ok": False, "reason": err[:120]}
         results = await asyncio.gather(*(guarded(s) for s in scan_symbols))
         for sym, market, res in results:
             reason = str((res or {}).get("reason") or "").strip()
@@ -325,6 +429,12 @@ class BoostScalpingEngine:
                 checked.append({"symbol": sym, "ok": False, "reason": reason})
             if market and res.get("ok") and (best is None or _f(res.get("score"), 0) > _f(best[0].get("score"), 0)):
                 best = (res, market)
+        rate_failures = [c for c in checked if ("510" in str(c.get("reason")) or "too frequent" in str(c.get("reason", "")).lower())]
+        timeout_failures = [c for c in checked if "timeout" in str(c.get("reason", "")).lower()]
+        if rate_failures or (checked and len(timeout_failures) / max(1, len(checked)) >= 0.50):
+            cd = float(settings.get("boost_mexc_rate_cooldown_sec", 8) or 8) if rate_failures else float(settings.get("boost_timeout_cooldown_sec", 4) or 4)
+            self._public_cooldown_until = max(self._public_cooldown_until, time.time() + cd)
+            log_event("boost_public_api_backoff", stage="deep_scan", ok=True, rate_failures=len(rate_failures), timeout_failures=len(timeout_failures), cooldown_sec=cd)
         ok_candidates = sorted([c for c in checked if c.get("ok")], key=lambda c: _f(c.get("score"), 0.0), reverse=True)[:20]
         rejected_top = sorted([c for c in checked if not c.get("ok")], key=lambda c: abs(_f(c.get("ret_3m_pct"), 0.0)) + _f(c.get("atr_1m_pct"), 0.0), reverse=True)[:8]
         log_event("boost_deep_scan_done", stage="deep_scan", ok=True, checked=len(checked), candidates=len(ok_candidates), best=(ok_candidates[0] if ok_candidates else None), top_rejects=rejected_top[:5])

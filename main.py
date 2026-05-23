@@ -53,17 +53,6 @@ balance_locks = {}
 ws_supervisor = None
 trading_task = None
 position_task = None
-# Protect concurrent mutations of running/entries_enabled/trading_task/position_task
-# from simultaneous Telegram button handlers.
-_bot_state_lock: asyncio.Lock | None = None  # lazily created inside event loop
-
-def _get_bot_state_lock() -> asyncio.Lock:
-    """Return (and lazily create) the global bot-state lock.
-    Using a factory avoids creating the Lock outside an event loop."""
-    global _bot_state_lock
-    if _bot_state_lock is None:
-        _bot_state_lock = asyncio.Lock()
-    return _bot_state_lock
 
 def admin_id_list() -> list[str]:
     return [x.strip() for x in str(ADMIN_IDS or os.getenv("ADMIN_IDS", "")).split(",") if x.strip()]
@@ -190,8 +179,7 @@ async def send_trade_chart(app, ex, plan, settings: dict) -> None:
             await app.bot.send_photo(chat_id=chat_id, photo=img, caption=caption)
         try:
             os.remove(chart_path)
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 182, _e)
+        except Exception:
             pass
     except Exception as e:
         log.warning("trade chart send failed for %s: %s", getattr(plan, "symbol", "-"), e)
@@ -474,8 +462,7 @@ def _position_base_qty(pos: dict) -> float:
             value = pos.get(key)
             if value not in (None, ""):
                 return abs(float(value))
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 465, _e)
+        except Exception:
             pass
     return 0.0
 
@@ -590,8 +577,7 @@ def format_position_opened(plan, placed: dict, live: bool, ai_verdict=None) -> s
             if len(reason) > 90:
                 reason = reason[:87] + "..."
             lines.append(f"🤖 AI: approved {conf:.0%}" + (f" — {reason}" if reason else ""))
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 580, _e)
+        except Exception:
             pass
     if str(plan.strategy).lower() == "liquidity_retest":
         lines.append("🏃 Runner: managed by liquidity retest rules")
@@ -721,8 +707,7 @@ def format_position_event(ev: dict) -> str:
             pnl_pct = float(result.get("pnl_pct") or 0)
             sign = "+" if pnl_usdt >= 0 else ""
             lines.append(f"PnL: {sign}{pnl_usdt:.4f} USDT ({sign}{pnl_pct:.2f}%)")
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 710, _e)
+        except Exception:
             pass
     reason = str(result.get("reason") or "")
     noisy = ("2009" in reason or "1001" in reason or "2015" in reason or "nonexistent or closed" in reason.lower() or "hidden margin" in reason.lower() or "contract does not exist" in reason.lower() or "precision error" in reason.lower() or "HTTP 200" in reason)
@@ -787,8 +772,7 @@ async def reset_exchange() -> None:
     if exchange_client:
         try:
             await exchange_client.close()
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 775, _e)
+        except Exception:
             pass
     exchange_client = None
 
@@ -797,8 +781,7 @@ async def reset_ws() -> None:
     if ws_supervisor:
         try:
             await ws_supervisor.stop()
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 784, _e)
+        except Exception:
             pass
     ws_supervisor = None
 
@@ -821,8 +804,7 @@ async def get_exchange(settings: dict):
     if exchange_client:
         try:
             await exchange_client.close()
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 807, _e)
+        except Exception:
             pass
     exchange_client = await ExchangeClient(DEFAULT_EXCHANGE, proxy_url, proxy_enabled).init(api_key, api_secret)
     exchange_client._bot_signature = desired_signature
@@ -932,8 +914,7 @@ def _boost_disarm_runtime(app) -> None:
         app.bot_data["boost_armed_runtime"] = False
         app.bot_data["boost_start_in_progress"] = False
         app.bot_data["boost_last_action"] = "disarmed"
-    except Exception as _e:  # auto-logged
-        log.debug("suppressed exception at main.py:%d: %s", 917, _e)
+    except Exception:
         pass
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1065,34 +1046,32 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running, entries_enabled, trading_task, position_task
     if not allowed(update): return
+    entries_enabled = False
     _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
-    async with _get_bot_state_lock():
-        entries_enabled = False
-        # Keep the loop alive when it is already running so open positions continue
-        # through TP/SL/trailing/local exits. If the bot was fully stopped, do not
-        # start a background scanner just because /stop was pressed.
-        if trading_task and not trading_task.done():
-            running = True
-            status = "Position manager remains active."
-        else:
-            running = False
-            status = "No active trading loop was running."
+    # Keep the loop alive when it is already running so open positions continue
+    # through TP/SL/trailing/local exits. If the bot was fully stopped, do not
+    # start a background scanner just because /stop was pressed.
+    if trading_task and not trading_task.done():
+        running = True
+        status = "Position manager remains active."
+    else:
+        running = False
+        status = "No active trading loop was running."
     await reply(update, "🟡 New entries stopped\n" + status + "\nUse /panic only for full emergency stop.", reply_markup=MAIN_MENU)
 
 async def panic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running, entries_enabled, trading_task, position_task
     if not allowed(update): return
+    entries_enabled = False
+    running = False
     _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
-    async with _get_bot_state_lock():
-        entries_enabled = False
-        running = False
-        for task in (trading_task, position_task):
-            if task and not task.done():
-                task.cancel()
+    for task in (trading_task, position_task):
+        if task and not task.done():
+            task.cancel()
     settings = await storage.all_settings()
     live = bool(settings.get("live_trading", False))
     closed_local = 0
@@ -1237,8 +1216,7 @@ def _boost_store_live_state(app, settings: dict | None = None, snap: dict | None
             "decision_conf": float(getattr(decision, "confidence", 0) or 0) if decision is not None else 0.0,
             "decision_reason": str(getattr(decision, "reason", "") or "")[:260] if decision is not None else "",
         }
-    except Exception as _e:  # auto-logged
-        log.debug("suppressed exception at main.py:%d: %s", 1219, _e)
+    except Exception:
         pass
 
 
@@ -1441,8 +1419,7 @@ async def _boost_live_panel_update_locked(app, chat_id: int, settings: dict, sna
                 lines += ["⚠ UNSAFE POSITION: emergency SL missing", "Mode: DEFENSIVE monitoring"]
             elif prot:
                 lines += [f"Protection: {prot[:42]}"]
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 1422, _e)
+        except Exception:
             pass
     if decision is not None and _boost_hud_is_important(status, decision=decision, position=position, force=force):
         try:
@@ -1453,8 +1430,7 @@ async def _boost_live_panel_update_locked(app, chat_id: int, settings: dict, sna
                 f"{_short_symbol(getattr(decision, 'symbol', '') or mk.get('symbol'))} {getattr(decision, 'decision', '-')}",
                 f"Confidence: {float(getattr(decision, 'confidence', 0) or 0):.2f}",
             ]
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 1433, _e)
+        except Exception:
             pass
     if clean_note:
         lines += ["", f"Note: {clean_note}"]
@@ -1593,8 +1569,7 @@ async def _boost_blacklist_symbol(symbol: str, reason: str, *, ttl_sec: int = 86
     await storage.set("boost_blocked_symbols_json", json.dumps(data, separators=(",", ":")), bump_revision=False)
     try:
         boost_scalping_engine._fee_cache = (0.0, [])
-    except Exception as _e:  # auto-logged
-        log.debug("suppressed exception at main.py:%d: %s", 1572, _e)
+    except Exception:
         pass
     return len(data)
 
@@ -1649,8 +1624,7 @@ async def boost_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Invalidate boost fee cache so the new manual list is used immediately.
     try:
         boost_scalping_engine._fee_cache = (0.0, [])
-    except Exception as _e:  # auto-logged
-        log.debug("suppressed exception at main.py:%d: %s", 1627, _e)
+    except Exception:
         pass
     trigger_scan_now(context.application, reason="boost_list:update")
     bases = [x[:-4] if x.endswith("USDT") else x for x in symbols]
@@ -1673,8 +1647,7 @@ async def boost_list_del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await storage.set("boost_allow_fee_fallback", False, bump_revision=False)
     try:
         boost_scalping_engine._fee_cache = (0.0, [])
-    except Exception as _e:  # auto-logged
-        log.debug("suppressed exception at main.py:%d: %s", 1650, _e)
+    except Exception:
         pass
     trigger_scan_now(context.application, reason="boost_list:clear")
     await reply(update, "🗑 BOOST whitelist cleared. Manual fee fallback: OFF", reply_markup=MAIN_MENU)
@@ -1751,12 +1724,12 @@ async def _boost_start_worker(app):
             # v0196: BOOST must be live, not silent. Scan a small fast rotating slice
             # with per-symbol timeout; otherwise one slow MEXC public request freezes
             # the whole cycle and Telegram only shows "BOOST arming".
-            "boost_min_checked_per_cycle": 8,
-            "boost_max_checked_per_cycle": 18,
-            "boost_symbol_snapshot_timeout_sec": 0.55,
+            "boost_min_checked_per_cycle": 3,
+            "boost_max_checked_per_cycle": 5,
+            "boost_symbol_snapshot_timeout_sec": 1.4,
             "boost_hotlist_refresh_sec": 300,
-            "boost_hotlist_size": 24,
-            "boost_scan_concurrency": 8,
+            "boost_hotlist_size": 18,
+            "boost_scan_concurrency": 1,
             "universe_mode": "full",
             # v0205 HUNTER: do not trade ordinary noise. Wait for extreme impulse.
             "boost_hunter_mode": True,
@@ -1820,7 +1793,12 @@ async def _boost_start_worker(app):
             "boost_rescue_max_loss_pct": 0.20,
             "boost_rescue_cooldown_sec": 180,
             "boost_rescue_max_per_hour": 2,
-            "scan_interval_sec": 1,
+            "scan_interval_sec": 2,
+            "boost_scan_interval_sec": 2,
+            "boost_snapshot_cache_ttl_sec": 5,
+            "boost_fetch_depth_in_scan": False,
+            "boost_mexc_rate_cooldown_sec": 8,
+            "boost_timeout_cooldown_sec": 4,
             "max_open_positions": 1,
             "auto_close_on_protection_failed": False,
         }
@@ -1850,8 +1828,7 @@ async def _boost_start_worker(app):
             if ex is not None:
                 try:
                     await _await_with_timeout(ex.close(), 1.5, "exchange close")
-                except Exception as _e:  # auto-logged
-                    log.debug("suppressed exception at main.py:%d: %s", 1826, _e)
+                except Exception:
                     pass
 
         share = max(0.001, min(1.0, float(s.get("boost_balance_share", 0.10) or 0.10)))
@@ -1931,8 +1908,7 @@ async def boost_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         boost_scalping_engine._hot_cache = (0.0, [], [])
         boost_scalping_engine._scan_cursor = 0
-    except Exception as _e:  # auto-logged
-        log.debug("suppressed exception at main.py:%d: %s", 1906, _e)
+    except Exception:
         pass
     task = context.application.bot_data.pop("boost_live_panel_watchdog_task", None)
     if task is not None and not task.done():
@@ -2000,8 +1976,7 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         total_opened = int(await storage.get("total_positions_opened", 0) or 0)
         local_open = len([p for p in await storage.positions() if str(p.get("status", "open")).lower() in {"open", "pending"}])
-    except Exception as _e:  # auto-logged
-        log.debug("suppressed exception at main.py:%d: %s", 1974, _e)
+    except Exception:
         pass
     try:
         s = await storage.all_settings()
@@ -2170,8 +2145,7 @@ def _position_identity_keys(pos: dict, ex=None) -> set[str]:
                     k = k[:-4] + '_USDT'
             if k:
                 keys.add(k)
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 2143, _e)
+        except Exception:
             pass
 
     for key in ("symbol", "mexc_symbol", "contract"):
@@ -2235,8 +2209,7 @@ async def boost_exchange_pnl_snapshot(ex, pos: dict) -> tuple[float | None, floa
                 try:
                     if row.get(k) not in (None, ""):
                         entry = float(row.get(k)); break
-                except Exception as _e:  # auto-logged
-                    log.debug("suppressed exception at main.py:%d: %s", 2207, _e)
+                except Exception:
                     pass
             info = row.get("info") or {}
             if entry <= 0 and isinstance(info, dict):
@@ -2244,8 +2217,7 @@ async def boost_exchange_pnl_snapshot(ex, pos: dict) -> tuple[float | None, floa
                     try:
                         if info.get(k) not in (None, ""):
                             entry = float(info.get(k)); break
-                    except Exception as _e:  # auto-logged
-                        log.debug("suppressed exception at main.py:%d: %s", 2215, _e)
+                    except Exception:
                         pass
             mark = 0.0
             for k in ("markPrice", "fairPrice", "lastPrice"):
@@ -2253,8 +2225,7 @@ async def boost_exchange_pnl_snapshot(ex, pos: dict) -> tuple[float | None, floa
                     v = row.get(k) if row.get(k) not in (None, "") else (info.get(k) if isinstance(info, dict) else None)
                     if v not in (None, ""):
                         mark = float(v); break
-                except Exception as _e:  # auto-logged
-                    log.debug("suppressed exception at main.py:%d: %s", 2223, _e)
+                except Exception:
                     pass
             upnl = None
             for k in ("unrealizedPnl", "unrealised", "profit"):
@@ -2262,8 +2233,7 @@ async def boost_exchange_pnl_snapshot(ex, pos: dict) -> tuple[float | None, floa
                     v = row.get(k) if row.get(k) not in (None, "") else (info.get(k) if isinstance(info, dict) else None)
                     if v not in (None, ""):
                         upnl = float(v); break
-                except Exception as _e:  # auto-logged
-                    log.debug("suppressed exception at main.py:%d: %s", 2231, _e)
+                except Exception:
                     pass
             pct = None
             if entry > 0 and mark > 0:
@@ -2460,8 +2430,7 @@ def _exchange_position_text(p: dict) -> str:
             value = p.get(key)
             if value not in (None, "") and float(value) > 0:
                 entry = float(value); break
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 2428, _e)
+        except Exception:
             pass
     if entry <= 0:
         for key in ("holdAvgPrice", "openAvgPrice", "entryPrice"):
@@ -2469,8 +2438,7 @@ def _exchange_position_text(p: dict) -> str:
                 value = info.get(key)
                 if value not in (None, "") and float(value) > 0:
                     entry = float(value); break
-            except Exception as _e:  # auto-logged
-                log.debug("suppressed exception at main.py:%d: %s", 2436, _e)
+            except Exception:
                 pass
     notional = abs(qty * entry) if qty and entry else 0.0
     coin = str(symbol).split('/')[0]
@@ -2820,8 +2788,7 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for lp in await storage.positions():
                     try:
                         await storage.remove_position(lp.get("symbol"))
-                    except Exception as _e:  # auto-logged
-                        log.debug("suppressed exception at main.py:%d: %s", 2786, _e)
+                    except Exception:
                         pass
                 local_cache_cleared = True
             else:
@@ -3268,14 +3235,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         try:
             await asyncio.wait_for(q.answer("Access denied", show_alert=True), timeout=3)
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 3233, _e)
+        except Exception:
             pass
         return
     try:
         await asyncio.wait_for(q.answer(), timeout=3)
-    except Exception as _e:  # auto-logged
-        log.debug("suppressed exception at main.py:%d: %s", 3238, _e)
+    except Exception:
         pass
     raw_data = str(q.data or "")
     data = raw_data.split(":")
@@ -3564,8 +3529,7 @@ async def fetch_spot_data_for_candidate(ex, candidate: dict, settings: dict | No
         if client:
             try:
                 await client.close()
-            except Exception as _e:  # auto-logged
-                log.debug("suppressed exception at main.py:%d: %s", 3527, _e)
+            except Exception:
                 pass
 
 async def ensure_recovery_before_entries(app, settings: dict, ex, exec_engine, live: bool) -> tuple[bool, str]:
@@ -3688,8 +3652,7 @@ def _record_boost_decision_metrics(decision) -> None:
         scanner.last_cycle_errors = len([c for c in checked if isinstance(c, dict) and str(c.get("reason", "")).lower().startswith(("error", "exception"))]) if isinstance(checked, list) else 0
         scanner.last_ai_candidates_count = int(m.get("ai_candidates") or len(m.get("top_candidates") or []))
         scanner.hot_symbols = [_short_symbol(x) for x in (m.get("top_candidates") or [])[:20]] if isinstance(m.get("top_candidates"), list) else []
-    except Exception as _e:  # auto-logged
-        log.debug("suppressed exception at main.py:%d: %s", 3650, _e)
+    except Exception:
         pass
 
 
@@ -3713,8 +3676,7 @@ def _boost_local_position_from_exchange(row: dict) -> dict:
             val = row.get(key, info.get(key))
             if val not in (None, ""):
                 entry = float(val); break
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 3674, _e)
+        except Exception:
             pass
     mark = 0.0
     for key in ("markPrice", "mark_price", "fairPrice", "lastPrice"):
@@ -3722,8 +3684,7 @@ def _boost_local_position_from_exchange(row: dict) -> dict:
             val = row.get(key, info.get(key))
             if val not in (None, ""):
                 mark = float(val); break
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 3682, _e)
+        except Exception:
             pass
     qty = 0.0
     for key in ("amount", "qty", "size", "contracts"):
@@ -3731,8 +3692,7 @@ def _boost_local_position_from_exchange(row: dict) -> dict:
             val = row.get(key, info.get(key))
             if val not in (None, ""):
                 qty = abs(float(val)); break
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 3690, _e)
+        except Exception:
             pass
     leverage = 0
     for key in ("leverage", "leverageLevel"):
@@ -3740,8 +3700,7 @@ def _boost_local_position_from_exchange(row: dict) -> dict:
             val = row.get(key, info.get(key))
             if val not in (None, ""):
                 leverage = int(float(val)); break
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at main.py:%d: %s", 3698, _e)
+        except Exception:
             pass
     notional = 0.0
     try:
@@ -3774,8 +3733,7 @@ async def _boost_find_active_position(ex, exec_engine) -> dict | None:
         for _p in await storage.positions():
             if str(_p.get("status", "open")).lower() in {"open", "pending", "closing"}:
                 return _p
-    except Exception as _e:  # auto-logged
-        log.debug("suppressed exception at main.py:%d: %s", 3731, _e)
+    except Exception:
         pass
     try:
         rows = await _await_with_timeout(ex.fetch_positions(), 4, "boost exchange active position scan")
@@ -4308,8 +4266,7 @@ async def trading_loop(app):
                             if not getattr(decision, "cached", False):
                                 try:
                                     await ai_stats_manager.record_wait(symbol, decision.reason or "no edge", decision.confidence, decision.model)
-                                except Exception as _e:  # auto-logged
-                                    log.debug("suppressed exception at main.py:%d: %s", 4264, _e)
+                                except Exception:
                                     pass
                             continue
                         cand = ai_scalping_engine.make_candidate(decision, settings)
@@ -4508,8 +4465,7 @@ async def trading_loop(app):
                     if ai_enabled:
                         try:
                             scanner.last_ai_check_symbols.append(str(plan.symbol))
-                        except Exception as _e:  # auto-logged
-                            log.debug("suppressed exception at main.py:%d: %s", 4463, _e)
+                        except Exception:
                             pass
                     ai_verdict = await ai_signal_engine.validate(cand, plan, settings)
                     if ai_enabled:
@@ -4615,8 +4571,7 @@ def _wrap_command(fn, name: str):
                 context.application.bot_data["boost_start_in_progress"] = False
             try:
                 await reply(update, f"❌ Command failed: {name}\n{str(e)[:500]}", reply_markup=MAIN_MENU)
-            except Exception as _e:  # auto-logged
-                log.debug("suppressed exception at main.py:%d: %s", 4569, _e)
+            except Exception:
                 pass
     return _inner
 

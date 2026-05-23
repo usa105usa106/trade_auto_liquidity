@@ -1,5 +1,3 @@
-import logging
-log = logging.getLogger("position_manager")
 import time
 import os
 from scalp_exit_engine import ScalpExitPolicy
@@ -38,8 +36,7 @@ class PositionManager:
                 value = await self.storage.get(key, None)
                 if value is not None:
                     return value
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at position_manager.py:%d: %s", 39, _e)
+        except Exception:
             pass
         return default
 
@@ -153,23 +150,20 @@ class PositionManager:
                     v = row.get(k) if row.get(k) not in (None, "") else (info.get(k) if isinstance(info, dict) else None)
                     if v not in (None, ""):
                         upnl = float(v); break
-                except Exception as _e:  # auto-logged
-                    log.debug("suppressed exception at position_manager.py:%d: %s", 153, _e)
+                except Exception:
                     pass
             entry = float(pos.get("entry_price") or 0)
             try:
                 if entry <= 0 and row.get("entryPrice") not in (None, ""):
                     entry = float(row.get("entryPrice"))
-            except Exception as _e:  # auto-logged
-                log.debug("suppressed exception at position_manager.py:%d: %s", 159, _e)
+            except Exception:
                 pass
             if entry <= 0 and isinstance(info, dict):
                 for k in ("holdAvgPrice", "openAvgPrice", "entryPrice"):
                     try:
                         if info.get(k) not in (None, ""):
                             entry = float(info.get(k)); break
-                    except Exception as _e:  # auto-logged
-                        log.debug("suppressed exception at position_manager.py:%d: %s", 166, _e)
+                    except Exception:
                         pass
             mark = 0.0
             for k in ("markPrice", "fairPrice", "lastPrice"):
@@ -177,8 +171,7 @@ class PositionManager:
                     v = row.get(k) if row.get(k) not in (None, "") else (info.get(k) if isinstance(info, dict) else None)
                     if v not in (None, ""):
                         mark = float(v); break
-                except Exception as _e:  # auto-logged
-                    log.debug("suppressed exception at position_manager.py:%d: %s", 174, _e)
+                except Exception:
                     pass
             ex_pct = local_pnl_pct
             if entry > 0 and mark > 0:
@@ -209,8 +202,7 @@ class PositionManager:
         if await self._is_terminal_closed(symbol):
             try:
                 await self.storage.remove_position(symbol)
-            except Exception as _e:  # auto-logged
-                log.debug("suppressed exception at position_manager.py:%d: %s", 205, _e)
+            except Exception:
                 pass
             return None
         res = await self.execution_engine.close_position(pos, reason, live, price)
@@ -220,8 +212,7 @@ class PositionManager:
             # real position after settlement.
             try:
                 await self.storage.remove_position(symbol)
-            except Exception as _e:  # auto-logged
-                log.debug("suppressed exception at position_manager.py:%d: %s", 215, _e)
+            except Exception:
                 pass
         return {"type": event_type, "symbol": symbol, "result": res}
 
@@ -241,8 +232,7 @@ class PositionManager:
         try:
             if interval <= 0 or now - float(pos.get("protection_checked_at") or pos.get("checked_at") or 0) < interval:
                 return None
-        except Exception as _e:  # auto-logged
-            log.debug("suppressed exception at position_manager.py:%d: %s", 235, _e)
+        except Exception:
             pass
         try:
             pe = ProtectionEngine(self.execution_engine.exchange_client, self.execution_engine)
@@ -374,8 +364,7 @@ class PositionManager:
                 # SL/TP/time-stop. CLOSED is terminal.
                 try:
                     await self.storage.remove_position(symbol)
-                except Exception as _e:  # auto-logged
-                    log.debug("suppressed exception at position_manager.py:%d: %s", 367, _e)
+                except Exception:
                     pass
                 continue
             wd = await self._protection_watchdog(pos, live)
@@ -422,8 +411,7 @@ class PositionManager:
                 if await self._is_terminal_closed(symbol):
                     try:
                         await self.storage.remove_position(symbol)
-                    except Exception as _e:  # auto-logged
-                        log.debug("suppressed exception at position_manager.py:%d: %s", 414, _e)
+                    except Exception:
                         pass
                     continue
                 pos.setdefault("initial_stop_price", stop)
@@ -446,8 +434,7 @@ class PositionManager:
                     if await self._is_terminal_closed(symbol):
                         try:
                             await self.storage.remove_position(symbol)
-                        except Exception as _e:  # auto-logged
-                            log.debug("suppressed exception at position_manager.py:%d: %s", 437, _e)
+                        except Exception:
                             pass
                         continue
                     pos["stop_price"] = runner_stop
