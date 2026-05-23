@@ -1538,33 +1538,51 @@ async def _boost_start_worker(app):
             # v0196: BOOST must be live, not silent. Scan a small fast rotating slice
             # with per-symbol timeout; otherwise one slow MEXC public request freezes
             # the whole cycle and Telegram only shows "BOOST arming".
-            "boost_min_checked_per_cycle": 12,
-            "boost_max_checked_per_cycle": 30,
-            "boost_symbol_snapshot_timeout_sec": 0.9,
+            "boost_min_checked_per_cycle": 8,
+            "boost_max_checked_per_cycle": 18,
+            "boost_symbol_snapshot_timeout_sec": 0.55,
             "boost_hotlist_refresh_sec": 300,
-            "boost_hotlist_size": 30,
-            "boost_scan_concurrency": 6,
+            "boost_hotlist_size": 24,
+            "boost_scan_concurrency": 8,
             "universe_mode": "full",
-            "boost_min_tp_pct": 0.06,
-            "boost_max_tp_pct": 0.14,
-            "boost_live_min_exchange_profit_pct": 0.015,
-            "boost_min_quote_volume_usdt": 0.0,
-            "boost_min_atr_pct": 0.04,
-            "boost_max_spread_pct": 0.12,
-            "boost_spot_imbalance_ratio": 1.30,
-            "boost_futures_momentum_min_pct": 0.015,
+            # v0203 HUNTER: do not trade ordinary noise. Wait for extreme impulse.
+            "boost_hunter_mode": True,
+            "boost_hunter_min_score": 105.0,
+            "boost_hunter_extreme_score": 145.0,
+            "boost_hunter_min_accel_pct": 0.05,
+            "boost_hunter_min_move_3m_pct": 0.22,
+            "boost_hunter_max_wick_pct": 0.42,
+            "boost_hunter_no_trade_cooldown_sec": 12,
+            "boost_hunter_entry_confirmations": 2,
+            "boost_momentum_decay_exit_enabled": True,
+            "boost_momentum_decay_min_profit_pct": 0.04,
+            "boost_min_tp_pct": 0.18,
+            "boost_max_tp_pct": 0.55,
+            "boost_live_min_exchange_profit_pct": 0.10,
+            "boost_min_quote_volume_usdt": 5000000.0,
+            "boost_min_atr_pct": 0.10,
+            "boost_max_spread_pct": 0.035,
+            "boost_spot_imbalance_ratio": 1.75,
+            "boost_futures_momentum_min_pct": 0.14,
             "boost_allow_fee_fallback": True,
             "boost_parallel_scan_enabled": True,
             "boost_live_panel_enabled": True,
             "boost_live_panel_interval_sec": 2,
+            "boost_trade_margin_pct": 0.35,
+            "boost_use_full_bank_per_trade": False,
+            "boost_risk_pct_per_trade": 0.035,
+            "boost_live_slippage_buffer_pct": 0.035,
+            "boost_spread_edge_mult": 2.8,
+            "boost_tp_spread_mult": 3.2,
+            "boost_tp_atr_mult": 0.70,
             "boost_live_status_every_cycle": True,
             "boost_live_safe_execution": True,
             "boost_no_exchange_protection_monitor_only": True,
             "boost_rotate_only_if_profit": True,
             "boost_min_profit_to_rotate_pct": 0.06,
-            "boost_rotate_strength_multiplier": 1.05,
-            "boost_rotate_min_score_gap": 0.0,
-            "boost_rotate_cooldown_sec": 1,
+            "boost_rotate_strength_multiplier": 1.20,
+            "boost_rotate_min_score_gap": 8.0,
+            "boost_rotate_cooldown_sec": 12,
             # v0199: automatic two-mode rotation. NORMAL rotates only from profit;
             # RESCUE is OFF by default in live: BOOST must not harvest losses.
             # It can be enabled manually only after testing, with strict limits.
@@ -1671,6 +1689,7 @@ async def boost_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
     await storage.set("boost_start_in_progress", False, bump_revision=False)
+    await storage.set("boost_hunter_last_no_trade_ts", time.time(), bump_revision=False)
     # Invalidate BOOST scanner caches so a later /boost_start starts clean.
     try:
         boost_scalping_engine._hot_cache = (0.0, [], [])
