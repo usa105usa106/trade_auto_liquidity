@@ -1197,7 +1197,7 @@ def _short_symbol(symbol: str) -> str:
 
 
 async def boost_live_panel_update(app, settings: dict, snap: dict, *, status: str = "scan", decision=None, position: dict | None = None, note: str = "", force: bool = False) -> None:
-    """Edit one BOOST live Telegram message instead of spamming the chat."""
+    """Keep one BOOST live Telegram panel at the bottom: delete old panel, send fresh panel."""
     if not _bool_setting(settings, "boost_live_panel_enabled", True):
         return
     chat_id = first_admin_id()
@@ -1252,22 +1252,30 @@ async def _boost_live_panel_update_locked(app, chat_id: int, settings: dict, sna
             pass
     if note:
         lines += ["", f"Note: {note[:220]}"]
-    lines.append(datetime.now(timezone(timedelta(hours=3))).strftime("\nUpdated: %H:%M:%S MSK"))
+    seq = int(app.bot_data.get("boost_live_panel_seq", 0) or 0) + 1
+    app.bot_data["boost_live_panel_seq"] = seq
+    lines.append(datetime.now(timezone(timedelta(hours=3))).strftime(f"\nUpdated: %H:%M:%S MSK | live #{seq}"))
     text = "\n".join(lines)
     # v0182: keep the live panel at the bottom of the chat. Editing an old
     # message does not move it down in Telegram, so we delete the previous
     # panel and send one fresh replacement. This keeps exactly one noisy live
     # panel while important lifecycle alerts remain in history.
+    old_ids = []
     msg_id = app.bot_data.get("boost_live_panel_message_id")
     if msg_id:
+        old_ids.append(msg_id)
+    old_ids.extend(app.bot_data.get("boost_live_panel_message_ids", []) or [])
+    for old_id in list(dict.fromkeys([x for x in old_ids if x]))[-5:]:
         try:
-            await _safe_delete_bot_message(app, chat_id, int(msg_id))
+            await _safe_delete_bot_message(app, chat_id, int(old_id))
         except Exception as e:
             log.debug("boost live panel delete skipped: %s", e)
     try:
-        msg = await _safe_send_bot_message(app, chat_id, text, reply_markup=_boost_rotation_keyboard(settings))
+        msg = await _safe_send_bot_message(app, chat_id, text, reply_markup=_boost_rotation_keyboard(settings), disable_web_page_preview=True)
         if msg is not None:
-            app.bot_data["boost_live_panel_message_id"] = getattr(msg, "message_id", None)
+            new_id = getattr(msg, "message_id", None)
+            app.bot_data["boost_live_panel_message_id"] = new_id
+            app.bot_data["boost_live_panel_message_ids"] = [new_id] if new_id else []
             app.bot_data["boost_panel_last_edit"] = now
     except Exception as e:
         # v0187: never fail silently. If the live panel cannot be posted, send a
@@ -1553,14 +1561,25 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = await storage.all_settings()
     equity = 0.0
     balance_note = ""
+    ex = None
     try:
-        ex = await _await_with_timeout(get_exchange(s), 6, "exchange init")
-        bal = await _await_with_timeout(ex.fetch_balance(), 8, "fetch_balance")
+        api_key, api_secret = _api_creds(s)
+        ex = ExchangeClient(DEFAULT_EXCHANGE, str(s.get("proxy_url", "") or ""), bool(s.get("proxy_enabled", False)))
+        ex.api_key = api_key
+        ex.api_secret = api_secret
+        # Never call get_exchange()/load_markets here: public market init is exactly what can hang.
+        bal = await _await_with_timeout(ex.fetch_balance(), 5, "native MEXC futures balance")
         usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
         equity = float(usdt.get("total") or usdt.get("free") or ((bal or {}).get("total", {}) or {}).get("USDT") or 0)
     except Exception as e:
         equity = float(s.get("boost_session_start_equity", 0) or 0)
         balance_note = f"\nBalance warning: {str(e)[:180]}"
+    finally:
+        if ex is not None:
+            try:
+                await _await_with_timeout(ex.close(), 2, "exchange close")
+            except Exception:
+                pass
 
     share = max(0.001, min(1.0, float(s.get("boost_balance_share", 0.10) or 0.10)))
     bank = max(0.0, equity * share)
@@ -1725,8 +1744,9 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ex = ExchangeClient(DEFAULT_EXCHANGE, proxy_url, proxy_enabled)
             ex.api_key = api_key
             ex.api_secret = api_secret
-            await _await_with_timeout(ex._sync_mexc_time(silent=True), 3, "mexc time sync")
-            bal = await _await_with_timeout(ex.fetch_balance(), 8, "fetch_balance")
+            # Do not call load_markets or a separate time-sync here.  The native request retries
+            # with time sync only if MEXC asks for it; this keeps Balance under a hard deadline.
+            bal = await _await_with_timeout(ex.fetch_balance(), 5, "native MEXC futures balance")
             usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
             free = usdt.get("free", "n/a") if isinstance(usdt, dict) else "n/a"
             total = usdt.get("total", "n/a") if isinstance(usdt, dict) else "n/a"
@@ -1740,7 +1760,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raw_pm = 0.0
             exchange_positions = []
             try:
-                exchange_positions = await _await_with_timeout(ex._mexc_fetch_positions(), 6, "fetch_positions")
+                exchange_positions = await _await_with_timeout(ex._mexc_fetch_positions(), 2, "fetch_positions")
             except Exception:
                 exchange_positions = []
             est_pm, est_count = _estimate_exchange_position_margin(
@@ -1754,12 +1774,21 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             try:
                 if ex:
-                    await ex.close()
+                    await _await_with_timeout(ex.close(), 2, "exchange close")
             except Exception:
                 pass
 
-        direct_ip = await direct_task
-        proxy_ip = await proxy_task if proxy_task else {"ok": False, "ip": "not configured", "error": "proxy off or missing"}
+        try:
+            direct_ip = await _await_with_timeout(direct_task, 3, "direct IP")
+        except Exception as e:
+            direct_ip = {"ok": False, "ip": "unavailable", "error": str(e)[:120]}
+        if proxy_task:
+            try:
+                proxy_ip = await _await_with_timeout(proxy_task, 3, "proxy IP")
+            except Exception as e:
+                proxy_ip = {"ok": False, "ip": "unavailable", "error": str(e)[:120]}
+        else:
+            proxy_ip = {"ok": False, "ip": "not configured", "error": "proxy off or missing"}
         proxy_line = f"{proxy_ip.get('ip')}" if proxy_ip.get("ok") else f"{proxy_ip.get('ip')} ({proxy_ip.get('error')})"
         direct_line = f"{direct_ip.get('ip')}" if direct_ip.get("ok") else f"{direct_ip.get('ip')} ({direct_ip.get('error')})"
         text = (
@@ -2717,7 +2746,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.application.bot_data["last_non_boost_button"] = raw_text
 
     try:
-        await asyncio.wait_for(fn(update, context), timeout=45)
+        cmd_timeout = 18 if fn is balance_cmd else 45
+        await asyncio.wait_for(fn(update, context), timeout=cmd_timeout)
     except asyncio.TimeoutError:
         log.exception("button command timeout: %s", raw_text)
         await reply(update, f"⏱ Команда зависла и остановлена по timeout: {raw_text}. Интерфейс не заблокирован.", reply_markup=MAIN_MENU)
