@@ -32,6 +32,22 @@ class ExecutionEngine:
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
+    async def _setting(self, key: str, default=None):
+        """Read a raw runtime setting from storage, then environment.
+
+        v0213 accidentally called self._setting(...) from BOOST protection paths
+        but only _setting_bool/_setting_float/_setting_int existed. That crashed
+        live protection watchdog with: ExecutionEngine has no attribute _setting.
+        """
+        try:
+            if hasattr(self.storage, "get"):
+                value = await self.storage.get(key, None)
+                if value is not None:
+                    return value
+        except Exception:
+            pass
+        return os.getenv(str(key).upper(), default)
+
     async def _setting_bool(self, key: str, env_key: str | None = None, default: bool = False) -> bool:
         """Read runtime safety switches from SQLite first, env second.
 
