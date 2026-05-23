@@ -189,8 +189,19 @@ class PositionManager:
             # exchange/native protection row to local monitoring.
             state.setdefault("take_profit_ok", bool(state.get("tp_exists")))
             state.setdefault("stop_loss_ok", bool(state.get("sl_exists")))
-            protected = state.get("protection_status") in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP"}
-            if not protected:
+            strategy_name = str(pos.get("strategy") or "").lower()
+            protected = state.get("protection_status") in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP", "LOCAL_FAST_PROTECTED"}
+            boost_safe = strategy_name == "boost_scalping" and str(await self._setting("boost_live_safe_execution", os.getenv("BOOST_LIVE_SAFE_EXECUTION", "true"))).lower() in {"1", "true", "yes", "on"}
+            if not protected and boost_safe:
+                # v0181: For BOOST, local fast monitoring is an accepted protection layer.
+                # Do not spam/force old LOCAL PROTECTION warnings when MEXC TP/SL verification is late.
+                state["protection_status"] = "LOCAL_FAST_PROTECTED"
+                state["protection_mode"] = "local_fast"
+                state["protection_note"] = "BOOST local fast monitor active; watchdog will retry exchange TP/SL"
+                pos["protection_mode"] = "local_fast"
+                pos.pop("protection_warning", None)
+                protected = True
+            elif not protected:
                 pos["protection_mode"] = "local_monitoring"
                 pos["protection_warning"] = "exchange TP/SL not confirmed; bot monitors TP/SL locally"
             else:
@@ -315,11 +326,14 @@ class PositionManager:
             strategy = str(pos.get("strategy") or "").lower()
             is_liquidity_retest = strategy == "liquidity_retest"
             is_ai_scalping = strategy == "ai_scalping"
+            is_boost_scalping = strategy == "boost_scalping"
             liquidation_stop_mode = bool(pos.get("liquidation_stop_mode")) and is_ai_scalping
             ai_manage_only_tpsl = str(await self._setting("ai_scalping_manage_only_tpsl", os.getenv("AI_SCALPING_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
+            boost_manage_only_tpsl = str(await self._setting("boost_manage_only_tpsl", os.getenv("BOOST_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
+            manage_only_tpsl = (is_ai_scalping and ai_manage_only_tpsl) or (is_boost_scalping and boost_manage_only_tpsl)
             policy = await self._refresh_scalp_policy()
             policy.update_best_pnl(pos, pnl)
-            if is_ai_scalping and ai_manage_only_tpsl:
+            if manage_only_tpsl:
                 move_be, new_stop = False, 0.0
             elif is_liquidity_retest:
                 # v0082: no aggressive scalp BE. Move to BE only after price has
@@ -398,10 +412,10 @@ class PositionManager:
                     if ev: events.append(ev)
                     continue
             if not is_liquidity_retest:
-                if is_ai_scalping and ai_manage_only_tpsl:
-                    # For AI scalping do not choke a live trade with BE/trailing/time-stop.
-                    # Local manager closes only when real price reaches TP or SL; watchdog
-                    # separately keeps trying to attach native MEXC TP/SL.
+                if manage_only_tpsl:
+                    # v0181: For AI scalping and BOOST, do not choke a live trade with
+                    # generic breakeven/trailing/time-stop. Local manager closes only
+                    # on actual TP/SL; BOOST rotation/micro-TP is handled by BOOST engine.
                     pass
                 else:
                     trailing_reason = policy.trailing_exit_reason(pos, pnl)

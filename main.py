@@ -1381,7 +1381,7 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await storage.set("boost_session_target_profit_usdt", bank * (target_mult - 1.0), bump_revision=False)
     await storage.set("scan_interval_sec", int(float(s.get("boost_scan_interval_sec", 3) or 3)), bump_revision=False)
     await storage.set("max_open_positions", 1)
-    # v0180 FULL UNIVERSE AGGRESSIVE ROTATION: pressing 🚀 BOOST MODE forces aggressive autopilot defaults ON,
+    # v0181 BOOST LIVE TPSL SAFE EXECUTION: pressing 🚀 BOOST MODE forces aggressive autopilot defaults ON,
     # even if an older Railway SQLite/settings state contains stale false/low values.
     await storage.set("boost_zero_fee_scanner_enabled", True, bump_revision=False)
     await storage.set("boost_balance_share", 0.10, bump_revision=False)

@@ -500,9 +500,12 @@ class ExecutionEngine:
                     # longer before attaching TP/SL, then _wait_for_live_position()
                     # polls until positionId/holdVol are visible.
                     post_delay = await self._setting_float("protection_post_open_delay_sec", "PROTECTION_POST_OPEN_DELAY_SEC", 1.5)
-                    if str(pos.get("strategy") or "").lower() == "ai_scalping":
+                    strategy_name = str(pos.get("strategy") or "").lower()
+                    if strategy_name in {"ai_scalping", "boost_scalping"}:
                         ai_delay = await self._setting_float("ai_scalping_protection_delay_sec", "AI_SCALPING_PROTECTION_DELAY_SEC", 3.0)
-                        post_delay = max(post_delay, ai_delay)
+                        # BOOST uses the same MEXC post-open TP/SL attach timing as BTC/ETH scalping.
+                        boost_delay = await self._setting_float("boost_protection_delay_sec", "BOOST_PROTECTION_DELAY_SEC", ai_delay) if strategy_name == "boost_scalping" else ai_delay
+                        post_delay = max(post_delay, boost_delay)
                     if post_delay > 0:
                         await asyncio.sleep(post_delay)
                     ep = await self._wait_for_live_position(plan.symbol, pos.get("side"))
@@ -610,18 +613,34 @@ class ExecutionEngine:
                 pos.update(protection)
                 await self.storage.upsert_position(pos)
                 if not protection.get("ok"):
-                    # v0148 hard rule for live scalping: no confirmed exchange TP/SL
-                    # means no position.  Do not run ordinary AI scalps in LOCAL
-                    # PROTECTION; retry happened inside place_protection_orders().
-                    reason = "protection_failed_no_exchange_tpsl"
-                    if bool(pos.get("liquidation_stop_mode")):
-                        reason = "protection_failed_no_exchange_tp_liq_mode"
-                    pos["protection_mode"] = "closing_unprotected"
-                    pos["protection_warning"] = "exchange protection missing after retries; closing position"
-                    pos["updated_at"] = time.time()
-                    await self.storage.upsert_position(pos)
-                    close_res = await self.close_position(pos, reason=reason, live=True)
-                    return {"ok": False, "order": order, "position": pos, "reason": "exchange protection missing; position closed", "protection": protection, "close": close_res}
+                    strategy_name = str(pos.get("strategy") or "").lower()
+                    boost_safe = strategy_name == "boost_scalping" and self._truthy(await self._setting("boost_live_safe_execution", os.getenv("BOOST_LIVE_SAFE_EXECUTION", "true")), True)
+                    if boost_safe:
+                        # v0181: BOOST must not immediately market-close just because MEXC did not
+                        # confirm native TP/SL fast enough. The separate BOOST/local fast loop
+                        # remains the primary exit engine, while watchdog keeps trying TP/SL.
+                        protection.update({
+                            "ok": True,
+                            "protection_status": "LOCAL_FAST_PROTECTED",
+                            "protection_mode": "local_fast",
+                            "protection_note": "exchange TP/SL not confirmed; BOOST local fast monitor active; no forced close",
+                            "boost_live_safe_execution": True,
+                        })
+                        pos.update(protection)
+                        pos["updated_at"] = time.time()
+                        await self.storage.upsert_position(pos)
+                    else:
+                        # v0148 hard rule for non-BOOST live scalping: no confirmed exchange TP/SL
+                        # means no position.  BOOST is exempt above.
+                        reason = "protection_failed_no_exchange_tpsl"
+                        if bool(pos.get("liquidation_stop_mode")):
+                            reason = "protection_failed_no_exchange_tp_liq_mode"
+                        pos["protection_mode"] = "closing_unprotected"
+                        pos["protection_warning"] = "exchange protection missing after retries; closing position"
+                        pos["updated_at"] = time.time()
+                        await self.storage.upsert_position(pos)
+                        close_res = await self.close_position(pos, reason=reason, live=True)
+                        return {"ok": False, "order": order, "position": pos, "reason": "exchange protection missing; position closed", "protection": protection, "close": close_res}
             return {"ok": True, "order": order, "position": pos}
 
 

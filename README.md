@@ -1,8 +1,8 @@
-## v0180 FULL UNIVERSE AGGRESSIVE ROTATION
+## v0181 BOOST LIVE TPSL SAFE EXECUTION
 
 Preloaded 0-fee whitelist from user screenshots. `/boost_list` can still replace it and `/boost_list_del` clears it.
 
-## v0180 FULL UNIVERSE AGGRESSIVE ROTATION
+## v0181 BOOST LIVE TPSL SAFE EXECUTION
 
 - `/boost_start` starts autopilot: reserves `BOOST_BALANCE_SHARE=0.10` of current futures equity as the BOOST bank.
 - Target is `BOOST_TARGET_MULTIPLIER=20`; example 50 USDT balance -> 5 USDT bank -> 100 USDT target bank.
@@ -409,7 +409,7 @@ MARGIN_ALLOCATION_ENABLED=true
 - Watchdog notifications now use `tp_exists/sl_exists` aliases correctly.
 
 
-## v0180 FULL UNIVERSE AGGRESSIVE ROTATION
+## v0181 BOOST LIVE TPSL SAFE EXECUTION
 
 - One live Telegram BOOST panel is edited instead of spamming messages.
 - Inline buttons: Rotation ON/OFF, Live panel ON/OFF, Refresh.
@@ -420,7 +420,7 @@ MARGIN_ALLOCATION_ENABLED=true
 Commands: `/boost_start`, `/boost_stop`, `/boost_status`, `/boost_rotation`.
 
 
-## v0180 FULL UNIVERSE AGGRESSIVE ROTATION
+## v0181 BOOST LIVE TPSL SAFE EXECUTION
 
 - `/boost_list BTC,ETH,SOL` sets trusted 0-fee BOOST whitelist. Lower/upper case and comma-separated lists are accepted. Tokens are normalized to `BTCUSDT`, `ETHUSDT`, etc.
 - `/boost_list` shows the current whitelist.
