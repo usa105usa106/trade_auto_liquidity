@@ -641,15 +641,35 @@ class AIScalpingEngine:
         return out or ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 
     async def market_snapshot(self, exchange_client, symbol: str, quality_mode: bool = False) -> dict:
-        c1 = await exchange_client.fetch_ohlcv(symbol, timeframe="1m", limit=60)
-        c5 = await exchange_client.fetch_ohlcv(symbol, timeframe="5m", limit=60)
-        c15 = await exchange_client.fetch_ohlcv(symbol, timeframe="15m", limit=50) if quality_mode else []
-        ticker = await exchange_client.fetch_ticker(symbol)
-        ob = await exchange_client.fetch_order_book(symbol, limit=10)
-        try:
-            spot_ob = await exchange_client.fetch_spot_order_book(symbol, limit=50)
-        except Exception as e:
-            spot_ob = {"bids": [], "asks": [], "error": str(e)[:120]}
+        # Fire all requests in parallel instead of sequentially.
+        # Sequential: 5 x ~0.3s = ~1.5s minimum per symbol.
+        # Parallel:   max(individual latency) = ~0.4s per symbol.
+        # This alone cuts snapshot time by ~3-4x and reduces total
+        # request burst because parallel requests finish sooner.
+        async def _safe_spot_ob():
+            try:
+                return await exchange_client.fetch_spot_order_book(symbol, limit=50)
+            except Exception as e:
+                return {"bids": [], "asks": [], "error": str(e)[:120]}
+
+        if quality_mode:
+            c1, c5, c15, ticker, ob, spot_ob = await asyncio.gather(
+                exchange_client.fetch_ohlcv(symbol, timeframe="1m", limit=60),
+                exchange_client.fetch_ohlcv(symbol, timeframe="5m", limit=60),
+                exchange_client.fetch_ohlcv(symbol, timeframe="15m", limit=50),
+                exchange_client.fetch_ticker(symbol),
+                exchange_client.fetch_order_book(symbol, limit=10),
+                _safe_spot_ob(),
+            )
+        else:
+            c1, c5, ticker, ob, spot_ob = await asyncio.gather(
+                exchange_client.fetch_ohlcv(symbol, timeframe="1m", limit=60),
+                exchange_client.fetch_ohlcv(symbol, timeframe="5m", limit=60),
+                exchange_client.fetch_ticker(symbol),
+                exchange_client.fetch_order_book(symbol, limit=10),
+                _safe_spot_ob(),
+            )
+            c15 = []
         closes1 = [_f(c[4]) for c in c1]
         closes5 = [_f(c[4]) for c in c5]
         closes15 = [_f(c[4]) for c in c15]
@@ -721,6 +741,9 @@ class AIScalpingEngine:
         WAIT cache so BTC/ETH are not re-asked every scan while the market is unchanged.
         """
         allowed_all = self.symbols(settings)
+        if not allowed_all:
+            return AIScalpDecision(ok=False, symbol=symbol or "", decision="WAIT", confidence=0.0,
+                                   error="no symbols configured", reason="allowed_all is empty", model=active_model(settings))
         norm = {x.upper().replace("_", "/"): x for x in allowed_all}
         sym = str(symbol or "").upper().replace("_", "/")
         if ":" not in sym and sym.endswith("/USDT"):

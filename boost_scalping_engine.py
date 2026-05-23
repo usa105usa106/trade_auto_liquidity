@@ -285,14 +285,19 @@ class BoostScalpingEngine:
         checked = []
         log_event("boost_deep_scan_start", stage="deep_scan", ok=True, hot_total=total, check_count=check_count, symbols=scan_symbols[:40])
         async def check_one(sym: str):
-            timeout = max(0.3, float(settings.get("boost_symbol_snapshot_timeout_sec", 0.9) or 0.9))
+            # With parallel fetch (asyncio.gather in market_snapshot), all 4-5 requests
+            # complete in ~max(single latency) instead of sum. 3.5s is generous but
+            # still fast enough for 1-3s scalp cycles, and stops false timeouts.
+            timeout = max(1.0, float(settings.get("boost_symbol_snapshot_timeout_sec", 3.5) or 3.5))
             market = await asyncio.wait_for(self._snapshot(exchange_client, sym), timeout=timeout)
             res = self._side_and_score(market, settings)
             res = self._hunter_score(market, res, settings)
             return sym, market, res
 
         # Parallel scan is critical for 1-3 second BOOST loops. Limit concurrency to avoid API ban.
-        conc = max(1, min(10, int(float(settings.get("boost_scan_concurrency", 6) or 6))))
+        # Keep concurrency low: 3 parallel symbols x 4 parallel requests each = 12 req/s,
+        # safely under MEXC's public limit. Higher values trigger code 510 bans.
+        conc = max(1, min(10, int(float(settings.get("boost_scan_concurrency", 3) or 3))))
         sem = asyncio.Semaphore(conc)
         async def guarded(sym: str):
             async with sem:

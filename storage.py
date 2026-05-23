@@ -1,6 +1,8 @@
 from __future__ import annotations
+import logging
 import time
 import json
+log = logging.getLogger("storage")
 import os
 import aiosqlite
 from typing import Any, Optional
@@ -117,8 +119,10 @@ DEFAULT_SETTINGS = {
     "boost_max_session_loss_pct": DEFAULTS.boost_max_session_loss_pct,
     "boost_max_consecutive_losses": DEFAULTS.boost_max_consecutive_losses,
     "boost_max_symbols_scan": DEFAULTS.boost_max_symbols_scan,
-    "boost_min_checked_per_cycle": 40,
-    "boost_max_checked_per_cycle": 100,
+    # Lowered from 40/100: with 3 concurrent symbols and parallel fetch,
+    # 10-18 checks/cycle is enough to find setups without hammering MEXC.
+    "boost_min_checked_per_cycle": 10,
+    "boost_max_checked_per_cycle": 18,
     "boost_min_quote_volume_usdt": DEFAULTS.boost_min_quote_volume_usdt,
     "boost_min_atr_pct": DEFAULTS.boost_min_atr_pct,
     "boost_max_spread_pct": DEFAULTS.boost_max_spread_pct,
@@ -193,6 +197,10 @@ class Storage:
 
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as db:
+            # WAL mode allows concurrent reads while a write is in progress,
+            # and avoids "database is locked" errors under high-frequency async access.
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA busy_timeout=5000")
             await db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -273,7 +281,8 @@ class Storage:
                 await self.set("ws_max_updates_per_batch", 1000, bump_revision=False)
             if int(await self.get("ws_stale_sec", 20) or 20) < 20:
                 await self.set("ws_stale_sec", 20, bump_revision=False)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at storage.py:%d: %s", 276, _e)
             pass
 
         # v0060 default migration: previous builds stored leverage=1 in SQLite,
@@ -287,7 +296,8 @@ class Storage:
                 if current_lev == 1 and os.getenv("MEXC_ORDER_LEVERAGE") is None:
                     await self.set("mexc_order_leverage", 5, bump_revision=False)
                 await self.set("v0060_leverage_default_migrated", True, bump_revision=False)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at storage.py:%d: %s", 290, _e)
             pass
 
     async def get(self, key: str, default: Any = None) -> Any:
@@ -427,7 +437,8 @@ class Storage:
         for r in rows:
             try:
                 out.append(json.loads(r[0]))
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at storage.py:%d: %s", 430, _e)
                 pass
         return out
 

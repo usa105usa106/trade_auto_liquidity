@@ -1,3 +1,5 @@
+import logging
+log = logging.getLogger("execution_engine")
 import time
 import asyncio
 import os
@@ -44,7 +46,8 @@ class ExecutionEngine:
                 value = await self.storage.get(key, None)
                 if value is not None:
                     return self._truthy(value, default)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at execution_engine.py:%d: %s", 47, _e)
             pass
         return self._truthy(os.getenv(env_key or key.upper()), default)
 
@@ -54,7 +57,8 @@ class ExecutionEngine:
                 value = await self.storage.get(key, None)
                 if value is not None:
                     return float(value)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at execution_engine.py:%d: %s", 57, _e)
             pass
         try:
             return float(os.getenv(env_key or key.upper(), str(default)))
@@ -145,14 +149,16 @@ class ExecutionEngine:
                 value = order.get(key)
                 if value and float(value) > 0:
                     return float(value)
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at execution_engine.py:%d: %s", 148, _e)
                 pass
         try:
             filled = float(order.get("filled") or order.get("amount") or 0)
             cost = float(order.get("cost") or 0)
             if filled > 0 and cost > 0:
                 return cost / filled
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at execution_engine.py:%d: %s", 155, _e)
             pass
         info = order.get("info", {}) if isinstance(order.get("info"), dict) else {}
         for key in ("avgPrice", "averagePrice", "dealAvgPrice", "price"):
@@ -160,7 +166,8 @@ class ExecutionEngine:
                 value = info.get(key)
                 if value and float(value) > 0:
                     return float(value)
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at execution_engine.py:%d: %s", 163, _e)
                 pass
         return float(fallback or 0)
 
@@ -213,7 +220,8 @@ class ExecutionEngine:
             precision = (market or {}).get("precision", {}).get("price") if isinstance(market, dict) else None
             if precision not in (None, ""):
                 return 10 ** (-int(float(precision)))
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at execution_engine.py:%d: %s", 216, _e)
             pass
         return 0.0
 
@@ -327,7 +335,8 @@ class ExecutionEngine:
             pos["protection_min_distance_pct"] = (min_abs / entry * 100.0) if entry else 0.0
         try:
             pos = self._sanitize_position_for_exchange(pos)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at execution_engine.py:%d: %s", 330, _e)
             pass
         return pos
 
@@ -357,7 +366,8 @@ class ExecutionEngine:
             pos["leverage"] = leverage
             pos["margin_type"] = "isolated" if open_type == 1 else "cross"
             pos["estimated_margin_usdt"] = float(pos.get("expected_margin_usdt") or 0) or (notional / leverage if leverage > 0 else notional)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at execution_engine.py:%d: %s", 360, _e)
             pass
         return pos
 
@@ -419,7 +429,8 @@ class ExecutionEngine:
                             "takeProfitReverse": 2,
                             "stopLossReverse": 2,
                         })
-                except Exception:
+                except Exception as _e:  # auto-logged
+                    log.debug("suppressed exception at execution_engine.py:%d: %s", 422, _e)
                     pass
             attached_tpsl_requested = bool(params.get("takeProfitPrice") or params.get("stopLossPrice"))
             attached_tpsl_failed = False
@@ -475,7 +486,8 @@ class ExecutionEngine:
                     pos["entry_attached_tpsl_requested"] = True
                     pos["entry_attached_take_price"] = params.get("takeProfitPrice")
                     pos["entry_attached_stop_price"] = params.get("stopLossPrice")
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at execution_engine.py:%d: %s", 478, _e)
                 pass
             # v0068: persist every known MEXC symbol spelling immediately.
             # Railway redeploys/local DB resets can still lose cache, but while
@@ -500,7 +512,8 @@ class ExecutionEngine:
                     pos["margin_guard_threshold_usdt"] = mg.get("threshold")
                 if lev:
                     pos["leverage_setup_ok"] = lev.get("ok")
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at execution_engine.py:%d: %s", 503, _e)
                 pass
             if pos["status"] == "open":
                 fill_price = self._order_fill_price(order, plan.entry_price)
@@ -534,7 +547,8 @@ class ExecutionEngine:
                                 val = ep.get(key)
                                 if val and float(val) > 0:
                                     pos["entry_price"] = float(val); break
-                            except Exception:
+                            except Exception as _e:  # auto-logged
+                                log.debug("suppressed exception at execution_engine.py:%d: %s", 537, _e)
                                 pass
                         if not float(pos.get("entry_price") or 0):
                             for key in ("holdAvgPrice", "openAvgPrice", "entryPrice"):
@@ -542,7 +556,8 @@ class ExecutionEngine:
                                     val = ep_info.get(key)
                                     if val and float(val) > 0:
                                         pos["entry_price"] = float(val); break
-                                except Exception:
+                                except Exception as _e:  # auto-logged
+                                    log.debug("suppressed exception at execution_engine.py:%d: %s", 545, _e)
                                     pass
                         pos["exchange_synced"] = True
                         pos["updated_at"] = time.time()
@@ -600,7 +615,8 @@ class ExecutionEngine:
                                 try:
                                     from debug_log import log_event
                                     log_event("error_mexc_native_tpsl_direct", symbol=pos.get("symbol"), side=pos.get("side"), error=str(e), ok=False)
-                                except Exception:
+                                except Exception as _e:  # auto-logged
+                                    log.debug("suppressed exception at execution_engine.py:%d: %s", 603, _e)
                                     pass
                 except Exception as e:
                     pos["exchange_sync_warning"] = str(e)
@@ -701,7 +717,8 @@ class ExecutionEngine:
                 value = pos.get(key)
                 if value not in (None, ""):
                     return abs(float(value))
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at execution_engine.py:%d: %s", 704, _e)
                 pass
         contracts = pos.get("contracts")
         if contracts is None:
@@ -763,14 +780,16 @@ class ExecutionEngine:
                 value = row.get(key)
                 if value not in (None, ""):
                     return abs(float(value))
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at execution_engine.py:%d: %s", 766, _e)
                 pass
         for key in ("holdVol", "vol", "positionAmt"):
             try:
                 value = info.get(key)
                 if value not in (None, ""):
                     return abs(float(value))
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at execution_engine.py:%d: %s", 773, _e)
                 pass
         return 0.0
 
@@ -1237,14 +1256,16 @@ class ExecutionEngine:
                     v = usdt.get(key) if isinstance(usdt, dict) else None
                     if v not in (None, ""):
                         return float(v)
-                except Exception:
+                except Exception as _e:  # auto-logged
+                    log.debug("suppressed exception at execution_engine.py:%d: %s", 1240, _e)
                     pass
             for section in ("total", "free"):
                 try:
                     v = ((bal or {}).get(section, {}) or {}).get("USDT")
                     if v not in (None, ""):
                         return float(v)
-                except Exception:
+                except Exception as _e:  # auto-logged
+                    log.debug("suppressed exception at execution_engine.py:%d: %s", 1247, _e)
                     pass
         except Exception:
             return None
@@ -1307,7 +1328,8 @@ class ExecutionEngine:
             # when local price said +0.04% but live slippage closed negative.
             try:
                 await asyncio.sleep(float(os.getenv("BOOST_REALIZED_PNL_SETTLE_SEC", "0.8")))
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at execution_engine.py:%d: %s", 1310, _e)
                 pass
             live_cash_after = await self._balance_cash_usdt()
             if live_cash_after is not None:

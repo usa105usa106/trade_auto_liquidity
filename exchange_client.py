@@ -1,3 +1,5 @@
+import logging
+log = logging.getLogger("exchange_client")
 import os
 import time
 import hmac
@@ -28,6 +30,11 @@ class ExchangeClient:
         self.time_difference_ms = 0
         self._mexc_private_request_times = deque()
         self._mexc_private_lock = asyncio.Lock()
+        # Public rate limiter: MEXC returns code 510 (too frequent) when
+        # more than ~10 public requests/second hit the same endpoint.
+        # Limit to 8 public requests per second to stay safe.
+        self._mexc_public_request_times: deque = deque()
+        self._mexc_public_lock = asyncio.Lock()
 
     async def init(self, api_key: str = "", api_secret: str = ""):
         self.api_key = api_key or ""
@@ -66,7 +73,8 @@ class ExchangeClient:
             pass
         try:
             await asyncio.wait_for(self._sync_mexc_time(silent=True), timeout=4)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 69, _e)
             pass
         return self
 
@@ -179,7 +187,8 @@ class ExchangeClient:
                 for k in ("symbol", "contract", "contractName", "baseCoin", "settleCoin"):
                     if k in info and k not in {"baseCoin", "settleCoin"}:
                         add(info.get(k))
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 182, _e)
             pass
         return out
 
@@ -213,7 +222,8 @@ class ExchangeClient:
                     import math
                     return max(0, min(12, int(round(-math.log10(f)))))
                 return max(0, min(12, int(f)))
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 216, _e)
             pass
         return default
 
@@ -283,7 +293,8 @@ class ExchangeClient:
                     val = row.get(key)
                     if val not in (None, "") and float(val) > 0:
                         return float(val)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 286, _e)
             pass
         try:
             t = await self.fetch_ticker(symbol)
@@ -291,7 +302,8 @@ class ExchangeClient:
                 val = t.get(key) if isinstance(t, dict) else None
                 if val not in (None, "") and float(val) > 0:
                     return float(val)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 294, _e)
             pass
         return float(fallback or 0)
 
@@ -307,7 +319,8 @@ class ExchangeClient:
             if prec not in (None, ""):
                 f = float(prec)
                 return f if 0 < f < 1 else 10 ** (-int(f))
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 310, _e)
             pass
         # Conservative fallbacks for MEXC USDT perpetual majors when CCXT
         # metadata is missing/stale.  This prevents 5003 from long float tails.
@@ -317,7 +330,8 @@ class ExchangeClient:
                 return 0.1
             if ms.startswith("ETH_"):
                 return 0.01
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 320, _e)
             pass
         # Generic safe fallback when markets were not loaded (BOOST avoids load_markets
         # to stay responsive). MEXC rejects long float tails with code 2015; two
@@ -325,7 +339,8 @@ class ExchangeClient:
         # is safer than sending raw Python floats like 260.03963536.
         try:
             px = float(symbol if False else 0)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 328, _e)
             pass
         return 0.0
 
@@ -482,7 +497,8 @@ class ExchangeClient:
             try:
                 if abs(float(fr.get("maker", 1))) <= 1e-12 and abs(float(fr.get("taker", 1))) <= 1e-12:
                     zeros.append(self.normalize_symbol(sym))
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at exchange_client.py:%d: %s", 485, _e)
                 pass
         if zeros:
             return sorted(set(zeros))[:max(1, int(max_symbols or 80))]
@@ -494,7 +510,8 @@ class ExchangeClient:
                     continue
                 try:
                     out.append(self.normalize_symbol(x))
-                except Exception:
+                except Exception as _e:  # auto-logged
+                    log.debug("suppressed exception at exchange_client.py:%d: %s", 497, _e)
                     pass
             return sorted(set(out))[:max(1, int(max_symbols or 80))]
         return []
@@ -690,7 +707,9 @@ class ExchangeClient:
         """Small native MEXC futures public REST helper.
 
         Used by BOOST when ccxt market initialization is slow/unavailable.
+        Rate-limited to avoid MEXC code 510 (too frequent) errors.
         """
+        await self._mexc_public_rate_limit()
         method = str(method or "GET").upper()
         query = dict(query or {})
         base = (base_url or self._mexc_rest_base()).rstrip("/")
@@ -723,6 +742,31 @@ class ExchangeClient:
         if "contract.mexc.com" in base:
             return "https://api.mexc.com"
         return base or "https://api.mexc.com"
+
+    async def _mexc_public_rate_limit(self) -> None:
+        """Throttle public MEXC futures requests to <=8 per second.
+
+        MEXC returns HTTP 200 with code=510 ('Requests are too frequent')
+        when the public endpoint is hit too fast. Running 6 symbols in
+        parallel with 5 requests each = 30 req/s, which reliably triggers
+        the ban. This limiter keeps us at 8 req/s to stay safely under the
+        threshold while still scanning fast enough for scalping.
+        """
+        limit = int(os.getenv("MEXC_PUBLIC_RATE_LIMIT", "8") or "8")
+        window = 1.0  # per second
+        if limit <= 0:
+            return
+        async with self._mexc_public_lock:
+            now = time.monotonic()
+            while self._mexc_public_request_times and now - self._mexc_public_request_times[0] >= window:
+                self._mexc_public_request_times.popleft()
+            if len(self._mexc_public_request_times) >= limit:
+                sleep_for = window - (now - self._mexc_public_request_times[0]) + 0.02
+                await asyncio.sleep(max(0.02, sleep_for))
+                now = time.monotonic()
+                while self._mexc_public_request_times and now - self._mexc_public_request_times[0] >= window:
+                    self._mexc_public_request_times.popleft()
+            self._mexc_public_request_times.append(time.monotonic())
 
     async def _mexc_private_rate_limit(self):
         """Limit private MEXC requests to <=4 per 2 seconds.
@@ -973,7 +1017,8 @@ class ExchangeClient:
             cs = float(m.get("contractSize") or m.get("contract_size") or 0)
             if cs > 0:
                 return cs
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 976, _e)
             pass
         sid = self._mexc_normalize_contract_id(symbol)
         fallback = {
@@ -994,7 +1039,8 @@ class ExchangeClient:
                 value = row.get(key)
                 if value not in (None, ""):
                     return abs(float(value))
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at exchange_client.py:%d: %s", 997, _e)
                 pass
         return 0.0
 
@@ -1014,14 +1060,16 @@ class ExchangeClient:
             try:
                 if row.get(key) not in (None, ""):
                     entry = float(row.get(key)); break
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at exchange_client.py:%d: %s", 1017, _e)
                 pass
         mark = 0.0
         for key in ("markPrice", "fairPrice", "lastPrice"):
             try:
                 if row.get(key) not in (None, ""):
                     mark = float(row.get(key)); break
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at exchange_client.py:%d: %s", 1024, _e)
                 pass
         side = self._mexc_position_side(row)
         variants = self.mexc_symbol_variants(symbol)
@@ -1132,7 +1180,8 @@ class ExchangeClient:
             try:
                 if row.get(key) not in (None, "", 0, "0"):
                     price = float(row.get(key)); break
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at exchange_client.py:%d: %s", 1135, _e)
                 pass
         typ = row.get("type") or row.get("orderType") or row.get("category")
         src = str(row.get("_source_endpoint") or "")
@@ -1254,11 +1303,13 @@ class ExchangeClient:
         else:
             try:
                 symbols.extend([o.get("symbol") for o in await self._mexc_fetch_open_orders() if o.get("symbol")])
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at exchange_client.py:%d: %s", 1257, _e)
                 pass
             try:
                 symbols.extend([p.get("symbol") for p in await self._mexc_fetch_positions() if p.get("symbol")])
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at exchange_client.py:%d: %s", 1261, _e)
                 pass
         seen = []
         for sym in symbols:
@@ -1349,7 +1400,8 @@ class ExchangeClient:
                 try:
                     if pos.get(k) not in (None, ""):
                         amount_f = abs(float(pos.get(k) or 0)); break
-                except Exception:
+                except Exception as _e:  # auto-logged
+                    log.debug("suppressed exception at exchange_client.py:%d: %s", 1352, _e)
                     pass
             if amount_f <= 0 and raw_f > 0:
                 amount_f = raw_f
@@ -1392,7 +1444,8 @@ class ExchangeClient:
             try:
                 if pos.get(key) not in (None, ""):
                     amount_f = abs(float(pos.get(key) or 0)); break
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at exchange_client.py:%d: %s", 1395, _e)
                 pass
         if amount_f <= 0 and raw_f > 0:
             amount_f = raw_f
@@ -1476,7 +1529,8 @@ class ExchangeClient:
         safe_tp = self._mexc_price_to_precision(symbol, safe_tp)
         try:
             vol = self._amount_to_mexc_vol(symbol, vol)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 1479, _e)
             pass
         body = {
             "symbol": self._mexc_symbol(symbol),
@@ -1499,7 +1553,8 @@ class ExchangeClient:
         try:
             from debug_log import log_event
             log_event("mexc_stoporder_place_body", symbol=self._mexc_symbol(symbol), side=side, positionId=pid, vol=vol, body=body)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 1502, _e)
             pass
         out = await self._mexc_private("POST", "/api/v1/private/stoporder/place", body=body)
         data = out.get("data") if isinstance(out, dict) else None
@@ -1683,7 +1738,8 @@ class ExchangeClient:
         try:
             if fallback and float(fallback) > 0:
                 return float(fallback)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 1686, _e)
             pass
         try:
             t = await self.fetch_ticker(symbol)
@@ -1691,7 +1747,8 @@ class ExchangeClient:
                 v = t.get(k)
                 if v and float(v) > 0:
                     return float(v)
-        except Exception:
+        except Exception as _e:  # auto-logged
+            log.debug("suppressed exception at exchange_client.py:%d: %s", 1694, _e)
             pass
         return float(fallback or 0)
 
@@ -1762,11 +1819,13 @@ class ExchangeClient:
             # intentionally defensive because position listing can be stale/empty.
             try:
                 await self._mexc_cancel_all_orders(symbol)
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at exchange_client.py:%d: %s", 1765, _e)
                 pass
             try:
                 await self.mexc_close_all_positions_native()
-            except Exception:
+            except Exception as _e:  # auto-logged
+                log.debug("suppressed exception at exchange_client.py:%d: %s", 1769, _e)
                 pass
         return {
             "ok": ok,
