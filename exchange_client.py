@@ -50,15 +50,24 @@ class ExchangeClient:
             config["proxies"] = {"http": self.proxy_url, "https": self.proxy_url}
             config["aiohttp_proxy"] = self.proxy_url
         self.exchange = klass(config)
-        await self.exchange.load_markets()
+        try:
+            await asyncio.wait_for(self.exchange.load_markets(), timeout=float(os.getenv("MEXC_LOAD_MARKETS_TIMEOUT", "8")))
+        except Exception as e:
+            # MEXC public market loading can time out on some hosts/IPs.  Keep the
+            # client usable for native futures private endpoints so Telegram
+            # commands such as Balance/Positions/Cancel All do not freeze.
+            log_mexc("GET", "load_markets", request={}, response={}, status=0, error=f"load_markets skipped: {e}")
         try:
             if hasattr(self.exchange, "load_time_difference"):
-                diff = await self.exchange.load_time_difference()
+                diff = await asyncio.wait_for(self.exchange.load_time_difference(), timeout=4)
                 self.time_difference_ms = int(diff or 0)
         except Exception:
             # Do not block startup; raw MEXC fallback also syncs from MEXC server time.
             pass
-        await self._sync_mexc_time(silent=True)
+        try:
+            await asyncio.wait_for(self._sync_mexc_time(silent=True), timeout=4)
+        except Exception:
+            pass
         return self
 
     def _split_symbol_parts(self, symbol: str) -> tuple[str, str]:

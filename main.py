@@ -49,6 +49,7 @@ running = False
 entries_enabled = False
 started_at = time.time()
 exchange_client = None
+balance_locks = {}
 ws_supervisor = None
 trading_task = None
 position_task = None
@@ -1696,70 +1697,86 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
-    try:
-        await reply(update, "💰 Balance: проверяю MEXC/IP, кнопки не блокируются...", reply_markup=MAIN_MENU)
-    except Exception:
-        pass
-    s = await storage.all_settings()
-    proxy_enabled = bool(s.get("proxy_enabled", False))
-    proxy_url = str(s.get("proxy_url", "") or "")
-
-    direct_ip = await fetch_public_ip(use_proxy=False, timeout_sec=2)
-    proxy_ip = await fetch_public_ip(use_proxy=True, proxy_url=proxy_url, timeout_sec=2) if proxy_enabled and proxy_url else {"ok": False, "ip": "not configured", "error": "proxy off or missing"}
-
-    balance_error = ""
-    free = total = "n/a"
-    try:
-        ex = await _await_with_timeout(get_exchange(s), 6, "exchange init")
-        bal = await _await_with_timeout(ex.fetch_balance(), 8, "fetch_balance")
-        usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
-        free = usdt.get("free", "n/a") if isinstance(usdt, dict) else "n/a"
-        total = usdt.get("total", "n/a") if isinstance(usdt, dict) else "n/a"
-        used = usdt.get("used", "n/a") if isinstance(usdt, dict) else "n/a"
-        position_margin = usdt.get("positionMargin", "n/a") if isinstance(usdt, dict) else "n/a"
-        frozen_balance = usdt.get("frozenBalance", "n/a") if isinstance(usdt, dict) else "n/a"
-        unrealized = usdt.get("unrealized", "n/a") if isinstance(usdt, dict) else "n/a"
-        # MEXC can report positionMargin=0 even while open_positions returns
-        # live positions. Show a safe effective margin instead of misleading 0.
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    lock = balance_locks.setdefault(chat_id, asyncio.Lock())
+    if lock.locked():
+        await reply(update, "💰 Balance уже проверяется. Подожди финальный ответ, я не запускаю второй запрос параллельно.", reply_markup=MAIN_MENU)
+        return
+    async with lock:
         try:
-            raw_pm = float(position_margin or 0)
+            await reply(update, "💰 Balance: проверяю MEXC/IP, кнопки не блокируются...", reply_markup=MAIN_MENU)
         except Exception:
-            raw_pm = 0.0
-        exchange_positions = []
+            pass
+        s = await storage.all_settings()
+        proxy_enabled = bool(s.get("proxy_enabled", False))
+        proxy_url = str(s.get("proxy_url", "") or "")
+
+        direct_task = asyncio.create_task(fetch_public_ip(use_proxy=False, timeout_sec=2))
+        proxy_task = asyncio.create_task(fetch_public_ip(use_proxy=True, proxy_url=proxy_url, timeout_sec=2)) if proxy_enabled and proxy_url else None
+
+        balance_error = ""
+        free = total = used = position_margin = frozen_balance = unrealized = "n/a"
+        ex = None
         try:
-            if hasattr(ex, "_mexc_fetch_positions"):
-                exchange_positions = await _await_with_timeout(ex._mexc_fetch_positions(), 6, "fetch_positions")
-            else:
-                exchange_positions = await _await_with_timeout(ex.fetch_positions(), 6, "fetch_positions")
-        except Exception:
+            api_key, api_secret = _api_creds(s)
+            # Balance must not depend on ccxt.load_markets(): that public MEXC call can hang
+            # on some Railway/VPS IPs and made every button look frozen.  Native futures
+            # balance/positions endpoints do not need market loading.
+            ex = ExchangeClient(DEFAULT_EXCHANGE, proxy_url, proxy_enabled)
+            ex.api_key = api_key
+            ex.api_secret = api_secret
+            await _await_with_timeout(ex._sync_mexc_time(silent=True), 3, "mexc time sync")
+            bal = await _await_with_timeout(ex.fetch_balance(), 8, "fetch_balance")
+            usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
+            free = usdt.get("free", "n/a") if isinstance(usdt, dict) else "n/a"
+            total = usdt.get("total", "n/a") if isinstance(usdt, dict) else "n/a"
+            used = usdt.get("used", "n/a") if isinstance(usdt, dict) else "n/a"
+            position_margin = usdt.get("positionMargin", "n/a") if isinstance(usdt, dict) else "n/a"
+            frozen_balance = usdt.get("frozenBalance", "n/a") if isinstance(usdt, dict) else "n/a"
+            unrealized = usdt.get("unrealized", "n/a") if isinstance(usdt, dict) else "n/a"
+            try:
+                raw_pm = float(position_margin or 0)
+            except Exception:
+                raw_pm = 0.0
             exchange_positions = []
-        est_pm, est_count = _estimate_exchange_position_margin(
-            exchange_positions,
-            int(float(s.get("mexc_order_leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or 5)),
-        )
-        if raw_pm <= 0 and est_pm > 0:
-            position_margin = f"~{est_pm:.6f} estimated ({est_count} open position; MEXC raw=0)"
-    except Exception as e:
-        balance_error = str(e)[:240]
-        used = position_margin = frozen_balance = unrealized = "n/a"
+            try:
+                exchange_positions = await _await_with_timeout(ex._mexc_fetch_positions(), 6, "fetch_positions")
+            except Exception:
+                exchange_positions = []
+            est_pm, est_count = _estimate_exchange_position_margin(
+                exchange_positions,
+                int(float(s.get("mexc_order_leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or 5)),
+            )
+            if raw_pm <= 0 and est_pm > 0:
+                position_margin = f"~{est_pm:.6f} estimated ({est_count} open position; MEXC raw=0)"
+        except Exception as e:
+            balance_error = str(e)[:240]
+        finally:
+            try:
+                if ex:
+                    await ex.close()
+            except Exception:
+                pass
 
-    proxy_line = f"{proxy_ip.get('ip')}" if proxy_ip.get("ok") else f"{proxy_ip.get('ip')} ({proxy_ip.get('error')})"
-    direct_line = f"{direct_ip.get('ip')}" if direct_ip.get("ok") else f"{direct_ip.get('ip')} ({direct_ip.get('error')})"
-    text = (
-        "💰 Futures Balance\n"
-        f"USDT free: {free}\n"
-        f"USDT total: {total}\n"
-        f"USDT used: {used}\n"
-        f"Position margin: {position_margin}\n"
-        f"Frozen balance: {frozen_balance}\n"
-        f"Unrealized PnL: {unrealized}\n"
-        f"Balance error: {balance_error or '-'}\n\n"
-        "🌍 IP diagnostics\n"
-        f"Direct IP: {direct_line}\n"
-        f"Proxy enabled: {proxy_enabled}\n"
-        f"Proxy IP: {proxy_line}"
-    )
-    await reply(update, text, reply_markup=MAIN_MENU)
+        direct_ip = await direct_task
+        proxy_ip = await proxy_task if proxy_task else {"ok": False, "ip": "not configured", "error": "proxy off or missing"}
+        proxy_line = f"{proxy_ip.get('ip')}" if proxy_ip.get("ok") else f"{proxy_ip.get('ip')} ({proxy_ip.get('error')})"
+        direct_line = f"{direct_ip.get('ip')}" if direct_ip.get("ok") else f"{direct_ip.get('ip')} ({direct_ip.get('error')})"
+        text = (
+            "💰 Futures Balance\n"
+            f"USDT free: {free}\n"
+            f"USDT total: {total}\n"
+            f"USDT used: {used}\n"
+            f"Position margin: {position_margin}\n"
+            f"Frozen balance: {frozen_balance}\n"
+            f"Unrealized PnL: {unrealized}\n"
+            f"Balance error: {balance_error or '-'}\n\n"
+            "🌍 IP diagnostics\n"
+            f"Direct IP: {direct_line}\n"
+            f"Proxy enabled: {proxy_enabled}\n"
+            f"Proxy IP: {proxy_line}"
+        )
+        await reply(update, text, reply_markup=MAIN_MENU)
 
 
 
