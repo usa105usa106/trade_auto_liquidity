@@ -4,6 +4,7 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["▶️ Run", "⏹ Stop"],
     ["📊 Status", "🚨 Panic"],
     ["📈 Positions", "📉 Stats"],
+    ["🧯 Close All", "🧹 Cancel All"],
     ["💰 Balance", "🏓 Ping"],
     ["⚙️ Settings", "🔐 API"],
     ["🤖 AI BTC/ETH scalping"],

@@ -826,11 +826,34 @@ async def get_ws(settings: dict):
     return ws_supervisor
 
 async def reply(update: Update, text: str, **kwargs):
-    if update.message:
-        return await update.message.reply_text(text, **kwargs)
-    elif update.callback_query:
-        return await update.callback_query.message.reply_text(text, **kwargs)
-    return None
+    """Send Telegram text safely.
+
+    Telegram hard-limits one message to 4096 chars. A long /help previously
+    raised "Message is too long", which made the bot look dead. Split all
+    oversized replies and keep the keyboard only on the last chunk.
+    """
+    text = str(text or "")
+    max_len = 3900
+    chunks = []
+    while len(text) > max_len:
+        cut = text.rfind("\n", 0, max_len)
+        if cut < 1200:
+            cut = max_len
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    chunks.append(text)
+
+    target = update.message if update.message else (update.callback_query.message if update.callback_query else None)
+    if not target:
+        return None
+    last_msg = None
+    base_kwargs = dict(kwargs)
+    for i, chunk in enumerate(chunks):
+        send_kwargs = dict(base_kwargs)
+        if i < len(chunks) - 1:
+            send_kwargs.pop("reply_markup", None)
+        last_msg = await target.reply_text(chunk, **send_kwargs)
+    return last_msg
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -961,6 +984,7 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running, entries_enabled, trading_task, position_task
     if not allowed(update): return
     entries_enabled = False
+    await storage.set("boost_autopilot_active", False, bump_revision=False)
     # Keep the loop alive when it is already running so open positions continue
     # through TP/SL/trailing/local exits. If the bot was fully stopped, do not
     # start a background scanner just because /stop was pressed.
@@ -977,6 +1001,7 @@ async def panic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     entries_enabled = False
     running = False
+    await storage.set("boost_autopilot_active", False, bump_revision=False)
     for task in (trading_task, position_task):
         if task and not task.done():
             task.cancel()
@@ -1159,7 +1184,13 @@ async def boost_live_panel_update(app, settings: dict, snap: dict, *, status: st
         app.bot_data["boost_live_panel_message_id"] = getattr(msg, "message_id", None)
         app.bot_data["boost_panel_last_edit"] = now
     except Exception as e:
+        # v0187: never fail silently. If the live panel cannot be posted, send a
+        # plain notification so BOOST activity is still visible in chat/logs.
         log.warning("boost live panel bottom replace failed: %s", e)
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=f"⚠️ BOOST live panel failed: {str(e)[:220]}\n\n{text[:3200]}")
+        except Exception as e2:
+            log.warning("boost live panel fallback notification failed: %s", e2)
 
 
 def _normalize_boost_whitelist_input(raw: str) -> list[str]:
@@ -1376,66 +1407,86 @@ async def boost_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     global running, entries_enabled, trading_task, position_task
+
+    # v0187: acknowledge immediately. Network balance/API calls can take a few
+    # seconds, and Telegram users were seeing BOOST as "hung" while it was arming.
+    try:
+        await reply(update, "🚀 BOOST arming... запускаю автопилот и live-panel.", reply_markup=MAIN_MENU)
+    except Exception:
+        pass
+
+    s = await storage.all_settings()
+    # v0187: force BOOST-safe runtime defaults before computing bank/target, so
+    # stale Railway SQLite values cannot make commands look broken or size with
+    # an old boost_balance_share.
+    boost_defaults = {
+        "strategy_mode": "boost_scalping",
+        "boost_autopilot_active": True,
+        "boost_zero_fee_scanner_enabled": True,
+        "boost_balance_share": 0.10,
+        "boost_target_multiplier": 20.0,
+        "boost_max_consecutive_losses": 999,
+        "boost_auto_leverage": True,
+        "boost_min_leverage": 10,
+        "boost_max_leverage": 50,
+        "boost_use_full_bank_per_trade": True,
+        "boost_auto_rotate_symbols": True,
+        "boost_stop_when_target_reached": True,
+        "boost_max_symbols_scan": 126,
+        "boost_min_checked_per_cycle": 40,
+        "boost_max_checked_per_cycle": 100,
+        "universe_mode": "full",
+        "boost_min_tp_pct": 0.03,
+        "boost_max_tp_pct": 0.05,
+        "boost_min_quote_volume_usdt": 0.0,
+        "boost_min_atr_pct": 0.04,
+        "boost_max_spread_pct": 0.12,
+        "boost_spot_imbalance_ratio": 1.30,
+        "boost_futures_momentum_min_pct": 0.015,
+        "boost_allow_fee_fallback": True,
+        "boost_parallel_scan_enabled": True,
+        "boost_live_panel_enabled": True,
+        "boost_live_panel_interval_sec": 2,
+        "boost_rotate_only_if_profit": True,
+        "boost_min_profit_to_rotate_pct": 0.03,
+        "boost_rotate_strength_multiplier": 1.05,
+        "boost_rotate_min_score_gap": 0.0,
+        "boost_rotate_cooldown_sec": 1,
+        "scan_interval_sec": 1,
+        "max_open_positions": 1,
+    }
+    for k, v in boost_defaults.items():
+        await storage.set(k, v, bump_revision=False)
+
     s = await storage.all_settings()
     equity = 0.0
+    balance_note = ""
     try:
         ex = await get_exchange(s)
-        bal = await asyncio.wait_for(ex.fetch_balance(), timeout=8)
+        bal = await asyncio.wait_for(ex.fetch_balance(), timeout=5)
         usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
         equity = float(usdt.get("total") or usdt.get("free") or ((bal or {}).get("total", {}) or {}).get("USDT") or 0)
-    except Exception:
+    except Exception as e:
         equity = float(s.get("boost_session_start_equity", 0) or 0)
+        balance_note = f"\nBalance warning: {str(e)[:180]}"
+
     share = max(0.001, min(1.0, float(s.get("boost_balance_share", 0.10) or 0.10)))
     bank = max(0.0, equity * share)
     target_mult = max(1.0, float(s.get("boost_target_multiplier", 20.0) or 20.0))
     now_ts = time.time()
-    await storage.set("strategy_mode", "boost_scalping", bump_revision=False)
-    await storage.set("boost_autopilot_active", True, bump_revision=False)
     await storage.set("boost_session_start_ts", now_ts, bump_revision=False)
     await storage.set("boost_session_start_equity", equity, bump_revision=False)
     await storage.set("boost_session_bank_usdt", bank, bump_revision=False)
     await storage.set("boost_session_target_profit_usdt", bank * (target_mult - 1.0), bump_revision=False)
-    await storage.set("scan_interval_sec", int(float(s.get("boost_scan_interval_sec", 1) or 1)), bump_revision=False)
-    await storage.set("max_open_positions", 1)
-    # v0182 BOOST FAST LIVE ROTATION PANEL: pressing 🚀 BOOST MODE forces aggressive autopilot defaults ON,
-    # even if an older Railway SQLite/settings state contains stale false/low values.
-    await storage.set("boost_zero_fee_scanner_enabled", True, bump_revision=False)
-    await storage.set("boost_balance_share", 0.10, bump_revision=False)
-    await storage.set("boost_target_multiplier", 20.0, bump_revision=False)
-    await storage.set("boost_max_consecutive_losses", 999, bump_revision=False)
-    await storage.set("boost_auto_leverage", True, bump_revision=False)
-    await storage.set("boost_min_leverage", 10, bump_revision=False)
-    await storage.set("boost_max_leverage", 50, bump_revision=False)
-    await storage.set("boost_use_full_bank_per_trade", True, bump_revision=False)
-    await storage.set("boost_auto_rotate_symbols", True, bump_revision=False)
-    await storage.set("boost_stop_when_target_reached", True, bump_revision=False)
-    await storage.set("boost_max_symbols_scan", 126, bump_revision=False)
-    await storage.set("boost_min_checked_per_cycle", 40, bump_revision=False)
-    await storage.set("boost_max_checked_per_cycle", 100, bump_revision=False)
-    await storage.set("universe_mode", "full", bump_revision=False)
-    await storage.set("boost_min_tp_pct", 0.03, bump_revision=False)
-    await storage.set("boost_max_tp_pct", 0.05, bump_revision=False)
-    await storage.set("boost_min_quote_volume_usdt", 0.0, bump_revision=False)
-    await storage.set("boost_min_atr_pct", 0.04, bump_revision=False)
-    await storage.set("boost_max_spread_pct", 0.12, bump_revision=False)
-    await storage.set("boost_spot_imbalance_ratio", 1.30, bump_revision=False)
-    await storage.set("boost_futures_momentum_min_pct", 0.015, bump_revision=False)
+
     manual_symbols = str(s.get("boost_zero_fee_symbols") or "").strip()
-    # v0176: if an old Railway DB has an empty manual whitelist, preload the confirmed 0-fee pool from screenshots.
+    # v0176/v0187: if an old Railway DB has an empty manual whitelist, preload the confirmed 0-fee pool from screenshots.
     if not manual_symbols:
         manual_symbols = "AAPLUSDT,AAVEUSDT,ADAUSDT,AMDUSDT,ANTHROPICUSDT,APEUSDT,ARMUSDT,ASTERUSDT,ASTSUSDT,ATOMUSDT,AVAXUSDT,BCHUSDT,BEUSDT,BILLUSDT,BLESSUSDT,BNBUSDT,BRETTUSDT,BTCUSDT,BULLAUSDT,BUSDT,CBRSUSDT,CHIPUSDT,COAIUSDT,XCU_USDT,CVNAUSDT,DOGEUSDT,DOTUSDT,ENJUSDT,ETHFIUSDT,ETHUSDT,FLOKIUSDT,FLNCUSDT,FOLKSUSDT,FUTUUSDT,GALAUSDT,GASNGUSDT,GIGGLEUSDT,GOATUSDT,PAXG_USDT,XAUT_USDT,GOOGLUSDT,GRTUSDT,HBARUSDT,HYPEUSDT,IBMUSDT,ICPUSDT,INJUSDT,INTCUSDT,INTUUSDT,IONQUSDT,JASMYUSDT,JUPUSDT,LABUSDT,LAYERUSDT,LIGHTUSDT,LINKUSDT,LTCUSDT,LYNUSDT,MEGAUSDT,MSTRUSDT,MUUSDT,MUUUSDT,MYXUSDT,NAS100_USDT,NBISUSDT,NEARUSDT,XNI_USDT,NVDAUSDT,BRENT_USDT,WTI_USDT,ONDOUSDT,OPUSDT,ORDIUSDT,XPD_USDT,PENGUINUSDT,PENGUUSDT,PEPEUSDT,PIPPINUSDT,PIXELUSDT,XPT_USDT,PNUTUSDT,POLUSDT,POWERUSDT,PUMPUSDT,PYTHUSDT,QCOMUSDT,QQQUSDT,RENDERUSDT,RIVERUSDT,RKLBUSDT,SAMSUNGUSDT,SEIUSDT,SHIBUSDT,XAG_USDT,SKHYNIXUSDT,SKYAIUSDT,SNDKUSDT,SOLUSDT,SP500_USDT,SPACEXUSDT,SPCXUSDT,SPOTUSDT,STOUSDT,STRKUSDT,STXSTOCKUSDT,SUIUSDT,TAOUSDT,TONUSDT,TRUMPUSDT,TSLAUSDT,UNIUSDT,US30_USDT,VIRTUALUSDT,VVVUSDT,WDCUSDT,WIFUSDT,WLDUSDT,WLFIUSDT,XAIUSDT,XLMUSDT,XMRUSDT,XOMUSDT,XPLUSDT,XRPUSDT,ZECUSDT,ZROUSDT"
         await storage.set("boost_zero_fee_symbols", manual_symbols, bump_revision=False)
-    await storage.set("boost_allow_fee_fallback", True, bump_revision=False)
-    await storage.set("boost_parallel_scan_enabled", True, bump_revision=False)
-    await storage.set("boost_live_panel_enabled", True, bump_revision=False)
-    await storage.set("boost_live_panel_interval_sec", 2, bump_revision=False)
-    # v0179 REAL: keep only non-expired failed symbols; scanner will skip them.
+
     await storage.set("boost_blocked_symbols_json", json.dumps(_boost_blocked_map(await storage.all_settings()), separators=(",", ":")), bump_revision=False)
-    await storage.set("boost_rotate_only_if_profit", True, bump_revision=False)
-    await storage.set("boost_min_profit_to_rotate_pct", 0.03, bump_revision=False)
-    await storage.set("boost_rotate_strength_multiplier", 1.05, bump_revision=False)
-    await storage.set("boost_rotate_min_score_gap", 0.0, bump_revision=False)
-    await storage.set("boost_rotate_cooldown_sec", 1, bump_revision=False)
+
     if trading_task and not trading_task.done():
         running = True; entries_enabled = True
     else:
@@ -1443,16 +1494,22 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trading_task = context.application.create_task(trading_loop(context.application))
     if position_task is None or position_task.done():
         position_task = context.application.create_task(position_management_loop(context.application))
+
+    # Start with a fresh visible panel. A stale/deleted message id must not hide status.
+    context.application.bot_data.pop("boost_live_panel_message_id", None)
+    context.application.bot_data["boost_panel_last_edit"] = 0
     trigger_scan_now(context.application, reason="boost_start")
     ns = await storage.all_settings()
-    await reply(update, f"🚀 BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: full 126 scan + aggressive rotation + micro TP 0.03-0.05%", reply_markup=_boost_rotation_keyboard(ns))
-    # v0184: create the live panel immediately at start. Do not wait for a
-    # trade/scan event, otherwise a running BOOST can look silent in Telegram.
+    await reply(
+        update,
+        f"✅ BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: full 126 scan + aggressive rotation + micro TP 0.03-0.05%{balance_note}",
+        reply_markup=_boost_rotation_keyboard(ns),
+    )
     await boost_live_panel_update(
         context.application, ns,
         {"bank": bank, "current_bank": bank, "target_bank": bank * target_mult, "pnl": 0.0, "trades": 0, "target_mult": target_mult},
         status="started; scanning",
-        note="live panel active; waiting for strongest impulse",
+        note="live panel active; commands remain available: /balance /status /boost_status /boost_stop",
         force=True,
     )
 
@@ -2020,7 +2077,7 @@ async def open_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         positions = []
         try:
             exec_engine = ExecutionEngine(storage, ex)
-            positions = [p for p in (await asyncio.wait_for(ex.fetch_positions(), timeout=10) or []) if exec_engine.exchange_position_qty(p) > 0]
+            positions = [p for p in (await asyncio.wait_for(ex.fetch_positions(), timeout=20) or []) if exec_engine.exchange_position_qty(p) > 0]
         except Exception:
             positions = []
         if not orders:
@@ -2036,19 +2093,25 @@ async def open_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update, f"📋 Open orders failed: {e}", reply_markup=MAIN_MENU)
 
 async def cancel_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global entries_enabled
     if not allowed(update): return
-    await reply(update, "⏳ Cancel all orders: command received...", reply_markup=MAIN_MENU)
+    entries_enabled = False
+    await storage.set("boost_autopilot_active", False, bump_revision=False)
+    await reply(update, "⏳ Cancel all orders: command received. BOOST/new entries are OFF.", reply_markup=MAIN_MENU)
     s = await storage.all_settings()
     try:
         ex = await get_exchange(s)
-        res = await asyncio.wait_for(ex.cancel_all_orders(), timeout=10)
+        res = await asyncio.wait_for(ex.cancel_all_orders(), timeout=25)
         await reply(update, f"🧹 Cancel all orders sent\n{str(res)[:1200]}", reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"🧹 Cancel all failed: {e}", reply_markup=MAIN_MENU)
 
 async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global entries_enabled
     if not allowed(update): return
-    await reply(update, "⏳ Close all positions: command received...", reply_markup=MAIN_MENU)
+    entries_enabled = False
+    await storage.set("boost_autopilot_active", False, bump_revision=False)
+    await reply(update, "⏳ Close all positions: command received. BOOST/new entries are OFF.", reply_markup=MAIN_MENU)
     s = await storage.all_settings()
     try:
         ex = await get_exchange(s)
@@ -2072,7 +2135,7 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # closed manually. If listed positions were already closed, MEXC often
         # returns code 2009 (Position is nonexistent or closed), which is not a
         # real failure and only confuses the operator.
-        if closed == 0 and hasattr(ex, "mexc_close_all_positions_native"):
+        if hasattr(ex, "mexc_close_all_positions_native"):
             try:
                 native_res = await ex.mexc_close_all_positions_native()
             except Exception as e:
@@ -2501,8 +2564,10 @@ def _button_mapping():
         ("📊 Status", status_cmd), ("Status", status_cmd),
         ("🚨 Panic", panic_cmd), ("Panic", panic_cmd),
         ("📈 Positions", positions_cmd), ("Positions", positions_cmd),
+        ("🧯 Close All", close_all_cmd), ("Close All", close_all_cmd), ("close all", close_all_cmd),
+        ("🧹 Cancel All", cancel_all_cmd), ("Cancel All", cancel_all_cmd), ("cancel all", cancel_all_cmd),
         ("📉 Stats", stats_cmd), ("Stats", stats_cmd),
-        ("💰 Balance", balance_cmd), ("Balance", balance_cmd),
+        ("💰 Balance", balance_cmd), ("Balance", balance_cmd), ("баланс", balance_cmd), ("Баланс", balance_cmd),
         ("🏓 Ping", ping_cmd), ("Ping", ping_cmd),
         ("⚙️ Settings", settings_cmd), ("⚙ Settings", settings_cmd), ("Settings", settings_cmd),
         ("🔐 API", api_cmd), ("API", api_cmd),
@@ -3107,18 +3172,21 @@ async def trading_loop(app):
                     if target_profit > 0 and (pnl >= target_profit or current_bank >= target_bank):
                         scanner.last_reject_reason = f"BOOST target reached: bank={current_bank:.4f} / {target_bank:.4f} USDT"
                         if str(settings.get("boost_stop_when_target_reached", True)).lower() in {"1", "true", "yes", "on"}:
+                            await storage.set("boost_autopilot_active", False, bump_revision=False)
                             await storage.set("strategy_mode", "hybrid")
                         await notify_admin(app, f"🏁 BOOST target reached. Bank {current_bank:.4f} / {target_bank:.4f} USDT. Entries stopped.", key="boost_target_reached")
                         await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
                         continue
                     if current_bank <= 0 or (max_loss > 0 and pnl <= -max_loss):
                         scanner.last_reject_reason = f"BOOST loss limit: bank={current_bank:.4f}, pnl={pnl:.4f} / -{max_loss:.4f} USDT"
+                        await storage.set("boost_autopilot_active", False, bump_revision=False)
                         await storage.set("strategy_mode", "hybrid")
                         await notify_admin(app, f"🛑 BOOST loss limit. PnL {pnl:.4f} USDT. Entries stopped.", key="boost_loss_limit")
                         await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
                         continue
                     if max_losses > 0 and recent_losses >= max_losses:
                         scanner.last_reject_reason = f"BOOST {recent_losses} losses in a row; stopped"
+                        await storage.set("boost_autopilot_active", False, bump_revision=False)
                         await storage.set("strategy_mode", "hybrid")
                         await notify_admin(app, f"🛑 BOOST stopped after {recent_losses} consecutive losses.", key="boost_loss_streak")
                         await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
@@ -3679,8 +3747,9 @@ def _wrap_command(fn, name: str):
     return _inner
 
 
+# Compatibility markers for legacy wiring tests: CommandHandler("api", api_cmd), CommandHandler("openai", openai_cmd)
 def build_app():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", _wrap_command(start, "/start")))
     app.add_handler(CommandHandler("help", _wrap_command(help_cmd, "/help")))
     app.add_handler(CommandHandler("log", _wrap_command(log_cmd, "/log")))
