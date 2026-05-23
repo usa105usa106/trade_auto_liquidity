@@ -48,11 +48,11 @@ def _norm_symbol(x: str) -> str:
 
 
 class BoostScalpingEngine:
-    """v0174 aggressive boost autopilot scanner.
+    """BOOST HUNTER live engine.
 
-    It does NOT rely on AI. First it asks MEXC for account-specific 0-fee
-    futures symbols, then ranks only active/liquid markets. If 0-fee cannot be
-    verified, it returns WAIT by default.
+    It does NOT trade every scan. It searches the 0-fee universe, builds a hotlist,
+    deep-checks only abnormal momentum, arms a candidate, and enters only after
+    confirmation. Telegram receives high-level HUD events; /log receives details.
     """
 
     def __init__(self):
@@ -60,6 +60,9 @@ class BoostScalpingEngine:
         self._fee_cache: tuple[float, list[str]] = (0.0, [])
         self._scan_cursor: int = 0
         self._hot_cache: tuple[float, list[str], list[dict]] = (0.0, [], [])
+        # v0205: HUNTER uses confirmation memory so a single noisy tick does not enter,
+        # while a real impulse is armed then fired on the next fast cycle.
+        self._confirm_cache: dict[str, dict] = {}
 
     async def zero_fee_symbols(self, exchange_client, settings: dict) -> list[str]:
         ttl = 600.0
@@ -201,6 +204,12 @@ class BoostScalpingEngine:
             same_dir = r1 < 0 and r3 < 0
         if not same_dir:
             return {**base, "ok": False, "reason": f"HUNTER no-trade: no same-dir confirmation r1={r1:.3f}% r3={r3:.3f}%"}
+        # Anti-chop: do not enter when the 1m candle is tiny versus spread/ATR.
+        # This blocks fake hotlist coins where the 3m move already happened and
+        # the current impulse is no longer paying for live spread/slippage.
+        min_live_1m = max(spread * 2.0 + _f(settings.get("boost_live_slippage_buffer_pct"), 0.035), atr * 0.25)
+        if abs(r1) < min_live_1m:
+            return {**base, "ok": False, "reason": f"HUNTER no-trade: live 1m {abs(r1):.3f}% < {min_live_1m:.3f}% cost/ATR gate"}
         if move < min_r3:
             return {**base, "ok": False, "reason": f"HUNTER no-trade: move {move:.3f}% < {min_r3:.3f}%"}
         if accel < min_accel:
@@ -218,7 +227,11 @@ class BoostScalpingEngine:
         return {**base, "ok": True, "score": hunter_score, "strength": strength, "hunter_score": hunter_score, "accel": accel, "move": move, "reason": f"HUNTER {side} score={hunter_score:.1f} move={move:.3f}% accel={accel:.3f}% ratio={ratio:.2f} atr={atr:.3f}%"}
 
     async def _hot_symbols(self, exchange_client, settings: dict, symbols: list[str]) -> tuple[list[str], list[dict]]:
-        """Every 5 minutes choose the hottest zero-fee symbols, then deep-scan only this hotlist every 1-3s."""
+        """Market radar: every 5 minutes choose the hottest zero-fee symbols.
+
+        The fast loop then scans this hotlist every 1-3 seconds. This is intentional:
+        the bot searches often, but trades rarely.
+        """
         now = time.time()
         refresh_sec = max(30.0, float(settings.get("boost_hotlist_refresh_sec", 300) or 300))
         hot_n = max(5, int(float(settings.get("boost_hotlist_size", 30) or 30)))
@@ -289,21 +302,50 @@ class BoostScalpingEngine:
                     return sym, None, {"ok": False, "reason": str(e)[:120]}
         results = await asyncio.gather(*(guarded(s) for s in scan_symbols))
         for sym, market, res in results:
+            reason = str((res or {}).get("reason") or "").strip()
+            if market and not reason:
+                reason = (
+                    f"rejected: spread={_f(market.get('spread_pct'), 0):.3f}% "
+                    f"atr={_f(market.get('atr_1m_pct'), 0):.3f}% "
+                    f"r1={_f(market.get('ret_1m_pct'), 0):.3f}% "
+                    f"r3={_f(market.get('ret_3m_pct'), 0):.3f}% "
+                    f"vol={_f(market.get('quote_volume_usdt'), 0):.0f}"
+                )
+            elif not reason:
+                reason = "snapshot failed/timeout"
             if market:
-                checked.append({"symbol": sym, "ok": res.get("ok"), "reason": res.get("reason"), "score": res.get("score", 0), "hunter_score": res.get("hunter_score"), "accel": res.get("accel"), **{k: market.get(k) for k in ("price","spread_pct","atr_1m_pct","ret_1m_pct","ret_3m_pct","quote_volume_usdt")}})
+                row = {"symbol": sym, "ok": bool(res.get("ok")), "reason": reason, "score": res.get("score", 0), "hunter_score": res.get("hunter_score"), "accel": res.get("accel"), **{k: market.get(k) for k in ("price","spread_pct","atr_1m_pct","ret_1m_pct","ret_3m_pct","quote_volume_usdt")}}
+                checked.append(row)
             else:
-                checked.append({"symbol": sym, "ok": False, "reason": res.get("reason")})
+                checked.append({"symbol": sym, "ok": False, "reason": reason})
             if market and res.get("ok") and (best is None or _f(res.get("score"), 0) > _f(best[0].get("score"), 0)):
                 best = (res, market)
         ok_candidates = sorted([c for c in checked if c.get("ok")], key=lambda c: _f(c.get("score"), 0.0), reverse=True)[:20]
-        log_event("boost_deep_scan_done", stage="deep_scan", ok=True, checked=len(checked), candidates=len(ok_candidates), best=(ok_candidates[0] if ok_candidates else None))
+        rejected_top = sorted([c for c in checked if not c.get("ok")], key=lambda c: abs(_f(c.get("ret_3m_pct"), 0.0)) + _f(c.get("atr_1m_pct"), 0.0), reverse=True)[:8]
+        log_event("boost_deep_scan_done", stage="deep_scan", ok=True, checked=len(checked), candidates=len(ok_candidates), best=(ok_candidates[0] if ok_candidates else None), top_rejects=rejected_top[:5])
         if not best:
-            why = "; ".join(f"{c.get('symbol')}:{c.get('reason')}" for c in checked[:5])
-            return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason=("HUNTER no-trade: " + why)[:260], model="boost_hunter_autopilot", market={"markets": checked, "checked": checked, "hotlist": hot_ranked, "universe_total": len(symbols), "loaded": len(symbols), "hot_total": total, "ai_candidates": 0})
+            why = "; ".join(f"{c.get('symbol')}:{c.get('reason')}" for c in rejected_top[:5] or checked[:5])
+            return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason=("HUNTER no-trade: " + why)[:380], model="boost_hunter_autopilot", market={"markets": checked, "checked": checked, "hotlist": hot_ranked, "universe_total": len(symbols), "loaded": len(symbols), "hot_total": total, "ai_candidates": 0, "top_rejects": rejected_top})
         res, market = best
         market["boost_score"] = _r(_f(res.get("score"), 0.0), 4)
         market["boost_strength"] = _r(_f(res.get("strength"), 0.0), 4)
+
+        # v0205 HUNTER_ARMED: require N fast confirmations for the same symbol+side.
+        # This avoids instant live entries on one bad tick, but does not freeze: /log and
+        # live-panel show ARMED 1/N until confirmation completes.
+        need_conf = max(1, int(float(settings.get("boost_hunter_entry_confirmations", 2) or 2)))
+        cache_ttl = max(2.0, float(settings.get("boost_hunter_confirm_ttl_sec", 8) or 8))
+        now = time.time()
+        key = f"{_norm_symbol(str(market.get('symbol') or ''))}:{res.get('side')}"
+        prev = self._confirm_cache.get(key) or {}
+        count = int(prev.get("count") or 0) + 1 if now - float(prev.get("ts") or 0) <= cache_ttl else 1
+        self._confirm_cache = {key: {"count": count, "ts": now, "reason": res.get("reason"), "score": res.get("score")}}
+        if count < need_conf:
+            log_event("boost_hunter_armed", stage="confirm", ok=True, symbol=market.get("symbol"), side=res.get("side"), confirm=count, need=need_conf, reason=str(res.get("reason") or "")[:220])
+            return AIScalpDecision(ok=True, symbol=market.get("symbol"), decision="WAIT", confidence=0.0, reason=f"HUNTER ARMED {count}/{need_conf}: {res.get('side')} {market.get('symbol')} | {res.get('reason')}", model="boost_hunter_autopilot", market={"markets": [market], "checked": checked, "hotlist": hot_ranked, "universe_total": len(symbols), "loaded": len(symbols), "hot_total": total, "ai_candidates": len(ok_candidates), "top_candidates": ok_candidates, "armed": {"symbol": market.get("symbol"), "side": res.get("side"), "confirm": count, "need": need_conf}}, tp_strength=_f(res.get("strength"), 0.0))
+
         conf = max(0.72, min(0.96, 0.72 + _f(res.get("strength"), 0.0) * 0.24))
+        log_event("boost_hunter_confirmed", stage="confirm", ok=True, symbol=market.get("symbol"), side=res.get("side"), confirm=count, need=need_conf, score=_f(res.get("score"), 0.0), reason=str(res.get("reason") or "")[:220])
         return AIScalpDecision(ok=True, symbol=market.get("symbol"), decision=res.get("side"), confidence=conf, reason=res.get("reason"), model="boost_hunter_autopilot", market={"markets": [market], "checked": checked, "hotlist": hot_ranked, "universe_total": len(symbols), "loaded": len(symbols), "hot_total": total, "ai_candidates": len(ok_candidates), "top_candidates": ok_candidates}, tp_strength=_f(res.get("strength"), 0.0))
 
     def _auto_leverage(self, market: dict, strength: float, settings: dict) -> int:
@@ -331,8 +373,12 @@ class BoostScalpingEngine:
         price = _f(market.get("price"), 0.0)
         if price <= 0:
             return None
-        min_tp = max(0.01, _f(settings.get("boost_min_tp_pct"), 0.18))
-        max_tp = max(min_tp, _f(settings.get("boost_max_tp_pct"), 0.55))
+        # No fixed hard TP scalping in HUNTER: this value is only a virtual
+        # reference for display/plan compatibility. Real exits are managed by
+        # live trailing + momentum decay in the BOOST loop. Exchange protection
+        # is emergency SL only.
+        min_tp = max(0.01, _f(settings.get("boost_min_tp_pct"), 0.22))
+        max_tp = max(min_tp, _f(settings.get("boost_max_tp_pct"), 0.90))
         strength = max(0.0, min(1.0, _f(decision.tp_strength, 0.0)))
         spread = max(0.0, _f(market.get("spread_pct"), 0.0))
         atr = max(0.01, _f(market.get("atr_1m_pct"), 0.10))
@@ -362,6 +408,10 @@ class BoostScalpingEngine:
             "atr_pct": max(0.01, _f(market.get("atr_1m_pct"), 0.10)),
             "ai_scalping_tp_pct": _r(tp, 4),
             "ai_scalping_sl_pct": _r(sl, 4),
+            "boost_virtual_tp_pct": _r(tp, 4),
+            "boost_emergency_sl_pct": _r(sl, 4),
+            "boost_exit_mode": "live_trailing_momentum_decay",
+            "boost_exchange_protection": "emergency_sl_only",
             "risk_pct": risk_pct,
             "trade_margin_pct": margin_pct,
             "leverage": leverage,

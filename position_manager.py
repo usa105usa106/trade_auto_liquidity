@@ -453,7 +453,7 @@ class PositionManager:
                 mode = str(pos.get("protection_mode") or "").lower()
                 status_txt = str(pos.get("protection_status") or "").upper()
                 monitor_only = str(await self._setting("boost_no_exchange_protection_monitor_only", os.getenv("BOOST_NO_EXCHANGE_PROTECTION_MONITOR_ONLY", "true"))).lower() in {"1", "true", "yes", "on"}
-                boost_monitor_only_no_exchange = monitor_only and not (mode == "exchange" or status_txt in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP"})
+                boost_monitor_only_no_exchange = monitor_only and not (mode in {"exchange", "exchange_emergency_sl_only"} or status_txt in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP", "EMERGENCY SL ONLY"})
 
             if side=="LONG":
                 if take and price>=take:

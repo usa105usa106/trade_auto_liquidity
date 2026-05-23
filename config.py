@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0203 BOOST HUNTER AUTOPILOT")
+VERSION = os.getenv("BOT_VERSION", "0208 HUNTER LIVE ENGINE")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -147,14 +147,14 @@ class Defaults:
     boost_auto_rotate_symbols: bool = env_bool("BOOST_AUTO_ROTATE_SYMBOLS", True)
     boost_stop_when_target_reached: bool = env_bool("BOOST_STOP_WHEN_TARGET_REACHED", True)
     boost_max_symbols_scan: int = env_int("BOOST_MAX_SYMBOLS_SCAN", 300)
-    boost_min_quote_volume_usdt: float = env_float("BOOST_MIN_QUOTE_VOLUME_USDT", 3000000.0)
-    boost_min_atr_pct: float = env_float("BOOST_MIN_ATR_PCT", 0.04)
+    boost_min_quote_volume_usdt: float = env_float("BOOST_MIN_QUOTE_VOLUME_USDT", 2500000.0)
+    boost_min_atr_pct: float = env_float("BOOST_MIN_ATR_PCT", 0.06)
     boost_max_spread_pct: float = env_float("BOOST_MAX_SPREAD_PCT", 0.045)
-    boost_spot_imbalance_ratio: float = env_float("BOOST_SPOT_IMBALANCE_RATIO", 1.30)
-    boost_futures_momentum_min_pct: float = env_float("BOOST_FUTURES_MOMENTUM_MIN_PCT", 0.045)
+    boost_spot_imbalance_ratio: float = env_float("BOOST_SPOT_IMBALANCE_RATIO", 1.45)
+    boost_futures_momentum_min_pct: float = env_float("BOOST_FUTURES_MOMENTUM_MIN_PCT", 0.09)
     boost_futures_max_against_pct: float = env_float("BOOST_FUTURES_MAX_AGAINST_PCT", 0.02)
-    boost_min_tp_pct: float = env_float("BOOST_MIN_TP_PCT", 0.12)
-    boost_max_tp_pct: float = env_float("BOOST_MAX_TP_PCT", 0.32)
+    boost_min_tp_pct: float = env_float("BOOST_MIN_TP_PCT", 0.16)
+    boost_max_tp_pct: float = env_float("BOOST_MAX_TP_PCT", 0.48)
     boost_sl_tp_multiplier: float = env_float("BOOST_SL_TP_MULTIPLIER", 2.40)
     boost_scan_interval_sec: int = env_int("BOOST_SCAN_INTERVAL_SEC", 1)
     boost_allow_fee_fallback: bool = env_bool("BOOST_ALLOW_FEE_FALLBACK", True)

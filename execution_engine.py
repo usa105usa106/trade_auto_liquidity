@@ -561,6 +561,7 @@ class ExecutionEngine:
                             and not bool(pos.get("liquidation_stop_mode"))
                             and float(pos.get("take_price") or 0) > 0
                             and float(pos.get("stop_price") or 0) > 0
+                            and not (str(pos.get("strategy") or "").lower() == "boost_scalping" and self._truthy(await self._setting("boost_emergency_sl_only", os.getenv("BOOST_EMERGENCY_SL_ONLY", "true")), True))
                         ):
                             try:
                                 # v0183: use the SAME safe-distance normalisation for BOOST direct
@@ -638,12 +639,17 @@ class ExecutionEngine:
                         # v0181: BOOST must not immediately market-close just because MEXC did not
                         # confirm native TP/SL fast enough. The separate BOOST/local fast loop
                         # remains the primary exit engine, while watchdog keeps trying TP/SL.
+                        unsafe = bool(protection.get("boost_unsafe_position")) or str(protection.get("protection_mode") or "") == "unsafe_no_emergency_sl"
                         protection.update({
                             "ok": True,
-                            "protection_status": "LOCAL_FAST_PROTECTED",
-                            "protection_mode": "local_fast",
-                            "protection_note": "exchange TP/SL not confirmed; BOOST local fast monitor active; no forced close",
+                            "protection_status": "UNSAFE POSITION" if unsafe else "LOCAL_FAST_PROTECTED",
+                            "protection_mode": "unsafe_no_emergency_sl" if unsafe else "local_fast",
+                            "protection_note": ("BOOST emergency SL failed; defensive mode active; no aggressive hold/rotation" if unsafe else "exchange TP/SL not confirmed; BOOST local fast monitor active; no forced close"),
                             "boost_live_safe_execution": True,
+                            "boost_unsafe_position": unsafe,
+                            "boost_defensive_mode": unsafe,
+                            "boost_unsafe_since": time.time() if unsafe else 0,
+                            "boost_unsafe_reason": str(protection.get("boost_unsafe_reason") or protection.get("sl_error") or protection.get("protection_warning") or "")[:500],
                         })
                         pos.update(protection)
                         pos["updated_at"] = time.time()
@@ -985,6 +991,30 @@ class ExecutionEngine:
                     out["liquidation_stop_mode"] = True
                 except Exception as e:
                     out["tp_error"] = str(e)[:500]
+            elif strategy_name_for_protection == "boost_scalping" and self._truthy(await self._setting("boost_emergency_sl_only", os.getenv("BOOST_EMERGENCY_SL_ONLY", "true")), True):
+                # HUNTER BOOST: exchange protection is emergency SL only.
+                # No fixed TP is placed on the exchange; live trailing/momentum decay exits
+                # the position in profit. This avoids old planorder TP/SL fallback problems
+                # and prevents the bot from harvesting tiny live losses.
+                try:
+                    if sl > 0:
+                        log_event("boost_emergency_sl_request", symbol=symbol, side=side, qty=qty, stop_price=sl, attempt=i + 1)
+                        order = await self._create_stop_market_order(symbol, side, qty, sl)
+                        out["sl_order_id"] = order.get("id")
+                        out["sl_raw"] = order
+                        out["sl_exists"] = True
+                        out["tp_exists"] = True
+                        out["tp_order_id"] = "LIVE_TRAILING_NO_FIXED_TP"
+                        out["protection_mode"] = "exchange_emergency_sl_only"
+                        out["protection_status"] = "EMERGENCY SL ONLY"
+                        out["protection_note"] = "HUNTER live exit manages profit; exchange has emergency SL only"
+                        out["ok"] = True
+                        log_event("boost_emergency_sl_response", symbol=symbol, side=side, stop_price=sl, order=order, ok=True)
+                    else:
+                        out["sl_error"] = "missing stop_price"
+                except Exception as e:
+                    out["sl_error"] = str(e)[:800]
+                    log_event("error_boost_emergency_sl", symbol=symbol, side=side, qty=qty, stop_price=sl, attempt=i + 1, error=str(e), ok=False)
             elif str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc" and hasattr(self.exchange_client, "mexc_place_tpsl_by_position"):
                 # v0160: MEXC native by-position TP/SL FIRST, using confirmed live position row.
                 # Use /api/v1/private/stoporder/place with positionId + holdVol;
@@ -1082,13 +1112,24 @@ class ExecutionEngine:
                 out["protection_status"] = "TP + LIQUIDATION STOP" if out["ok"] else "LOCAL BOT PROTECTED"
                 out["protection_mode"] = "exchange_tp_liquidation_sl" if out["ok"] else "local_monitoring"
             else:
-                verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), str(out.get("sl_order_id") or ""))
-                out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})
-                # v0148 strict exchange-first check: a returned id is not enough.
-                # TP/SL must be visible through MEXC open/plan/stop/TP-SL endpoints.
-                out["ok"] = bool(out.get("tp_exists") and out.get("sl_exists"))
-                out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
-                out["protection_mode"] = "exchange" if out["ok"] else "local_monitoring"
+                if strategy_name_for_protection == "boost_scalping" and self._truthy(await self._setting("boost_emergency_sl_only", os.getenv("BOOST_EMERGENCY_SL_ONLY", "true")), True) and out.get("sl_order_id"):
+                    # Only SL has to exist in HUNTER mode. Do not require a TP order.
+                    out["tp_exists"] = True
+                    out["tp_order_id"] = out.get("tp_order_id") or "LIVE_TRAILING_NO_FIXED_TP"
+                    out["sl_exists"] = True
+                    out["ok"] = True
+                    out["protection_status"] = "EMERGENCY SL ONLY"
+                    out["protection_mode"] = "exchange_emergency_sl_only"
+                    out["boost_unsafe_position"] = False
+                    out["boost_defensive_mode"] = False
+                else:
+                    verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), str(out.get("sl_order_id") or ""))
+                    out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})
+                    # v0148 strict exchange-first check: a returned id is not enough.
+                    # TP/SL must be visible through MEXC open/plan/stop/TP-SL endpoints.
+                    out["ok"] = bool(out.get("tp_exists") and out.get("sl_exists"))
+                    out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
+                    out["protection_mode"] = "exchange" if out["ok"] else "local_monitoring"
             log_event("protection_attempt_result", symbol=symbol, side=side, attempt=i + 1, ok=out.get("ok"), tp_exists=out.get("tp_exists"), sl_exists=out.get("sl_exists"), tp_order_id=out.get("tp_order_id"), sl_order_id=out.get("sl_order_id"), tpsl_error=out.get("tpsl_error"), tp_error=out.get("tp_error"), sl_error=out.get("sl_error"), verify_error=out.get("verify_error"))
             history.append({k: v for k, v in out.items() if k not in {"tp_raw", "sl_raw"}})
             best = out
@@ -1100,8 +1141,20 @@ class ExecutionEngine:
         best["protection_status"] = "LOCAL BOT PROTECTED"
         best["protection_mode"] = "local_monitoring"
         best["protection_attempts"] = history
-        best["protection_warning"] = "exchange protection not confirmed after 3 attempts; caller must close unprotected position"
-        log_event("error_protection_failed_final", symbol=symbol, side=side, qty=qty, take_price=pos.get("take_price"), stop_price=pos.get("stop_price"), attempts=history, ok=False)
+        best["protection_warning"] = "exchange protection not confirmed after attempts"
+        if strategy_name_for_protection == "boost_scalping" and self._truthy(await self._setting("boost_emergency_sl_only", os.getenv("BOOST_EMERGENCY_SL_ONLY", "true")), True):
+            # v0209: HUNTER UNSAFE state. Entry may already be live, but the exchange
+            # emergency SL is missing. Do not pretend this is normal local protection:
+            # the BOOST loop will switch to defensive mode, retry the SL, disable
+            # aggressive rotation/rescue, and exit faster only when real profit exists.
+            best["ok"] = False
+            best["boost_unsafe_position"] = True
+            best["boost_defensive_mode"] = True
+            best["protection_status"] = "UNSAFE POSITION"
+            best["protection_mode"] = "unsafe_no_emergency_sl"
+            best["protection_warning"] = "BOOST emergency exchange SL failed; defensive live monitoring enabled"
+            best["boost_unsafe_reason"] = str(best.get("sl_error") or best.get("verify_error") or "emergency SL not confirmed")[:500]
+        log_event("error_protection_failed_final", symbol=symbol, side=side, qty=qty, take_price=pos.get("take_price"), stop_price=pos.get("stop_price"), attempts=history, ok=False, boost_unsafe=best.get("boost_unsafe_position", False))
         return best
 
     async def cancel_entry(self, pos: dict, live: bool, reason: str = "limit_timeout"):

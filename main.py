@@ -1196,12 +1196,169 @@ def _short_symbol(symbol: str) -> str:
     return str(symbol or "-").replace("/", "_").replace(":USDT", "")
 
 
+
+def _boost_store_live_state(app, settings: dict | None = None, snap: dict | None = None, *, status: str = "scan", decision=None, position: dict | None = None, note: str = "") -> None:
+    """Store latest BOOST state for the independent Telegram live watchdog.
+
+    The trading loop can be busy on MEXC REST. The watchdog uses this cache to
+    keep Telegram alive instead of waiting for the next scanner branch.
+    """
+    try:
+        app.bot_data["boost_live_last_state"] = {
+            "ts": time.time(),
+            "settings": dict(settings or {}),
+            "snap": dict(snap or {}),
+            "status": str(status or "scan")[:120],
+            "note": str(note or "")[:500],
+            "position": dict(position or {}) if isinstance(position, dict) else None,
+            "decision_symbol": str(getattr(decision, "symbol", "") or "")[:80] if decision is not None else "",
+            "decision_side": str(getattr(decision, "decision", "") or "")[:24] if decision is not None else "",
+            "decision_conf": float(getattr(decision, "confidence", 0) or 0) if decision is not None else 0.0,
+            "decision_reason": str(getattr(decision, "reason", "") or "")[:260] if decision is not None else "",
+        }
+    except Exception:
+        pass
+
+
+class _BoostCachedDecision:
+    def __init__(self, state: dict):
+        self.symbol = state.get("decision_symbol", "")
+        self.decision = state.get("decision_side", "")
+        self.confidence = state.get("decision_conf", 0.0)
+        self.reason = state.get("decision_reason", "")
+        self.market = {"markets": [{"symbol": self.symbol}]}
+
+
+async def _boost_live_panel_watchdog(app) -> None:
+    """Independent BOOST Telegram heartbeat.
+
+    This is intentionally separate from the trading loop. If scanning/execution is
+    slow or waiting on MEXC, the chat still receives a fresh bottom panel and /log
+    gets visible heartbeat/error events.
+    """
+    log_event("boost_live_panel_watchdog", stage="started", ok=True)
+    while True:
+        try:
+            settings = await storage.all_settings()
+            if not _is_boost_runtime_armed(app, settings):
+                break
+            if not _bool_setting(settings, "boost_live_panel_enabled", True):
+                await asyncio.sleep(2)
+                continue
+            state = dict(app.bot_data.get("boost_live_last_state") or {})
+            snap = dict(state.get("snap") or {})
+            if not snap:
+                try:
+                    snap = await _boost_session_snapshot(settings)
+                except Exception:
+                    bank = float(settings.get("boost_session_bank_usdt", 0) or 0)
+                    mult = float(settings.get("boost_target_multiplier", 20) or 20)
+                    snap = {"bank": bank, "current_bank": bank, "target_bank": bank * mult, "pnl": 0.0, "trades": 0, "target_mult": mult}
+            decision = _BoostCachedDecision(state) if state.get("decision_symbol") or state.get("decision_reason") else None
+            age = time.time() - float(state.get("ts", 0) or 0)
+            status = state.get("status") or "hunter scanning"
+            note = state.get("note") or "watchdog: BOOST live feed active"
+            if age > 8:
+                note = f"watchdog heartbeat; trading loop last update {age:.0f}s ago. {note}"[:500]
+            # v0207: watchdog must NOT spam Telegram. It only refreshes the
+            # cached HUD on a slow heartbeat; important events are still sent
+            # immediately by the trading loop with force=True.
+            await boost_live_panel_update(
+                app,
+                settings,
+                snap,
+                status=status,
+                decision=decision,
+                position=state.get("position"),
+                note=note,
+                force=False,
+            )
+            await asyncio.sleep(max(5.0, float(settings.get("boost_live_watchdog_tick_sec", 5) or 5)))
+        except asyncio.CancelledError:
+            log_event("boost_live_panel_watchdog", stage="cancelled", ok=True)
+            raise
+        except Exception as e:
+            log_event("boost_live_panel_watchdog", stage="error", ok=False, error=str(e)[:500])
+            await asyncio.sleep(3)
+    log_event("boost_live_panel_watchdog", stage="stopped", ok=True)
+
+
+
+
+def _boost_hud_status_key(status: str, decision=None, position: dict | None = None) -> str:
+    """Coarse event key for the Telegram trader HUD.
+
+    The chat is a trader HUD, not a debug console. Scanner noise may update the
+    in-memory cache and /log, but Telegram is allowed to move/send the panel only
+    on important state transitions or on a slow heartbeat.
+    """
+    st = str(status or "").strip().lower()
+    if any(x in st for x in ("opened", "entry", "rotation opened")):
+        sym = str(getattr(decision, "symbol", "") or (position or {}).get("symbol") or "")
+        side = str(getattr(decision, "decision", "") or (position or {}).get("side") or "")
+        return f"entry:{sym}:{side}"
+    if any(x in st for x in ("rotated", "rotation")):
+        sym = str(getattr(decision, "symbol", "") or "")
+        return f"rotation:{sym}"
+    if any(x in st for x in ("target", "completed")):
+        return "target"
+    if any(x in st for x in ("stopped", "stop")):
+        return "stopped"
+    if any(x in st for x in ("blocked", "symbol blocked")):
+        return "blocked"
+    if "error" in st or "failed" in st:
+        return "error"
+    if any(x in st for x in ("armed", "confirmed")):
+        sym = str(getattr(decision, "symbol", "") or "")
+        return f"armed:{sym}"
+    if position:
+        sym = str((position or {}).get("symbol") or "")
+        side = str((position or {}).get("side") or "")
+        return f"active:{sym}:{side}"
+    if "waiting" in st or "scanning" in st or "scan" in st:
+        return "scanning"
+    return st[:60] or "unknown"
+
+
+def _boost_hud_is_important(status: str, decision=None, position: dict | None = None, *, force: bool = False) -> bool:
+    st = str(status or "").lower()
+    if any(x in st for x in (
+        "started", "opened", "entry", "rotation", "rotated", "target", "completed",
+        "stopped", "blocked", "error", "failed", "armed", "confirmed", "profit", "tp", "sl", "unsafe", "defensive",
+    )):
+        return True
+    # force=True from scanner wait/reject branches is intentionally ignored unless
+    # it is an important event; otherwise Telegram becomes unreadable.
+    return False
+
+
+def _boost_hud_clean_note(note: str, status: str = "") -> str:
+    raw = str(note or "").strip()
+    low = raw.lower()
+    st = str(status or "").lower()
+    if not raw:
+        if "scan" in st or "wait" in st:
+            return "Жду EXTREME impulse. Технические детали смотри в /log."
+        return ""
+    # Hide per-symbol reject spam from Telegram. Full details stay in /log.
+    if "unsafe position" in low or "emergency sl" in low:
+        return raw[:260]
+    if "hunter no-trade" in low:
+        return "NO-TRADE: нет подтверждённого EXTREME impulse. Детали по монетам — в /log."
+    if raw.count("/USDT") >= 2 or raw.count(";") >= 2:
+        return "Сканер работает. Подробные reject reasons не спамлю в чат — смотри /log."
+    if "126 zero-fee" in low or "hotlist" in low:
+        return "Сканирую zero-fee hotlist, вход только по сильному подтверждённому импульсу."
+    return raw[:220]
+
 async def boost_live_panel_update(app, settings: dict, snap: dict, *, status: str = "scan", decision=None, position: dict | None = None, note: str = "", force: bool = False) -> None:
     """Keep one BOOST live Telegram panel at the bottom: delete old panel, send fresh panel."""
+    _boost_store_live_state(app, settings, snap, status=status, decision=decision, position=position, note=note)
     if not _bool_setting(settings, "boost_live_panel_enabled", True):
         return
     chat_id = first_admin_id()
     if not chat_id:
+        log_event("boost_live_panel", stage="no_admin_chat", ok=False)
         return
     lock = app.bot_data.get("boost_live_panel_lock")
     if lock is None:
@@ -1214,20 +1371,41 @@ async def boost_live_panel_update(app, settings: dict, snap: dict, *, status: st
 
 
 async def _boost_live_panel_update_locked(app, chat_id: int, settings: dict, snap: dict, *, status: str = "scan", decision=None, position: dict | None = None, note: str = "", force: bool = False) -> None:
-    interval = max(1, int(float(settings.get("boost_live_panel_interval_sec", 5) or 5)))
+    # v0207 anti-spam HUD: Telegram shows only high-value trader events.
+    # Low-level scan/reject details are stored in /log and in bot_data cache.
+    interval = max(15, int(float(settings.get("boost_live_panel_interval_sec", 30) or 30)))
+    heartbeat = max(interval, int(float(settings.get("boost_live_panel_heartbeat_sec", 60) or 60)))
     now = time.time()
-    if not force and now - float(app.bot_data.get("boost_panel_last_edit", 0) or 0) < interval:
-        return
+    event_key = _boost_hud_status_key(status, decision=decision, position=position)
+    last_key = str(app.bot_data.get("boost_live_panel_last_event_key") or "")
+    last_sent = float(app.bot_data.get("boost_panel_last_edit", 0) or 0)
+    important = _boost_hud_is_important(status, decision=decision, position=position, force=force)
+
+    if not important:
+        # No scanner spam. Quiet states may refresh only on a slow heartbeat or
+        # when the coarse state changes, e.g. scanning -> active position.
+        if event_key == last_key and now - last_sent < heartbeat:
+            log_event("boost_live_panel", stage="throttled_quiet", ok=True, status=str(status)[:80], event_key=event_key)
+            return
+        if event_key != last_key and now - last_sent < interval:
+            log_event("boost_live_panel", stage="throttled_state_change", ok=True, status=str(status)[:80], event_key=event_key)
+            return
+    else:
+        # Important events are immediate, but still avoid duplicate bursts.
+        if event_key == last_key and now - last_sent < 8:
+            log_event("boost_live_panel", stage="throttled_duplicate_event", ok=True, status=str(status)[:80], event_key=event_key)
+            return
+
     rot = "ON" if _bool_setting(settings, "boost_parallel_scan_enabled", True) else "OFF"
+    clean_note = _boost_hud_clean_note(note, status)
+    pretty_status = str(status or "scan").replace(";", " / ")[:80]
     lines = [
-        "🚀 BOOST AUTOPILOT LIVE",
-        f"Status: {status}",
-        "Commands/buttons stay active: Balance / Status / Stop Boost / Close All / Cancel All",
-        f"Bank: {float(snap.get('current_bank') or 0):.4f} / {float(snap.get('target_bank') or 0):.4f} USDT",
-        f"Session PnL: {float(snap.get('pnl') or 0):+.4f} USDT | Trades: {snap.get('trades', 0)}",
-        f"Rotation while profit: {rot}",
-        f"Blocked symbols: {_boost_blocked_count(settings)}",
-        "Protection: if exchange TP/SL is missing, BOOST position is monitored; no forced negative close.",
+        "🚀 BOOST HUNTER HUD",
+        f"State: {pretty_status}",
+        f"Bank: {float(snap.get('current_bank') or 0):.4f} → {float(snap.get('target_bank') or 0):.4f} USDT",
+        f"PnL: {float(snap.get('pnl') or 0):+.4f} USDT | Trades: {snap.get('trades', 0)}",
+        f"Rotation: {rot} | Blocked: {_boost_blocked_count(settings)}",
+        "Chat: важные события. Debug/reject reasons: /log.",
     ]
     if position:
         try:
@@ -1235,23 +1413,27 @@ async def _boost_live_panel_update_locked(app, chat_id: int, settings: dict, sna
             side = str(position.get("side") or "-").upper()
             entry = float(position.get("entry_price") or 0)
             lev = position.get("leverage") or position.get("mexc_order_leverage") or "-"
+            prot = str(position.get("protection_status") or position.get("protection_mode") or "").upper()
             lines += ["", "Open trade:", f"{sym} {side} | lev {lev}x | entry {entry:.8g}"]
+            if _boost_position_is_unsafe(position):
+                lines += ["⚠ UNSAFE POSITION: emergency SL missing", "Mode: DEFENSIVE monitoring"]
+            elif prot:
+                lines += [f"Protection: {prot[:42]}"]
         except Exception:
             pass
-    if decision is not None:
+    if decision is not None and _boost_hud_is_important(status, decision=decision, position=position, force=force):
         try:
             mk = ((getattr(decision, "market", None) or {}).get("markets") or [{}])[0]
             lines += [
                 "",
-                "Scanner:",
-                f"Best: {_short_symbol(getattr(decision, 'symbol', '') or mk.get('symbol'))} {getattr(decision, 'decision', '-')}",
-                f"Conf: {float(getattr(decision, 'confidence', 0) or 0):.2f}",
-                f"Reason: {str(getattr(decision, 'reason', '') or '-')[:130]}",
+                "Signal:",
+                f"{_short_symbol(getattr(decision, 'symbol', '') or mk.get('symbol'))} {getattr(decision, 'decision', '-')}",
+                f"Confidence: {float(getattr(decision, 'confidence', 0) or 0):.2f}",
             ]
         except Exception:
             pass
-    if note:
-        lines += ["", f"Note: {note[:220]}"]
+    if clean_note:
+        lines += ["", f"Note: {clean_note}"]
     seq = int(app.bot_data.get("boost_live_panel_seq", 0) or 0) + 1
     app.bot_data["boost_live_panel_seq"] = seq
     lines.append(datetime.now(timezone(timedelta(hours=3))).strftime(f"\nUpdated: %H:%M:%S MSK | live #{seq}"))
@@ -1277,6 +1459,10 @@ async def _boost_live_panel_update_locked(app, chat_id: int, settings: dict, sna
             app.bot_data["boost_live_panel_message_id"] = new_id
             app.bot_data["boost_live_panel_message_ids"] = [new_id] if new_id else []
             app.bot_data["boost_panel_last_edit"] = now
+            app.bot_data["boost_live_panel_last_event_key"] = event_key
+            log_event("boost_live_panel", stage="sent", ok=True, message_id=int(new_id or 0), status=str(status)[:80], event_key=event_key, important=important)
+        else:
+            log_event("boost_live_panel", stage="send_returned_none", ok=False, status=str(status)[:80])
     except Exception as e:
         # v0187: never fail silently. If the live panel cannot be posted, send a
         # plain notification so BOOST activity is still visible in chat/logs.
@@ -1531,7 +1717,7 @@ async def _boost_start_worker(app):
             "boost_auto_leverage": True,
             "boost_min_leverage": 30,
             "boost_max_leverage": 50,
-            "boost_use_full_bank_per_trade": True,
+            "boost_use_full_bank_per_trade": False,
             "boost_auto_rotate_symbols": True,
             "boost_stop_when_target_reached": True,
             "boost_max_symbols_scan": 126,
@@ -1545,44 +1731,58 @@ async def _boost_start_worker(app):
             "boost_hotlist_size": 24,
             "boost_scan_concurrency": 8,
             "universe_mode": "full",
-            # v0203 HUNTER: do not trade ordinary noise. Wait for extreme impulse.
+            # v0205 HUNTER: do not trade ordinary noise. Wait for extreme impulse.
             "boost_hunter_mode": True,
-            "boost_hunter_min_score": 105.0,
-            "boost_hunter_extreme_score": 145.0,
-            "boost_hunter_min_accel_pct": 0.05,
-            "boost_hunter_min_move_3m_pct": 0.22,
-            "boost_hunter_max_wick_pct": 0.42,
+            "boost_hunter_min_score": 112.0,
+            "boost_hunter_extreme_score": 155.0,
+            "boost_hunter_min_accel_pct": 0.035,
+            "boost_hunter_min_move_3m_pct": 0.24,
+            "boost_hunter_max_wick_pct": 0.44,
             "boost_hunter_no_trade_cooldown_sec": 12,
             "boost_hunter_entry_confirmations": 2,
+            "boost_hunter_confirm_ttl_sec": 8,
             "boost_momentum_decay_exit_enabled": True,
-            "boost_momentum_decay_min_profit_pct": 0.04,
-            "boost_min_tp_pct": 0.18,
-            "boost_max_tp_pct": 0.55,
-            "boost_live_min_exchange_profit_pct": 0.10,
-            "boost_min_quote_volume_usdt": 5000000.0,
-            "boost_min_atr_pct": 0.10,
+            "boost_momentum_decay_min_profit_pct": 0.12,
+            "boost_min_tp_pct": 0.22,
+            "boost_max_tp_pct": 0.90,
+            "boost_live_min_exchange_profit_pct": 0.12,
+            "boost_min_quote_volume_usdt": 2500000.0,
+            "boost_min_atr_pct": 0.08,
             "boost_max_spread_pct": 0.035,
-            "boost_spot_imbalance_ratio": 1.75,
+            "boost_spot_imbalance_ratio": 1.65,
             "boost_futures_momentum_min_pct": 0.14,
             "boost_allow_fee_fallback": True,
             "boost_parallel_scan_enabled": True,
             "boost_live_panel_enabled": True,
-            "boost_live_panel_interval_sec": 2,
-            "boost_trade_margin_pct": 0.35,
+            # v0207: Telegram is a trader HUD, not a debug console.
+            "boost_live_panel_interval_sec": 30,
+            "boost_live_panel_heartbeat_sec": 60,
+            "boost_live_watchdog_tick_sec": 5,
+            "boost_trade_margin_pct": 0.28,
             "boost_use_full_bank_per_trade": False,
-            "boost_risk_pct_per_trade": 0.035,
-            "boost_live_slippage_buffer_pct": 0.035,
+            "boost_risk_pct_per_trade": 0.025,
+            "boost_live_slippage_buffer_pct": 0.045,
             "boost_spread_edge_mult": 2.8,
             "boost_tp_spread_mult": 3.2,
             "boost_tp_atr_mult": 0.70,
-            "boost_live_status_every_cycle": True,
+            "boost_live_status_every_cycle": False,
             "boost_live_safe_execution": True,
             "boost_no_exchange_protection_monitor_only": True,
+            "boost_emergency_sl_only": True,
+            "boost_dynamic_trailing_enabled": True,
+            "boost_trailing_min_profit_pct": 0.14,
+            "boost_trailing_giveback_pct": 0.07,
+            "boost_trailing_giveback_ratio": 0.38,
+            "boost_momentum_decay_exit_enabled": True,
+            "boost_momentum_decay_min_profit_pct": 0.12,
+            "boost_momentum_decay_r1_floor_pct": 0.015,
+            "boost_no_forced_negative_close": True,
+            "boost_hunter_trade_rare_search_often": True,
             "boost_rotate_only_if_profit": True,
-            "boost_min_profit_to_rotate_pct": 0.06,
-            "boost_rotate_strength_multiplier": 1.20,
-            "boost_rotate_min_score_gap": 8.0,
-            "boost_rotate_cooldown_sec": 12,
+            "boost_min_profit_to_rotate_pct": 0.12,
+            "boost_rotate_strength_multiplier": 1.35,
+            "boost_rotate_min_score_gap": 15.0,
+            "boost_rotate_cooldown_sec": 45,
             # v0199: automatic two-mode rotation. NORMAL rotates only from profit;
             # RESCUE is OFF by default in live: BOOST must not harvest losses.
             # It can be enabled manually only after testing, with strict limits.
@@ -1653,14 +1853,23 @@ async def _boost_start_worker(app):
             position_task = app.create_task(position_management_loop(app))
             log_event("boost_start_stage", stage="position_loop_created", ok=True)
 
+        # v0204: live chat must not depend on scanner/execution branches.
+        # Start an independent watchdog that sends a fresh bottom panel every few seconds.
+        old_watchdog = app.bot_data.get("boost_live_panel_watchdog_task")
+        if old_watchdog is not None and not old_watchdog.done():
+            old_watchdog.cancel()
+        app.bot_data["boost_live_panel_watchdog_task"] = app.create_task(_boost_live_panel_watchdog(app))
+        log_event("boost_start_stage", stage="live_panel_watchdog_created", ok=True)
+
         app.bot_data.pop("boost_live_panel_message_id", None)
         app.bot_data["boost_panel_last_edit"] = 0
+        app.bot_data.pop("boost_live_panel_last_event_key", None)
         trigger_scan_now(app, reason="boost_start")
         ns = await storage.all_settings()
         chat_id = first_admin_id()
         if chat_id:
             await _safe_send_bot_message(app, chat_id,
-                f"✅ BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: 126 zero-fee → TOP hotlist every 5m → fast 1-3s rotation + live-safe TP 0.06-0.14%\nSafety: commands/buttons stay available; /log now shows BOOST stages/errors.{balance_note}",
+                f"✅ BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: HUNTER LIVE ENGINE: 126 zero-fee → market radar/hotlist → deep momentum → ARMED/CONFIRMED → live trailing exit + emergency SL only\nSafety: commands/buttons stay available; /log now shows BOOST stages/errors.{balance_note}",
                 reply_markup=_boost_rotation_keyboard(ns))
         await boost_live_panel_update(
             app, ns,
@@ -1696,8 +1905,13 @@ async def boost_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         boost_scalping_engine._scan_cursor = 0
     except Exception:
         pass
+    task = context.application.bot_data.pop("boost_live_panel_watchdog_task", None)
+    if task is not None and not task.done():
+        task.cancel()
+    context.application.bot_data.pop("boost_live_last_state", None)
     context.application.bot_data.pop("boost_live_panel_message_id", None)
     context.application.bot_data.pop("boost_live_panel_message_ids", None)
+    context.application.bot_data.pop("boost_live_panel_last_event_key", None)
     log_event("boost_stop", stage="command", ok=True)
     await reply(update, "🛑 BOOST полностью остановлен: новые входы, hotlist/rotation/live-panel отключены. Открытые позиции не закрывал автоматически; /panic или /close_all — если надо закрыть сразу.", reply_markup=MAIN_MENU)
 
@@ -2026,6 +2240,161 @@ async def boost_exchange_pnl_snapshot(ex, pos: dict) -> tuple[float | None, floa
     except Exception:
         return None, None, None
     return None, None, None
+
+
+
+
+def _boost_position_is_unsafe(pos: dict) -> bool:
+    mode = str((pos or {}).get("protection_mode") or "").lower()
+    status = str((pos or {}).get("protection_status") or "").upper()
+    return bool((pos or {}).get("boost_unsafe_position")) or mode == "unsafe_no_emergency_sl" or status == "UNSAFE POSITION"
+
+
+async def _boost_try_recover_unsafe_position(app, exec_engine, pos: dict, live: bool) -> tuple[bool, str]:
+    """Retry emergency SL for a BOOST position marked UNSAFE.
+
+    Returns (recovered, note). This is intentionally throttled because MEXC can
+    reject precision/rate-limited stop requests during volatility.
+    """
+    if not _boost_position_is_unsafe(pos) or not live:
+        return False, ""
+    now = time.time()
+    key = f"boost_unsafe_sl_retry:{_short_symbol(pos.get('symbol'))}:{int(float(pos.get('opened_at') or 0))}"
+    last = float(app.bot_data.get(key, 0) or 0)
+    retry_sec = float((await storage.get("boost_unsafe_sl_retry_sec", 10)) or 10)
+    if now - last < retry_sec:
+        return False, f"UNSAFE POSITION: emergency SL missing; retry in {max(0, retry_sec-(now-last)):.0f}s"
+    app.bot_data[key] = now
+    try:
+        prot = await _await_with_timeout(exec_engine.place_protection_orders(pos, live=True), 12, "boost unsafe emergency SL retry")
+        ok = bool(prot.get("ok")) and str(prot.get("protection_mode") or "").lower() in {"exchange", "exchange_emergency_sl_only"}
+        pos.update(prot)
+        if ok:
+            pos["boost_unsafe_position"] = False
+            pos["boost_defensive_mode"] = False
+            pos["protection_status"] = prot.get("protection_status") or "EMERGENCY SL ONLY"
+            pos["protection_mode"] = prot.get("protection_mode") or "exchange_emergency_sl_only"
+            pos["updated_at"] = now
+            await storage.upsert_position(pos)
+            log_event("boost_unsafe_recovered", stage="emergency_sl_retry", ok=True, symbol=pos.get("symbol"), protection_mode=pos.get("protection_mode"))
+            await notify_admin(app, f"✅ BOOST emergency SL recovered\n{_short_symbol(pos.get('symbol'))} {str(pos.get('side') or '').upper()}\nDefensive mode OFF", key=f"boost_unsafe_recovered_{_short_symbol(pos.get('symbol'))}", min_interval_sec=5)
+            return True, "Emergency SL recovered; defensive mode OFF"
+        pos["boost_unsafe_position"] = True
+        pos["boost_defensive_mode"] = True
+        pos["protection_status"] = "UNSAFE POSITION"
+        pos["protection_mode"] = "unsafe_no_emergency_sl"
+        pos["boost_unsafe_reason"] = str(prot.get("boost_unsafe_reason") or prot.get("sl_error") or prot.get("protection_warning") or prot)[:500]
+        pos["updated_at"] = now
+        await storage.upsert_position(pos)
+        log_event("boost_unsafe_retry_failed", stage="emergency_sl_retry", ok=False, symbol=pos.get("symbol"), reason=pos.get("boost_unsafe_reason"))
+        return False, f"UNSAFE POSITION: emergency SL failed again; defensive mode ON"
+    except Exception as e:
+        pos["boost_unsafe_position"] = True
+        pos["boost_defensive_mode"] = True
+        pos["protection_status"] = "UNSAFE POSITION"
+        pos["protection_mode"] = "unsafe_no_emergency_sl"
+        pos["boost_unsafe_reason"] = str(e)[:500]
+        pos["updated_at"] = now
+        await storage.upsert_position(pos)
+        log_event("boost_unsafe_retry_error", stage="emergency_sl_retry", ok=False, symbol=pos.get("symbol"), error=str(e)[:500])
+        return False, f"UNSAFE POSITION: SL retry error; defensive mode ON"
+
+async def _boost_hunter_manage_active_position(app, ex, exec_engine, settings: dict, active_pos: dict, snap_now: dict, live: bool) -> bool:
+    """Manage an active BOOST position with live trailing + momentum decay.
+
+    Returns True when it closed the active position. It never closes a live BOOST
+    position in loss for convenience; negative exits are left only to the
+    exchange emergency SL or explicit /panic /close_all.
+    """
+    try:
+        if str(active_pos.get("strategy") or "").lower() != "boost_scalping":
+            return False
+        sym = str(active_pos.get("symbol") or "")
+        side = str(active_pos.get("side") or "").upper()
+        if not sym or side not in {"LONG", "SHORT"}:
+            return False
+        price = await get_last_price(ex, sym)
+        local_pnl = pos_manager.pnl_pct(active_pos, price) if price else 0.0
+        ex_pnl, ex_upnl, ex_mark = (None, None, None)
+        if live:
+            ex_pnl, ex_upnl, ex_mark = await boost_exchange_pnl_snapshot(ex, active_pos)
+        pnl_pct = float(ex_pnl) if ex_pnl is not None else float(local_pnl)
+
+        unsafe = _boost_position_is_unsafe(active_pos)
+        unsafe_note = ""
+        if unsafe:
+            recovered, unsafe_note = await _boost_try_recover_unsafe_position(app, exec_engine, active_pos, live)
+            unsafe = not recovered
+            if unsafe:
+                active_pos["boost_unsafe_position"] = True
+                active_pos["boost_defensive_mode"] = True
+                # Defensive mode exits earlier, but still respects the hard rule:
+                # no bot-forced negative close. Emergency SL remains the only loss exit.
+                log_event("boost_unsafe_defensive_active", stage="position", ok=True, symbol=sym, side=side, pnl_pct=pnl_pct, reason=active_pos.get("boost_unsafe_reason"))
+
+        key = f"boost_peak_pnl:{_short_symbol(sym)}:{side}:{int(float(active_pos.get('opened_at') or 0))}"
+        peak = max(float(app.bot_data.get(key, pnl_pct) or pnl_pct), pnl_pct)
+        app.bot_data[key] = peak
+
+        min_profit = float(settings.get("boost_trailing_min_profit_pct", settings.get("boost_live_min_exchange_profit_pct", 0.12)) or 0.12)
+        giveback_abs = float(settings.get("boost_trailing_giveback_pct", 0.07) or 0.07)
+        giveback_ratio = float(settings.get("boost_trailing_giveback_ratio", 0.38) or 0.38)
+        if unsafe:
+            # Missing exchange SL: take smaller real profit and give less back.
+            min_profit = min(min_profit, float(settings.get("boost_unsafe_min_profit_exit_pct", 0.05) or 0.05))
+            giveback_abs = min(giveback_abs, float(settings.get("boost_unsafe_giveback_pct", 0.03) or 0.03))
+            giveback_ratio = min(giveback_ratio, float(settings.get("boost_unsafe_giveback_ratio", 0.25) or 0.25))
+        giveback = max(giveback_abs, peak * giveback_ratio)
+        can_close_profit = pnl_pct >= min_profit and ((ex_upnl is None) or float(ex_upnl) > 0)
+
+        reason = ""
+        if _bool_setting(settings, "boost_dynamic_trailing_enabled", True):
+            if peak >= min_profit and pnl_pct <= peak - giveback and can_close_profit:
+                reason = f"dynamic_trailing_exit peak={peak:+.3f}% now={pnl_pct:+.3f}% giveback={giveback:.3f}%"
+
+        if not reason and _bool_setting(settings, "boost_momentum_decay_exit_enabled", True) and can_close_profit:
+            # Momentum decay is checked from a fresh snapshot. Failure to snapshot is
+            # not a close signal; it just leaves the position monitored.
+            try:
+                timeout = max(0.35, float(settings.get("boost_symbol_snapshot_timeout_sec", 0.55) or 0.55))
+                market = await asyncio.wait_for(boost_scalping_engine._snapshot(ex, sym), timeout=timeout)
+                r1 = float(market.get("ret_1m_pct") or 0)
+                r3 = float(market.get("ret_3m_pct") or 0)
+                floor = float(settings.get("boost_momentum_decay_r1_floor_pct", 0.015) or 0.015)
+                if side == "LONG":
+                    decay = r1 <= floor or r3 <= 0
+                else:
+                    decay = r1 >= -floor or r3 >= 0
+                if decay:
+                    reason = f"momentum_decay_exit pnl={pnl_pct:+.3f}% r1={r1:+.3f}% r3={r3:+.3f}%"
+            except Exception as e:
+                log_event("boost_momentum_decay_check", stage="snapshot_error", ok=False, symbol=sym, error=str(e)[:160])
+
+        log_event("boost_active_manage", stage="position", ok=True, symbol=sym, side=side, pnl_pct=pnl_pct, peak_pct=peak, ex_upnl=ex_upnl, close_reason=reason or "hold")
+        if not reason:
+            hud_status = "unsafe defensive" if unsafe else "active; monitoring"
+            note = (unsafe_note or "UNSAFE POSITION: emergency SL missing; defensive mode ON") if unsafe else f"live trailing peak={peak:+.3f}% now={pnl_pct:+.3f}%"
+            await boost_live_panel_update(app, settings, snap_now, status=hud_status, position=active_pos, note=note, force=unsafe)
+            return False
+
+        # Hard rule: no forced negative close from bot logic.
+        if live and pnl_pct < min_profit:
+            log_event("boost_exit_blocked", stage="no_forced_negative_close", ok=True, symbol=sym, pnl_pct=pnl_pct, min_profit=min_profit, reason=reason)
+            return False
+
+        close_res = await _await_with_timeout(exec_engine.close_position(active_pos, reason=reason, live=live, exit_price=ex_mark or price), 18, "boost live exit close_position")
+        if close_res.get("ok"):
+            app.bot_data.pop(key, None)
+            await notify_admin(app, f"💰 BOOST profit exit\n{_short_symbol(sym)} {side}\nPnL≈{pnl_pct:+.3f}%\nReason: {reason}", key=f"boost_profit_exit_{int(time.time()*1000)}")
+            await boost_live_panel_update(app, settings, snap_now, status="profit exit", position=active_pos, note=reason, force=True)
+            trigger_scan_now(app, reason="boost_profit_exit")
+            return True
+        log_event("boost_exit_failed", stage="close_position", ok=False, symbol=sym, reason=str(close_res)[:500])
+        await boost_live_panel_update(app, settings, snap_now, status="exit failed", position=active_pos, note=str(close_res)[:220], force=True)
+        return False
+    except Exception as e:
+        log_event("boost_active_manage_error", stage="position", ok=False, error=str(e)[:500])
+        return False
 
 async def _hidden_margin_snapshot(ex) -> dict:
     """Read MEXC balance margin robustly when open_positions returns empty."""
@@ -3564,7 +3933,12 @@ async def trading_loop(app):
                         if str(settings.get("boost_stop_when_target_reached", True)).lower() in {"1", "true", "yes", "on"}:
                             await storage.set("boost_autopilot_active", False, bump_revision=False)
                             await storage.set("strategy_mode", "hybrid")
+                            _boost_disarm_runtime(app)
+                            task = app.bot_data.pop("boost_live_panel_watchdog_task", None)
+                            if task is not None and not task.done():
+                                task.cancel()
                         await notify_admin(app, f"🏁 BOOST target reached. Bank {current_bank:.4f} / {target_bank:.4f} USDT. Entries stopped.", key="boost_target_reached")
+                        await boost_live_panel_update(app, settings, {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}, status="target completed", note="BOOST x20 target reached; autopilot stopped", force=True)
                         await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
                         continue
                     if current_bank <= 0 or (max_loss > 0 and pnl <= -max_loss):
@@ -3584,10 +3958,25 @@ async def trading_loop(app):
 
                     active_pos = await _boost_find_active_position(ex, exec_engine)
                     if active_pos:
-                        scanner.last_reject_reason = "BOOST: active position; parallel scan"
+                        scanner.last_reject_reason = "BOOST: active position; live trailing + parallel scan"
                         snap_now = {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}
+                        # HUNTER live engine: primary exit is dynamic trailing / momentum decay.
+                        # Exchange orders are emergency backstop only. If this closes in profit,
+                        # immediately continue to the next scan/rotation cycle.
+                        try:
+                            closed_by_hunter = await _boost_hunter_manage_active_position(app, ex, exec_engine, settings, active_pos, snap_now, live)
+                            if closed_by_hunter:
+                                await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
+                                continue
+                        except Exception as e:
+                            log_event("boost_hunter_manage_error", stage="active_position", ok=False, error=str(e)[:500])
                         rotation_enabled = _bool_setting(settings, "boost_parallel_scan_enabled", True)
-                        rotate_note = "active; rotation disabled"
+                        if _boost_position_is_unsafe(active_pos):
+                            rotation_enabled = False
+                            rotate_note = "UNSAFE POSITION: rotation/rescue disabled until emergency SL is recovered"
+                            log_event("boost_rotation_blocked", stage="unsafe_position", ok=True, symbol=active_pos.get("symbol"), reason=rotate_note)
+                        else:
+                            rotate_note = "active; rotation disabled"
                         if rotation_enabled:
                             try:
                                 price = await get_last_price(ex, active_pos.get("symbol"))
@@ -3776,7 +4165,7 @@ async def trading_loop(app):
                             await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                         continue
                     if placed.get("ok"):
-                        scanner.last_signal_summary = f"BOOST opened {plan.symbol} {plan.side} margin≈{plan.expected_margin_usdt:.2f} TP={plan.take_price:.6g} SL={plan.stop_price:.6g}"
+                        scanner.last_signal_summary = f"BOOST opened {plan.symbol} {plan.side} margin≈{plan.expected_margin_usdt:.2f}; exit=live trailing/momentum decay; emergency SL={plan.stop_price:.6g}"
                         scanner.last_reject_reason = f"BOOST bank={bank:.2f}, session pnl={pnl:.4f}, target profit={target_profit:.2f}"
                         boost_msg = (
                             f"🚀 BOOST opened\n"
@@ -3786,8 +4175,8 @@ async def trading_loop(app):
                             f"Bank target: {bank:.2f} → {bank*target_mult:.2f} USDT\n"
                             f"Conf: {decision.confidence:.2f}\n"
                             f"Reason: {decision.reason}\n"
-                            f"TP: {plan.take_price:.6g}\n"
-                            f"SL: {plan.stop_price:.6g}"
+                            f"Exit: live trailing / momentum decay\n"
+                            f"Emergency SL: {plan.stop_price:.6g}"
                         )
                         await notify_admin(app, boost_msg, key="boost_opened")
                         await boost_live_panel_update(app, settings, {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}, status="opened", decision=decision, note=scanner.last_signal_summary, force=True)
