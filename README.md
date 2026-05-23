@@ -1,4 +1,4 @@
-## v0183 BOOST TPSL PARITY FIX
+## v0184 BOOST LIVE PANEL EXCHANGE PNL FIX
 
 - Restored fast BOOST live panel as one bottom Telegram message.
 - Full zero-fee universe scan stays aggressive.

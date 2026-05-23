@@ -945,6 +945,10 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # status card, which looked like duplicate start. The reply itself becomes
     # the editable scanner-status message.
     settings = await storage.all_settings()
+    # v0185: normal Run must not implicitly start BOOST from a stale strategy_mode.
+    if str(settings.get("strategy_mode", "")).lower() == "boost_scalping" and not _is_boost_active(settings):
+        await storage.set("strategy_mode", "hybrid", bump_revision=False)
+        settings = await storage.all_settings()
     status = "already running; scan requested now" if already_running else "started; scan requested now"
     header = "🟢 Bot already running" if already_running else "🟢 Bot started"
     msg = await reply(update, f"{header}\n" + _scan_status_text(settings, status=status), reply_markup=MAIN_MENU)
@@ -1068,6 +1072,16 @@ def _bool_setting(settings: dict, key: str, default: bool = False) -> bool:
     if isinstance(val, bool):
         return val
     return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_boost_active(settings: dict) -> bool:
+    """BOOST autopilot may run only after explicit /boost_start or 🚀 BOOST MODE.
+
+    This prevents normal buttons/commands (Balance, Status, Run, Settings,
+    callback menu changes) from accidentally starting boost just because
+    strategy_mode remained boost_scalping in SQLite.
+    """
+    return _bool_setting(settings, "boost_autopilot_active", False)
 
 
 def _boost_rotation_keyboard(settings: dict) -> InlineKeyboardMarkup:
@@ -1343,6 +1357,7 @@ async def boost_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"🚀 BOOST AUTOPILOT\n"
         f"Mode: {s.get('strategy_mode')}\n"
+        f"BOOST armed: {_is_boost_active(s)}\n"
         f"Running: {running} | Entries: {entries_enabled}\n"
         f"Bank: {snap['bank']:.4f} → target {snap['target_bank']:.4f} USDT (x{snap['target_mult']:.0f})\n"
         f"Current boost bank: {snap['current_bank']:.4f} USDT\n"
@@ -1375,6 +1390,7 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_mult = max(1.0, float(s.get("boost_target_multiplier", 20.0) or 20.0))
     now_ts = time.time()
     await storage.set("strategy_mode", "boost_scalping", bump_revision=False)
+    await storage.set("boost_autopilot_active", True, bump_revision=False)
     await storage.set("boost_session_start_ts", now_ts, bump_revision=False)
     await storage.set("boost_session_start_equity", equity, bump_revision=False)
     await storage.set("boost_session_bank_usdt", bank, bump_revision=False)
@@ -1428,14 +1444,25 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if position_task is None or position_task.done():
         position_task = context.application.create_task(position_management_loop(context.application))
     trigger_scan_now(context.application, reason="boost_start")
-    await reply(update, f"🚀 BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: full 126 scan + aggressive rotation + micro TP 0.03-0.05%", reply_markup=_boost_rotation_keyboard(await storage.all_settings()))
+    ns = await storage.all_settings()
+    await reply(update, f"🚀 BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: full 126 scan + aggressive rotation + micro TP 0.03-0.05%", reply_markup=_boost_rotation_keyboard(ns))
+    # v0184: create the live panel immediately at start. Do not wait for a
+    # trade/scan event, otherwise a running BOOST can look silent in Telegram.
+    await boost_live_panel_update(
+        context.application, ns,
+        {"bank": bank, "current_bank": bank, "target_bank": bank * target_mult, "pnl": 0.0, "trades": 0, "target_mult": target_mult},
+        status="started; scanning",
+        note="live panel active; waiting for strongest impulse",
+        force=True,
+    )
 
 async def boost_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     global running, entries_enabled
     entries_enabled = False
+    await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("strategy_mode", "hybrid")
-    await reply(update, "🛑 BOOST stopped. New entries disabled. Open positions are still managed; use /close_all if you want to close immediately.", reply_markup=MAIN_MENU)
+    await reply(update, "🛑 BOOST stopped. New BOOST entries disabled. Open positions are still managed; use /close_all if you want to close immediately.", reply_markup=MAIN_MENU)
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -1633,6 +1660,70 @@ def _dedupe_exchange_positions(rows: list[dict], ex=None) -> list[dict]:
         out.append(row)
     return out
 
+
+
+async def boost_exchange_pnl_snapshot(ex, pos: dict) -> tuple[float | None, float | None, float | None]:
+    """Return (pnl_pct, pnl_usdt, mark_price) from the real exchange row.
+
+    BOOST live exits are too tiny to trust local ticker-only PnL.  Confirm with
+    MEXC mark/fair price and unrealizedPnl before closing for TP/rotation.
+    """
+    try:
+        exec_engine = ExecutionEngine(storage, ex)
+        rows = await ex.fetch_positions()
+        wanted = _position_identity_keys(pos, ex)
+        side_want = str(pos.get("side") or "").lower()
+        for row in rows or []:
+            if exec_engine.exchange_position_qty(row) <= 0:
+                continue
+            keys = _position_identity_keys(row, ex)
+            if not (keys & wanted):
+                continue
+            raw_side = str(row.get("side") or ((row.get("info") or {}).get("holdSide") if isinstance(row.get("info"), dict) else "") or "").lower()
+            if side_want and raw_side and side_want not in raw_side and raw_side not in side_want:
+                # MEXC can return buy/sell/long/short; do not over-filter if empty.
+                pass
+            entry = 0.0
+            for k in ("entryPrice", "entry_price", "average"):
+                try:
+                    if row.get(k) not in (None, ""):
+                        entry = float(row.get(k)); break
+                except Exception:
+                    pass
+            info = row.get("info") or {}
+            if entry <= 0 and isinstance(info, dict):
+                for k in ("holdAvgPrice", "openAvgPrice", "entryPrice"):
+                    try:
+                        if info.get(k) not in (None, ""):
+                            entry = float(info.get(k)); break
+                    except Exception:
+                        pass
+            mark = 0.0
+            for k in ("markPrice", "fairPrice", "lastPrice"):
+                try:
+                    v = row.get(k) if row.get(k) not in (None, "") else (info.get(k) if isinstance(info, dict) else None)
+                    if v not in (None, ""):
+                        mark = float(v); break
+                except Exception:
+                    pass
+            upnl = None
+            for k in ("unrealizedPnl", "unrealised", "profit"):
+                try:
+                    v = row.get(k) if row.get(k) not in (None, "") else (info.get(k) if isinstance(info, dict) else None)
+                    if v not in (None, ""):
+                        upnl = float(v); break
+                except Exception:
+                    pass
+            pct = None
+            if entry > 0 and mark > 0:
+                if str(pos.get("side") or "").upper() == "LONG":
+                    pct = (mark - entry) / entry * 100.0
+                else:
+                    pct = (entry - mark) / entry * 100.0
+            return pct, upnl, mark or None
+    except Exception:
+        return None, None, None
+    return None, None, None
 
 async def _hidden_margin_snapshot(ex) -> dict:
     """Read MEXC balance margin robustly when open_positions returns empty."""
@@ -2393,11 +2484,11 @@ async def ai_scalping_toggle_cmd(update: Update, context: ContextTypes.DEFAULT_T
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
-    text = update.message.text
+    text = (update.message.text or "").strip()
     mapping = {
         "▶️ Run": run_cmd, "⏹ Stop": stop_cmd, "📊 Status": status_cmd, "🚨 Panic": panic_cmd,
         "📈 Positions": positions_cmd, "📉 Stats": stats_cmd, "💰 Balance": balance_cmd,
-        "🏓 Ping": ping_cmd, "⚙️ Settings": settings_cmd, "🔐 API": api_cmd, "📊 AI Stats": ai_stats_cmd, "🤖 AI BTC/ETH scalping": ai_scalping_toggle_cmd, "🚀 BOOST MODE": boost_start_cmd, "🛑 STOP BOOST": boost_stop_cmd, "📊 BOOST STATUS": boost_status_cmd, "🚀 Boost": boost_status_cmd, "⚙️ MEXC": mexc_settings_cmd,
+        "🏓 Ping": ping_cmd, "⚙️ Settings": settings_cmd, "🔐 API": api_cmd, "📊 AI Stats": ai_stats_cmd, "🤖 AI BTC/ETH scalping": ai_scalping_toggle_cmd, "🚀 BOOST MODE": boost_start_cmd, "🛑 STOP BOOST": boost_stop_cmd, "📊 BOOST STATUS": boost_status_cmd, "⚙️ MEXC": mexc_settings_cmd,
     }
     fn = mapping.get(text)
     if fn: await fn(update, context)
@@ -2466,6 +2557,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parsed = value
         await storage.set(key, parsed)
         if key == "strategy_mode" and str(parsed).lower() == "boost_scalping":
+            # v0185: choosing BOOST in Settings must not start autopilot.
+            # Only /boost_start or the 🚀 BOOST MODE main button can arm it.
+            await storage.set("boost_autopilot_active", False, bump_revision=False)
             prev_scan = int(float(s.get("scan_interval_sec", 5) or 5))
             for k2, v2 in {
                 "strategy_mode": "boost_scalping",
@@ -2822,7 +2916,7 @@ async def trading_loop(app):
                 settings = await storage.all_settings()
                 mode_name = str(settings.get("strategy_mode", "hybrid")).lower()
                 ai_mode = mode_name == "ai_scalping"
-                boost_mode = mode_name == "boost_scalping"
+                boost_mode = mode_name == "boost_scalping" and _is_boost_active(settings)
                 live = bool(settings.get("live_trading", False))
                 ex = await get_exchange(settings)
                 ws = await get_ws(settings)
@@ -3010,7 +3104,13 @@ async def trading_loop(app):
                         if rotation_enabled:
                             try:
                                 price = await get_last_price(ex, active_pos.get("symbol"))
-                                pos_pnl = pos_manager.pnl_pct(active_pos, price) if price else 0.0
+                                local_pos_pnl = pos_manager.pnl_pct(active_pos, price) if price else 0.0
+                                ex_pos_pnl, ex_upnl, ex_mark = (None, None, None)
+                                if live:
+                                    ex_pos_pnl, ex_upnl, ex_mark = await boost_exchange_pnl_snapshot(ex, active_pos)
+                                # For LIVE BOOST rotation, trust MEXC mark/unrealized over local ticker.
+                                # This prevents closing a "paper plus" that is actually negative on exchange.
+                                pos_pnl = float(ex_pos_pnl) if ex_pos_pnl is not None else local_pos_pnl
                                 min_profit = float(settings.get("boost_min_profit_to_rotate_pct", 0.04) or 0.04)
                                 only_profit = _bool_setting(settings, "boost_rotate_only_if_profit", True)
                                 last_rot = float(app.bot_data.get("boost_last_rotation_ts", 0) or 0)
@@ -3026,17 +3126,21 @@ async def trading_loop(app):
                                     mult = float(settings.get("boost_rotate_strength_multiplier", 1.35) or 1.35)
                                     gap = float(settings.get("boost_rotate_min_score_gap", 5.0) or 5.0)
                                     stronger = bool(candidate_decision.ok and candidate_decision.decision != "WAIT" and new_sym and new_sym != cur_sym and new_score >= max(cur_score * mult, cur_score + gap))
-                                    rotate_note = f"pnl={pos_pnl:+.3f}% best={_short_symbol(new_sym)} score={new_score:.1f} cur_score={cur_score:.1f}"
-                                    if stronger:
+                                    real_guard_ok = True
+                                    if live:
+                                        # Rotation is allowed only if the exchange itself confirms profit.
+                                        real_guard_ok = (ex_upnl is None or ex_upnl > 0) and pos_pnl >= min_profit
+                                    rotate_note = f"pnl={pos_pnl:+.3f}% local={local_pos_pnl:+.3f}% exUPnL={(ex_upnl if ex_upnl is not None else 0):+.4f} best={_short_symbol(new_sym)} score={new_score:.1f} cur_score={cur_score:.1f}"
+                                    if stronger and real_guard_ok:
                                         # Rotate only from an already profitable position. Never hop out
                                         # of a losing BOOST trade just because a new symbol looks stronger.
                                         res = await exec_engine.close_position(active_pos, "boost_rotate_to_stronger", live, price)
                                         app.bot_data["boost_last_rotation_ts"] = time.time()
                                         close_ok = bool(res.get("ok")) if isinstance(res, dict) else bool(res)
-                                        scanner.last_reject_reason = f"BOOST rotate: closed {_short_symbol(cur_sym)} at {pos_pnl:+.3f}%, next {_short_symbol(new_sym)}"
+                                        scanner.last_reject_reason = f"BOOST rotate: closed {_short_symbol(cur_sym)} at exchange {pos_pnl:+.3f}%, next {_short_symbol(new_sym)}"
                                         await notify_admin(app, (
                                             f"🔄 BOOST rotation\n"
-                                            f"Closed {_short_symbol(cur_sym)} at {pos_pnl:+.3f}%\n"
+                                            f"Closed {_short_symbol(cur_sym)} at exchange {pos_pnl:+.3f}% | real uPnL={(ex_upnl if ex_upnl is not None else 0):+.4f} USDT\n"
                                             f"Stronger: {_short_symbol(new_sym)} {candidate_decision.decision} score {new_score:.1f} > {cur_score:.1f}\n"
                                             f"Result: {res.get('ok') if isinstance(res, dict) else res}"
                                         ), key=f"boost_rotation_{int(time.time()*1000)}")

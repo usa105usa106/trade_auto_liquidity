@@ -1140,6 +1140,35 @@ class ExecutionEngine:
         except Exception as e:
             return False, {"error": str(e)[:180]}
 
+    async def _balance_cash_usdt(self) -> float | None:
+        """Best-effort futures cash balance for realized live PnL deltas.
+
+        For live BOOST scalping, local mark-price PnL can differ materially from
+        MEXC execution because TP is only 0.03-0.05%.  cashBalance is the most
+        useful value for realized close delta; fall back to total only if cash is
+        unavailable.
+        """
+        try:
+            bal = await self.exchange_client.fetch_balance()
+            usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
+            for key in ("cashBalance", "availableCash", "total", "free"):
+                try:
+                    v = usdt.get(key) if isinstance(usdt, dict) else None
+                    if v not in (None, ""):
+                        return float(v)
+                except Exception:
+                    pass
+            for section in ("total", "free"):
+                try:
+                    v = ((bal or {}).get(section, {}) or {}).get("USDT")
+                    if v not in (None, ""):
+                        return float(v)
+                except Exception:
+                    pass
+        except Exception:
+            return None
+        return None
+
     async def close_position(self, pos: dict, reason: str, live: bool, exit_price: float | None = None):
         symbol = pos["symbol"]
         side = "sell" if str(pos.get("side")).upper() == "LONG" else "buy"
@@ -1148,6 +1177,9 @@ class ExecutionEngine:
         await self.storage.upsert_position(pos)
         already_closed = False
         close_attempts = []
+        strategy = str(pos.get("strategy") or "").lower()
+        live_boost = bool(live and strategy == "boost_scalping")
+        live_cash_before = await self._balance_cash_usdt() if live_boost else None
         if live:
             try:
                 # Close the exact exchange row/holdVol when available and keep
@@ -1187,6 +1219,26 @@ class ExecutionEngine:
         if notional <= 0 and entry > 0:
             notional = abs(float(pos.get("qty") or 0) * entry)
         pnl_usdt = pnl_pct / 100.0 * notional
+        pnl_source = "local_price"
+        if live_boost and live_cash_before is not None:
+            # Let MEXC settle the market close, then use the actual cash delta.
+            # This prevents Telegram/session BOOST bank from showing a fake win
+            # when local price said +0.04% but live slippage closed negative.
+            try:
+                await asyncio.sleep(float(os.getenv("BOOST_REALIZED_PNL_SETTLE_SEC", "0.8")))
+            except Exception:
+                pass
+            live_cash_after = await self._balance_cash_usdt()
+            if live_cash_after is not None:
+                delta = float(live_cash_after) - float(live_cash_before)
+                # Ignore impossible huge deltas caused by a stale balance read, but
+                # accept small negative/positive real execution differences.
+                if abs(delta) <= max(10.0, abs(notional) * 0.25 + 2.0):
+                    pnl_usdt = delta
+                    pnl_source = "exchange_cash_delta"
+                    if notional > 0:
+                        pnl_pct = (pnl_usdt / notional) * 100.0
+
         await self.storage.add_trade({
             "ts_open": pos.get("opened_at"),
             "ts_close": time.time(),
@@ -1201,6 +1253,7 @@ class ExecutionEngine:
             "pnl_pct": pnl_pct,
             "result": "win" if pnl_usdt > 0 else "loss",
             "reason": reason,
+            "pnl_source": pnl_source,
             "mirror_used": pos.get("mirror_used", False),
             "session": pos.get("session"),
         })

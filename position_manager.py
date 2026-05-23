@@ -129,6 +129,61 @@ class PositionManager:
                 return False, 0.0, current_stage
         return True, float(new_stop), target_stage
 
+
+    async def _live_boost_profit_confirmed(self, pos: dict, local_pnl_pct: float, min_profit_pct: float = 0.0) -> tuple[bool, str]:
+        """For LIVE BOOST tiny TP, confirm profit using exchange mark/uPnL.
+
+        Local REST/WS prices can say +0.03% while the real MEXC position is
+        negative after spread/slippage.  Do not close BOOST take-profit unless
+        exchange mark PnL and/or unrealizedPnl confirms it.
+        """
+        if str(pos.get("strategy") or "").lower() != "boost_scalping":
+            return True, "not_boost"
+        try:
+            row = await self.execution_engine._find_exchange_position_row(pos.get("symbol"))
+            if not row:
+                return True, "no_exchange_row"
+            info = row.get("info") or {}
+            upnl = None
+            for k in ("unrealizedPnl", "unrealised", "profit"):
+                try:
+                    v = row.get(k) if row.get(k) not in (None, "") else (info.get(k) if isinstance(info, dict) else None)
+                    if v not in (None, ""):
+                        upnl = float(v); break
+                except Exception:
+                    pass
+            entry = float(pos.get("entry_price") or 0)
+            try:
+                if entry <= 0 and row.get("entryPrice") not in (None, ""):
+                    entry = float(row.get("entryPrice"))
+            except Exception:
+                pass
+            if entry <= 0 and isinstance(info, dict):
+                for k in ("holdAvgPrice", "openAvgPrice", "entryPrice"):
+                    try:
+                        if info.get(k) not in (None, ""):
+                            entry = float(info.get(k)); break
+                    except Exception:
+                        pass
+            mark = 0.0
+            for k in ("markPrice", "fairPrice", "lastPrice"):
+                try:
+                    v = row.get(k) if row.get(k) not in (None, "") else (info.get(k) if isinstance(info, dict) else None)
+                    if v not in (None, ""):
+                        mark = float(v); break
+                except Exception:
+                    pass
+            ex_pct = local_pnl_pct
+            if entry > 0 and mark > 0:
+                if str(pos.get("side") or "").upper() == "LONG":
+                    ex_pct = (mark - entry) / entry * 100.0
+                else:
+                    ex_pct = (entry - mark) / entry * 100.0
+            ok = ex_pct >= min_profit_pct and (upnl is None or upnl > 0)
+            return bool(ok), f"exchange_pct={ex_pct:+.4f}% local_pct={local_pnl_pct:+.4f}% uPnL={(upnl if upnl is not None else 0):+.5f}"
+        except Exception as e:
+            return False, f"exchange_confirm_error={str(e)[:120]}"
+
     async def _is_terminal_closed(self, symbol: str) -> bool:
         """Return True when a recent close lock makes local callbacks stale.
 
@@ -395,6 +450,14 @@ class PositionManager:
                     stop = runner_stop
             if side=="LONG":
                 if take and price>=take:
+                    if live and strategy == "boost_scalping":
+                        min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.0) or 0.0)
+                        ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, min_profit)
+                        if not ok_profit:
+                            pos["boost_tp_skip_reason"] = why_profit
+                            await self.storage.upsert_position(pos)
+                            events.append({"type":"boost_tp_wait_exchange_profit", "symbol": symbol, "reason": why_profit})
+                            continue
                     ev = await self._close_and_event(pos, "tp", "take_profit", live, price)
                     if ev: events.append(ev)
                     continue
@@ -404,6 +467,14 @@ class PositionManager:
                     continue
             else:
                 if take and price<=take:
+                    if live and strategy == "boost_scalping":
+                        min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.0) or 0.0)
+                        ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, min_profit)
+                        if not ok_profit:
+                            pos["boost_tp_skip_reason"] = why_profit
+                            await self.storage.upsert_position(pos)
+                            events.append({"type":"boost_tp_wait_exchange_profit", "symbol": symbol, "reason": why_profit})
+                            continue
                     ev = await self._close_and_event(pos, "tp", "take_profit", live, price)
                     if ev: events.append(ev)
                     continue
