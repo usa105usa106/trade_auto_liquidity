@@ -104,9 +104,9 @@ async def notify_admin(app, text: str, min_interval_sec: int = 0, key: str = "no
             return
         app.bot_data[last_key] = now
     try:
-        await app.bot.send_message(chat_id=chat_id, text=text)
+        await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=str(text)[:3900]), timeout=6)
     except Exception as e:
-        log.warning("telegram notification failed: %s", e)
+        log.warning("telegram notification failed/timeout: %s", e)
 
 
 async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", min_interval_sec: int = 0) -> None:
@@ -132,12 +132,12 @@ async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", 
     old_msg_id = app.bot_data.get(msg_key)
     if old_msg_id:
         try:
-            await app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id))
+            await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id)), timeout=4)
         except Exception as e:
             # Message may already be gone or too old; continue and post a fresh one.
             log.debug("telegram bottom status delete skipped: %s", e)
     try:
-        msg = await app.bot.send_message(chat_id=chat_id, text=text)
+        msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=str(text)[:3900]), timeout=6)
         app.bot_data[msg_key] = getattr(msg, "message_id", None)
     except Exception as e:
         log.warning("telegram bottom status failed: %s", e)
@@ -641,10 +641,25 @@ def format_position_event(ev: dict) -> str:
         "breakeven": "breakeven moved",
         "protection_failed": "protection failed",
         "protection_local": "exchange protection failed; bot monitors TP/SL locally",
+        "boost_monitor_only_no_exchange_protection": "BOOST monitor-only: exchange TP/SL missing; local negative SL close skipped",
     }
     label = reason_map.get(str(typ), str(typ))
 
     # v0134 improved protection notifications
+    if typ == "boost_monitor_only_no_exchange_protection":
+        try:
+            pp = float(ev.get("pnl_pct") or 0)
+            pp_s = f"{pp:+.3f}%"
+        except Exception:
+            pp_s = "n/a"
+        return "\n".join([
+            "🟡 BOOST monitor-only",
+            f"{symbol}",
+            "Exchange TP/SL is still missing.",
+            f"Local SL close skipped; current PnL: {pp_s}",
+            "Bot keeps monitoring and will keep trying to restore exchange protection."
+        ])
+
     if typ == "protection_watchdog":
         protection_status = str(ev.get("protection_status") or "UNKNOWN")
         protection_mode = str(ev.get("protection_mode") or "")
@@ -852,8 +867,29 @@ async def reply(update: Update, text: str, **kwargs):
         send_kwargs = dict(base_kwargs)
         if i < len(chunks) - 1:
             send_kwargs.pop("reply_markup", None)
-        last_msg = await target.reply_text(chunk, **send_kwargs)
+        try:
+            last_msg = await asyncio.wait_for(target.reply_text(str(chunk)[:3900], **send_kwargs), timeout=6)
+        except Exception as e:
+            log.warning("telegram reply failed/timeout: %s", e)
+            last_msg = None
+            break
     return last_msg
+
+
+async def _safe_send_bot_message(app, chat_id: int, text: str, **kwargs):
+    """Send Telegram notification with timeout so BOOST never blocks commands."""
+    try:
+        return await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=text[:3900], **kwargs), timeout=6)
+    except Exception as e:
+        log.warning("telegram send timeout/error: %s", e)
+        return None
+
+async def _safe_delete_bot_message(app, chat_id: int, message_id: int):
+    try:
+        return await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(message_id)), timeout=4)
+    except Exception as e:
+        log.debug("telegram delete timeout/error: %s", e)
+        return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -969,7 +1005,8 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # the editable scanner-status message.
     settings = await storage.all_settings()
     # v0185: normal Run must not implicitly start BOOST from a stale strategy_mode.
-    if str(settings.get("strategy_mode", "")).lower() == "boost_scalping" and not _is_boost_active(settings):
+    if str(settings.get("strategy_mode", "")).lower() == "boost_scalping" and not _is_boost_runtime_armed(context.application, settings):
+        await storage.set("boost_autopilot_active", False, bump_revision=False)
         await storage.set("strategy_mode", "hybrid", bump_revision=False)
         settings = await storage.all_settings()
     status = "already running; scan requested now" if already_running else "started; scan requested now"
@@ -984,7 +1021,10 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running, entries_enabled, trading_task, position_task
     if not allowed(update): return
     entries_enabled = False
+    context.application.bot_data["boost_armed_runtime"] = False
+    context.application.bot_data["boost_start_in_progress"] = False
     await storage.set("boost_autopilot_active", False, bump_revision=False)
+    await storage.set("strategy_mode", "hybrid", bump_revision=False)
     # Keep the loop alive when it is already running so open positions continue
     # through TP/SL/trailing/local exits. If the bot was fully stopped, do not
     # start a background scanner just because /stop was pressed.
@@ -1001,7 +1041,10 @@ async def panic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     entries_enabled = False
     running = False
+    context.application.bot_data["boost_armed_runtime"] = False
+    context.application.bot_data["boost_start_in_progress"] = False
     await storage.set("boost_autopilot_active", False, bump_revision=False)
+    await storage.set("strategy_mode", "hybrid", bump_revision=False)
     for task in (trading_task, position_task):
         if task and not task.done():
             task.cancel()
@@ -1100,13 +1143,18 @@ def _bool_setting(settings: dict, key: str, default: bool = False) -> bool:
 
 
 def _is_boost_active(settings: dict) -> bool:
-    """BOOST autopilot may run only after explicit /boost_start or 🚀 BOOST MODE.
-
-    This prevents normal buttons/commands (Balance, Status, Run, Settings,
-    callback menu changes) from accidentally starting boost just because
-    strategy_mode remained boost_scalping in SQLite.
-    """
+    """Persistent BOOST switch set only by /boost_start and cleared by stop/emergency."""
     return _bool_setting(settings, "boost_autopilot_active", False)
+
+
+def _is_boost_runtime_armed(app, settings: dict) -> bool:
+    """Return True only when BOOST was explicitly armed in this running process.
+
+    This blocks stale DB state and unrelated buttons/callbacks from reviving
+    boost_scalping. After Railway restart the user must press /boost_start or
+    🚀 BOOST MODE again; /balance, /status, Settings, etc. cannot start BOOST.
+    """
+    return bool(app.bot_data.get("boost_armed_runtime", False)) and _is_boost_active(settings)
 
 
 def _boost_rotation_keyboard(settings: dict) -> InlineKeyboardMarkup:
@@ -1131,6 +1179,17 @@ async def boost_live_panel_update(app, settings: dict, snap: dict, *, status: st
     chat_id = first_admin_id()
     if not chat_id:
         return
+    lock = app.bot_data.get("boost_live_panel_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        app.bot_data["boost_live_panel_lock"] = lock
+    if lock.locked() and not force:
+        return
+    async with lock:
+        await _boost_live_panel_update_locked(app, chat_id, settings, snap, status=status, decision=decision, position=position, note=note, force=force)
+
+
+async def _boost_live_panel_update_locked(app, chat_id: int, settings: dict, snap: dict, *, status: str = "scan", decision=None, position: dict | None = None, note: str = "", force: bool = False) -> None:
     interval = max(1, int(float(settings.get("boost_live_panel_interval_sec", 5) or 5)))
     now = time.time()
     if not force and now - float(app.bot_data.get("boost_panel_last_edit", 0) or 0) < interval:
@@ -1139,10 +1198,12 @@ async def boost_live_panel_update(app, settings: dict, snap: dict, *, status: st
     lines = [
         "🚀 BOOST AUTOPILOT LIVE",
         f"Status: {status}",
+        "Commands/buttons stay active: Balance / Status / Stop Boost / Close All / Cancel All",
         f"Bank: {float(snap.get('current_bank') or 0):.4f} / {float(snap.get('target_bank') or 0):.4f} USDT",
         f"Session PnL: {float(snap.get('pnl') or 0):+.4f} USDT | Trades: {snap.get('trades', 0)}",
         f"Rotation while profit: {rot}",
         f"Blocked symbols: {_boost_blocked_count(settings)}",
+        "Protection: if exchange TP/SL is missing, BOOST position is monitored; no forced negative close.",
     ]
     if position:
         try:
@@ -1176,13 +1237,14 @@ async def boost_live_panel_update(app, settings: dict, snap: dict, *, status: st
     msg_id = app.bot_data.get("boost_live_panel_message_id")
     if msg_id:
         try:
-            await app.bot.delete_message(chat_id=chat_id, message_id=int(msg_id))
+            await _safe_delete_bot_message(app, chat_id, int(msg_id))
         except Exception as e:
             log.debug("boost live panel delete skipped: %s", e)
     try:
-        msg = await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=_boost_rotation_keyboard(settings))
-        app.bot_data["boost_live_panel_message_id"] = getattr(msg, "message_id", None)
-        app.bot_data["boost_panel_last_edit"] = now
+        msg = await _safe_send_bot_message(app, chat_id, text, reply_markup=_boost_rotation_keyboard(settings))
+        if msg is not None:
+            app.bot_data["boost_live_panel_message_id"] = getattr(msg, "message_id", None)
+            app.bot_data["boost_panel_last_edit"] = now
     except Exception as e:
         # v0187: never fail silently. If the live panel cannot be posted, send a
         # plain notification so BOOST activity is still visible in chat/logs.
@@ -1407,13 +1469,14 @@ async def boost_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     global running, entries_enabled, trading_task, position_task
+    if context.application.bot_data.get("boost_start_in_progress"):
+        await reply(update, "⏳ BOOST start is already in progress. Use /boost_status or /boost_stop.", reply_markup=MAIN_MENU)
+        return
+    context.application.bot_data["boost_start_in_progress"] = True
 
-    # v0187: acknowledge immediately. Network balance/API calls can take a few
-    # seconds, and Telegram users were seeing BOOST as "hung" while it was arming.
-    try:
-        await reply(update, "🚀 BOOST arming... запускаю автопилот и live-panel.", reply_markup=MAIN_MENU)
-    except Exception:
-        pass
+    # Acknowledge immediately. Network balance/API calls can take a few seconds,
+    # and Telegram users were seeing BOOST as hung while it was arming.
+    await reply(update, "🚀 BOOST arming... запускаю автопилот и live-panel. Команды и кнопки остаются доступны.", reply_markup=MAIN_MENU)
 
     s = await storage.all_settings()
     # v0187: force BOOST-safe runtime defaults before computing bank/target, so
@@ -1447,6 +1510,9 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "boost_parallel_scan_enabled": True,
         "boost_live_panel_enabled": True,
         "boost_live_panel_interval_sec": 2,
+        "boost_live_status_every_cycle": True,
+        "boost_live_safe_execution": True,
+        "boost_no_exchange_protection_monitor_only": True,
         "boost_rotate_only_if_profit": True,
         "boost_min_profit_to_rotate_pct": 0.03,
         "boost_rotate_strength_multiplier": 1.05,
@@ -1454,6 +1520,7 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "boost_rotate_cooldown_sec": 1,
         "scan_interval_sec": 1,
         "max_open_positions": 1,
+        "auto_close_on_protection_failed": False,
     }
     for k, v in boost_defaults.items():
         await storage.set(k, v, bump_revision=False)
@@ -1502,9 +1569,10 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ns = await storage.all_settings()
     await reply(
         update,
-        f"✅ BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: full 126 scan + aggressive rotation + micro TP 0.03-0.05%{balance_note}",
+        f"✅ BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: full 126 scan + aggressive rotation + micro TP 0.03-0.05%\nSafety: if exchange TP/SL is missing, BOOST monitors the position and will not force-close it just because protection attach failed.{balance_note}",
         reply_markup=_boost_rotation_keyboard(ns),
     )
+    context.application.bot_data["boost_armed_runtime"] = True
     await boost_live_panel_update(
         context.application, ns,
         {"bank": bank, "current_bank": bank, "target_bank": bank * target_mult, "pnl": 0.0, "trades": 0, "target_mult": target_mult},
@@ -1512,11 +1580,14 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         note="live panel active; commands remain available: /balance /status /boost_status /boost_stop",
         force=True,
     )
+    context.application.bot_data["boost_start_in_progress"] = False
 
 async def boost_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     global running, entries_enabled
     entries_enabled = False
+    context.application.bot_data["boost_armed_runtime"] = False
+    context.application.bot_data["boost_start_in_progress"] = False
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("strategy_mode", "hybrid")
     await reply(update, "🛑 BOOST stopped. New BOOST entries disabled. Open positions are still managed; use /close_all if you want to close immediately.", reply_markup=MAIN_MENU)
@@ -1602,6 +1673,10 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
+    try:
+        await reply(update, "💰 Balance: проверяю MEXC/IP, кнопки не блокируются...", reply_markup=MAIN_MENU)
+    except Exception:
+        pass
     s = await storage.all_settings()
     proxy_enabled = bool(s.get("proxy_enabled", False))
     proxy_url = str(s.get("proxy_url", "") or "")
@@ -1613,7 +1688,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     free = total = "n/a"
     try:
         ex = await get_exchange(s)
-        bal = await asyncio.wait_for(ex.fetch_balance(), timeout=8)
+        bal = await asyncio.wait_for(ex.fetch_balance(), timeout=5)
         usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
         free = usdt.get("free", "n/a") if isinstance(usdt, dict) else "n/a"
         total = usdt.get("total", "n/a") if isinstance(usdt, dict) else "n/a"
@@ -1630,9 +1705,9 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exchange_positions = []
         try:
             if hasattr(ex, "_mexc_fetch_positions"):
-                exchange_positions = await asyncio.wait_for(ex._mexc_fetch_positions(), timeout=8)
+                exchange_positions = await asyncio.wait_for(ex._mexc_fetch_positions(), timeout=5)
             else:
-                exchange_positions = await asyncio.wait_for(ex.fetch_positions(), timeout=8)
+                exchange_positions = await asyncio.wait_for(ex.fetch_positions(), timeout=5)
         except Exception:
             exchange_positions = []
         est_pm, est_count = _estimate_exchange_position_margin(
@@ -2096,7 +2171,10 @@ async def cancel_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global entries_enabled
     if not allowed(update): return
     entries_enabled = False
+    context.application.bot_data["boost_armed_runtime"] = False
+    context.application.bot_data["boost_start_in_progress"] = False
     await storage.set("boost_autopilot_active", False, bump_revision=False)
+    await storage.set("strategy_mode", "hybrid", bump_revision=False)
     await reply(update, "⏳ Cancel all orders: command received. BOOST/new entries are OFF.", reply_markup=MAIN_MENU)
     s = await storage.all_settings()
     try:
@@ -2110,7 +2188,10 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global entries_enabled
     if not allowed(update): return
     entries_enabled = False
+    context.application.bot_data["boost_armed_runtime"] = False
+    context.application.bot_data["boost_start_in_progress"] = False
     await storage.set("boost_autopilot_active", False, bump_revision=False)
+    await storage.set("strategy_mode", "hybrid", bump_revision=False)
     await reply(update, "⏳ Close all positions: command received. BOOST/new entries are OFF.", reply_markup=MAIN_MENU)
     s = await storage.all_settings()
     try:
@@ -2150,7 +2231,7 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_pm = post_used = None
         try:
             await asyncio.sleep(float(os.getenv("POST_CLOSE_BALANCE_CHECK_DELAY_SEC", "0.8")))
-            bal = await asyncio.wait_for(ex.fetch_balance(), timeout=8)
+            bal = await asyncio.wait_for(ex.fetch_balance(), timeout=5)
             usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
             post_pm = float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
             post_used = float(usdt.get("used") or ((bal or {}).get("used", {}) or {}).get("USDT") or 0)
@@ -2919,7 +3000,7 @@ async def ensure_recovery_before_entries(app, settings: dict, ex, exec_engine, l
 
 async def account_equity_usdt(ex, default: float = 1000.0) -> float:
     try:
-        bal = await asyncio.wait_for(ex.fetch_balance(), timeout=8)
+        bal = await asyncio.wait_for(ex.fetch_balance(), timeout=5)
         usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
         total = usdt.get("total") if isinstance(usdt, dict) else None
         free = usdt.get("free") if isinstance(usdt, dict) else None
@@ -3017,7 +3098,7 @@ async def trading_loop(app):
                 settings = await storage.all_settings()
                 mode_name = str(settings.get("strategy_mode", "hybrid")).lower()
                 ai_mode = mode_name == "ai_scalping"
-                boost_mode = mode_name == "boost_scalping" and _is_boost_active(settings)
+                boost_mode = mode_name == "boost_scalping" and _is_boost_runtime_armed(app, settings)
                 live = bool(settings.get("live_trading", False))
                 ex = await get_exchange(settings)
                 ws = await get_ws(settings)
@@ -3740,6 +3821,8 @@ def _wrap_command(fn, name: str):
             return await fn(update, context)
         except Exception as e:
             log.exception("telegram command failed: %s", name)
+            if name == "/boost_start":
+                context.application.bot_data["boost_start_in_progress"] = False
             try:
                 await reply(update, f"❌ Command failed: {name}\n{str(e)[:500]}", reply_markup=MAIN_MENU)
             except Exception:
@@ -3749,7 +3832,7 @@ def _wrap_command(fn, name: str):
 
 # Compatibility markers for legacy wiring tests: CommandHandler("api", api_cmd), CommandHandler("openai", openai_cmd)
 def build_app():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).concurrent_updates(True).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(on_startup).concurrent_updates(16).build()
     app.add_handler(CommandHandler("start", _wrap_command(start, "/start")))
     app.add_handler(CommandHandler("help", _wrap_command(help_cmd, "/help")))
     app.add_handler(CommandHandler("log", _wrap_command(log_cmd, "/log")))

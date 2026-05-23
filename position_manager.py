@@ -448,6 +448,13 @@ class PositionManager:
                     if wd:
                         events.append(wd)
                     stop = runner_stop
+            boost_monitor_only_no_exchange = False
+            if is_boost_scalping and live:
+                mode = str(pos.get("protection_mode") or "").lower()
+                status_txt = str(pos.get("protection_status") or "").upper()
+                monitor_only = str(await self._setting("boost_no_exchange_protection_monitor_only", os.getenv("BOOST_NO_EXCHANGE_PROTECTION_MONITOR_ONLY", "true"))).lower() in {"1", "true", "yes", "on"}
+                boost_monitor_only_no_exchange = monitor_only and not (mode == "exchange" or status_txt in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP"})
+
             if side=="LONG":
                 if take and price>=take:
                     if live and strategy == "boost_scalping":
@@ -462,9 +469,15 @@ class PositionManager:
                     if ev: events.append(ev)
                     continue
                 if stop and price<=stop and not liquidation_stop_mode:
-                    ev = await self._close_and_event(pos, "sl", "stop_loss", live, price)
-                    if ev: events.append(ev)
-                    continue
+                    if boost_monitor_only_no_exchange:
+                        pos["boost_monitor_only_skip_sl"] = f"exchange TP/SL missing; local SL close skipped at pnl {pnl:+.3f}%"
+                        pos["updated_at"] = now
+                        await self.storage.upsert_position(pos)
+                        events.append({"type":"boost_monitor_only_no_exchange_protection", "symbol": symbol, "pnl_pct": pnl})
+                    else:
+                        ev = await self._close_and_event(pos, "sl", "stop_loss", live, price)
+                        if ev: events.append(ev)
+                        continue
             else:
                 if take and price<=take:
                     if live and strategy == "boost_scalping":
@@ -479,9 +492,15 @@ class PositionManager:
                     if ev: events.append(ev)
                     continue
                 if stop and price>=stop and not liquidation_stop_mode:
-                    ev = await self._close_and_event(pos, "sl", "stop_loss", live, price)
-                    if ev: events.append(ev)
-                    continue
+                    if boost_monitor_only_no_exchange:
+                        pos["boost_monitor_only_skip_sl"] = f"exchange TP/SL missing; local SL close skipped at pnl {pnl:+.3f}%"
+                        pos["updated_at"] = now
+                        await self.storage.upsert_position(pos)
+                        events.append({"type":"boost_monitor_only_no_exchange_protection", "symbol": symbol, "pnl_pct": pnl})
+                    else:
+                        ev = await self._close_and_event(pos, "sl", "stop_loss", live, price)
+                        if ev: events.append(ev)
+                        continue
             if not is_liquidity_retest:
                 if manage_only_tpsl:
                     # v0181: For AI scalping and BOOST, do not choke a live trade with

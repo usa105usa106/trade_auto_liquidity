@@ -1,4 +1,4 @@
-## v0188 COMMANDS BOOST EMERGENCY FIX
+## v0190 BOOST COMMAND ISOLATION LIVE PANEL FIX
 
 - Restored fast BOOST live panel as one bottom Telegram message.
 - Full zero-fee universe scan stays aggressive.
