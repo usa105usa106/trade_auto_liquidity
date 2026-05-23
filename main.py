@@ -3596,7 +3596,16 @@ async def emit_position_events(app, events: list[dict]) -> None:
     """
     for ev in events or []:
         ev_type = str(ev.get("type") or "")
-        if ev_type in {"pending_sync_warning", "price_error"}:
+        # v0223: keep Telegram clean. These are not actionable errors; they mean
+        # local TP/fast-profit was touched but MEXC real profit was not confirmed
+        # yet. Re-sending them every manage tick floods the chat and delays useful
+        # rotation/profit messages. Store/log them silently instead.
+        if ev_type in {
+            "pending_sync_warning",
+            "price_error",
+            "boost_tp_wait_exchange_profit",
+            "boost_fast_profit_wait_exchange_profit",
+        }:
             continue
         text = format_position_event(ev)
         if ev_type == "protection_watchdog":
@@ -4020,8 +4029,11 @@ async def trading_loop(app):
 
                                     real_profit_ok = True
                                     if live:
-                                        # NORMAL rotation is allowed only when MEXC confirms real profit.
-                                        real_profit_ok = (ex_upnl is None or ex_upnl > 0) and pos_pnl >= min_profit
+                                        # v0223: MEXC sometimes reports unrealizedPnl as 0.0 while
+                                        # mark/entry already gives a clearly positive exchange PnL%.
+                                        # Do not HOLD a strong rotation just because uPnL is rounded to
+                                        # zero; require positive exchange pct and non-negative uPnL.
+                                        real_profit_ok = (ex_upnl is None or ex_upnl >= 0) and pos_pnl >= min_profit
                                     normal_rotate = bool(stronger_normal and (not only_profit or pos_pnl >= min_profit) and real_profit_ok)
 
                                     rescue_rotate = False
