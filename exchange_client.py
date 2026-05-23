@@ -93,9 +93,10 @@ class ExchangeClient:
         return base.strip("_/:-"), (quote or "USDT").strip("_/:-")
 
     def normalize_symbol(self, symbol: str) -> str:
-        """Return an exchange-compatible swap symbol, or raise if none exists."""
+        """Return an exchange-compatible swap symbol, or a safe MEXC futures display symbol when ccxt is not initialized."""
         if not self.exchange:
-            raise RuntimeError("exchange is not initialized")
+            base, quote = self._split_symbol_parts(symbol)
+            return f"{base}/{quote}:USDT"
         markets = getattr(self.exchange, "markets", None) or {}
         if symbol in markets:
             return symbol
@@ -492,6 +493,29 @@ class ExchangeClient:
         return await self.exchange.fetch_tickers()
 
     async def fetch_order_book(self, symbol, limit=20):
+        if self.exchange_id == "mexc" and self.exchange is None:
+            msym = self._mexc_symbol(symbol)
+            lim = max(5, min(int(limit or 20), 100))
+            try:
+                resp = await self._mexc_public("GET", f"/api/v1/contract/depth/{msym}", query={"limit": lim})
+            except Exception:
+                resp = await self._mexc_public("GET", "/api/v1/contract/depth", query={"symbol": msym, "limit": lim})
+            data = resp.get("data") if isinstance(resp, dict) else resp
+            def rows(key):
+                raw = (data or {}).get(key) if isinstance(data, dict) else []
+                out = []
+                for row in raw or []:
+                    try:
+                        if isinstance(row, dict):
+                            p = row.get("price") or row.get("p")
+                            q = row.get("vol") or row.get("volume") or row.get("quantity") or row.get("q")
+                        else:
+                            p, q = row[0], row[1]
+                        out.append([float(p), float(q)])
+                    except Exception:
+                        continue
+                return out
+            return {"symbol": self.normalize_symbol(symbol), "bids": rows("bids"), "asks": rows("asks")}
         return await self.exchange.fetch_order_book(self.normalize_symbol(symbol), limit=limit)
 
     async def fetch_spot_order_book(self, symbol, limit=20):
@@ -532,9 +556,52 @@ class ExchangeClient:
         return await self.exchange.fetch_order_book(f"{base}/{quote}", limit=lim)
 
     async def fetch_ticker(self, symbol, params=None):
+        if self.exchange_id == "mexc" and self.exchange is None:
+            msym = self._mexc_symbol(symbol)
+            resp = await self._mexc_public("GET", f"/api/v1/contract/ticker", query={"symbol": msym})
+            data = resp.get("data") if isinstance(resp, dict) else None
+            row = data[0] if isinstance(data, list) and data else data
+            if not isinstance(row, dict):
+                row = {}
+            last = row.get("lastPrice") or row.get("last") or row.get("fairPrice") or row.get("indexPrice") or 0
+            bid = row.get("bid1") or row.get("bid") or row.get("bidPrice") or last
+            ask = row.get("ask1") or row.get("ask") or row.get("askPrice") or last
+            return {
+                "symbol": self.normalize_symbol(symbol),
+                "last": float(last or 0), "close": float(last or 0),
+                "bid": float(bid or last or 0), "ask": float(ask or last or 0),
+                "quoteVolume": float(row.get("amount24") or row.get("volume24") or row.get("holdVol") or 0),
+                "info": row,
+            }
         return await self.exchange.fetch_ticker(self.normalize_symbol(symbol), params or {})
 
     async def fetch_ohlcv(self, symbol, timeframe="1m", limit=60, params=None):
+        if self.exchange_id == "mexc" and self.exchange is None:
+            msym = self._mexc_symbol(symbol)
+            tf = str(timeframe or "1m")
+            interval_map = {"1m": "Min1", "5m": "Min5", "15m": "Min15", "30m": "Min30", "1h": "Min60", "4h": "Hour4", "1d": "Day1"}
+            interval = interval_map.get(tf, tf)
+            lim = max(2, min(int(limit or 60), 200))
+            resp = await self._mexc_public("GET", f"/api/v1/contract/kline/{msym}", query={"interval": interval, "limit": lim})
+            data = resp.get("data") if isinstance(resp, dict) else resp
+            rows = []
+            if isinstance(data, dict) and all(k in data for k in ("time", "open", "close", "high", "low")):
+                vols = data.get("vol") or data.get("volume") or [0] * len(data.get("time") or [])
+                for t,o,c,h,l,v in zip(data.get("time") or [], data.get("open") or [], data.get("close") or [], data.get("high") or [], data.get("low") or [], vols):
+                    try:
+                        ts = int(float(t)); ts = ts*1000 if ts < 10_000_000_000 else ts
+                        rows.append([ts, float(o), float(h), float(l), float(c), float(v or 0)])
+                    except Exception:
+                        continue
+            elif isinstance(data, list):
+                for r in data:
+                    try:
+                        ts,o,h,l,c,v = r[0], r[1], r[2], r[3], r[4], (r[5] if len(r)>5 else 0)
+                        ts = int(float(ts)); ts = ts*1000 if ts < 10_000_000_000 else ts
+                        rows.append([ts, float(o), float(h), float(l), float(c), float(v or 0)])
+                    except Exception:
+                        continue
+            return rows[-lim:]
         return await self.exchange.fetch_ohlcv(self.normalize_symbol(symbol), timeframe=timeframe, limit=limit, params=params or {})
 
     async def fetch_order(self, order_id, symbol):
@@ -595,6 +662,31 @@ class ExchangeClient:
                 out.append({"id": o.get("id"), "symbol": o.get("symbol"), "error": str(e)})
         return out
 
+
+
+    async def _mexc_public(self, method: str, path: str, query: dict | None = None, base_url: str | None = None):
+        """Small native MEXC futures public REST helper.
+
+        Used by BOOST when ccxt market initialization is slow/unavailable.
+        """
+        method = str(method or "GET").upper()
+        query = dict(query or {})
+        base = (base_url or self._mexc_rest_base()).rstrip("/")
+        qs = urlencode(sorted((k, v) for k, v in query.items() if v is not None))
+        url = f"{base}{path}" + (f"?{qs}" if qs else "")
+        connector, proxy_arg = self._proxy_connector_and_arg()
+        timeout = aiohttp.ClientTimeout(total=float(os.getenv("MEXC_PUBLIC_TIMEOUT", "6") or 6))
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async with session.request(method, url, headers={"User-Agent": "Mozilla/5.0"}, proxy=proxy_arg) as r:
+                text = await r.text()
+                try:
+                    out = json.loads(text)
+                except Exception:
+                    out = {"raw": text}
+                log_mexc(method, path, request={"query": query}, response=out, status=r.status)
+                if r.status >= 400 or (isinstance(out, dict) and out.get("success") is False):
+                    raise RuntimeError(f"MEXC public HTTP {r.status}: {str(out)[:240]}")
+                return out
 
     def _mexc_rest_base(self) -> str:
         """Base URL for MEXC futures private REST.

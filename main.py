@@ -32,7 +32,7 @@ from boost_scalping_engine import BoostScalpingEngine
 from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
-from debug_log import tail_text, tail_important
+from debug_log import tail_text, tail_important, log_event
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
@@ -1501,130 +1501,149 @@ async def boost_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     global running, entries_enabled, trading_task, position_task
-    if context.application.bot_data.get("boost_start_in_progress") or context.application.bot_data.get("boost_armed_runtime"):
-        await reply(update, "⏳ BOOST уже запущен/запускается. Повторный запуск заблокирован. Use /boost_status or /boost_stop.", reply_markup=MAIN_MENU)
+    app = context.application
+    if app.bot_data.get("boost_start_in_progress") or app.bot_data.get("boost_armed_runtime"):
+        await reply(update, "⏳ BOOST уже запущен/запускается. Повторный запуск заблокирован. Use /boost_status or /boost_stop. Проверь /log.", reply_markup=MAIN_MENU)
         return
-    context.application.bot_data["boost_start_in_progress"] = True
-    context.application.bot_data["boost_armed_runtime"] = True
+    app.bot_data["boost_start_in_progress"] = True
+    app.bot_data["boost_armed_runtime"] = True
+    log_event("boost_start_requested", stage="command", ok=True)
 
-    # Acknowledge immediately. Network balance/API calls can take a few seconds,
-    # and Telegram users were seeing BOOST as hung while it was arming.
-    await reply(update, "🚀 BOOST arming... запускаю автопилот и live-panel. Команды и кнопки остаются доступны.", reply_markup=MAIN_MENU)
+    await reply(update, "🚀 BOOST arming... запускаю автопилот и live-panel. Команды и кнопки остаются доступны. Прогресс смотри в /log.", reply_markup=MAIN_MENU)
 
-    s = await storage.all_settings()
-    # v0187: force BOOST-safe runtime defaults before computing bank/target, so
-    # stale Railway SQLite values cannot make commands look broken or size with
-    # an old boost_balance_share.
-    boost_defaults = {
-        "strategy_mode": "boost_scalping",
-        "boost_autopilot_active": True,
-        "boost_zero_fee_scanner_enabled": True,
-        "boost_balance_share": 0.10,
-        "boost_target_multiplier": 20.0,
-        "boost_max_consecutive_losses": 999,
-        "boost_auto_leverage": True,
-        "boost_min_leverage": 10,
-        "boost_max_leverage": 50,
-        "boost_use_full_bank_per_trade": True,
-        "boost_auto_rotate_symbols": True,
-        "boost_stop_when_target_reached": True,
-        "boost_max_symbols_scan": 126,
-        "boost_min_checked_per_cycle": 40,
-        "boost_max_checked_per_cycle": 100,
-        "universe_mode": "full",
-        "boost_min_tp_pct": 0.03,
-        "boost_max_tp_pct": 0.05,
-        "boost_min_quote_volume_usdt": 0.0,
-        "boost_min_atr_pct": 0.04,
-        "boost_max_spread_pct": 0.12,
-        "boost_spot_imbalance_ratio": 1.30,
-        "boost_futures_momentum_min_pct": 0.015,
-        "boost_allow_fee_fallback": True,
-        "boost_parallel_scan_enabled": True,
-        "boost_live_panel_enabled": True,
-        "boost_live_panel_interval_sec": 2,
-        "boost_live_status_every_cycle": True,
-        "boost_live_safe_execution": True,
-        "boost_no_exchange_protection_monitor_only": True,
-        "boost_rotate_only_if_profit": True,
-        "boost_min_profit_to_rotate_pct": 0.03,
-        "boost_rotate_strength_multiplier": 1.05,
-        "boost_rotate_min_score_gap": 0.0,
-        "boost_rotate_cooldown_sec": 1,
-        "scan_interval_sec": 1,
-        "max_open_positions": 1,
-        "auto_close_on_protection_failed": False,
-    }
-    for k, v in boost_defaults.items():
-        await storage.set(k, v, bump_revision=False)
+    # ВАЖНО: запуск BOOST вынесен в отдельную задачу. Даже если MEXC/ccxt зависнет,
+    # Telegram-команды, кнопки и /log не должны блокироваться на обработчике /boost_start.
+    app.create_task(_boost_start_worker(app))
 
-    s = await storage.all_settings()
-    equity = 0.0
-    balance_note = ""
-    ex = None
+
+async def _boost_start_worker(app):
+    global running, entries_enabled, trading_task, position_task
     try:
-        api_key, api_secret = _api_creds(s)
-        ex = ExchangeClient(DEFAULT_EXCHANGE, str(s.get("proxy_url", "") or ""), bool(s.get("proxy_enabled", False)))
-        ex.api_key = api_key
-        ex.api_secret = api_secret
-        # Never call get_exchange()/load_markets here: public market init is exactly what can hang.
-        bal = await _await_with_timeout(ex.fetch_balance(), 5, "native MEXC futures balance")
-        usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
-        equity = float(usdt.get("total") or usdt.get("free") or ((bal or {}).get("total", {}) or {}).get("USDT") or 0)
+        log_event("boost_start_stage", stage="load_settings", ok=True)
+        s = await storage.all_settings()
+        boost_defaults = {
+            "strategy_mode": "boost_scalping",
+            "boost_autopilot_active": True,
+            "boost_zero_fee_scanner_enabled": True,
+            "boost_balance_share": 0.10,
+            "boost_target_multiplier": 20.0,
+            "boost_max_consecutive_losses": 999,
+            "boost_auto_leverage": True,
+            "boost_min_leverage": 10,
+            "boost_max_leverage": 50,
+            "boost_use_full_bank_per_trade": True,
+            "boost_auto_rotate_symbols": True,
+            "boost_stop_when_target_reached": True,
+            "boost_max_symbols_scan": 126,
+            "boost_min_checked_per_cycle": 40,
+            "boost_max_checked_per_cycle": 100,
+            "universe_mode": "full",
+            "boost_min_tp_pct": 0.03,
+            "boost_max_tp_pct": 0.05,
+            "boost_min_quote_volume_usdt": 0.0,
+            "boost_min_atr_pct": 0.04,
+            "boost_max_spread_pct": 0.12,
+            "boost_spot_imbalance_ratio": 1.30,
+            "boost_futures_momentum_min_pct": 0.015,
+            "boost_allow_fee_fallback": True,
+            "boost_parallel_scan_enabled": True,
+            "boost_live_panel_enabled": True,
+            "boost_live_panel_interval_sec": 2,
+            "boost_live_status_every_cycle": True,
+            "boost_live_safe_execution": True,
+            "boost_no_exchange_protection_monitor_only": True,
+            "boost_rotate_only_if_profit": True,
+            "boost_min_profit_to_rotate_pct": 0.03,
+            "boost_rotate_strength_multiplier": 1.05,
+            "boost_rotate_min_score_gap": 0.0,
+            "boost_rotate_cooldown_sec": 1,
+            "scan_interval_sec": 1,
+            "max_open_positions": 1,
+            "auto_close_on_protection_failed": False,
+        }
+        for k, v in boost_defaults.items():
+            await storage.set(k, v, bump_revision=False)
+        log_event("boost_start_stage", stage="defaults_saved", ok=True)
+
+        s = await storage.all_settings()
+        equity = 0.0
+        balance_note = ""
+        ex = None
+        try:
+            api_key, api_secret = _api_creds(s)
+            ex = ExchangeClient(DEFAULT_EXCHANGE, str(s.get("proxy_url", "") or ""), bool(s.get("proxy_enabled", False)))
+            ex.api_key = api_key
+            ex.api_secret = api_secret
+            log_event("boost_start_stage", stage="balance_precheck", ok=True)
+            bal = await _await_with_timeout(ex.fetch_balance(), 4, "BOOST native MEXC futures balance")
+            usdt = bal.get("USDT", {}) if isinstance(bal, dict) else {}
+            equity = float(usdt.get("total") or usdt.get("free") or ((bal or {}).get("total", {}) or {}).get("USDT") or 0)
+            log_event("boost_start_stage", stage="balance_ok", ok=True, equity=equity)
+        except Exception as e:
+            equity = float(s.get("boost_session_start_equity", 0) or 0)
+            balance_note = f"\nBalance warning: {str(e)[:180]}"
+            log_event("boost_start_error", stage="balance_precheck", ok=False, error=str(e)[:500])
+        finally:
+            if ex is not None:
+                try:
+                    await _await_with_timeout(ex.close(), 1.5, "exchange close")
+                except Exception:
+                    pass
+
+        share = max(0.001, min(1.0, float(s.get("boost_balance_share", 0.10) or 0.10)))
+        bank = max(0.0, equity * share)
+        target_mult = max(1.0, float(s.get("boost_target_multiplier", 20.0) or 20.0))
+        now_ts = time.time()
+        await storage.set("boost_session_start_ts", now_ts, bump_revision=False)
+        await storage.set("boost_session_start_equity", equity, bump_revision=False)
+        await storage.set("boost_session_bank_usdt", bank, bump_revision=False)
+        await storage.set("boost_session_target_profit_usdt", bank * (target_mult - 1.0), bump_revision=False)
+        log_event("boost_start_stage", stage="session_saved", ok=True, bank=bank, target=bank*target_mult)
+
+        manual_symbols = str(s.get("boost_zero_fee_symbols") or "").strip()
+        if not manual_symbols:
+            manual_symbols = "AAPLUSDT,AAVEUSDT,ADAUSDT,AMDUSDT,ANTHROPICUSDT,APEUSDT,ARMUSDT,ASTERUSDT,ASTSUSDT,ATOMUSDT,AVAXUSDT,BCHUSDT,BEUSDT,BILLUSDT,BLESSUSDT,BNBUSDT,BRETTUSDT,BTCUSDT,BULLAUSDT,BUSDT,CBRSUSDT,CHIPUSDT,COAIUSDT,XCU_USDT,CVNAUSDT,DOGEUSDT,DOTUSDT,ENJUSDT,ETHFIUSDT,ETHUSDT,FLOKIUSDT,FLNCUSDT,FOLKSUSDT,FUTUUSDT,GALAUSDT,GASNGUSDT,GIGGLEUSDT,GOATUSDT,PAXG_USDT,XAUT_USDT,GOOGLUSDT,GRTUSDT,HBARUSDT,HYPEUSDT,IBMUSDT,ICPUSDT,INJUSDT,INTCUSDT,INTUUSDT,IONQUSDT,JASMYUSDT,JUPUSDT,LABUSDT,LAYERUSDT,LIGHTUSDT,LINKUSDT,LTCUSDT,LYNUSDT,MEGAUSDT,MSTRUSDT,MUUSDT,MUUUSDT,MYXUSDT,NAS100_USDT,NBISUSDT,NEARUSDT,XNI_USDT,NVDAUSDT,BRENT_USDT,WTI_USDT,ONDOUSDT,OPUSDT,ORDIUSDT,XPD_USDT,PENGUINUSDT,PENGUUSDT,PEPEUSDT,PIPPINUSDT,PIXELUSDT,XPT_USDT,PNUTUSDT,POLUSDT,POWERUSDT,PUMPUSDT,PYTHUSDT,QCOMUSDT,QQQUSDT,RENDERUSDT,RIVERUSDT,RKLBUSDT,SAMSUNGUSDT,SEIUSDT,SHIBUSDT,XAG_USDT,SKHYNIXUSDT,SKYAIUSDT,SNDKUSDT,SOLUSDT,SP500_USDT,SPACEXUSDT,SPCXUSDT,SPOTUSDT,STOUSDT,STRKUSDT,STXSTOCKUSDT,SUIUSDT,TAOUSDT,TONUSDT,TRUMPUSDT,TSLAUSDT,UNIUSDT,US30_USDT,VIRTUALUSDT,VVVUSDT,WDCUSDT,WIFUSDT,WLDUSDT,WLFIUSDT,XAIUSDT,XLMUSDT,XMRUSDT,XOMUSDT,XPLUSDT,XRPUSDT,ZECUSDT,ZROUSDT"
+            await storage.set("boost_zero_fee_symbols", manual_symbols, bump_revision=False)
+        await storage.set("boost_blocked_symbols_json", json.dumps(_boost_blocked_map(await storage.all_settings()), separators=(",", ":")), bump_revision=False)
+
+        if trading_task and not trading_task.done():
+            running = True; entries_enabled = True
+            log_event("boost_start_stage", stage="trading_loop_already_running", ok=True)
+        else:
+            running = True; entries_enabled = True
+            trading_task = app.create_task(trading_loop(app))
+            log_event("boost_start_stage", stage="trading_loop_created", ok=True)
+        if position_task is None or position_task.done():
+            position_task = app.create_task(position_management_loop(app))
+            log_event("boost_start_stage", stage="position_loop_created", ok=True)
+
+        app.bot_data.pop("boost_live_panel_message_id", None)
+        app.bot_data["boost_panel_last_edit"] = 0
+        trigger_scan_now(app, reason="boost_start")
+        ns = await storage.all_settings()
+        chat_id = first_admin_id()
+        if chat_id:
+            await _safe_send_bot_message(app, chat_id,
+                f"✅ BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: full scan + rotation + micro TP 0.03-0.05%\nSafety: commands/buttons stay available; /log now shows BOOST stages/errors.{balance_note}",
+                reply_markup=_boost_rotation_keyboard(ns))
+        await boost_live_panel_update(
+            app, ns,
+            {"bank": bank, "current_bank": bank, "target_bank": bank * target_mult, "pnl": 0.0, "trades": 0, "target_mult": target_mult},
+            status="started; scanning",
+            note="live panel active; commands remain available: /balance /status /boost_status /boost_stop",
+            force=True,
+        )
+        app.bot_data["boost_armed_runtime"] = True
+        app.bot_data["boost_start_in_progress"] = False
+        log_event("boost_start_done", stage="done", ok=True)
     except Exception as e:
-        equity = float(s.get("boost_session_start_equity", 0) or 0)
-        balance_note = f"\nBalance warning: {str(e)[:180]}"
-    finally:
-        if ex is not None:
-            try:
-                await _await_with_timeout(ex.close(), 2, "exchange close")
-            except Exception:
-                pass
-
-    share = max(0.001, min(1.0, float(s.get("boost_balance_share", 0.10) or 0.10)))
-    bank = max(0.0, equity * share)
-    target_mult = max(1.0, float(s.get("boost_target_multiplier", 20.0) or 20.0))
-    now_ts = time.time()
-    await storage.set("boost_session_start_ts", now_ts, bump_revision=False)
-    await storage.set("boost_session_start_equity", equity, bump_revision=False)
-    await storage.set("boost_session_bank_usdt", bank, bump_revision=False)
-    await storage.set("boost_session_target_profit_usdt", bank * (target_mult - 1.0), bump_revision=False)
-
-    manual_symbols = str(s.get("boost_zero_fee_symbols") or "").strip()
-    # v0176/v0187: if an old Railway DB has an empty manual whitelist, preload the confirmed 0-fee pool from screenshots.
-    if not manual_symbols:
-        manual_symbols = "AAPLUSDT,AAVEUSDT,ADAUSDT,AMDUSDT,ANTHROPICUSDT,APEUSDT,ARMUSDT,ASTERUSDT,ASTSUSDT,ATOMUSDT,AVAXUSDT,BCHUSDT,BEUSDT,BILLUSDT,BLESSUSDT,BNBUSDT,BRETTUSDT,BTCUSDT,BULLAUSDT,BUSDT,CBRSUSDT,CHIPUSDT,COAIUSDT,XCU_USDT,CVNAUSDT,DOGEUSDT,DOTUSDT,ENJUSDT,ETHFIUSDT,ETHUSDT,FLOKIUSDT,FLNCUSDT,FOLKSUSDT,FUTUUSDT,GALAUSDT,GASNGUSDT,GIGGLEUSDT,GOATUSDT,PAXG_USDT,XAUT_USDT,GOOGLUSDT,GRTUSDT,HBARUSDT,HYPEUSDT,IBMUSDT,ICPUSDT,INJUSDT,INTCUSDT,INTUUSDT,IONQUSDT,JASMYUSDT,JUPUSDT,LABUSDT,LAYERUSDT,LIGHTUSDT,LINKUSDT,LTCUSDT,LYNUSDT,MEGAUSDT,MSTRUSDT,MUUSDT,MUUUSDT,MYXUSDT,NAS100_USDT,NBISUSDT,NEARUSDT,XNI_USDT,NVDAUSDT,BRENT_USDT,WTI_USDT,ONDOUSDT,OPUSDT,ORDIUSDT,XPD_USDT,PENGUINUSDT,PENGUUSDT,PEPEUSDT,PIPPINUSDT,PIXELUSDT,XPT_USDT,PNUTUSDT,POLUSDT,POWERUSDT,PUMPUSDT,PYTHUSDT,QCOMUSDT,QQQUSDT,RENDERUSDT,RIVERUSDT,RKLBUSDT,SAMSUNGUSDT,SEIUSDT,SHIBUSDT,XAG_USDT,SKHYNIXUSDT,SKYAIUSDT,SNDKUSDT,SOLUSDT,SP500_USDT,SPACEXUSDT,SPCXUSDT,SPOTUSDT,STOUSDT,STRKUSDT,STXSTOCKUSDT,SUIUSDT,TAOUSDT,TONUSDT,TRUMPUSDT,TSLAUSDT,UNIUSDT,US30_USDT,VIRTUALUSDT,VVVUSDT,WDCUSDT,WIFUSDT,WLDUSDT,WLFIUSDT,XAIUSDT,XLMUSDT,XMRUSDT,XOMUSDT,XPLUSDT,XRPUSDT,ZECUSDT,ZROUSDT"
-        await storage.set("boost_zero_fee_symbols", manual_symbols, bump_revision=False)
-
-    await storage.set("boost_blocked_symbols_json", json.dumps(_boost_blocked_map(await storage.all_settings()), separators=(",", ":")), bump_revision=False)
-
-    if trading_task and not trading_task.done():
-        running = True; entries_enabled = True
-    else:
-        running = True; entries_enabled = True
-        trading_task = context.application.create_task(trading_loop(context.application))
-    if position_task is None or position_task.done():
-        position_task = context.application.create_task(position_management_loop(context.application))
-
-    # Start with a fresh visible panel. A stale/deleted message id must not hide status.
-    context.application.bot_data.pop("boost_live_panel_message_id", None)
-    context.application.bot_data["boost_panel_last_edit"] = 0
-    trigger_scan_now(context.application, reason="boost_start")
-    ns = await storage.all_settings()
-    await reply(
-        update,
-        f"✅ BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: full 126 scan + aggressive rotation + micro TP 0.03-0.05%\nSafety: if exchange TP/SL is missing, BOOST monitors the position and will not force-close it just because protection attach failed.{balance_note}",
-        reply_markup=_boost_rotation_keyboard(ns),
-    )
-    context.application.bot_data["boost_armed_runtime"] = True
-    await boost_live_panel_update(
-        context.application, ns,
-        {"bank": bank, "current_bank": bank, "target_bank": bank * target_mult, "pnl": 0.0, "trades": 0, "target_mult": target_mult},
-        status="started; scanning",
-        note="live panel active; commands remain available: /balance /status /boost_status /boost_stop",
-        force=True,
-    )
-    context.application.bot_data["boost_start_in_progress"] = False
+        app.bot_data["boost_start_in_progress"] = False
+        app.bot_data["boost_armed_runtime"] = False
+        await storage.set("boost_autopilot_active", False, bump_revision=False)
+        log_event("boost_start_error", stage="fatal", ok=False, error=str(e)[:1000])
+        chat_id = first_admin_id()
+        if chat_id:
+            await _safe_send_bot_message(app, chat_id, f"❌ BOOST start failed: {str(e)[:700]}\nСмотри /log", reply_markup=MAIN_MENU)
 
 async def boost_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -3225,10 +3244,20 @@ async def trading_loop(app):
                 ai_mode = mode_name == "ai_scalping"
                 boost_mode = mode_name == "boost_scalping" and _is_boost_runtime_armed(app, settings)
                 live = bool(settings.get("live_trading", False))
-                ex = await _await_with_timeout(get_exchange(settings), 8, "exchange init")
+                if boost_mode:
+                    # BOOST must not get stuck on ccxt.load_markets()/exchange init.
+                    # Direct ExchangeClient is enough for native MEXC futures balance/orders;
+                    # public scanner calls will log their own errors if MEXC public API is unavailable.
+                    api_key, api_secret = _api_creds(settings)
+                    ex = ExchangeClient(DEFAULT_EXCHANGE, str(settings.get("proxy_url", "") or ""), bool(settings.get("proxy_enabled", False)))
+                    ex.api_key = api_key
+                    ex.api_secret = api_secret
+                    log_event("boost_loop_stage", stage="direct_exchange_client", ok=True)
+                else:
+                    ex = await _await_with_timeout(get_exchange(settings), 8, "exchange init")
                 ws = await get_ws(settings)
 
-                if bool(settings.get("ws_enabled", True)) and not ws.status.running:
+                if (not boost_mode) and bool(settings.get("ws_enabled", True)) and not ws.status.running:
                     await ws.start()
 
                 exec_engine = ExecutionEngine(storage, ex)

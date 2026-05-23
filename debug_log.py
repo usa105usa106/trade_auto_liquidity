@@ -92,6 +92,7 @@ def tail_important(lines: int = 160, max_chars: int = 12000) -> str:
     )
     important_kinds = (
         "error", "protection", "tpsl", "trigger", "opened", "closed",
+        "boost", "scan", "scanner", "decision", "rejected", "wait", "stage",
         "mexc_native", "mexc_trigger", "mexc_stoporder_place_body",
     )
     records: list[str] = []
