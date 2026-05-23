@@ -1590,7 +1590,7 @@ class ExchangeClient:
             "side": close_side,
             "amount": amount,
             "price": None,
-            "info": {"native_mexc_trigger": True, "_protection_kind": kind_l, "safe_trigger_price": safe_trigger, "reference_price": ref, **(out if isinstance(out, dict) else {"raw": out})},
+            "info": {"native_mexc_trigger": True, "_protection_kind": kind_l, "_protection_endpoint": "planorder", "safe_trigger_price": safe_trigger, "reference_price": ref, **(out if isinstance(out, dict) else {"raw": out})},
         }
 
     async def mexc_place_stop_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, client_order_id: str = "", leverage: int | None = None) -> dict:

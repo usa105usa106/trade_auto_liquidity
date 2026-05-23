@@ -161,6 +161,30 @@ class ProtectionEngine:
                 "checked_at": time.time(),
             }
 
+        # HUNTER/BOOST uses live trailing/momentum exits and places ONLY an
+        # emergency exchange SL.  The SL is often created as a MEXC planorder,
+        # not as stoporder/open_orders.  Older code required both TP and SL here;
+        # then it saw stoporder=[] after a successful planorder/place and marked
+        # the position unsafe, sometimes canceling the real planorder.  For BOOST,
+        # an active SL plan/stop order is enough exchange protection.
+        is_boost = str(pos.get("strategy") or "").lower() == "boost_scalping"
+        emergency_only = str(pos.get("protection_mode") or "").lower() == "exchange_emergency_sl_only" or str(pos.get("tp_order_id") or "") == "LIVE_TRAILING_NO_FIXED_TP" or bool(pos.get("boost_emergency_sl_only"))
+        if is_boost and emergency_only:
+            status = "EMERGENCY SL ONLY" if found_sl else "UNSAFE POSITION"
+            return {
+                "tp_exists": True,
+                "sl_exists": found_sl,
+                "take_profit_ok": True,
+                "stop_loss_ok": found_sl,
+                "tp_order_id": pos.get("tp_order_id") or "LIVE_TRAILING_NO_FIXED_TP",
+                "sl_order_id": matched_sl_id or pos.get("sl_order_id"),
+                "protection_status": status,
+                "protection_mode": "exchange_emergency_sl_only" if found_sl else "unsafe_no_emergency_sl",
+                "boost_unsafe_position": not found_sl,
+                "boost_defensive_mode": not found_sl,
+                "checked_at": time.time(),
+            }
+
         status = "EXCHANGE PROTECTED" if (found_tp and found_sl) else "LOCAL BOT PROTECTED"
         return {
             "tp_exists": found_tp,
@@ -186,7 +210,7 @@ class ProtectionEngine:
 
     async def reconcile(self, pos: dict, live: bool = True, reattach: bool = True) -> dict:
         out = await self.check(pos)
-        if out.get("protection_status") in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP"} or not reattach or not live or not self.execution_engine:
+        if out.get("protection_status") in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP", "EMERGENCY SL ONLY"} or not reattach or not live or not self.execution_engine:
             return out
         liq_mode = bool(pos.get("liquidation_stop_mode")) and str(pos.get("strategy") or "").lower() == "ai_scalping"
         try:
