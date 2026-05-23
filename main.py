@@ -1130,22 +1130,22 @@ async def boost_live_panel_update(app, settings: dict, snap: dict, *, status: st
         lines += ["", f"Note: {note[:220]}"]
     lines.append(datetime.now(timezone(timedelta(hours=3))).strftime("\nUpdated: %H:%M:%S MSK"))
     text = "\n".join(lines)
+    # v0182: keep the live panel at the bottom of the chat. Editing an old
+    # message does not move it down in Telegram, so we delete the previous
+    # panel and send one fresh replacement. This keeps exactly one noisy live
+    # panel while important lifecycle alerts remain in history.
     msg_id = app.bot_data.get("boost_live_panel_message_id")
+    if msg_id:
+        try:
+            await app.bot.delete_message(chat_id=chat_id, message_id=int(msg_id))
+        except Exception as e:
+            log.debug("boost live panel delete skipped: %s", e)
     try:
-        if msg_id:
-            await app.bot.edit_message_text(chat_id=chat_id, message_id=int(msg_id), text=text, reply_markup=_boost_rotation_keyboard(settings))
-        else:
-            msg = await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=_boost_rotation_keyboard(settings))
-            app.bot_data["boost_live_panel_message_id"] = getattr(msg, "message_id", None)
+        msg = await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=_boost_rotation_keyboard(settings))
+        app.bot_data["boost_live_panel_message_id"] = getattr(msg, "message_id", None)
         app.bot_data["boost_panel_last_edit"] = now
     except Exception as e:
-        log.warning("boost live panel update failed: %s", e)
-        try:
-            msg = await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=_boost_rotation_keyboard(settings))
-            app.bot_data["boost_live_panel_message_id"] = getattr(msg, "message_id", None)
-            app.bot_data["boost_panel_last_edit"] = now
-        except Exception as e2:
-            log.warning("boost live panel resend failed: %s", e2)
+        log.warning("boost live panel bottom replace failed: %s", e)
 
 
 def _normalize_boost_whitelist_input(raw: str) -> list[str]:
@@ -1379,9 +1379,9 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await storage.set("boost_session_start_equity", equity, bump_revision=False)
     await storage.set("boost_session_bank_usdt", bank, bump_revision=False)
     await storage.set("boost_session_target_profit_usdt", bank * (target_mult - 1.0), bump_revision=False)
-    await storage.set("scan_interval_sec", int(float(s.get("boost_scan_interval_sec", 3) or 3)), bump_revision=False)
+    await storage.set("scan_interval_sec", int(float(s.get("boost_scan_interval_sec", 1) or 1)), bump_revision=False)
     await storage.set("max_open_positions", 1)
-    # v0181 BOOST LIVE TPSL SAFE EXECUTION: pressing 🚀 BOOST MODE forces aggressive autopilot defaults ON,
+    # v0182 BOOST FAST LIVE ROTATION PANEL: pressing 🚀 BOOST MODE forces aggressive autopilot defaults ON,
     # even if an older Railway SQLite/settings state contains stale false/low values.
     await storage.set("boost_zero_fee_scanner_enabled", True, bump_revision=False)
     await storage.set("boost_balance_share", 0.10, bump_revision=False)
@@ -1412,13 +1412,14 @@ async def boost_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await storage.set("boost_allow_fee_fallback", True, bump_revision=False)
     await storage.set("boost_parallel_scan_enabled", True, bump_revision=False)
     await storage.set("boost_live_panel_enabled", True, bump_revision=False)
+    await storage.set("boost_live_panel_interval_sec", 2, bump_revision=False)
     # v0179 REAL: keep only non-expired failed symbols; scanner will skip them.
     await storage.set("boost_blocked_symbols_json", json.dumps(_boost_blocked_map(await storage.all_settings()), separators=(",", ":")), bump_revision=False)
     await storage.set("boost_rotate_only_if_profit", True, bump_revision=False)
     await storage.set("boost_min_profit_to_rotate_pct", 0.03, bump_revision=False)
     await storage.set("boost_rotate_strength_multiplier", 1.05, bump_revision=False)
     await storage.set("boost_rotate_min_score_gap", 0.0, bump_revision=False)
-    await storage.set("boost_rotate_cooldown_sec", 3, bump_revision=False)
+    await storage.set("boost_rotate_cooldown_sec", 1, bump_revision=False)
     if trading_task and not trading_task.done():
         running = True; entries_enabled = True
     else:
@@ -2469,7 +2470,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for k2, v2 in {
                 "strategy_mode": "boost_scalping",
                 "max_open_positions": 1,
-                "scan_interval_sec": int(float(s.get("boost_scan_interval_sec", 3) or 3)),
+                "scan_interval_sec": int(float(s.get("boost_scan_interval_sec", 1) or 1)),
                 "boost_prev_scan_interval_sec": prev_scan,
                 "boost_session_start_ts": 0.0,
                 "trade_margin_pct": float(s.get("boost_balance_share", 0.10) or 0.10),
@@ -3027,11 +3028,51 @@ async def trading_loop(app):
                                     stronger = bool(candidate_decision.ok and candidate_decision.decision != "WAIT" and new_sym and new_sym != cur_sym and new_score >= max(cur_score * mult, cur_score + gap))
                                     rotate_note = f"pnl={pos_pnl:+.3f}% best={_short_symbol(new_sym)} score={new_score:.1f} cur_score={cur_score:.1f}"
                                     if stronger:
+                                        # Rotate only from an already profitable position. Never hop out
+                                        # of a losing BOOST trade just because a new symbol looks stronger.
                                         res = await exec_engine.close_position(active_pos, "boost_rotate_to_stronger", live, price)
                                         app.bot_data["boost_last_rotation_ts"] = time.time()
+                                        close_ok = bool(res.get("ok")) if isinstance(res, dict) else bool(res)
                                         scanner.last_reject_reason = f"BOOST rotate: closed {_short_symbol(cur_sym)} at {pos_pnl:+.3f}%, next {_short_symbol(new_sym)}"
-                                        await notify_admin(app, f"🔄 BOOST rotation\nClosed {_short_symbol(cur_sym)} at {pos_pnl:+.3f}%\nStronger: {_short_symbol(new_sym)} {candidate_decision.decision} score {new_score:.1f} > {cur_score:.1f}\nResult: {res.get('ok') if isinstance(res, dict) else res}", key="boost_rotation")
-                                        await boost_live_panel_update(app, settings, snap_now, status="rotated; rescanning", decision=candidate_decision, position=active_pos, note=scanner.last_reject_reason, force=True)
+                                        await notify_admin(app, (
+                                            f"🔄 BOOST rotation\n"
+                                            f"Closed {_short_symbol(cur_sym)} at {pos_pnl:+.3f}%\n"
+                                            f"Stronger: {_short_symbol(new_sym)} {candidate_decision.decision} score {new_score:.1f} > {cur_score:.1f}\n"
+                                            f"Result: {res.get('ok') if isinstance(res, dict) else res}"
+                                        ), key=f"boost_rotation_{int(time.time()*1000)}")
+                                        await boost_live_panel_update(app, settings, snap_now, status="rotated; opening stronger", decision=candidate_decision, position=None, note=scanner.last_reject_reason, force=True)
+                                        if close_ok:
+                                            # v0182: do not wait for the next scanner cycle. Open the stronger
+                                            # candidate immediately: take micro-profit -> jump to stronger impulse.
+                                            try:
+                                                rot_cand = boost_scalping_engine.make_candidate(candidate_decision, settings)
+                                                rot_plan = TradePlanner().make_plan(rot_cand, settings, equity_usdt=current_bank) if rot_cand else None
+                                                if rot_plan:
+                                                    rot_plan.session = f"boost_{int(start_ts)}"
+                                                    placed2 = await exec_engine.place_entry(rot_plan, live)
+                                                    if placed2.get("ok"):
+                                                        scanner.last_signal_summary = f"BOOST rotated/opened {rot_plan.symbol} {rot_plan.side} margin≈{rot_plan.expected_margin_usdt:.2f} TP={rot_plan.take_price:.6g} SL={rot_plan.stop_price:.6g}"
+                                                        await notify_admin(app, (
+                                                            f"🚀 BOOST rotation opened\n"
+                                                            f"{rot_plan.symbol} {rot_plan.side}\n"
+                                                            f"Leverage: x{getattr(rot_plan, 'leverage', '-')}\n"
+                                                            f"Margin≈{rot_plan.expected_margin_usdt:.2f} USDT\n"
+                                                            f"Reason: {candidate_decision.reason}\n"
+                                                            f"TP: {rot_plan.take_price:.6g}\nSL: {rot_plan.stop_price:.6g}"
+                                                        ), key=f"boost_rotation_opened_{int(time.time()*1000)}")
+                                                        await boost_live_panel_update(app, settings, snap_now, status="rotation opened", decision=candidate_decision, position=None, note=scanner.last_signal_summary, force=True)
+                                                    else:
+                                                        rej_reason = str(placed2.get("reason", "unknown"))
+                                                        blocked = await _boost_handle_entry_failure(app, getattr(rot_plan, "symbol", ""), rej_reason)
+                                                        scanner.last_reject_reason = f"BOOST rotation entry rejected {rej_reason}"
+                                                        await boost_live_panel_update(app, settings, snap_now, status=("symbol blocked; rescanning" if blocked else "rotation entry rejected"), decision=candidate_decision, note=scanner.last_reject_reason, force=True)
+                                                else:
+                                                    scanner.last_reject_reason = "BOOST rotation planner rejected stronger candidate"
+                                            except Exception as e:
+                                                err = str(e)
+                                                await _boost_handle_entry_failure(app, new_sym, err)
+                                                scanner.last_reject_reason = f"BOOST rotation immediate open failed {err[:160]}"
+                                                await notify_admin(app, f"⚠️ BOOST rotation open failed: {err[:240]}", min_interval_sec=10, key="boost_rotation_open_failed")
                                         await sleep_until_next_scan(app, 1)
                                         continue
                                     await boost_live_panel_update(app, settings, snap_now, status="active; scanning stronger", decision=candidate_decision, position=active_pos, note=rotate_note, force=False)
@@ -3044,7 +3085,7 @@ async def trading_loop(app):
                         else:
                             await boost_live_panel_update(app, settings, snap_now, status="active", position=active_pos, note=rotate_note, force=False)
                         await update_scanner_status(app, settings, status="boost active", force=False)
-                        await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                        await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                         continue
 
                     decision = await boost_scalping_engine.decide(ex, settings)
@@ -3054,7 +3095,7 @@ async def trading_loop(app):
                         scanner.last_signal_summary = f"BOOST scan bank={current_bank:.2f}/{target_bank:.2f} pnl={pnl:.4f}"
                         await boost_live_panel_update(app, settings, {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}, status="waiting impulse", decision=decision, note=scanner.last_reject_reason, force=False)
                         await update_scanner_status(app, settings, status="boost wait", force=False)
-                        await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                        await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                         continue
                     cand = boost_scalping_engine.make_candidate(decision, settings)
                     # Plan sizing is based only on the compounding BOOST bank, not the full account.
@@ -3063,7 +3104,7 @@ async def trading_loop(app):
                     plan = TradePlanner().make_plan(cand, settings, equity_usdt=current_bank) if cand else None
                     if not plan:
                         scanner.last_reject_reason = "BOOST planner rejected"
-                        await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                        await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                         continue
                     plan.session = f"boost_{int(start_ts)}"
                     if live:
@@ -3074,11 +3115,11 @@ async def trading_loop(app):
                             need = float(getattr(plan, "expected_margin_usdt", 0.0) or 0.0)
                             if need > 0 and free < need * 1.05 + 0.5:
                                 scanner.last_reject_reason = f"BOOST balance free={free:.2f} need≈{need*1.05+0.5:.2f}"
-                                await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                                await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                                 continue
                         except Exception as e:
                             scanner.last_reject_reason = f"BOOST balance precheck warning {e}"
-                            await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                            await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                             continue
                     try:
                         placed = await exec_engine.place_entry(plan, live)
@@ -3091,7 +3132,7 @@ async def trading_loop(app):
                             await sleep_until_next_scan(app, 1)
                         else:
                             await notify_admin(app, f"⚠️ BOOST execution exception: {err}", min_interval_sec=60, key="boost_exec_error")
-                            await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                            await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                         continue
                     if placed.get("ok"):
                         scanner.last_signal_summary = f"BOOST opened {plan.symbol} {plan.side} margin≈{plan.expected_margin_usdt:.2f} TP={plan.take_price:.6g} SL={plan.stop_price:.6g}"
@@ -3118,7 +3159,7 @@ async def trading_loop(app):
                             await sleep_until_next_scan(app, 1)
                             continue
                     await update_scanner_status(app, settings, status="boost opened" if placed.get("ok") else "boost rejected", force=True)
-                    await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 3)))
+                    await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                     continue
 
                 # 6) AI BTC/ETH dual scalping loop. In this mode the bot does not run the

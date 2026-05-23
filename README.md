@@ -1,3 +1,11 @@
+## v0183 BOOST TPSL PARITY FIX
+
+- Restored fast BOOST live panel as one bottom Telegram message.
+- Full zero-fee universe scan stays aggressive.
+- Rotation can close only profitable positions and immediately open stronger candidate.
+- Micro TP remains 0.03-0.05%.
+- Scan/rotation loop interval defaults to 1 sec.
+
 ## v0181 BOOST LIVE TPSL SAFE EXECUTION
 
 Preloaded 0-fee whitelist from user screenshots. `/boost_list` can still replace it and `/boost_list_del` clears it.

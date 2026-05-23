@@ -550,12 +550,18 @@ class ExecutionEngine:
                             and float(pos.get("stop_price") or 0) > 0
                         ):
                             try:
-                                tp0 = float(pos.get("take_price") or 0)
-                                sl0 = float(pos.get("stop_price") or 0)
+                                # v0183: use the SAME safe-distance normalisation for BOOST direct
+                                # native TP/SL as the generic protection routine. In v0182 the direct
+                                # /stoporder/place call used raw BOOST micro TP (0.03-0.05%) before
+                                # _normalize_protection_distance(), so MEXC often rejected/ignored it
+                                # while BTC/ETH scalping later succeeded through the normalized path.
+                                exchange_protection_pos = await self._normalize_protection_distance(dict(pos))
+                                tp0 = float(exchange_protection_pos.get("take_price") or pos.get("take_price") or 0)
+                                sl0 = float(exchange_protection_pos.get("stop_price") or pos.get("stop_price") or 0)
                                 if tp0 > 0 and sl0 > 0:
                                     close_side0 = "sell" if str(pos.get("side")).upper() == "LONG" else "buy"
                                     from debug_log import log_event
-                                    log_event("mexc_native_tpsl_direct_before_generic", symbol=pos.get("symbol"), side=close_side0, qty=pos.get("qty"), stop_price=sl0, take_price=tp0)
+                                    log_event("mexc_native_tpsl_direct_before_generic", symbol=pos.get("symbol"), side=close_side0, qty=pos.get("qty"), stop_price=sl0, take_price=tp0, local_take_price=pos.get("take_price"), local_stop_price=pos.get("stop_price"))
                                     native = await self.exchange_client.mexc_place_tpsl_by_position(
                                         symbol=pos.get("symbol"),
                                         side=close_side0,
@@ -915,11 +921,16 @@ class ExecutionEngine:
                 return {**existing, "ok": True, "protection_status": "EXCHANGE PROTECTED", "protection_mode": "exchange", "protection_note": "existing TP/SL detected before reattach"}
         except Exception as e:
             pos["pre_protection_verify_warning"] = str(e)[:180]
-        if str(pos.get("strategy") or "").lower() == "ai_scalping":
-            # AI scalping uses very small TP/SL distances; MEXC often needs an
-            # extra second before the native TPSL order becomes visible.
-            attempts = max(attempts, int(os.getenv("AI_SCALPING_PROTECTION_ATTEMPTS", "5") or "5"))
-            delay = max(delay, float(os.getenv("AI_SCALPING_PROTECTION_RECHECK_DELAY_SEC", "1.2") or "1.2"))
+        strategy_name_for_protection = str(pos.get("strategy") or "").lower()
+        if strategy_name_for_protection in {"ai_scalping", "boost_scalping"}:
+            # AI BTC/ETH scalping and BOOST both use tiny local exits. Exchange
+            # TP/SL is safety/backstop and MEXC often needs more retries before
+            # native stoporder rows become visible. BOOST now gets the same
+            # protection retry logic as BTC/ETH scalping.
+            attempts_env = "BOOST_PROTECTION_ATTEMPTS" if strategy_name_for_protection == "boost_scalping" else "AI_SCALPING_PROTECTION_ATTEMPTS"
+            delay_env = "BOOST_PROTECTION_RECHECK_DELAY_SEC" if strategy_name_for_protection == "boost_scalping" else "AI_SCALPING_PROTECTION_RECHECK_DELAY_SEC"
+            attempts = max(attempts, int(os.getenv(attempts_env, os.getenv("AI_SCALPING_PROTECTION_ATTEMPTS", "5")) or "5"))
+            delay = max(delay, float(os.getenv(delay_env, os.getenv("AI_SCALPING_PROTECTION_RECHECK_DELAY_SEC", "1.2")) or "1.2"))
         history = []
         best = {"ok": False}
         for i in range(attempts):
