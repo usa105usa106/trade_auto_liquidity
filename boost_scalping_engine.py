@@ -116,13 +116,13 @@ class BoostScalpingEngine:
             long_ratio = short_ratio = 1.01
         r1 = _f(market.get("ret_1m_pct"), 0.0)
         r3 = _f(market.get("ret_3m_pct"), 0.0)
-        min_momo = _f(settings.get("boost_futures_momentum_min_pct"), 0.045)
+        min_momo = _f(settings.get("boost_futures_momentum_min_pct"), 0.028)
         max_against = _f(settings.get("boost_futures_max_against_pct"), 0.01)
         # Live edge gate: do not scalp a move that is smaller than spread + likely
         # slippage. 0-fee does not mean 0-cost; bad spread/latency turns paper
         # micro-profits into live losses.
-        slip_buf = _f(settings.get("boost_live_slippage_buffer_pct"), 0.035)
-        min_edge = max(min_momo, spread * _f(settings.get("boost_spread_edge_mult"), 2.8) + slip_buf)
+        slip_buf = _f(settings.get("boost_live_slippage_buffer_pct"), 0.018)
+        min_edge = max(min_momo, spread * _f(settings.get("boost_spread_edge_mult"), 1.6) + slip_buf)
 
         side = None
         ratio = 0.0
@@ -137,7 +137,9 @@ class BoostScalpingEngine:
         if side is None:
             return {"ok": False, "reason": f"no live edge: need≈{min_edge:.3f}% spread={spread:.3f}% bid/ask={long_ratio:.2f} ask/bid={short_ratio:.2f} r1={r1:.3f}% r3={r3:.3f}%"}
         strength = max(0.0, min(1.0, ((min(ratio, 4.0) - ratio_min) / max(0.1, 4.0 - ratio_min)) * 0.55 + min(1.0, momo / max(min_momo * 4.0, 0.01)) * 0.45))
-        score = ratio * 12.0 + momo * 90.0 + atr * 20.0 - spread * 80.0
+        accel = max(0.0, abs(r1) * 3.0 + abs(r3) * 1.4)
+        persistence = 1.0 if abs(r1) > (abs(r3) * 0.18) else 0.65
+        score = ratio * 10.0 + momo * 120.0 + atr * 18.0 + accel * 25.0 + persistence * 8.0 - spread * 55.0
         return {"ok": True, "side": side, "score": score, "strength": strength, "ratio": ratio, "momo": momo, "reason": f"{side} ratio={ratio:.2f} r1={r1:.3f}% r3={r3:.3f}% atr={atr:.3f}%"}
 
     async def _fast_contract_tickers(self, exchange_client) -> list[dict]:
@@ -308,7 +310,7 @@ class BoostScalpingEngine:
         # Anti-chop: do not enter when the 1m candle is tiny versus spread/ATR.
         # This blocks fake hotlist coins where the 3m move already happened and
         # the current impulse is no longer paying for live spread/slippage.
-        min_live_1m = max(spread * 2.0 + _f(settings.get("boost_live_slippage_buffer_pct"), 0.035), atr * 0.25)
+        min_live_1m = max(spread * 2.0 + _f(settings.get("boost_live_slippage_buffer_pct"), 0.018), atr * 0.25)
         if abs(r1) < min_live_1m:
             return {**base, "ok": False, "reason": f"HUNTER no-trade: live 1m {abs(r1):.3f}% < {min_live_1m:.3f}% cost/ATR gate"}
         if move < min_r3:
@@ -498,13 +500,13 @@ class BoostScalpingEngine:
         spread = max(0.0, _f(market.get("spread_pct"), 0.0))
         atr = max(0.01, _f(market.get("atr_1m_pct"), 0.10))
         # TP must cover spread + expected live slippage. Strong impulse waits longer.
-        edge_tp = spread * _f(settings.get("boost_tp_spread_mult"), 3.2) + _f(settings.get("boost_live_slippage_buffer_pct"), 0.035)
+        edge_tp = spread * _f(settings.get("boost_tp_spread_mult"), 3.2) + _f(settings.get("boost_live_slippage_buffer_pct"), 0.018)
         atr_tp = atr * _f(settings.get("boost_tp_atr_mult"), 0.70)
         raw_tp = min_tp + (max_tp - min_tp) * strength
         tp = min(max_tp, max(min_tp, edge_tp, atr_tp, raw_tp))
         if str(settings.get("boost_hunter_mode", True)).lower() in {"1", "true", "yes", "on"}:
             # HUNTER lets strong impulses breathe more; exits can still be earlier by momentum decay.
-            tp = min(max_tp, max(tp, atr * 0.95, spread * 4.5 + _f(settings.get("boost_live_slippage_buffer_pct"), 0.035)))
+            tp = min(max_tp, max(tp, atr * 0.95, spread * 4.5 + _f(settings.get("boost_live_slippage_buffer_pct"), 0.018)))
         # Emergency stop only. It is wider than TP so the bot does not harvest
         # normal noise as repeated losses. Local/rotation logic still refuses
         # to close minus positions for convenience.
