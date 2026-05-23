@@ -1529,17 +1529,25 @@ async def _boost_start_worker(app):
             "boost_target_multiplier": 20.0,
             "boost_max_consecutive_losses": 999,
             "boost_auto_leverage": True,
-            "boost_min_leverage": 10,
+            "boost_min_leverage": 30,
             "boost_max_leverage": 50,
             "boost_use_full_bank_per_trade": True,
             "boost_auto_rotate_symbols": True,
             "boost_stop_when_target_reached": True,
             "boost_max_symbols_scan": 126,
-            "boost_min_checked_per_cycle": 40,
-            "boost_max_checked_per_cycle": 100,
+            # v0196: BOOST must be live, not silent. Scan a small fast rotating slice
+            # with per-symbol timeout; otherwise one slow MEXC public request freezes
+            # the whole cycle and Telegram only shows "BOOST arming".
+            "boost_min_checked_per_cycle": 12,
+            "boost_max_checked_per_cycle": 30,
+            "boost_symbol_snapshot_timeout_sec": 0.9,
+            "boost_hotlist_refresh_sec": 300,
+            "boost_hotlist_size": 30,
+            "boost_scan_concurrency": 6,
             "universe_mode": "full",
-            "boost_min_tp_pct": 0.03,
-            "boost_max_tp_pct": 0.05,
+            "boost_min_tp_pct": 0.06,
+            "boost_max_tp_pct": 0.14,
+            "boost_live_min_exchange_profit_pct": 0.015,
             "boost_min_quote_volume_usdt": 0.0,
             "boost_min_atr_pct": 0.04,
             "boost_max_spread_pct": 0.12,
@@ -1553,10 +1561,20 @@ async def _boost_start_worker(app):
             "boost_live_safe_execution": True,
             "boost_no_exchange_protection_monitor_only": True,
             "boost_rotate_only_if_profit": True,
-            "boost_min_profit_to_rotate_pct": 0.03,
+            "boost_min_profit_to_rotate_pct": 0.06,
             "boost_rotate_strength_multiplier": 1.05,
             "boost_rotate_min_score_gap": 0.0,
             "boost_rotate_cooldown_sec": 1,
+            # v0199: automatic two-mode rotation. NORMAL rotates only from profit;
+            # RESCUE may close a losing position only for an extreme signal that
+            # statistically has enough expected move to cover the loss + buffer.
+            "boost_rescue_rotation_enabled": True,
+            "boost_rescue_min_score_multiplier": 1.70,
+            "boost_rescue_min_score_gap": 18.0,
+            "boost_rescue_expected_move_loss_mult": 2.50,
+            "boost_rescue_max_loss_pct": 0.70,
+            "boost_rescue_cooldown_sec": 180,
+            "boost_rescue_max_per_hour": 2,
             "scan_interval_sec": 1,
             "max_open_positions": 1,
             "auto_close_on_protection_failed": False,
@@ -1624,7 +1642,7 @@ async def _boost_start_worker(app):
         chat_id = first_admin_id()
         if chat_id:
             await _safe_send_bot_message(app, chat_id,
-                f"✅ BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: full scan + rotation + micro TP 0.03-0.05%\nSafety: commands/buttons stay available; /log now shows BOOST stages/errors.{balance_note}",
+                f"✅ BOOST started\nBank: {bank:.4f} USDT ({share*100:.1f}% balance)\nTarget: {bank*target_mult:.4f} USDT (x{target_mult:.0f})\nZero-fee DB: {len([x for x in manual_symbols.split(',') if x.strip()])} symbols\nMode: 126 zero-fee → TOP hotlist every 5m → fast 1-3s rotation + live-safe TP 0.06-0.14%\nSafety: commands/buttons stay available; /log now shows BOOST stages/errors.{balance_note}",
                 reply_markup=_boost_rotation_keyboard(ns))
         await boost_live_panel_update(
             app, ns,
@@ -1651,8 +1669,18 @@ async def boost_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entries_enabled = False
     _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
-    await storage.set("strategy_mode", "hybrid")
-    await reply(update, "🛑 BOOST stopped. New BOOST entries disabled. Open positions are still managed; use /close_all if you want to close immediately.", reply_markup=MAIN_MENU)
+    await storage.set("strategy_mode", "hybrid", bump_revision=False)
+    await storage.set("boost_start_in_progress", False, bump_revision=False)
+    # Invalidate BOOST scanner caches so a later /boost_start starts clean.
+    try:
+        boost_scalping_engine._hot_cache = (0.0, [], [])
+        boost_scalping_engine._scan_cursor = 0
+    except Exception:
+        pass
+    context.application.bot_data.pop("boost_live_panel_message_id", None)
+    context.application.bot_data.pop("boost_live_panel_message_ids", None)
+    log_event("boost_stop", stage="command", ok=True)
+    await reply(update, "🛑 BOOST полностью остановлен: новые входы, hotlist/rotation/live-panel отключены. Открытые позиции не закрывал автоматически; /panic или /close_all — если надо закрыть сразу.", reply_markup=MAIN_MENU)
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -2584,7 +2612,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "openai_analysis_enabled", "openai_model", "openai_check_strength", "openai_api_key",
         "openai_env_fallback", "openai_timeout_sec", "openai_fail_open", "openai_show_decisions",
         "trade_charts_enabled", "liquidity_runner_enabled",
-        "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_ai_entry_filter_enabled", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_btc_min_tp_pct", "ai_scalping_btc_max_tp_pct", "ai_scalping_eth_min_tp_pct", "ai_scalping_eth_max_tp_pct", "ai_scalping_sl_tp_multiplier", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct", "ai_scalping_ai_cooldown_sec", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled", "ai_scalping_liquidation_stop_mode", "ai_scalping_liq_margin_pct", "ai_scalping_liq_buffer_pct", "ai_scalping_liq_max_leverage", "boost_zero_fee_scanner_enabled", "boost_balance_share", "boost_target_multiplier", "boost_session_hours", "boost_max_session_loss_pct", "boost_max_consecutive_losses", "boost_auto_leverage", "boost_min_leverage", "boost_max_leverage", "boost_use_full_bank_per_trade", "boost_risk_pct_per_trade", "boost_auto_rotate_symbols", "boost_stop_when_target_reached", "boost_max_symbols_scan", "boost_min_quote_volume_usdt", "boost_min_atr_pct", "boost_max_spread_pct", "boost_spot_imbalance_ratio", "boost_futures_momentum_min_pct", "boost_futures_max_against_pct", "boost_min_tp_pct", "boost_max_tp_pct", "boost_sl_tp_multiplier", "boost_scan_interval_sec", "boost_allow_fee_fallback", "boost_zero_fee_symbols", "boost_live_panel_enabled", "boost_live_panel_interval_sec", "boost_parallel_scan_enabled", "boost_rotate_only_if_profit", "boost_min_profit_to_rotate_pct", "boost_rotate_strength_multiplier", "boost_rotate_min_score_gap", "boost_rotate_cooldown_sec",
+        "ai_scalping_symbols", "ai_scalping_min_confidence", "ai_scalping_ai_entry_filter_enabled", "ai_scalping_tp_pct", "ai_scalping_sl_pct", "ai_scalping_btc_tp_pct", "ai_scalping_btc_sl_pct", "ai_scalping_eth_tp_pct", "ai_scalping_eth_sl_pct", "ai_scalping_btc_min_tp_pct", "ai_scalping_btc_max_tp_pct", "ai_scalping_eth_min_tp_pct", "ai_scalping_eth_max_tp_pct", "ai_scalping_sl_tp_multiplier", "ai_scalping_max_spread_pct", "ai_scalping_quality_filters_enabled", "ai_scalping_quality_min_confidence", "ai_scalping_quality_cooldown_sec", "ai_scalping_quality_min_atr_pct", "ai_scalping_quality_min_ema_gap_pct", "ai_scalping_quality_min_ret_5m_abs_pct", "ai_scalping_ai_cooldown_sec", "ai_scalping_openai_fallback_enabled", "ai_scalping_json_mode_enabled", "ai_scalping_liquidation_stop_mode", "ai_scalping_liq_margin_pct", "ai_scalping_liq_buffer_pct", "ai_scalping_liq_max_leverage", "boost_zero_fee_scanner_enabled", "boost_balance_share", "boost_target_multiplier", "boost_session_hours", "boost_max_session_loss_pct", "boost_max_consecutive_losses", "boost_auto_leverage", "boost_min_leverage", "boost_max_leverage", "boost_use_full_bank_per_trade", "boost_risk_pct_per_trade", "boost_auto_rotate_symbols", "boost_stop_when_target_reached", "boost_max_symbols_scan", "boost_min_quote_volume_usdt", "boost_min_atr_pct", "boost_max_spread_pct", "boost_spot_imbalance_ratio", "boost_futures_momentum_min_pct", "boost_futures_max_against_pct", "boost_min_tp_pct", "boost_max_tp_pct", "boost_sl_tp_multiplier", "boost_scan_interval_sec", "boost_allow_fee_fallback", "boost_zero_fee_symbols", "boost_live_panel_enabled", "boost_live_panel_interval_sec", "boost_parallel_scan_enabled", "boost_rotate_only_if_profit", "boost_min_profit_to_rotate_pct", "boost_rotate_strength_multiplier", "boost_rotate_min_score_gap", "boost_rotate_cooldown_sec", "boost_live_min_exchange_profit_pct",
     }
     if key not in allowed_keys:
         await reply(update, f"❌ Setting is not allowed through /set: {key}", reply_markup=MAIN_MENU)
@@ -3256,6 +3284,8 @@ async def trading_loop(app):
                 else:
                     ex = await _await_with_timeout(get_exchange(settings), 8, "exchange init")
                 ws = await get_ws(settings)
+                if boost_mode:
+                    log_event("boost_loop_stage", stage="ws_ready", ok=True)
 
                 if (not boost_mode) and bool(settings.get("ws_enabled", True)) and not ws.status.running:
                     await ws.start()
@@ -3317,7 +3347,11 @@ async def trading_loop(app):
                 risk = RiskEngine(storage)
                 equity = await account_equity_usdt(ex, float(os.getenv("DEFAULT_EQUITY_USDT", "1000")))
                 ok, reason = await risk.allow_new_trades(settings, equity=equity)
+                if boost_mode:
+                    log_event("boost_loop_stage", stage="risk_ok", ok=True, equity=equity)
                 if not ok:
+                    if boost_mode:
+                        log_event("boost_loop_blocked", stage="risk", ok=False, reason=str(reason)[:300])
                     scanner.last_reject_reason = f"risk blocked: {reason}"
                     await update_scanner_status(app, settings, status="risk paused", force=True)
                     await notify_admin(app, f"🛑 Новые входы на паузе: {reason}", min_interval_sec=300, key="risk_paused")
@@ -3358,13 +3392,19 @@ async def trading_loop(app):
                         await _await_with_timeout(ex.fetch_balance(), 8, "live balance probe")
                     except Exception as e:
                         log.warning("live balance/API probe failed: %s", e)
+                        if boost_mode:
+                            log_event("boost_loop_error", stage="live_balance_probe", ok=False, error=str(e)[:500])
                         sync_ok = False
 
                 if live:
                     gate_ok, gate_reason = ProductionGate().validate_for_live(settings, api_ready=api_ready, ws_healthy=ws_healthy, sync_ok=sync_ok)
                 else:
                     gate_ok, gate_reason = ProductionGate().validate_for_paper(settings, ws_healthy=ws_healthy)
+                if boost_mode:
+                    log_event("boost_loop_stage", stage="production_gate", ok=bool(gate_ok), reason=str(gate_reason)[:300])
                 if not gate_ok:
+                    if boost_mode:
+                        await boost_live_panel_update(app, settings, {"bank": float(settings.get("boost_session_bank_usdt", 0) or 0), "current_bank": float(settings.get("boost_session_bank_usdt", 0) or 0), "target_bank": float(settings.get("boost_session_bank_usdt", 0) or 0) * float(settings.get("boost_target_multiplier", 20) or 20), "pnl": 0.0, "trades": 0}, status="blocked", note=f"production gate: {gate_reason}", force=True)
                     scanner.last_reject_reason = f"gate blocked: {gate_reason}"
                     await update_scanner_status(app, settings, status="entries blocked", force=True)
                     if "websocket" not in str(gate_reason).lower():
@@ -3454,7 +3494,12 @@ async def trading_loop(app):
                                 only_profit = _bool_setting(settings, "boost_rotate_only_if_profit", True)
                                 last_rot = float(app.bot_data.get("boost_last_rotation_ts", 0) or 0)
                                 cd = float(settings.get("boost_rotate_cooldown_sec", 20) or 20)
-                                if (not only_profit or pos_pnl >= min_profit) and time.time() - last_rot >= cd:
+                                cooldown_ok = time.time() - last_rot >= cd
+                                # v0199: Always keep scanning while a BOOST position is active.
+                                # NORMAL rotation: current position is already in real profit.
+                                # RESCUE rotation: current position is negative, but a new signal is extreme
+                                # enough to justify closing the loss and immediately jumping.
+                                if cooldown_ok:
                                     candidate_decision = await _await_with_timeout(boost_scalping_engine.decide(ex, settings), 12, "boost rotation decide")
                                     _record_boost_decision_metrics(candidate_decision)
                                     new_sym = str(candidate_decision.symbol or "")
@@ -3464,21 +3509,56 @@ async def trading_loop(app):
                                     cur_score = float(((active_pos.get("score_details") or {}).get("boost_score")) or 0)
                                     mult = float(settings.get("boost_rotate_strength_multiplier", 1.35) or 1.35)
                                     gap = float(settings.get("boost_rotate_min_score_gap", 5.0) or 5.0)
-                                    stronger = bool(candidate_decision.ok and candidate_decision.decision != "WAIT" and new_sym and new_sym != cur_sym and new_score >= max(cur_score * mult, cur_score + gap))
-                                    real_guard_ok = True
+                                    stronger_normal = bool(candidate_decision.ok and candidate_decision.decision != "WAIT" and new_sym and new_sym != cur_sym and new_score >= max(cur_score * mult, cur_score + gap))
+
+                                    real_profit_ok = True
                                     if live:
-                                        # Rotation is allowed only if the exchange itself confirms profit.
-                                        real_guard_ok = (ex_upnl is None or ex_upnl > 0) and pos_pnl >= min_profit
-                                    rotate_note = f"pnl={pos_pnl:+.3f}% local={local_pos_pnl:+.3f}% exUPnL={(ex_upnl if ex_upnl is not None else 0):+.4f} best={_short_symbol(new_sym)} score={new_score:.1f} cur_score={cur_score:.1f}"
-                                    if stronger and real_guard_ok:
-                                        # Rotate only from an already profitable position. Never hop out
-                                        # of a losing BOOST trade just because a new symbol looks stronger.
-                                        res = await exec_engine.close_position(active_pos, "boost_rotate_to_stronger", live, price)
+                                        # NORMAL rotation is allowed only when MEXC confirms real profit.
+                                        real_profit_ok = (ex_upnl is None or ex_upnl > 0) and pos_pnl >= min_profit
+                                    normal_rotate = bool(stronger_normal and (not only_profit or pos_pnl >= min_profit) and real_profit_ok)
+
+                                    rescue_rotate = False
+                                    rescue_reason = ""
+                                    if not normal_rotate and pos_pnl < 0 and _bool_setting(settings, "boost_rescue_rotation_enabled", True):
+                                        rescue_last = float(app.bot_data.get("boost_last_rescue_rotation_ts", 0) or 0)
+                                        rescue_cd = float(settings.get("boost_rescue_cooldown_sec", 180) or 180)
+                                        rescue_max_loss = abs(float(settings.get("boost_rescue_max_loss_pct", 0.70) or 0.70))
+                                        rescue_mult = float(settings.get("boost_rescue_min_score_multiplier", 1.70) or 1.70)
+                                        rescue_gap = float(settings.get("boost_rescue_min_score_gap", 18.0) or 18.0)
+                                        loss_mult = float(settings.get("boost_rescue_expected_move_loss_mult", 2.50) or 2.50)
+                                        max_per_hour = int(float(settings.get("boost_rescue_max_per_hour", 2) or 2))
+                                        rescue_times = [float(x) for x in app.bot_data.get("boost_rescue_rotation_times", []) if time.time() - float(x) < 3600]
+                                        app.bot_data["boost_rescue_rotation_times"] = rescue_times
+                                        r1 = abs(float(new_market.get("ret_1m_pct") or 0))
+                                        r3 = abs(float(new_market.get("ret_3m_pct") or 0))
+                                        atr = abs(float(new_market.get("atr_1m_pct") or 0))
+                                        tmp_candidate = boost_scalping_engine.make_candidate(candidate_decision, settings) if candidate_decision.ok else None
+                                        cand_lev = float((tmp_candidate or {}).get("leverage") or settings.get("boost_min_leverage", 30) or 30)
+                                        expected_price_move = max(r1, r3, atr)
+                                        expected_roi_move = expected_price_move * max(1.0, cand_lev)
+                                        rescue_score_ok = bool(candidate_decision.ok and candidate_decision.decision != "WAIT" and new_sym and new_sym != cur_sym and new_score >= max(cur_score * rescue_mult, cur_score + rescue_gap))
+                                        rescue_loss_ok = abs(pos_pnl) <= rescue_max_loss
+                                        rescue_move_ok = expected_roi_move >= abs(pos_pnl) * loss_mult
+                                        rescue_rate_ok = (time.time() - rescue_last >= rescue_cd) and (len(rescue_times) < max_per_hour)
+                                        rescue_rotate = bool(rescue_score_ok and rescue_loss_ok and rescue_move_ok and rescue_rate_ok)
+                                        rescue_reason = f"RESCUE score_ok={rescue_score_ok} loss={pos_pnl:+.3f}% max={rescue_max_loss:.3f}% exp≈{expected_roi_move:.3f}% need>{abs(pos_pnl)*loss_mult:.3f}% rate_ok={rescue_rate_ok}"
+
+                                    mode_reason = "NORMAL" if normal_rotate else ("RESCUE" if rescue_rotate else "HOLD")
+                                    rotate_note = f"{mode_reason} pnl={pos_pnl:+.3f}% local={local_pos_pnl:+.3f}% exUPnL={(ex_upnl if ex_upnl is not None else 0):+.4f} best={_short_symbol(new_sym)} score={new_score:.1f} cur_score={cur_score:.1f} {rescue_reason}"
+                                    log_event("boost_rotation_check", stage="rotation", ok=True, mode=mode_reason, symbol=cur_sym, candidate=new_sym, pnl_pct=pos_pnl, new_score=new_score, cur_score=cur_score, note=rotate_note[:500])
+                                    if normal_rotate or rescue_rotate:
+                                        close_reason = "boost_normal_rotate_to_stronger" if normal_rotate else "boost_rescue_rotate_to_extreme"
+                                        res = await exec_engine.close_position(active_pos, close_reason, live, price)
                                         app.bot_data["boost_last_rotation_ts"] = time.time()
+                                        if rescue_rotate:
+                                            app.bot_data["boost_last_rescue_rotation_ts"] = time.time()
+                                            rt = [float(x) for x in app.bot_data.get("boost_rescue_rotation_times", []) if time.time() - float(x) < 3600]
+                                            rt.append(time.time())
+                                            app.bot_data["boost_rescue_rotation_times"] = rt
                                         close_ok = bool(res.get("ok")) if isinstance(res, dict) else bool(res)
-                                        scanner.last_reject_reason = f"BOOST rotate: closed {_short_symbol(cur_sym)} at exchange {pos_pnl:+.3f}%, next {_short_symbol(new_sym)}"
+                                        scanner.last_reject_reason = f"BOOST {mode_reason} rotation: closed {_short_symbol(cur_sym)} at exchange {pos_pnl:+.3f}%, next {_short_symbol(new_sym)}"
                                         await notify_admin(app, (
-                                            f"🔄 BOOST rotation\n"
+                                            f"🔄 BOOST {mode_reason} rotation\n"
                                             f"Closed {_short_symbol(cur_sym)} at exchange {pos_pnl:+.3f}% | real uPnL={(ex_upnl if ex_upnl is not None else 0):+.4f} USDT\n"
                                             f"Stronger: {_short_symbol(new_sym)} {candidate_decision.decision} score {new_score:.1f} > {cur_score:.1f}\n"
                                             f"Result: {res.get('ok') if isinstance(res, dict) else res}"
@@ -3531,8 +3611,18 @@ async def trading_loop(app):
                         await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                         continue
 
-                    decision = await _await_with_timeout(boost_scalping_engine.decide(ex, settings), 15, "boost decide")
+                    log_event("boost_loop_stage", stage="scan_start", ok=True, bank=bank, current_bank=current_bank, target_bank=target_bank)
+                    await boost_live_panel_update(app, settings, {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}, status="scanning", note="BOOST: 126 zero-fee → hotlist → fast rotation scan", force=False)
+                    try:
+                        decision = await _await_with_timeout(boost_scalping_engine.decide(ex, settings), 18, "boost decide")
+                    except Exception as e:
+                        scanner.last_reject_reason = f"BOOST scan error/timeout: {str(e)[:180]}"
+                        log_event("boost_loop_error", stage="boost_decide", ok=False, error=str(e)[:500])
+                        await boost_live_panel_update(app, settings, {"bank": bank, "current_bank": current_bank, "target_bank": target_bank, "pnl": pnl, "trades": len(trades), "target_mult": target_mult}, status="scan error; retrying", note=scanner.last_reject_reason, force=True)
+                        await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
+                        continue
                     _record_boost_decision_metrics(decision)
+                    log_event("boost_loop_stage", stage="scan_done", ok=True, decision=str(getattr(decision, "decision", "")), symbol=str(getattr(decision, "symbol", "") or ""), reason=str(getattr(decision, "reason", ""))[:300])
                     if not decision.ok or decision.decision == "WAIT":
                         scanner.last_reject_reason = decision.reason or "BOOST wait"
                         scanner.last_signal_summary = f"BOOST scan bank={current_bank:.2f}/{target_bank:.2f} pnl={pnl:.4f}"

@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0195 BOOST LOG START FIX")
+VERSION = os.getenv("BOT_VERSION", "0199 BOOST NORMAL RESCUE ROTATION")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -140,7 +140,7 @@ class Defaults:
     boost_max_session_loss_pct: float = env_float("BOOST_MAX_SESSION_LOSS_PCT", 80.0)
     boost_max_consecutive_losses: int = env_int("BOOST_MAX_CONSECUTIVE_LOSSES", 3)
     boost_auto_leverage: bool = env_bool("BOOST_AUTO_LEVERAGE", True)
-    boost_min_leverage: int = env_int("BOOST_MIN_LEVERAGE", 10)
+    boost_min_leverage: int = env_int("BOOST_MIN_LEVERAGE", 30)
     boost_max_leverage: int = env_int("BOOST_MAX_LEVERAGE", 50)
     boost_use_full_bank_per_trade: bool = env_bool("BOOST_USE_FULL_BANK_PER_TRADE", True)
     boost_risk_pct_per_trade: float = env_float("BOOST_RISK_PCT_PER_TRADE", 0.12)
@@ -153,8 +153,8 @@ class Defaults:
     boost_spot_imbalance_ratio: float = env_float("BOOST_SPOT_IMBALANCE_RATIO", 1.30)
     boost_futures_momentum_min_pct: float = env_float("BOOST_FUTURES_MOMENTUM_MIN_PCT", 0.015)
     boost_futures_max_against_pct: float = env_float("BOOST_FUTURES_MAX_AGAINST_PCT", 0.02)
-    boost_min_tp_pct: float = env_float("BOOST_MIN_TP_PCT", 0.03)
-    boost_max_tp_pct: float = env_float("BOOST_MAX_TP_PCT", 0.05)
+    boost_min_tp_pct: float = env_float("BOOST_MIN_TP_PCT", 0.06)
+    boost_max_tp_pct: float = env_float("BOOST_MAX_TP_PCT", 0.14)
     boost_sl_tp_multiplier: float = env_float("BOOST_SL_TP_MULTIPLIER", 1.15)
     boost_scan_interval_sec: int = env_int("BOOST_SCAN_INTERVAL_SEC", 1)
     boost_allow_fee_fallback: bool = env_bool("BOOST_ALLOW_FEE_FALLBACK", True)
@@ -173,6 +173,13 @@ class Defaults:
     boost_rotate_strength_multiplier: float = env_float("BOOST_ROTATE_STRENGTH_MULTIPLIER", 1.35)
     boost_rotate_min_score_gap: float = env_float("BOOST_ROTATE_MIN_SCORE_GAP", 5.0)
     boost_rotate_cooldown_sec: int = env_int("BOOST_ROTATE_COOLDOWN_SEC", 1)
+    boost_rescue_rotation_enabled: bool = env_bool("BOOST_RESCUE_ROTATION_ENABLED", True)
+    boost_rescue_min_score_multiplier: float = env_float("BOOST_RESCUE_MIN_SCORE_MULTIPLIER", 1.70)
+    boost_rescue_min_score_gap: float = env_float("BOOST_RESCUE_MIN_SCORE_GAP", 18.0)
+    boost_rescue_expected_move_loss_mult: float = env_float("BOOST_RESCUE_EXPECTED_MOVE_LOSS_MULT", 2.50)
+    boost_rescue_max_loss_pct: float = env_float("BOOST_RESCUE_MAX_LOSS_PCT", 0.70)
+    boost_rescue_cooldown_sec: int = env_int("BOOST_RESCUE_COOLDOWN_SEC", 180)
+    boost_rescue_max_per_hour: int = env_int("BOOST_RESCUE_MAX_PER_HOUR", 2)
 
 DEFAULTS = Defaults()
 DB_PATH = os.getenv("DATABASE_PATH", "bot_data.sqlite3")

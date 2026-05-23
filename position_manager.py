@@ -458,7 +458,7 @@ class PositionManager:
             if side=="LONG":
                 if take and price>=take:
                     if live and strategy == "boost_scalping":
-                        min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.0) or 0.0)
+                        min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.015) or 0.0)
                         ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, min_profit)
                         if not ok_profit:
                             pos["boost_tp_skip_reason"] = why_profit
@@ -481,7 +481,7 @@ class PositionManager:
             else:
                 if take and price<=take:
                     if live and strategy == "boost_scalping":
-                        min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.0) or 0.0)
+                        min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.015) or 0.0)
                         ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, min_profit)
                         if not ok_profit:
                             pos["boost_tp_skip_reason"] = why_profit

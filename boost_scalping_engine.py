@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import time
 import json
+import asyncio
 from typing import Any
 
 from ai_scalping_engine import AIScalpDecision, AIScalpingEngine, _f, _r, _depth_usdt_within
+from debug_log import log_event
 
 
 def _blocked_symbols_from_settings(settings: dict) -> set[str]:
@@ -57,6 +59,7 @@ class BoostScalpingEngine:
         self._base = AIScalpingEngine()
         self._fee_cache: tuple[float, list[str]] = (0.0, [])
         self._scan_cursor: int = 0
+        self._hot_cache: tuple[float, list[str], list[dict]] = (0.0, [], [])
 
     async def zero_fee_symbols(self, exchange_client, settings: dict) -> list[str]:
         ttl = 600.0
@@ -126,45 +129,127 @@ class BoostScalpingEngine:
         score = ratio * 12.0 + momo * 90.0 + atr * 20.0 - spread * 80.0
         return {"ok": True, "side": side, "score": score, "strength": strength, "ratio": ratio, "momo": momo, "reason": f"{side} ratio={ratio:.2f} r1={r1:.3f}% r3={r3:.3f}% atr={atr:.3f}%"}
 
+    async def _fast_contract_tickers(self, exchange_client) -> list[dict]:
+        """Read all MEXC futures tickers in one public request when native client is available."""
+        try:
+            if getattr(exchange_client, "exchange_id", "") == "mexc" and getattr(exchange_client, "exchange", None) is None and hasattr(exchange_client, "_mexc_public"):
+                resp = await asyncio.wait_for(exchange_client._mexc_public("GET", "/api/v1/contract/ticker"), timeout=4.0)
+                data = resp.get("data") if isinstance(resp, dict) else resp
+                if isinstance(data, list):
+                    return [x for x in data if isinstance(x, dict)]
+                if isinstance(data, dict):
+                    return [data]
+        except Exception as e:
+            log_event("boost_hotlist_error", stage="all_tickers", ok=False, error=str(e)[:300])
+        return []
+
+    def _ticker_symbol_key(self, row: dict) -> str:
+        raw = row.get("symbol") or row.get("contract") or row.get("id") or row.get("symbolName") or ""
+        return _norm_symbol(str(raw))
+
+    def _ticker_rank_score(self, row: dict) -> dict:
+        last = _f(row.get("lastPrice") or row.get("last") or row.get("fairPrice") or row.get("indexPrice"), 0.0)
+        high = _f(row.get("high24Price") or row.get("high24") or row.get("high"), 0.0)
+        low = _f(row.get("low24Price") or row.get("low24") or row.get("low"), 0.0)
+        bid = _f(row.get("bid1") or row.get("bid") or row.get("bidPrice"), last)
+        ask = _f(row.get("ask1") or row.get("ask") or row.get("askPrice"), last)
+        qv = _f(row.get("amount24") or row.get("volume24") or row.get("quoteVolume") or row.get("turnover24") or row.get("holdVol"), 0.0)
+        # MEXC sometimes gives riseFallRate as fraction (0.012 = 1.2%). Keep both cases safe.
+        r = _f(row.get("riseFallRate") or row.get("changeRate") or row.get("rate"), 0.0)
+        change_pct = r * 100.0 if abs(r) <= 2 else r
+        range_pct = ((high - low) / last * 100.0) if last > 0 and high > low else 0.0
+        spread_pct = ((ask - bid) / last * 100.0) if last > 0 and ask > 0 and bid > 0 else 0.0
+        vol_score = min(25.0, max(0.0, qv) ** 0.25 / 8.0) if qv > 0 else 0.0
+        score = abs(change_pct) * 2.5 + range_pct * 3.0 + vol_score - spread_pct * 60.0
+        return {"score": _r(score, 4), "change_pct": _r(change_pct, 4), "range_pct": _r(range_pct, 4), "quote_volume_usdt": _r(qv, 2), "spread_pct": _r(spread_pct, 4), "last": last}
+
+    async def _hot_symbols(self, exchange_client, settings: dict, symbols: list[str]) -> tuple[list[str], list[dict]]:
+        """Every 5 minutes choose the hottest zero-fee symbols, then deep-scan only this hotlist every 1-3s."""
+        now = time.time()
+        refresh_sec = max(30.0, float(settings.get("boost_hotlist_refresh_sec", 300) or 300))
+        hot_n = max(5, int(float(settings.get("boost_hotlist_size", 30) or 30)))
+        max_symbols = int(float(settings.get("boost_max_symbols_scan", len(symbols)) or len(symbols)))
+        universe = [_norm_symbol(x) for x in symbols[:max_symbols]]
+        allowed = set(universe)
+        if self._hot_cache[1] and now - self._hot_cache[0] < refresh_sec:
+            return [s for s in self._hot_cache[1] if s in allowed][:hot_n], self._hot_cache[2]
+        rows = await self._fast_contract_tickers(exchange_client)
+        ranked = []
+        for row in rows:
+            sym = self._ticker_symbol_key(row)
+            if sym not in allowed:
+                continue
+            metr = self._ticker_rank_score(row)
+            if metr.get("last", 0) <= 0:
+                continue
+            ranked.append({"symbol": sym, **metr})
+        ranked = sorted(ranked, key=lambda x: _f(x.get("score"), 0.0), reverse=True)
+        hot = [r["symbol"] for r in ranked[:hot_n]]
+        if not hot:
+            # If bulk tickers failed, do not go random-small forever: sweep the full 126 in controlled chunks.
+            hot = universe[:hot_n]
+            ranked = [{"symbol": x, "score": 0, "reason": "fallback_universe"} for x in hot]
+        self._hot_cache = (now, hot, ranked[:hot_n])
+        log_event("boost_hotlist_refresh", stage="hotlist", ok=True, universe=len(universe), hot=len(hot), top=ranked[:5])
+        return hot, ranked[:hot_n]
+
     async def decide(self, exchange_client, settings: dict) -> AIScalpDecision:
         symbols = await self.zero_fee_symbols(exchange_client, settings)
         blocked = _blocked_symbols_from_settings(settings)
         if blocked:
             symbols = [s for s in symbols if _norm_symbol(s) not in blocked]
         if not symbols:
-            return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason="BOOST: no tradable 0-fee futures symbols after blacklist/filter", model="boost_zero_fee_scanner", market={"markets": []})
+            return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason="BOOST: no tradable 0-fee futures symbols after blacklist/filter", model="boost_zero_fee_hotlist", market={"markets": []})
+
+        hot_symbols, hot_ranked = await self._hot_symbols(exchange_client, settings, symbols)
+        total = len(hot_symbols)
+        if total <= 0:
+            return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason="BOOST: hotlist empty", model="boost_zero_fee_hotlist", market={"markets": [], "universe_total": len(symbols)})
+
+        # Fast loop: every cycle deep-check the hottest active coins, not a random 15-25.
+        min_checks = max(1, int(float(settings.get("boost_min_checked_per_cycle", 12) or 12)))
+        max_checks = max(min_checks, int(float(settings.get("boost_max_checked_per_cycle", min(30, total)) or min(30, total))))
+        check_count = min(total, max_checks)
+        start = self._scan_cursor % max(1, total)
+        scan_symbols = (hot_symbols[start:] + hot_symbols[:start])[:check_count]
+        self._scan_cursor = (start + check_count) % max(1, total)
+
         best = None
         checked = []
-        max_symbols = int(float(settings.get("boost_max_symbols_scan", len(symbols)) or len(symbols)))
-        universe = list(symbols[:max_symbols])
-        total = len(universe)
-        min_checks = max(1, int(float(settings.get("boost_min_checked_per_cycle", 40) or 40)))
-        max_checks = max(min_checks, int(float(settings.get("boost_max_checked_per_cycle", 100) or 100)))
-        check_count = min(total, max_checks)
-        # v0180: scan a large rotating slice from the FULL zero-fee universe every cycle.
-        # This keeps replacement choices coming from all 126 symbols, not a tiny adaptive set of 5.
-        start = self._scan_cursor % max(1, total)
-        scan_symbols = (universe[start:] + universe[:start])[:check_count]
-        self._scan_cursor = (start + check_count) % max(1, total)
-        for sym in scan_symbols:
-            try:
-                market = await self._snapshot(exchange_client, sym)
-                res = self._side_and_score(market, settings)
+        log_event("boost_deep_scan_start", stage="deep_scan", ok=True, hot_total=total, check_count=check_count, symbols=scan_symbols[:40])
+        async def check_one(sym: str):
+            timeout = max(0.3, float(settings.get("boost_symbol_snapshot_timeout_sec", 0.9) or 0.9))
+            market = await asyncio.wait_for(self._snapshot(exchange_client, sym), timeout=timeout)
+            res = self._side_and_score(market, settings)
+            return sym, market, res
+
+        # Parallel scan is critical for 1-3 second BOOST loops. Limit concurrency to avoid API ban.
+        conc = max(1, min(10, int(float(settings.get("boost_scan_concurrency", 6) or 6))))
+        sem = asyncio.Semaphore(conc)
+        async def guarded(sym: str):
+            async with sem:
+                try:
+                    return await check_one(sym)
+                except Exception as e:
+                    return sym, None, {"ok": False, "reason": str(e)[:120]}
+        results = await asyncio.gather(*(guarded(s) for s in scan_symbols))
+        for sym, market, res in results:
+            if market:
                 checked.append({"symbol": sym, "ok": res.get("ok"), "reason": res.get("reason"), "score": res.get("score", 0), **{k: market.get(k) for k in ("price","spread_pct","atr_1m_pct","ret_1m_pct","ret_3m_pct","quote_volume_usdt")}})
-                if res.get("ok") and (best is None or _f(res.get("score"), 0) > _f(best[0].get("score"), 0)):
-                    best = (res, market)
-            except Exception as e:
-                checked.append({"symbol": sym, "ok": False, "reason": str(e)[:120]})
+            else:
+                checked.append({"symbol": sym, "ok": False, "reason": res.get("reason")})
+            if market and res.get("ok") and (best is None or _f(res.get("score"), 0) > _f(best[0].get("score"), 0)):
+                best = (res, market)
+        ok_candidates = sorted([c for c in checked if c.get("ok")], key=lambda c: _f(c.get("score"), 0.0), reverse=True)[:20]
+        log_event("boost_deep_scan_done", stage="deep_scan", ok=True, checked=len(checked), candidates=len(ok_candidates), best=(ok_candidates[0] if ok_candidates else None))
         if not best:
             why = "; ".join(f"{c.get('symbol')}:{c.get('reason')}" for c in checked[:5])
-            return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason=("BOOST wait: " + why)[:220], model="boost_zero_fee_scanner", market={"markets": checked, "checked": checked, "universe_total": len(symbols), "loaded": len(symbols), "ai_candidates": 0})
+            return AIScalpDecision(ok=True, decision="WAIT", confidence=0.0, reason=("BOOST wait: " + why)[:220], model="boost_zero_fee_hotlist", market={"markets": checked, "checked": checked, "hotlist": hot_ranked, "universe_total": len(symbols), "loaded": len(symbols), "hot_total": total, "ai_candidates": 0})
         res, market = best
         market["boost_score"] = _r(_f(res.get("score"), 0.0), 4)
         market["boost_strength"] = _r(_f(res.get("strength"), 0.0), 4)
         conf = max(0.72, min(0.96, 0.72 + _f(res.get("strength"), 0.0) * 0.24))
-        ok_candidates = [c for c in checked if c.get("ok")]
-        ok_candidates = sorted(ok_candidates, key=lambda c: _f(c.get("score"), 0.0), reverse=True)[:20]
-        return AIScalpDecision(ok=True, symbol=market.get("symbol"), decision=res.get("side"), confidence=conf, reason=res.get("reason"), model="boost_zero_fee_scanner", market={"markets": [market], "checked": checked, "universe_total": len(symbols), "loaded": len(symbols), "ai_candidates": len(ok_candidates), "top_candidates": ok_candidates}, tp_strength=_f(res.get("strength"), 0.0))
+        return AIScalpDecision(ok=True, symbol=market.get("symbol"), decision=res.get("side"), confidence=conf, reason=res.get("reason"), model="boost_zero_fee_hotlist", market={"markets": [market], "checked": checked, "hotlist": hot_ranked, "universe_total": len(symbols), "loaded": len(symbols), "hot_total": total, "ai_candidates": len(ok_candidates), "top_candidates": ok_candidates}, tp_strength=_f(res.get("strength"), 0.0))
 
     def _auto_leverage(self, market: dict, strength: float, settings: dict) -> int:
         min_lev = max(1, int(float(settings.get("boost_min_leverage", 10) or 10)))
@@ -172,10 +257,17 @@ class BoostScalpingEngine:
         if str(settings.get("boost_auto_leverage", True)).lower() not in {"1", "true", "yes", "on"}:
             return max(1, int(float(settings.get("mexc_order_leverage", min_lev) or min_lev)))
         atr = max(0.01, _f(market.get("atr_1m_pct"), 0.10))
-        # More strength -> more leverage; more volatility -> lower safe cap.
-        strength_lev = int(min_lev + max(0.0, min(1.0, strength)) * (max_lev - min_lev))
-        vol_cap = int(max(min_lev, min(max_lev, 4.0 / atr)))  # ATR 0.10%=40x cap, 0.20%=20x, 0.50%=8x
-        return max(min_lev, min(max_lev, strength_lev, vol_cap))
+        r3 = abs(_f(market.get("ret_3m_pct"), 0.0))
+        # BOOST uses 30x-50x by default. Strength/impulse raises leverage; extreme ATR
+        # only prevents jumping to max, it must not silently fall back to 10x.
+        impulse_boost = min(1.0, r3 / max(0.05, _f(settings.get("boost_futures_momentum_min_pct"), 0.015) * 8.0))
+        blended = max(0.0, min(1.0, strength * 0.70 + impulse_boost * 0.30))
+        strength_lev = int(round(min_lev + blended * (max_lev - min_lev)))
+        if atr >= 0.45:
+            strength_lev = min(strength_lev, max(min_lev, int(max_lev * 0.70)))
+        elif atr >= 0.25:
+            strength_lev = min(strength_lev, max(min_lev, int(max_lev * 0.85)))
+        return max(min_lev, min(max_lev, strength_lev))
 
     def make_candidate(self, decision: AIScalpDecision, settings: dict) -> dict | None:
         if not decision.ok or decision.decision not in {"LONG", "SHORT"} or not decision.symbol:
