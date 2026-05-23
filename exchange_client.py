@@ -1247,6 +1247,59 @@ class ExchangeClient:
             unique.append(o)
         return unique
 
+
+    async def mexc_find_active_plan_order(self, symbol: str, order_id: str = "", external_oid: str = "") -> dict:
+        """Return active MEXC futures planorder by id/externalOid for a symbol.
+
+        BOOST emergency SL is created through /planorder/place.  It is not
+        visible in /stoporder/open_orders, so the protection watchdog must
+        verify it against planorder/list/orders directly before declaring the
+        position UNSAFE or canceling/recreating protection.
+        """
+        if self.exchange_id != "mexc":
+            return {}
+        msym = self._mexc_symbol(symbol)
+        oid = str(order_id or "").strip()
+        ext = str(external_oid or "").strip()
+        queries = [
+            {"symbol": msym, "state": 1, "page_num": 1, "page_size": 100},
+            {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100},
+            {"state": 1, "page_num": 1, "page_size": 100},
+            {"is_finished": 0, "page_num": 1, "page_size": 100},
+        ]
+        last_err = ""
+        for query in queries:
+            try:
+                out = await self._mexc_private_read_any_base("/api/v1/private/planorder/list/orders", query=query)
+                rows = [r for r in self._mexc_rows(out.get("data")) if isinstance(r, dict)]
+                for row in rows:
+                    sym_ok = self._mexc_normalize_contract_id(row.get("symbol") or row.get("contract")) == self._mexc_normalize_contract_id(msym)
+                    if not sym_ok:
+                        continue
+                    row_ids = {str(row.get(k) or "").strip() for k in ("orderId", "id", "planOrderId")}
+                    row_ext = str(row.get("externalOid") or row.get("clientOrderId") or "").strip()
+                    state = str(row.get("state", "1")).lower()
+                    finished = str(row.get("is_finished", row.get("isFinished", 0))).lower()
+                    active = state in {"1", "", "created", "wait", "pending"} and finished in {"0", "false", "", "none"}
+                    txt = " ".join(str(row.get(k) or "").lower() for k in ("externalOid", "clientOrderId", "orderType", "type", "side", "reduceOnly"))
+                    reduce_ok = str(row.get("reduceOnly") or row.get("reduce_only") or "").lower() in {"1", "true", "yes"}
+                    id_ok = (oid and oid in row_ids) or (ext and ext == row_ext)
+                    bot_sl_ok = (not oid and not ext and ("bot_sl" in txt or reduce_ok or str(row.get("side") or "") in {"2", "4"}))
+                    if active and (id_ok or bot_sl_ok):
+                        row = dict(row)
+                        row["_source_endpoint"] = "/api/v1/private/planorder/list/orders"
+                        row["_protection_endpoint"] = "planorder"
+                        return row
+            except Exception as e:
+                last_err = str(e)[:220]
+        if last_err:
+            try:
+                from debug_log import log_event
+                log_event("mexc_planorder_verify_error", symbol=symbol, order_id=oid, external_oid=ext, error=last_err, ok=False)
+            except Exception:
+                pass
+        return {}
+
     async def _mexc_cancel_all_orders(self, symbol=None):
         symbols = []
         if symbol:

@@ -245,14 +245,17 @@ class PositionManager:
             state.setdefault("take_profit_ok", bool(state.get("tp_exists")))
             state.setdefault("stop_loss_ok", bool(state.get("sl_exists")))
             strategy_name = str(pos.get("strategy") or "").lower()
-            protected = state.get("protection_status") in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP", "LOCAL_FAST_PROTECTED"}
+            protected = state.get("protection_status") in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP", "LOCAL_FAST_PROTECTED", "EMERGENCY SL ONLY"}
             boost_safe = strategy_name == "boost_scalping" and str(await self._setting("boost_live_safe_execution", os.getenv("BOOST_LIVE_SAFE_EXECUTION", "true"))).lower() in {"1", "true", "yes", "on"}
-            if not protected and boost_safe:
-                # v0181: For BOOST, local fast monitoring is an accepted protection layer.
-                # Do not spam/force old LOCAL PROTECTION warnings when MEXC TP/SL verification is late.
+            unsafe_boost = strategy_name == "boost_scalping" and (state.get("protection_status") == "UNSAFE POSITION" or state.get("boost_unsafe_position"))
+            if not protected and boost_safe and not unsafe_boost:
+                # BOOST local fast monitoring is accepted only when we are NOT in
+                # emergency-SL-only/UNSAFE state.  Do not overwrite UNSAFE or
+                # EMERGENCY SL ONLY with local_fast, because that made the next
+                # watchdog pass forget the planorder mode and call cancel_all.
                 state["protection_status"] = "LOCAL_FAST_PROTECTED"
                 state["protection_mode"] = "local_fast"
-                state["protection_note"] = "BOOST local fast monitor active; watchdog will retry exchange TP/SL"
+                state["protection_note"] = "BOOST local fast monitor active; watchdog will retry exchange protection"
                 pos["protection_mode"] = "local_fast"
                 pos.pop("protection_warning", None)
                 protected = True
@@ -261,6 +264,11 @@ class PositionManager:
                 pos["protection_warning"] = "exchange TP/SL not confirmed; bot monitors TP/SL locally"
             else:
                 pos["protection_mode"] = state.get("protection_mode") or "exchange"
+                if state.get("protection_status") == "EMERGENCY SL ONLY":
+                    pos["boost_emergency_sl_only"] = True
+                    pos["tp_order_id"] = pos.get("tp_order_id") or "LIVE_TRAILING_NO_FIXED_TP"
+                    pos["boost_unsafe_position"] = False
+                    pos["boost_defensive_mode"] = False
                 pos.pop("protection_warning", None)
             await self.storage.upsert_position(pos)
             if state.get("reattach_attempted") or state.get("protection_status") != "EXCHANGE PROTECTED":
@@ -454,6 +462,45 @@ class PositionManager:
                 status_txt = str(pos.get("protection_status") or "").upper()
                 monitor_only = str(await self._setting("boost_no_exchange_protection_monitor_only", os.getenv("BOOST_NO_EXCHANGE_PROTECTION_MONITOR_ONLY", "true"))).lower() in {"1", "true", "yes", "on"}
                 boost_monitor_only_no_exchange = monitor_only and not (mode in {"exchange", "exchange_emergency_sl_only"} or status_txt in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP", "EMERGENCY SL ONLY"})
+
+                # v0219: HUNTER fast-profit extraction. BOOST/HUNTER should not
+                # sit in a positive impulse for too long waiting for a large
+                # trailing exit. Close only after MEXC confirms real positive
+                # exchange PnL, so this still avoids the old fake-paper-profit
+                # minus closes.
+                try:
+                    fast_enabled = str(await self._setting("boost_fast_profit_enabled", True)).lower() in {"1", "true", "yes", "on"}
+                    if fast_enabled:
+                        age_sec = max(0.0, now - opened)
+                        min_age = float(await self._setting("boost_fast_profit_min_age_sec", 3) or 3)
+                        min_pct = float(await self._setting("boost_fast_profit_min_pct", 0.018) or 0.018)
+                        ex_min = float(await self._setting("boost_fast_profit_exchange_min_pct", 0.004) or 0.004)
+                        max_hold = float(await self._setting("boost_fast_profit_max_hold_sec", 24) or 24)
+                        trail_start = float(await self._setting("boost_fast_trailing_start_pct", 0.030) or 0.030)
+                        trail_giveback = float(await self._setting("boost_fast_trailing_giveback_pct", 0.010) or 0.010)
+                        decay_profit = float(await self._setting("boost_momentum_decay_profit_pct", 0.010) or 0.010)
+                        best = float(pos.get("best_pnl_pct") or pnl)
+                        fast_reason = ""
+                        if age_sec >= min_age and pnl >= min_pct:
+                            fast_reason = "boost_fast_profit"
+                        elif age_sec >= min_age and best >= trail_start and pnl > 0 and (best - pnl) >= trail_giveback:
+                            fast_reason = "boost_fast_trailing_lock"
+                        elif age_sec >= max_hold and pnl >= decay_profit:
+                            fast_reason = "boost_max_hold_profit_lock"
+                        if fast_reason:
+                            ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, ex_min)
+                            if ok_profit:
+                                ev = await self._close_and_event(pos, "tp", fast_reason, live, price)
+                                if ev:
+                                    events.append(ev)
+                                continue
+                            else:
+                                pos["boost_fast_profit_skip_reason"] = why_profit
+                                pos["updated_at"] = now
+                                await self.storage.upsert_position(pos)
+                                events.append({"type":"boost_fast_profit_wait_exchange_profit", "symbol": symbol, "reason": why_profit, "local_pnl_pct": pnl, "best_pnl_pct": best})
+                except Exception as e:
+                    events.append({"type":"boost_fast_profit_error", "symbol": symbol, "error": str(e)[:160]})
 
             if side=="LONG":
                 if take and price>=take:

@@ -19,6 +19,28 @@ class ProtectionEngine:
     def _norm_id(self, value: Any) -> str:
         return str(value or "").strip()
 
+    def _is_boost_emergency_only(self, pos: dict) -> bool:
+        """Detect BOOST/HUNTER emergency-SL-only positions robustly.
+
+        Old watchdog paths sometimes downgraded protection_mode to local_fast
+        after a false miss, so relying only on protection_mode caused the next
+        reconcile pass to call cancel_all.  A HUNTER position is emergency-only
+        if it is boost_scalping OR carries the live-trailing TP marker / boost
+        flags / bot_sl planorder id.
+        """
+        strategy = str(pos.get("strategy") or "").lower()
+        mode = str(pos.get("protection_mode") or "").lower()
+        tp_id = str(pos.get("tp_order_id") or "")
+        sl_id = str(pos.get("sl_order_id") or "")
+        return (
+            strategy == "boost_scalping"
+            or mode in {"exchange_emergency_sl_only", "unsafe_no_emergency_sl", "local_fast"}
+            or tp_id == "LIVE_TRAILING_NO_FIXED_TP"
+            or bool(pos.get("boost_emergency_sl_only"))
+            or bool(pos.get("boost_unsafe_position"))
+            or (sl_id and str(pos.get("take_price") or "") and strategy in {"", "boost_scalping"})
+        )
+
     def _order_text(self, order: dict) -> str:
         info = order.get("info") if isinstance(order.get("info"), dict) else {}
         parts = [
@@ -168,8 +190,8 @@ class ProtectionEngine:
         # the position unsafe, sometimes canceling the real planorder.  For BOOST,
         # an active SL plan/stop order is enough exchange protection.
         is_boost = str(pos.get("strategy") or "").lower() == "boost_scalping"
-        emergency_only = str(pos.get("protection_mode") or "").lower() == "exchange_emergency_sl_only" or str(pos.get("tp_order_id") or "") == "LIVE_TRAILING_NO_FIXED_TP" or bool(pos.get("boost_emergency_sl_only"))
-        if is_boost and emergency_only:
+        emergency_only = self._is_boost_emergency_only(pos)
+        if emergency_only:
             status = "EMERGENCY SL ONLY" if found_sl else "UNSAFE POSITION"
             return {
                 "tp_exists": True,
@@ -203,6 +225,58 @@ class ProtectionEngine:
         if not symbol:
             return {"protection_status": "LOCAL BOT PROTECTED", "protection_mode": "local_monitoring", "protection_error": "missing symbol", "tp_exists": False, "sl_exists": False}
         try:
+            # BOOST/HUNTER emergency SL is often a MEXC planorder.  Verify that
+            # exact planorder first, otherwise fetch_open_orders may surface only
+            # stoporder=[] in logs and the watchdog falsely marks the position
+            # UNSAFE, then cancels/retries protection in a loop.
+            is_boost = str(pos.get("strategy") or "").lower() == "boost_scalping"
+            emergency_only = self._is_boost_emergency_only(pos)
+            sl_id = str(pos.get("sl_order_id") or "").strip()
+            # BOOST/HUNTER emergency SL is normally a planorder.  Do not fall
+            # through to generic fetch_open_orders()/stoporder/* when sl_id is
+            # missing/stale: search planorder by id first, then by active bot_sl
+            # plan for this symbol.  This prevents the watchdog from spamming
+            # stoporder/* and cancel_all while a valid planorder exists.
+            if emergency_only and hasattr(self.exchange_client, "mexc_find_active_plan_order"):
+                row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=sl_id)
+                if not row:
+                    row = await self.exchange_client.mexc_find_active_plan_order(symbol)
+                if row:
+                    try:
+                        from debug_log import log_event
+                        log_event("boost_planorder_emergency_sl_verified", symbol=symbol, sl_order_id=sl_id, endpoint="planorder/list/orders", ok=True)
+                    except Exception:
+                        pass
+                    return {
+                        "tp_exists": True,
+                        "sl_exists": True,
+                        "take_profit_ok": True,
+                        "stop_loss_ok": True,
+                        "tp_order_id": pos.get("tp_order_id") or "LIVE_TRAILING_NO_FIXED_TP",
+                        "sl_order_id": sl_id,
+                        "protection_status": "EMERGENCY SL ONLY",
+                        "protection_mode": "exchange_emergency_sl_only",
+                        "boost_unsafe_position": False,
+                        "boost_defensive_mode": False,
+                        "checked_at": time.time(),
+                    }
+            if emergency_only:
+                # In BOOST emergency-SL-only mode, absence of a planorder means
+                # UNSAFE; do NOT query stoporder/* here.  Reconcile will retry
+                # placing the plan SL without destructive cancel_all.
+                return {
+                    "tp_exists": True,
+                    "sl_exists": False,
+                    "take_profit_ok": True,
+                    "stop_loss_ok": False,
+                    "tp_order_id": pos.get("tp_order_id") or "LIVE_TRAILING_NO_FIXED_TP",
+                    "sl_order_id": sl_id,
+                    "protection_status": "UNSAFE POSITION",
+                    "protection_mode": "unsafe_no_emergency_sl",
+                    "boost_unsafe_position": True,
+                    "boost_defensive_mode": True,
+                    "checked_at": time.time(),
+                }
             orders = await self.exchange_client.fetch_open_orders(symbol)
             return self.classify_orders(pos, orders or [])
         except Exception as e:
@@ -221,14 +295,22 @@ class ProtectionEngine:
             out["reattach_error"] = "invalid qty/TP" if liq_mode else "invalid qty/SL/TP"
             return out
         # If one leg is missing or stale after restart, replace the symbol's
-        # protection set atomically: cancel old TP/SL/plan orders first, then
-        # recreate both legs with the current qty/SL/TP. This prevents duplicate
-        # stale stops and makes breakeven/runner SL updates effective on MEXC.
-        try:
-            if hasattr(self.exchange_client, "cancel_all_orders"):
-                await self.exchange_client.cancel_all_orders(pos.get("symbol"))
-        except Exception as e:
-            out["cancel_before_reattach_error"] = str(e)[:240]
+        # protection set atomically.  Exception: BOOST emergency-SL-only mode.
+        # There a valid SL may be a planorder, and destructive cancel_all can
+        # remove the only real emergency backstop.  Retry placing SL without
+        # cancel_all unless the user explicitly runs Cancel All/Panic.
+        is_boost = str(pos.get("strategy") or "").lower() == "boost_scalping"
+        emergency_only = self._is_boost_emergency_only(pos)
+        if is_boost or emergency_only:
+            # BOOST/HUNTER must never run cancel_all from watchdog.  It can
+            # delete the only emergency planorder backstop while the bot is live.
+            out["cancel_before_reattach_skipped"] = "BOOST/HUNTER watchdog: never cancel possible emergency planorder backstop"
+        else:
+            try:
+                if hasattr(self.exchange_client, "cancel_all_orders"):
+                    await self.exchange_client.cancel_all_orders(pos.get("symbol"))
+            except Exception as e:
+                out["cancel_before_reattach_error"] = str(e)[:240]
         prot = await self.execution_engine.place_protection_orders(pos, live=True)
         out.update({"reattach_attempted": True, **prot})
         # Re-check after placement to avoid trusting a partially failed create_order response.

@@ -908,8 +908,14 @@ class ExecutionEngine:
                 return {"tp_exists": True, "sl_exists": True, "protection_status": "EXCHANGE PROTECTED", "protection_mode": "exchange"}
             from protection_engine import ProtectionEngine
             check_pos = {**dict(pos), "tp_order_id": tp_order_id, "sl_order_id": sl_order_id}
+            pe = ProtectionEngine(self.exchange_client)
+            # BOOST/HUNTER emergency-SL-only planorders must be verified through
+            # ProtectionEngine.check(), because MEXC exposes them under
+            # /planorder/list/orders and not necessarily under stoporder/* logs.
+            if str(check_pos.get("strategy") or "").lower() == "boost_scalping" or str(check_pos.get("tp_order_id") or "") == "LIVE_TRAILING_NO_FIXED_TP" or bool(check_pos.get("boost_emergency_sl_only")):
+                return await pe.check(check_pos)
             orders = await self.exchange_client.fetch_open_orders(check_pos.get("symbol"))
-            return ProtectionEngine(self.exchange_client).classify_orders(check_pos, orders or [])
+            return pe.classify_orders(check_pos, orders or [])
         except Exception as e:
             return {
                 "tp_exists": False,
@@ -950,6 +956,7 @@ class ExecutionEngine:
         if qty <= 0:
             return {"ok": False, "protection_status": "LOCAL BOT PROTECTED", "protection_mode": "local_monitoring", "protection_warning": "missing qty for exchange protection"}
         side = "sell" if str(pos.get("side")).upper() == "LONG" else "buy"
+        strategy_name_for_protection = str(pos.get("strategy") or "").lower()
         require_exchange_protection = await self._setting_bool("require_exchange_protection", "REQUIRE_EXCHANGE_PROTECTION", True)
         attempts = max(1, int(os.getenv("PROTECTION_PLACE_MAX_ATTEMPTS", "3") or "3"))
         delay = float(os.getenv("PROTECTION_RECHECK_DELAY_SEC", "0.8") or "0.8")
@@ -964,10 +971,11 @@ class ExecutionEngine:
                 if existing.get("tp_exists"):
                     return {**existing, "ok": True, "sl_exists": True, "sl_order_id": "LIQUIDATION_STOP", "protection_status": "TP + LIQUIDATION STOP", "protection_mode": "exchange_tp_liquidation_sl", "protection_note": "existing TP detected before reattach"}
             elif existing.get("tp_exists") and existing.get("sl_exists"):
+                if strategy_name_for_protection == "boost_scalping" or existing.get("protection_mode") == "exchange_emergency_sl_only":
+                    return {**existing, "ok": True, "protection_status": "EMERGENCY SL ONLY", "protection_mode": "exchange_emergency_sl_only", "protection_note": "existing BOOST emergency SL detected before reattach"}
                 return {**existing, "ok": True, "protection_status": "EXCHANGE PROTECTED", "protection_mode": "exchange", "protection_note": "existing TP/SL detected before reattach"}
         except Exception as e:
             pos["pre_protection_verify_warning"] = str(e)[:180]
-        strategy_name_for_protection = str(pos.get("strategy") or "").lower()
         if strategy_name_for_protection in {"ai_scalping", "boost_scalping"}:
             # AI BTC/ETH scalping and BOOST both use tiny local exits. Exchange
             # TP/SL is safety/backstop and MEXC often needs more retries before
@@ -988,12 +996,19 @@ class ExecutionEngine:
             # remove an attached TP/SL leg that was actually accepted but not yet
             # visible in every endpoint. Only do destructive cleanup after several
             # failed attempts, and only when explicitly enabled.
-            if i >= 2 and os.getenv("PROTECTION_CANCEL_STALE_ON_RETRY", "false").lower() in {"1", "true", "yes", "on"} and hasattr(self.exchange_client, "cancel_all_orders"):
+            if (
+                strategy_name_for_protection != "boost_scalping"
+                and i >= 2
+                and os.getenv("PROTECTION_CANCEL_STALE_ON_RETRY", "false").lower() in {"1", "true", "yes", "on"}
+                and hasattr(self.exchange_client, "cancel_all_orders")
+            ):
                 try:
                     await self.exchange_client.cancel_all_orders(symbol)
                 except Exception as e:
                     out["retry_cancel_error"] = str(e)[:240]
                 await asyncio.sleep(delay)
+            elif strategy_name_for_protection == "boost_scalping" and i >= 2:
+                out["retry_cancel_skipped"] = "BOOST/HUNTER emergency-only: never cancel possible planorder backstop"
             if liquidation_stop_mode:
                 try:
                     if tp > 0:
