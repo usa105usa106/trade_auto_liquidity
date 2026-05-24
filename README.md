@@ -1,5 +1,5 @@
 
-## v0236 QUICK BOUNCE SL 1.5 TP 2.5 REAL
+## v0238 QUICK BOUNCE SPREAD 0.30
 
 - Quick Bounce сначала пытается поставить реальные SL/TP на бирже.
 - Если реальные SL/TP не подтвердились, сделка НЕ закрывается.

@@ -3346,7 +3346,7 @@ async def quick_bounce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "quick_bounce_pump_4h_pct": 5.0,
         "quick_bounce_reversal_pct": 1.0,
         "quick_bounce_min_volume_ratio": 1.15,
-        "quick_bounce_max_spread_pct": 0.20,
+        "quick_bounce_max_spread_pct": 0.30,
         "quick_bounce_min_24h_volume_usdt": 20000000.0,
         "quick_bounce_btc_filter_enabled": True,
         "quick_bounce_btc_max_drop_1h_pct": 2.0,

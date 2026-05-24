@@ -154,6 +154,70 @@ class Scanner:
         finally:
             await exchange.close()
 
+
+    async def _fetch_mexc_futures_tickers_rest(self, exchange_client, settings: dict | None = None) -> dict:
+        """Native MEXC futures REST ticker fallback.
+
+        This is deliberately independent from the websocket ticker cache and from
+        ccxt.fetch_tickers(), because on Railway/MEXC the websocket cache can be
+        empty while /api/v1/contract/ticker is healthy.  Returned rows are shaped
+        like a minimal ccxt ticker map so the existing universe/ranking code can
+        consume them unchanged.
+        """
+        settings = settings or {}
+        # Prefer the project's native MEXC public method when available.
+        if hasattr(exchange_client, "_mexc_public"):
+            resp = await exchange_client._mexc_public("GET", "/api/v1/contract/ticker")
+            data = resp.get("data") if isinstance(resp, dict) else resp
+            out = {}
+            for row in data or []:
+                if not isinstance(row, dict):
+                    continue
+                raw_symbol = row.get("symbol") or row.get("contractCode") or row.get("instrumentId")
+                if not raw_symbol or "USDT" not in str(raw_symbol).upper():
+                    continue
+                try:
+                    norm = exchange_client.normalize_symbol(raw_symbol)
+                except Exception:
+                    norm = str(raw_symbol).replace("_", "/").replace(":USDT", "")
+                    if "/" not in norm and norm.endswith("USDT"):
+                        norm = norm[:-4] + "/USDT"
+                    if not norm.endswith(":USDT"):
+                        norm = norm + ":USDT"
+                def _num(*keys, default=0.0):
+                    for key in keys:
+                        val = row.get(key)
+                        if val not in (None, ""):
+                            try:
+                                return float(val)
+                            except Exception:
+                                pass
+                    return default
+                last = _num("lastPrice", "last", "price", "fairPrice", "markPrice")
+                pct = _num("riseFallRate", "changeRate", "priceChangePercent")
+                # MEXC may return riseFallRate as fraction (0.0123) rather than percent.
+                pct = pct * 100.0 if abs(pct) <= 1.0 else pct
+                quote_vol = _num("amount24", "quoteVolume", "turnover24", "turnover")
+                base_vol = _num("volume24", "volume", "vol24", "holdVol")
+                out[norm] = {
+                    "symbol": norm,
+                    "last": last,
+                    "close": last,
+                    "percentage": pct,
+                    "quoteVolume": quote_vol,
+                    "baseVolume": base_vol,
+                    "info": row,
+                }
+            if out:
+                return out
+            raise RuntimeError("MEXC futures REST returned empty ticker set")
+
+        # Last resort for non-native clients.
+        tickers = await exchange_client.fetch_tickers()
+        if tickers:
+            return tickers
+        raise RuntimeError("MEXC futures REST returned empty ticker set")
+
     async def _fetch_scan_tickers(self, exchange_client, settings: dict, ws_supervisor=None) -> tuple[dict, str]:
         """Return futures tickers for universe scanning using the user-selected source.
 
@@ -200,14 +264,21 @@ class Scanner:
                 raise RuntimeError(msg)
 
         try:
-            tickers = await exchange_client.fetch_tickers()
+            tickers = await self._fetch_mexc_futures_tickers_rest(exchange_client, settings)
             if tickers:
+                # REST success means the scanner is healthy. Keep the websocket
+                # issue as a non-fatal warning in source, not as last_refresh_error,
+                # so Telegram does not show "source issue" while we are already
+                # scanning fresh REST data.
+                source = "mexc_futures_rest"
                 if ws_error:
-                    self.last_refresh_error = ws_error
-                return tickers, "mexc_futures_rest"
+                    source = "mexc_futures_rest_after_ws_empty"
+                    self.last_universe_target_reason = f"REST fallback used after websocket issue: {ws_error[:120]}"
+                self.last_refresh_error = ""
+                return tickers, source
             raise RuntimeError("MEXC futures REST returned empty ticker set")
         except Exception as e:
-            msg = f"MEXC futures scan failed: {e}"
+            msg = f"MEXC futures REST fallback failed: {e}"
             if ws_error:
                 msg = f"{ws_error}; {msg}"
             raise RuntimeError(msg)

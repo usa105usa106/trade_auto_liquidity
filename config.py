@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0236 QUICK BOUNCE SL 1_5 TP 2_5 REAL")
+VERSION = os.getenv("BOT_VERSION", "0238 QUICK BOUNCE SPREAD 0.30")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -146,7 +146,7 @@ class Defaults:
     quick_bounce_pump_4h_pct: float = env_float("QUICK_BOUNCE_PUMP_4H_PCT", 5.0)
     quick_bounce_reversal_pct: float = env_float("QUICK_BOUNCE_REVERSAL_PCT", 1.0)
     quick_bounce_min_volume_ratio: float = env_float("QUICK_BOUNCE_MIN_VOLUME_RATIO", 1.15)
-    quick_bounce_max_spread_pct: float = env_float("QUICK_BOUNCE_MAX_SPREAD_PCT", 0.20)
+    quick_bounce_max_spread_pct: float = env_float("QUICK_BOUNCE_MAX_SPREAD_PCT", 0.30)
     quick_bounce_min_24h_volume_usdt: float = env_float("QUICK_BOUNCE_MIN_24H_VOLUME_USDT", 20000000.0)
     quick_bounce_btc_filter_enabled: bool = env_bool("QUICK_BOUNCE_BTC_FILTER_ENABLED", True)
     quick_bounce_btc_max_drop_1h_pct: float = env_float("QUICK_BOUNCE_BTC_MAX_DROP_1H_PCT", 2.0)

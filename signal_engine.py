@@ -84,7 +84,7 @@ class SignalEngine:
         self.quick_bounce_pump_4h_pct = float(os.getenv("QUICK_BOUNCE_PUMP_4H_PCT", "5.0"))
         self.quick_bounce_reversal_pct = float(os.getenv("QUICK_BOUNCE_REVERSAL_PCT", "1.0"))
         self.quick_bounce_min_volume_ratio = float(os.getenv("QUICK_BOUNCE_MIN_VOLUME_RATIO", "1.15"))
-        self.quick_bounce_max_spread_pct = float(os.getenv("QUICK_BOUNCE_MAX_SPREAD_PCT", "0.20"))
+        self.quick_bounce_max_spread_pct = float(os.getenv("QUICK_BOUNCE_MAX_SPREAD_PCT", "0.30"))
         self.quick_bounce_min_24h_volume_usdt = float(os.getenv("QUICK_BOUNCE_MIN_24H_VOLUME_USDT", "20000000"))
         self.quick_bounce_btc_filter_enabled = str(os.getenv("QUICK_BOUNCE_BTC_FILTER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
         self.quick_bounce_btc_max_drop_1h_pct = float(os.getenv("QUICK_BOUNCE_BTC_MAX_DROP_1H_PCT", "2.0"))
