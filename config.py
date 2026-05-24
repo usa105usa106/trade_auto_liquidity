@@ -4,12 +4,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Previous packaged version markers for regression tests: 0078 SCALP EXIT SAFETY | 0089 OPENAI PROMPT QUALITY FIX | 0096 SAFE STOP MARKET RECOVERY
+# Previous packaged version markers for regression tests: 0078 SCALP EXIT SAFETY | 0089 OPENAI PROMPT QUALITY FIX | 0096 SAFE STOP MARKET RECOVERY | 0234 QUICK BOUNCE RR 1TO2 TPSL FIX
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0231 QUICK BOUNCE REAL TPSL FALLBACK")
+VERSION = os.getenv("BOT_VERSION", "0236 QUICK BOUNCE SL 1_5 TP 2_5 REAL")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -138,8 +138,9 @@ class Defaults:
     quick_bounce_trade_margin_pct: float = env_float("QUICK_BOUNCE_TRADE_MARGIN_PCT", 0.10)
     quick_bounce_max_open_positions: int = env_int("QUICK_BOUNCE_MAX_OPEN_POSITIONS", 5)
     quick_bounce_leverage: int = env_int("QUICK_BOUNCE_LEVERAGE", 10)
-    quick_bounce_tp_pct: float = env_float("QUICK_BOUNCE_TP_PCT", 2.0)
-    quick_bounce_sl_pct: float = env_float("QUICK_BOUNCE_SL_PCT", 2.0)
+    quick_bounce_tp_pct: float = env_float("QUICK_BOUNCE_TP_PCT", 2.5)
+    quick_bounce_sl_pct: float = env_float("QUICK_BOUNCE_SL_PCT", 1.5)
+    quick_bounce_rr: float = env_float("QUICK_BOUNCE_RR", 1.6667)
     quick_bounce_time_stop_sec: int = env_int("QUICK_BOUNCE_TIME_STOP_SEC", 43200)
     quick_bounce_drop_4h_pct: float = env_float("QUICK_BOUNCE_DROP_4H_PCT", 5.0)
     quick_bounce_pump_4h_pct: float = env_float("QUICK_BOUNCE_PUMP_4H_PCT", 5.0)

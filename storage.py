@@ -112,6 +112,7 @@ DEFAULT_SETTINGS = {
     "quick_bounce_leverage": DEFAULTS.quick_bounce_leverage,
     "quick_bounce_tp_pct": DEFAULTS.quick_bounce_tp_pct,
     "quick_bounce_sl_pct": DEFAULTS.quick_bounce_sl_pct,
+    "quick_bounce_rr": DEFAULTS.quick_bounce_rr,
     "quick_bounce_time_stop_sec": DEFAULTS.quick_bounce_time_stop_sec,
     "quick_bounce_drop_4h_pct": DEFAULTS.quick_bounce_drop_4h_pct,
     "quick_bounce_pump_4h_pct": DEFAULTS.quick_bounce_pump_4h_pct,

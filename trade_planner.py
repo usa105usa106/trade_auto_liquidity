@@ -76,8 +76,8 @@ class TradePlanner:
             "quick_bounce": {
                 "min_tp": float(os.getenv("QUICK_BOUNCE_TP_PCT", "2.0")),
                 "max_tp": float(os.getenv("QUICK_BOUNCE_TP_PCT", "2.0")),
-                "min_sl": float(os.getenv("QUICK_BOUNCE_SL_PCT", "2.0")),
-                "max_sl": float(os.getenv("QUICK_BOUNCE_SL_PCT", "2.0")),
+                "min_sl": float(os.getenv("QUICK_BOUNCE_SL_PCT", "1.0")),
+                "max_sl": float(os.getenv("QUICK_BOUNCE_SL_PCT", "1.0")),
                 "tp_mult": 1.0,
                 "sl_mult": 1.0,
             },
@@ -152,8 +152,15 @@ class TradePlanner:
                         rr = clamp(target_rr, 2.0, 4.0)
             candidate["liquidity_retest_rr"] = rr
         elif strategy in {"quick_bounce"}:
-            tp_pct = max(0.01, float(candidate.get("score_details", {}).get("tp_pct") or settings.get("quick_bounce_tp_pct", os.getenv("QUICK_BOUNCE_TP_PCT", "2.0")) or 2.0))
-            sl_pct = max(0.01, float(candidate.get("score_details", {}).get("sl_pct") or settings.get("quick_bounce_sl_pct", os.getenv("QUICK_BOUNCE_SL_PCT", "2.0")) or 2.0))
+            # v0236: quick_bounce uses fixed distance: SL 1.5% and TP 2.5%.
+            # Both prices are computed from the same anchor price, then rebased to the
+            # real exchange fill before TP/SL orders are placed. This prevents the
+            # screenshot bug where entry was the fill but TP/SL stayed on the signal price.
+            sl_pct = max(0.01, float(settings.get("quick_bounce_sl_pct", os.getenv("QUICK_BOUNCE_SL_PCT", "1.5")) or 1.5))
+            tp_pct = max(0.01, float(settings.get("quick_bounce_tp_pct", os.getenv("QUICK_BOUNCE_TP_PCT", "2.5")) or 2.5))
+            rr = round(tp_pct / sl_pct, 6) if sl_pct > 0 else 1.0
+            candidate["score_details"] = dict(candidate.get("score_details") or {})
+            candidate["score_details"].update({"sl_pct": sl_pct, "tp_pct": tp_pct, "rr": rr})
             candidate["trade_margin_pct"] = float(settings.get("quick_bounce_trade_margin_pct", os.getenv("QUICK_BOUNCE_TRADE_MARGIN_PCT", "0.10")) or 0.10)
             candidate["max_open_positions"] = int(float(settings.get("quick_bounce_max_open_positions", os.getenv("QUICK_BOUNCE_MAX_OPEN_POSITIONS", "5")) or 5))
             candidate["leverage"] = int(float(settings.get("quick_bounce_leverage", os.getenv("QUICK_BOUNCE_LEVERAGE", "10")) or 10))

@@ -261,7 +261,7 @@ class PositionManager:
             state.setdefault("take_profit_ok", bool(state.get("tp_exists")))
             state.setdefault("stop_loss_ok", bool(state.get("sl_exists")))
             strategy_name = str(pos.get("strategy") or "").lower()
-            protected = state.get("protection_status") in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP", "LOCAL_FAST_PROTECTED", "EMERGENCY SL ONLY"}
+            protected = state.get("protection_status") in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP", "LOCAL_FAST_PROTECTED", "EMERGENCY SL ONLY", "VIRTUAL_PROTECTED"}
             boost_safe = strategy_name == "boost_scalping" and str(await self._setting("boost_live_safe_execution", os.getenv("BOOST_LIVE_SAFE_EXECUTION", "true"))).lower() in {"1", "true", "yes", "on"}
             unsafe_boost = strategy_name == "boost_scalping" and (state.get("protection_status") == "UNSAFE POSITION" or state.get("boost_unsafe_position"))
             if not protected and boost_safe and not unsafe_boost:
@@ -287,7 +287,7 @@ class PositionManager:
                     pos["boost_defensive_mode"] = False
                 pos.pop("protection_warning", None)
             await self.storage.upsert_position(pos)
-            if state.get("reattach_attempted") or state.get("protection_status") != "EXCHANGE PROTECTED":
+            if state.get("reattach_attempted") or not protected:
                 return {"type": "protection_watchdog", "symbol": pos.get("symbol"), **state}
         except Exception as e:
             pos["protection_warning"] = f"protection watchdog error: {str(e)[:180]}"

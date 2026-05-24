@@ -595,14 +595,14 @@ class SignalEngine:
             out.append(self._base(symbol, "LONG", "quick_bounce", close, score, spread_pct, depth_usdt, atrp, {
                 "setup": "1h_drop_15m_bounce", "move_4h_pct": round(move_4h_pct, 3), "bounce_from_low_pct": round(bounce_from_low, 3),
                 "volume_ratio": round(local_vol_ratio, 3), "quote_volume_24h": round(quote_vol, 2), "btc_change_1h_pct": btc_change_1h,
-                "anomaly_tf": "1h", "confirm_tf": "15m", "tp_pct": 2.0, "sl_pct": 2.0,
+                "anomaly_tf": "1h", "confirm_tf": "15m", "tp_pct": 2.5, "sl_pct": 1.5,
             }))
         if short_ok:
             score = 70 + min(12, abs(move_4h_pct) * 1.2) + min(8, pullback_from_high * 2.0) + min(6, max(0, local_vol_ratio - 1) * 4) + (3 if imbalance < 0 else 0)
             out.append(self._base(symbol, "SHORT", "quick_bounce", close, score, spread_pct, depth_usdt, atrp, {
                 "setup": "1h_pump_15m_pullback", "move_4h_pct": round(move_4h_pct, 3), "pullback_from_high_pct": round(pullback_from_high, 3),
                 "volume_ratio": round(local_vol_ratio, 3), "quote_volume_24h": round(quote_vol, 2), "btc_change_1h_pct": btc_change_1h,
-                "anomaly_tf": "1h", "confirm_tf": "15m", "tp_pct": 2.0, "sl_pct": 2.0,
+                "anomaly_tf": "1h", "confirm_tf": "15m", "tp_pct": 2.5, "sl_pct": 1.5,
             }))
         if not out:
             btc_note = f" btc1h={btc_change_1h:+.2f}%" if btc_change_1h is not None else ""

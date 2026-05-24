@@ -277,6 +277,56 @@ class ProtectionEngine:
                     "boost_defensive_mode": True,
                     "checked_at": time.time(),
                 }
+
+            # v0233 Quick Bounce uses MEXC /planorder/place for standalone
+            # reduce-only TP/SL. Those orders do NOT appear in
+            # /stoporder/open_orders, so checking generic open orders can produce
+            # false LOCAL PROTECTION messages right after a successful placement.
+            # Verify the exact saved planorder ids first and trust them while
+            # active. This also prevents watchdog reattach/cancel loops and
+            # duplicate TP/SL orders.
+            is_quick_bounce = str(pos.get("strategy") or "").lower() == "quick_bounce"
+            if is_quick_bounce and hasattr(self.exchange_client, "mexc_find_active_plan_order"):
+                tp_id = str(pos.get("tp_order_id") or "").strip()
+                sl_id_qb = str(pos.get("sl_order_id") or "").strip()
+                tp_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=tp_id) if tp_id else {}
+                sl_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=sl_id_qb) if sl_id_qb else {}
+                if tp_row and sl_row:
+                    return {
+                        "tp_exists": True,
+                        "sl_exists": True,
+                        "take_profit_ok": True,
+                        "stop_loss_ok": True,
+                        "tp_order_id": tp_id,
+                        "sl_order_id": sl_id_qb,
+                        "protection_status": "EXCHANGE PROTECTED",
+                        "protection_mode": "exchange_planorder",
+                        "protection_note": "MEXC planorder TP/SL verified by id",
+                        "checked_at": time.time(),
+                    }
+                # If the position was just created and MEXC list endpoint has not
+                # indexed planorders yet, do not immediately downgrade. The
+                # successful /planorder/place ids are strong enough to avoid a
+                # false warning during the grace period.
+                try:
+                    opened_at = float(pos.get("opened_at") or pos.get("created_at") or 0)
+                except Exception:
+                    opened_at = 0.0
+                grace = 90.0
+                if tp_id and sl_id_qb and opened_at and time.time() - opened_at < grace:
+                    return {
+                        "tp_exists": True,
+                        "sl_exists": True,
+                        "take_profit_ok": True,
+                        "stop_loss_ok": True,
+                        "tp_order_id": tp_id,
+                        "sl_order_id": sl_id_qb,
+                        "protection_status": "EXCHANGE PROTECTED",
+                        "protection_mode": "exchange_planorder_pending_verify",
+                        "protection_note": "MEXC planorder ids accepted; list verification in grace period",
+                        "checked_at": time.time(),
+                    }
+
             orders = await self.exchange_client.fetch_open_orders(symbol)
             return self.classify_orders(pos, orders or [])
         except Exception as e:
@@ -285,6 +335,17 @@ class ProtectionEngine:
     async def reconcile(self, pos: dict, live: bool = True, reattach: bool = True) -> dict:
         out = await self.check(pos)
         if out.get("protection_status") in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP", "EMERGENCY SL ONLY"} or not reattach or not live or not self.execution_engine:
+            return out
+        # v0233: Quick Bounce fallback is intentionally virtual monitoring.
+        # If exchange TP/SL are not confirmed, keep the position open and do
+        # NOT cancel/recreate planorders from the watchdog; that can duplicate
+        # orders or remove a valid backstop while MEXC list endpoints lag.
+        if str(pos.get("strategy") or "").lower() == "quick_bounce":
+            out["protection_status"] = "VIRTUAL_PROTECTED"
+            out["protection_mode"] = "virtual"
+            out["virtual_tp_sl_active"] = True
+            out["quick_bounce_no_reattach"] = True
+            out["protection_note"] = "Quick Bounce uses local TP/SL fallback; watchdog does not reattach/cancel planorders"
             return out
         liq_mode = bool(pos.get("liquidation_stop_mode")) and str(pos.get("strategy") or "").lower() == "ai_scalping"
         try:

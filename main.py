@@ -469,15 +469,16 @@ def format_quick_bounce_opened(plan, placed: dict) -> str:
     stop = float(pos.get("stop_price") or plan.stop_price)
     take = float(pos.get("take_price") or plan.take_price)
     _notional, margin, leverage, _margin_type = _position_money_fields(pos)
+    side = str(pos.get("side") or getattr(plan, "side", "")).upper()
     protection_mode = str(pos.get("protection_mode") or "unknown").lower()
-    if protection_mode == "exchange":
+    if protection_mode in {"exchange", "exchange_planorder", "exchange_planorder_pending_verify"}:
         protection_line = "защита: реальные SL/TP на бирже"
-    elif protection_mode == "virtual":
+    elif protection_mode in {"virtual", "local_monitoring"}:
         protection_line = "защита: виртуальные SL/TP"
     else:
         protection_line = f"защита: {protection_mode}"
     return "\n".join([
-        f"🟢 Открыл {_qb_symbol(plan.symbol)}",
+        f"🟢 Открыл {side} {_qb_symbol(plan.symbol)}",
         f"${margin:.2f} плечо x{leverage}",
         f"вход ${_fmt_price(entry)}",
         f"стоп ${_fmt_price(stop)}",
@@ -3334,8 +3335,9 @@ async def quick_bounce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "quick_bounce_trade_margin_pct": 0.10,
         "mexc_order_leverage": 10,
         "quick_bounce_leverage": 10,
-        "quick_bounce_tp_pct": 2.0,
-        "quick_bounce_sl_pct": 2.0,
+        "quick_bounce_tp_pct": 2.5,
+        "quick_bounce_sl_pct": 1.5,
+        "quick_bounce_rr": 1.6667,
         "quick_bounce_time_stop_sec": 43200,
         "quick_bounce_top_coins": 200,
         "quick_bounce_max_open_positions": 5,

@@ -1,5 +1,5 @@
 
-## v0231 QUICK BOUNCE REAL TPSL FALLBACK
+## v0236 QUICK BOUNCE SL 1.5 TP 2.5 REAL
 
 - Quick Bounce сначала пытается поставить реальные SL/TP на бирже.
 - Если реальные SL/TP не подтвердились, сделка НЕ закрывается.

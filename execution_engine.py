@@ -560,6 +560,25 @@ class ExecutionEngine:
                                         pos["entry_price"] = float(val); break
                                 except Exception:
                                     pass
+                        # v0235: MEXC can fill market orders at a different price than the
+                        # scanner/signal price used to build the TradePlan. After the live
+                        # position row is visible, re-anchor TP/SL to the real exchange entry
+                        # before placing plan orders. Without this, Telegram can show entry
+                        # from exchange but stop/take from the old signal price, creating
+                        # distorted distances like SL 1.27% and TP 2.70% instead of 2%/2%.
+                        try:
+                            live_entry = float(pos.get("entry_price") or 0)
+                            original_entry = float(plan.entry_price or 0)
+                            if live_entry > 0 and original_entry > 0 and abs(live_entry - original_entry) / original_entry > 0.000001:
+                                old_entry_for_rebase = pos.get("fill_price_source")
+                                pos["entry_price"] = original_entry
+                                pos = self._rebase_protection_to_fill(pos, live_entry)
+                                pos["fill_price_source"] = "exchange_position"
+                                pos["fill_price_previous_source"] = old_entry_for_rebase
+                                pos["initial_stop_price"] = pos.get("stop_price")
+                                pos["initial_take_price"] = pos.get("take_price")
+                        except Exception as e:
+                            pos["fill_rebase_warning"] = str(e)[:220]
                         pos["exchange_synced"] = True
                         pos["updated_at"] = time.time()
 
@@ -942,6 +961,34 @@ class ExecutionEngine:
             from protection_engine import ProtectionEngine
             check_pos = {**dict(pos), "tp_order_id": tp_order_id, "sl_order_id": sl_order_id}
             pe = ProtectionEngine(self.exchange_client)
+            # v0232: MEXC /planorder/place can return success + order ids while
+            # /stoporder/open_orders remains empty because these are plan orders,
+            # not stoporder rows. Verify the exact planorder ids directly before
+            # falling back to generic open-order classification. This prevents
+            # Quick Bounce from falsely downgrading real TP/SL to virtual mode.
+            if (
+                str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc"
+                and hasattr(self.exchange_client, "mexc_find_active_plan_order")
+                and tp_order_id
+                and sl_order_id
+            ):
+                try:
+                    tp_row = await self.exchange_client.mexc_find_active_plan_order(check_pos.get("symbol"), order_id=tp_order_id)
+                    sl_row = await self.exchange_client.mexc_find_active_plan_order(check_pos.get("symbol"), order_id=sl_order_id)
+                    if tp_row and sl_row:
+                        return {
+                            "tp_exists": True,
+                            "sl_exists": True,
+                            "take_profit_ok": True,
+                            "stop_loss_ok": True,
+                            "tp_order_id": tp_order_id,
+                            "sl_order_id": sl_order_id,
+                            "protection_status": "EXCHANGE PROTECTED",
+                            "protection_mode": "exchange_planorder",
+                            "protection_note": "MEXC planorder TP/SL verified by id",
+                        }
+                except Exception as plan_verify_error:
+                    check_pos["planorder_verify_warning"] = str(plan_verify_error)[:240]
             # BOOST/HUNTER emergency-SL-only planorders must be verified through
             # ProtectionEngine.check(), because MEXC exposes them under
             # /planorder/list/orders and not necessarily under stoporder/* logs.
@@ -1253,11 +1300,14 @@ class ExecutionEngine:
                 if not res.get("ok"):
                     return False, results
             elif i == 0 and fallback_qty > 0:
-                res = await self._create_order_retry(
-                    symbol, "market", side, fallback_qty, None,
-                    {"reduceOnly": True, "clientOrderId": f"bot_close_{int(time.time()*1000)}"}, attempts=2
-                )
-                results.append({"attempt": i + 1, "mode": "fallback_qty", "result": res})
+                # v0232: if the exchange already reports no live position, do not
+                # send a blind reduce-only fallback close. On MEXC this produced
+                # noisy code 2009 logs ("Position is nonexistent or closed") right
+                # after real TP/SL had already closed the trade. Treat exchange-flat
+                # as idempotent success; hidden-margin recovery is handled by the
+                # separate safe-state/recovery checks, not by guessing a close side.
+                results.append({"attempt": i + 1, "mode": "already_flat_no_exchange_row", "result": {"ok": True, "skipped": True, "reason": "exchange reports no open position"}})
+                return True, results
             else:
                 return True, results
             await asyncio.sleep(delay)
