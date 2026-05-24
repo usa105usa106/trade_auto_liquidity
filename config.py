@@ -4,12 +4,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Previous packaged version markers for regression tests: 0078 SCALP EXIT SAFETY | 0089 OPENAI PROMPT QUALITY FIX | 0096 SAFE STOP MARKET RECOVERY | 0234 QUICK BOUNCE RR 1TO2 TPSL FIX
+# Previous packaged version markers for regression tests: 0078 SCALP EXIT SAFETY | 0089 OPENAI PROMPT QUALITY FIX | 0096 SAFE STOP MARKET RECOVERY | 0234 QUICK BOUNCE RR 1TO2 TPSL FIX | 0237 QUICK BOUNCE REST TICKER FALLBACK | 0238 QUICK BOUNCE SPREAD 0.30
 
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0238 QUICK BOUNCE SPREAD 0.30")
+VERSION = os.getenv("BOT_VERSION", "0239 IMPULSE DUMP MODE")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -156,6 +156,29 @@ class Defaults:
     quick_bounce_anomaly_timeframe: str = os.getenv("QUICK_BOUNCE_ANOMALY_TIMEFRAME", "1h")
     quick_bounce_confirm_timeframe: str = os.getenv("QUICK_BOUNCE_CONFIRM_TIMEFRAME", "15m")
     quick_bounce_max_candidates: int = env_int("QUICK_BOUNCE_MAX_CANDIDATES", 5)
+
+    impulse_dump_enabled: bool = env_bool("IMPULSE_DUMP_ENABLED", False)
+    impulse_dump_top_coins: int = env_int("IMPULSE_DUMP_TOP_COINS", 200)
+    impulse_dump_scan_interval_sec: int = env_int("IMPULSE_DUMP_SCAN_INTERVAL_SEC", 900)
+    impulse_dump_trade_margin_pct: float = env_float("IMPULSE_DUMP_TRADE_MARGIN_PCT", 0.10)
+    impulse_dump_max_open_positions: int = env_int("IMPULSE_DUMP_MAX_OPEN_POSITIONS", 5)
+    impulse_dump_leverage: int = env_int("IMPULSE_DUMP_LEVERAGE", 10)
+    impulse_dump_sl_pct: float = env_float("IMPULSE_DUMP_SL_PCT", 2.0)
+    impulse_dump_total_drop_target_pct: float = env_float("IMPULSE_DUMP_TOTAL_DROP_TARGET_PCT", 10.0)
+    impulse_dump_min_drop_pct: float = env_float("IMPULSE_DUMP_MIN_DROP_PCT", 3.0)
+    impulse_dump_max_drop_pct: float = env_float("IMPULSE_DUMP_MAX_DROP_PCT", 6.0)
+    impulse_dump_time_stop_sec: int = env_int("IMPULSE_DUMP_TIME_STOP_SEC", 86400)
+    impulse_dump_min_volume_ratio: float = env_float("IMPULSE_DUMP_MIN_VOLUME_RATIO", 1.05)
+    impulse_dump_max_spread_pct: float = env_float("IMPULSE_DUMP_MAX_SPREAD_PCT", 0.30)
+    impulse_dump_min_24h_volume_usdt: float = env_float("IMPULSE_DUMP_MIN_24H_VOLUME_USDT", 20000000.0)
+    impulse_dump_btc_filter_enabled: bool = env_bool("IMPULSE_DUMP_BTC_FILTER_ENABLED", True)
+    impulse_dump_btc_max_pump_1h_pct: float = env_float("IMPULSE_DUMP_BTC_MAX_PUMP_1H_PCT", 1.5)
+    impulse_dump_cooldown_after_close_sec: int = env_int("IMPULSE_DUMP_COOLDOWN_AFTER_CLOSE_SEC", 0)
+    impulse_dump_max_daily_loss_pct: float = env_float("IMPULSE_DUMP_MAX_DAILY_LOSS_PCT", 5.0)
+    impulse_dump_stop_after_consecutive_sl: int = env_int("IMPULSE_DUMP_STOP_AFTER_CONSECUTIVE_SL", 3)
+    impulse_dump_anomaly_timeframe: str = os.getenv("IMPULSE_DUMP_ANOMALY_TIMEFRAME", "1h")
+    impulse_dump_confirm_timeframe: str = os.getenv("IMPULSE_DUMP_CONFIRM_TIMEFRAME", "15m")
+    impulse_dump_max_candidates: int = env_int("IMPULSE_DUMP_MAX_CANDIDATES", 5)
 
     # v0175 Boost Whitelist Commands: /boost_list accepts BTC,ETH,SOL format and /boost_list_del clears trusted zero-fee symbols.
     boost_zero_fee_scanner_enabled: bool = env_bool("BOOST_ZERO_FEE_SCANNER_ENABLED", True)

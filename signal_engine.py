@@ -89,6 +89,15 @@ class SignalEngine:
         self.quick_bounce_btc_filter_enabled = str(os.getenv("QUICK_BOUNCE_BTC_FILTER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
         self.quick_bounce_btc_max_drop_1h_pct = float(os.getenv("QUICK_BOUNCE_BTC_MAX_DROP_1H_PCT", "2.0"))
         self.quick_bounce_btc_max_pump_1h_pct = float(os.getenv("QUICK_BOUNCE_BTC_MAX_PUMP_1H_PCT", "2.0"))
+        self.impulse_dump_min_drop_pct = float(os.getenv("IMPULSE_DUMP_MIN_DROP_PCT", "3.0"))
+        self.impulse_dump_max_drop_pct = float(os.getenv("IMPULSE_DUMP_MAX_DROP_PCT", "6.0"))
+        self.impulse_dump_total_drop_target_pct = float(os.getenv("IMPULSE_DUMP_TOTAL_DROP_TARGET_PCT", "10.0"))
+        self.impulse_dump_sl_pct = float(os.getenv("IMPULSE_DUMP_SL_PCT", "2.0"))
+        self.impulse_dump_min_volume_ratio = float(os.getenv("IMPULSE_DUMP_MIN_VOLUME_RATIO", "1.05"))
+        self.impulse_dump_max_spread_pct = float(os.getenv("IMPULSE_DUMP_MAX_SPREAD_PCT", "0.30"))
+        self.impulse_dump_min_24h_volume_usdt = float(os.getenv("IMPULSE_DUMP_MIN_24H_VOLUME_USDT", "20000000"))
+        self.impulse_dump_btc_filter_enabled = str(os.getenv("IMPULSE_DUMP_BTC_FILTER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
+        self.impulse_dump_btc_max_pump_1h_pct = float(os.getenv("IMPULSE_DUMP_BTC_MAX_PUMP_1H_PCT", "1.5"))
 
     @staticmethod
     def _truthy(value, default: bool = False) -> bool:
@@ -140,6 +149,15 @@ class SignalEngine:
         self.quick_bounce_btc_filter_enabled = self._truthy(settings.get("quick_bounce_btc_filter_enabled"), self.quick_bounce_btc_filter_enabled)
         self.quick_bounce_btc_max_drop_1h_pct = self._float_setting(settings, "quick_bounce_btc_max_drop_1h_pct", self.quick_bounce_btc_max_drop_1h_pct)
         self.quick_bounce_btc_max_pump_1h_pct = self._float_setting(settings, "quick_bounce_btc_max_pump_1h_pct", self.quick_bounce_btc_max_pump_1h_pct)
+        self.impulse_dump_min_drop_pct = self._float_setting(settings, "impulse_dump_min_drop_pct", self.impulse_dump_min_drop_pct)
+        self.impulse_dump_max_drop_pct = self._float_setting(settings, "impulse_dump_max_drop_pct", self.impulse_dump_max_drop_pct)
+        self.impulse_dump_total_drop_target_pct = self._float_setting(settings, "impulse_dump_total_drop_target_pct", self.impulse_dump_total_drop_target_pct)
+        self.impulse_dump_sl_pct = self._float_setting(settings, "impulse_dump_sl_pct", self.impulse_dump_sl_pct)
+        self.impulse_dump_min_volume_ratio = self._float_setting(settings, "impulse_dump_min_volume_ratio", self.impulse_dump_min_volume_ratio)
+        self.impulse_dump_max_spread_pct = self._float_setting(settings, "impulse_dump_max_spread_pct", self.impulse_dump_max_spread_pct)
+        self.impulse_dump_min_24h_volume_usdt = self._float_setting(settings, "impulse_dump_min_24h_volume_usdt", self.impulse_dump_min_24h_volume_usdt)
+        self.impulse_dump_btc_filter_enabled = self._truthy(settings.get("impulse_dump_btc_filter_enabled"), self.impulse_dump_btc_filter_enabled)
+        self.impulse_dump_btc_max_pump_1h_pct = self._float_setting(settings, "impulse_dump_btc_max_pump_1h_pct", self.impulse_dump_btc_max_pump_1h_pct)
         self._apply_liquidity_retest_quality_profile()
 
     def _apply_liquidity_retest_quality_profile(self) -> None:
@@ -244,6 +262,9 @@ class SignalEngine:
         if preferred_strategy == "quick_bounce":
             candles_1h = (mtf_candles or {}).get("1h") if isinstance(mtf_candles, dict) else None
             candidates += self._quick_bounce(symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=candles_1h, ticker=ticker, market_context=market_context)
+        if preferred_strategy == "impulse_dump":
+            candles_1h = (mtf_candles or {}).get("1h") if isinstance(mtf_candles, dict) else None
+            candidates += self._impulse_dump(symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=candles_1h, ticker=ticker, market_context=market_context)
 
         raw_candidates = list(candidates)
         candidates = [c for c in candidates if c["confidence"] >= self.min_confidence]
@@ -255,6 +276,8 @@ class SignalEngine:
                 self.last_reject_reason = getattr(self, "last_liquidity_retest_reject_reason", "liquidity_retest filters: no valid sweep/reclaim/retest/RR")
             elif preferred_strategy == "quick_bounce":
                 self.last_reject_reason = getattr(self, "last_quick_bounce_reject_reason", "quick_bounce filters: no anomaly + reversal")
+            elif preferred_strategy == "impulse_dump":
+                self.last_reject_reason = getattr(self, "last_impulse_dump_reject_reason", "impulse_dump filters: no 3-6% dump continuation")
             else:
                 self.last_reject_reason = "no strategy setup"
             return None
@@ -510,6 +533,103 @@ class SignalEngine:
         blockers = [l for l in lows[-8:-1] if target < l < close]
         return len(blockers) <= 2
 
+
+    def _impulse_dump(self, symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=None, ticker=None, market_context=None):
+        """Cascade SHORT mode.
+
+        Finds coins that have already fallen 3-6% over the 1h/4h context and
+        only shorts if 15m confirms continuation. TP is not a fixed 10% from
+        entry: it targets about -10% total move from the pre-dump anchor, so a
+        -4% current dump gets about 6% more TP, while a -6% current dump gets
+        about 4% more TP.
+        """
+        out = []
+        self.last_impulse_dump_reject_reason = "not enough candles"
+        if len(candles) < 12:
+            return out
+        candles_1h = candles_1h or candles
+        if len(candles_1h) < 5:
+            return out
+        if spread_pct > self.impulse_dump_max_spread_pct:
+            self.last_impulse_dump_reject_reason = f"spread high {spread_pct:.3f}% > {self.impulse_dump_max_spread_pct:.3f}%"
+            return out
+
+        quote_vol = 0.0
+        if isinstance(ticker, dict):
+            for key in ("quoteVolume", "quote_volume", "amount24", "volume24"):
+                try:
+                    quote_vol = float(ticker.get(key) or 0)
+                    if quote_vol > 0:
+                        break
+                except Exception:
+                    pass
+        if quote_vol and quote_vol < self.impulse_dump_min_24h_volume_usdt:
+            self.last_impulse_dump_reject_reason = f"24h volume low {quote_vol:.0f} < {self.impulse_dump_min_24h_volume_usdt:.0f}"
+            return out
+
+        btc_change_1h = None
+        if isinstance(market_context, dict):
+            try:
+                btc_change_1h = float(market_context.get("btc_change_1h_pct"))
+            except Exception:
+                btc_change_1h = None
+        if self.impulse_dump_btc_filter_enabled and btc_change_1h is not None and btc_change_1h > abs(self.impulse_dump_btc_max_pump_1h_pct):
+            self.last_impulse_dump_reject_reason = f"btc pump filter btc1h={btc_change_1h:+.2f}% > {self.impulse_dump_btc_max_pump_1h_pct:.2f}%"
+            return out
+
+        opens15 = [float(c[1]) for c in candles]
+        highs15 = [float(c[2]) for c in candles]
+        lows15 = [float(c[3]) for c in candles]
+        closes15 = [float(c[4]) for c in candles]
+        vols15 = [float(c[5]) for c in candles]
+        closes1h = [float(c[4]) for c in candles_1h]
+
+        lookback_1h = min(len(candles_1h), 5)
+        anchor = closes1h[-lookback_1h]
+        move_4h_pct = pct(close, anchor)
+        drop_abs = abs(move_4h_pct) if move_4h_pct < 0 else 0.0
+        min_drop = abs(self.impulse_dump_min_drop_pct)
+        max_drop = abs(self.impulse_dump_max_drop_pct)
+
+        recent_vol = mean(vols15[-4:]) if len(vols15) >= 4 else vols15[-1]
+        base_vol = mean(vols15[-20:-4]) if len(vols15) >= 24 else mean(vols15[:-4] or vols15)
+        local_vol_ratio = (recent_vol / base_vol) if base_vol else vol_ratio
+        if local_vol_ratio < self.impulse_dump_min_volume_ratio:
+            self.last_impulse_dump_reject_reason = f"volume low {local_vol_ratio:.2f} < {self.impulse_dump_min_volume_ratio:.2f}"
+            return out
+
+        last_red = closes15[-1] < opens15[-1] and closes15[-1] < closes15[-2]
+        lower_low = lows15[-1] <= min(lows15[-5:-1]) if len(lows15) >= 6 else False
+        weak_bounce_failed = closes15[-1] < mean(closes15[-4:-1]) if len(closes15) >= 5 else False
+        continuation_ok = last_red or lower_low or weak_bounce_failed
+
+        if not (min_drop <= drop_abs <= max_drop):
+            self.last_impulse_dump_reject_reason = f"drop outside 3-6% move4h={move_4h_pct:+.2f}%"
+            return out
+        if not continuation_ok:
+            self.last_impulse_dump_reject_reason = f"no 15m continuation move4h={move_4h_pct:+.2f}% red={last_red} lower_low={lower_low} weak_bounce_failed={weak_bounce_failed} vol={local_vol_ratio:.2f}"
+            return out
+
+        tp_pct = max(0.5, self.impulse_dump_total_drop_target_pct - drop_abs)
+        # User target: entry after -3..-6%, then catch remaining 7..4% to total -10%.
+        tp_pct = max(4.0, min(7.0, tp_pct))
+        sl_pct = max(0.01, self.impulse_dump_sl_pct)
+        rr = round(tp_pct / sl_pct, 6) if sl_pct > 0 else 1.0
+        score = 72 + min(10, (drop_abs - min_drop) * 2.0) + min(8, max(0, local_vol_ratio - 1) * 5) + (3 if imbalance < 0 else 0) + (2 if lower_low else 0)
+        out.append(self._base(symbol, "SHORT", "impulse_dump", close, score, spread_pct, depth_usdt, atrp, {
+            "setup": "3_6pct_dump_short_continuation",
+            "move_4h_pct": round(move_4h_pct, 3),
+            "current_drop_pct": round(drop_abs, 3),
+            "target_total_drop_pct": round(self.impulse_dump_total_drop_target_pct, 3),
+            "tp_pct": round(tp_pct, 4),
+            "sl_pct": round(sl_pct, 4),
+            "rr": rr,
+            "volume_ratio": round(local_vol_ratio, 3),
+            "quote_volume_24h": round(quote_vol, 2),
+            "btc_change_1h_pct": btc_change_1h,
+            "anomaly_tf": "1h", "confirm_tf": "15m",
+        }))
+        return out
 
     def _quick_bounce(self, symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=None, ticker=None, market_context=None):
         """Fast anomaly bounce mode, v0227.

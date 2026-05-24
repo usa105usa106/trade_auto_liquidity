@@ -208,9 +208,10 @@ class PositionManager:
             return None
         res = await self.execution_engine.close_position(pos, reason, live, price)
         try:
-            if str(pos.get("strategy", "")).lower() == "quick_bounce":
+            strategy_name = str(pos.get("strategy", "")).lower()
+            if strategy_name in {"quick_bounce", "impulse_dump"}:
                 log_event(
-                    "quick_bounce_closed",
+                    f"{strategy_name}_closed",
                     stage="exit",
                     ok=bool(isinstance(res, dict) and res.get("ok")),
                     symbol=str(symbol),
@@ -599,6 +600,12 @@ class PositionManager:
                 qb_time_stop = int(await self._setting("quick_bounce_time_stop_sec", os.getenv("QUICK_BOUNCE_TIME_STOP_SEC", "43200")) or 43200)
                 if qb_time_stop > 0 and now - opened >= qb_time_stop:
                     ev = await self._close_and_event(pos, "time_stop", "quick_bounce_time_stop", live, price)
+                    if ev: events.append(ev)
+                    continue
+            if strategy == "impulse_dump":
+                dump_time_stop = int(await self._setting("impulse_dump_time_stop_sec", os.getenv("IMPULSE_DUMP_TIME_STOP_SEC", "86400")) or 86400)
+                if dump_time_stop > 0 and now - opened >= dump_time_stop:
+                    ev = await self._close_and_event(pos, "time_stop", "impulse_dump_time_stop", live, price)
                     if ev: events.append(ev)
                     continue
             if not is_liquidity_retest:

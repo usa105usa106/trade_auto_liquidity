@@ -487,6 +487,115 @@ def format_quick_bounce_opened(plan, placed: dict) -> str:
     ])
 
 
+
+async def impulse_dump_progress_message(app, pct: int, *, done: bool = False, clear: bool = False) -> None:
+    chat_id = first_admin_id()
+    if not chat_id:
+        return
+    old_id = app.bot_data.get("impulse_dump_progress_message_id")
+    if old_id:
+        try:
+            await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_id)), timeout=4)
+        except Exception as e:
+            log.debug("impulse dump progress delete skipped: %s", e)
+        app.bot_data["impulse_dump_progress_message_id"] = None
+    if clear:
+        log_event("impulse_dump_progress", stage="clear", ok=True, pct=pct)
+        return
+    text = f"✅ Закончил сканирование {pct}%" if done else f"🔍 Сканирование {pct}%..."
+    try:
+        msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=text), timeout=6)
+        app.bot_data["impulse_dump_progress_message_id"] = getattr(msg, "message_id", None)
+        log_event("impulse_dump_progress", stage="done" if done else "scan", ok=True, pct=pct, message_id=getattr(msg, "message_id", None))
+    except Exception as e:
+        log.warning("impulse dump progress send failed: %s", e)
+        log_event("impulse_dump_progress_error", stage="send", ok=False, pct=pct, error=str(e)[:300])
+
+
+async def impulse_dump_summary_message(app, settings: dict, candidates: list[dict] | None = None, *, opened_note: str = "") -> None:
+    chat_id = first_admin_id()
+    if not chat_id:
+        return
+    candidates = candidates or []
+    try:
+        positions = await storage.positions()
+    except Exception:
+        positions = []
+    positions = [p for p in positions if str(p.get("strategy", "")).lower() == "impulse_dump"]
+    open_names = [_qb_symbol(p.get("symbol")) for p in positions]
+    max_slots = int(float(settings.get("impulse_dump_max_open_positions", settings.get("max_open_positions", 5)) or 5))
+    found = int(getattr(scanner, "last_ai_candidates_count", 0) or len(candidates))
+    chosen = [_qb_symbol(c.get("symbol")) for c in candidates[:max_slots]]
+    free_slots = max(0, max_slots - len(positions))
+    picked_now = chosen[:free_slots]
+    reserve = chosen[free_slots:free_slots + 1]
+    try:
+        since = time.time() - 86400
+        trades = [t for t in await storage.trade_rows(since=since) if str(t.get("strategy", "")).lower() == "impulse_dump"]
+    except Exception:
+        trades = []
+    closed = [_qb_symbol(t.get("symbol")) for t in trades[-8:]]
+    killed = [_qb_symbol(t.get("symbol")) for t in trades if "time" in str(t.get("reason", "")).lower() or "time" in str(t.get("result", "")).lower()]
+    pnl = sum(float(t.get("pnl_usdt") or 0) for t in trades)
+    sl_streak = app.bot_data.get("impulse_dump_consecutive_sl", 0)
+    lines = [
+        "🔻 ИМПУЛЬСНЫЙ СЛИВ",
+        "",
+        f"Сканирование: топ {int(float(settings.get('impulse_dump_top_coins', settings.get('max_symbols', 200)) or 200))}",
+        f"Нашёл монет по условиям в круге: {found}",
+        "Выбраны лучшие: " + (", ".join(picked_now) if picked_now else "нет"),
+    ]
+    if reserve:
+        lines.append(f"Лучший кандидат при освобождении слота: {reserve[0]}")
+    lines += [
+        "Открытые на бирже: " + (", ".join(open_names) if open_names else "нет"),
+        "Закрытые на бирже: " + (", ".join(closed) if closed else "нет"),
+        f"Заполнены {len(positions)}/{max_slots} слотов",
+        "Убитые за 24 часа: " + (", ".join(killed[-5:]) if killed else "нет"),
+        f"SL подряд: {sl_streak}/3",
+        f"Общий плюс по закрытым монетам: ${pnl:+.2f}",
+    ]
+    if opened_note:
+        lines += ["", opened_note]
+    text = "\n".join(lines)[:3900]
+    old_id = app.bot_data.get("impulse_dump_summary_message_id")
+    if old_id:
+        try:
+            await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_id)), timeout=4)
+        except Exception as e:
+            log.debug("impulse dump summary delete skipped: %s", e)
+    try:
+        msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=text), timeout=6)
+        app.bot_data["impulse_dump_summary_message_id"] = getattr(msg, "message_id", None)
+        log_event("impulse_dump_summary", stage="sent", ok=True, found=found, chosen=chosen, open_symbols=open_names, closed_symbols=closed[-8:], time_killed=killed[-5:], slots=f"{len(positions)}/{max_slots}", closed_pnl_usdt=round(pnl, 4), message_id=getattr(msg, "message_id", None))
+    except Exception as e:
+        log.warning("impulse dump summary send failed: %s", e)
+        log_event("impulse_dump_summary_error", stage="send", ok=False, error=str(e)[:300])
+
+
+def format_impulse_dump_opened(plan, placed: dict) -> str:
+    pos = placed.get("position") if isinstance(placed, dict) else None
+    pos = pos if isinstance(pos, dict) else plan.__dict__
+    entry = float(pos.get("entry_price") or plan.entry_price)
+    stop = float(pos.get("stop_price") or plan.stop_price)
+    take = float(pos.get("take_price") or plan.take_price)
+    _notional, margin, leverage, _margin_type = _position_money_fields(pos)
+    protection_mode = str(pos.get("protection_mode") or "unknown").lower()
+    if protection_mode in {"exchange", "exchange_planorder", "exchange_planorder_pending_verify"}:
+        protection_line = "защита: реальные SL/TP на бирже"
+    elif protection_mode in {"virtual", "local_monitoring"}:
+        protection_line = "защита: виртуальные SL/TP"
+    else:
+        protection_line = f"защита: {protection_mode}"
+    return "\n".join([
+        f"🔻 Открыл SHORT {_qb_symbol(plan.symbol)}",
+        f"${margin:.2f} плечо x{leverage}",
+        f"вход ${_fmt_price(entry)}",
+        f"стоп ${_fmt_price(stop)}",
+        f"тейк ${_fmt_price(take)}",
+        protection_line,
+    ])
+
 def trigger_scan_now(app, reason: str = "manual") -> None:
     """Wake the trading loop immediately instead of waiting scan_interval_sec.
 
@@ -3385,6 +3494,81 @@ async def quick_bounce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_MENU,
     )
 
+
+async def impulse_dump_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    global running, entries_enabled, trading_task, position_task
+    s = await storage.all_settings()
+    enabled = str(s.get("strategy_mode", "hybrid")).lower() == "impulse_dump" and _bool_setting(s, "impulse_dump_enabled", False)
+    if enabled:
+        await storage.set("impulse_dump_enabled", False, bump_revision=False)
+        await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+        trigger_scan_now(context.application, reason="impulse_dump:off")
+        await reply(update, "○ Импульсный слив OFF\nСканер остановлен, новые SHORT не открываются. Открытые позиции продолжают сопровождаться до TP/SL/24h.", reply_markup=MAIN_MENU)
+        return
+
+    updates = {
+        "impulse_dump_enabled": True,
+        "quick_bounce_enabled": False,
+        "strategy_mode": "impulse_dump",
+        "universe_mode": "top-200",
+        "max_symbols": 200,
+        "scan_interval_sec": 900,
+        "symbol_refresh_sec": 900,
+        "max_open_positions": 5,
+        "trade_margin_pct": 0.10,
+        "impulse_dump_trade_margin_pct": 0.10,
+        "mexc_order_leverage": 10,
+        "impulse_dump_leverage": 10,
+        "impulse_dump_sl_pct": 2.0,
+        "impulse_dump_total_drop_target_pct": 10.0,
+        "impulse_dump_min_drop_pct": 3.0,
+        "impulse_dump_max_drop_pct": 6.0,
+        "impulse_dump_time_stop_sec": 86400,
+        "impulse_dump_top_coins": 200,
+        "impulse_dump_max_open_positions": 5,
+        "impulse_dump_max_candidates": 5,
+        "impulse_dump_min_volume_ratio": 1.05,
+        "impulse_dump_max_spread_pct": 0.30,
+        "impulse_dump_min_24h_volume_usdt": 20000000.0,
+        "impulse_dump_btc_filter_enabled": True,
+        "impulse_dump_btc_max_pump_1h_pct": 1.5,
+        "cooldown_after_close_sec": 0,
+        "impulse_dump_cooldown_after_close_sec": 0,
+        "max_daily_loss_pct": 5.0,
+        "impulse_dump_max_daily_loss_pct": 5.0,
+        "impulse_dump_stop_after_consecutive_sl": 3,
+        "impulse_dump_anomaly_timeframe": "1h",
+        "impulse_dump_confirm_timeframe": "15m",
+        "auto_strategy_adaptation": False,
+        "regime_adaptation": False,
+        "liquidity_runner_enabled": False,
+        "mirror_mode": "off",
+        "spot_confirmation_enabled": False,
+        "session_filter_enabled": False,
+        "america_short_bias_enabled": False,
+        "openai_analysis_enabled": False,
+    }
+    for k, v in updates.items():
+        await storage.set(k, v, bump_revision=False)
+    await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+    scanner.last_refresh = 0
+    entries_enabled = True
+    running = True
+    context.application.bot_data["impulse_dump_consecutive_sl"] = 0
+    if trading_task is None or trading_task.done():
+        trading_task = context.application.create_task(trading_loop(context.application))
+    if position_task is None or position_task.done():
+        position_task = context.application.create_task(position_management_loop(context.application))
+    trigger_scan_now(context.application, reason="impulse_dump:on")
+    await reply(
+        update,
+        "✅ Импульсный слив ON\n"
+        "Топ-200, скан 15m, только SHORT, падение 3–6% за 1h/4h, до 5 сделок, 10% депозита, 10x isolated.\n"
+        "SL +2% от входа, TP до общего падения ≈10%, time-stop 24h. После 3 SL подряд режим стоп до следующего дня.",
+        reply_markup=MAIN_MENU,
+    )
+
 def _button_text_key(text: str) -> str:
     """Normalize Telegram reply-keyboard text.
 
@@ -3412,6 +3596,7 @@ def _button_mapping():
         ("📊 AI Stats", ai_stats_cmd), ("AI Stats", ai_stats_cmd),
         ("🤖 AI BTC/ETH scalping", ai_scalping_toggle_cmd), ("AI BTC/ETH scalping", ai_scalping_toggle_cmd),
         ("⚡ быстрый отскок", quick_bounce_cmd), ("быстрый отскок", quick_bounce_cmd), ("Быстрый отскок", quick_bounce_cmd),
+        ("🔻 импульсный слив", impulse_dump_cmd), ("импульсный слив", impulse_dump_cmd), ("Импульсный слив", impulse_dump_cmd),
         ("🚀 BOOST MODE", boost_start_cmd), ("BOOST MODE", boost_start_cmd),
         ("🛑 STOP BOOST", boost_stop_cmd), ("STOP BOOST", boost_stop_cmd),
         ("📊 BOOST STATUS", boost_status_cmd), ("BOOST STATUS", boost_status_cmd),
@@ -4608,15 +4793,48 @@ async def trading_loop(app):
                 )
                 scanner.last_effective_strategy = effective_strategy
                 quick_bounce_cycle = base_strategy_mode == "quick_bounce"
+                impulse_dump_cycle = base_strategy_mode == "impulse_dump"
                 if quick_bounce_cycle and not _bool_setting(settings, "quick_bounce_enabled", False):
                     scanner.last_signal_summary = "quick_bounce OFF: scanner stopped"
                     scanner.last_reject_reason = "Press ⚡ быстрый отскок again to resume scanning. Existing positions are still managed."
                     await update_scanner_status(app, settings, status="quick bounce off")
                     await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 900)))
                     continue
+                if impulse_dump_cycle and not _bool_setting(settings, "impulse_dump_enabled", False):
+                    scanner.last_signal_summary = "impulse_dump OFF: scanner stopped"
+                    scanner.last_reject_reason = "Press 🔻 импульсный слив again to resume scanning. Existing positions are still managed."
+                    await update_scanner_status(app, settings, status="impulse dump off")
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 900)))
+                    continue
+                if impulse_dump_cycle:
+                    # Stop this mode until the next day after 3 stop-losses in a row.
+                    try:
+                        today_since = time.time() - 86400
+                        rows = [t for t in await storage.trade_rows(since=today_since) if str(t.get("strategy", "")).lower() == "impulse_dump"]
+                        streak = 0
+                        for t in reversed(rows):
+                            reason = str(t.get("reason", "") or t.get("result", "")).lower()
+                            if "sl" in reason or "stop" in reason:
+                                streak += 1
+                            elif reason:
+                                break
+                        app.bot_data["impulse_dump_consecutive_sl"] = streak
+                        limit_sl = int(float(settings.get("impulse_dump_stop_after_consecutive_sl", 3) or 3))
+                        if limit_sl > 0 and streak >= limit_sl:
+                            await storage.set("impulse_dump_enabled", False, bump_revision=False)
+                            await storage.set("settings_revision", int(settings.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+                            log_event("impulse_dump_stopped_after_sl_streak", stage="risk", ok=False, streak=streak)
+                            await notify_admin(app, f"🛑 Импульсный слив остановлен до следующего дня: {streak} SL подряд.", key="impulse_dump_sl_streak_stop")
+                            await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 900)))
+                            continue
+                    except Exception as e:
+                        log.debug("impulse dump SL streak check failed: %s", e)
                 if quick_bounce_cycle:
                     log_event("quick_bounce_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("quick_bounce_top_coins", settings.get("max_symbols", 200)) or 200)), anomaly_tf=str(settings.get("quick_bounce_anomaly_timeframe", "1h")), confirm_tf=str(settings.get("quick_bounce_confirm_timeframe", "15m")))
                     await quick_bounce_progress_message(app, 10)
+                if impulse_dump_cycle:
+                    log_event("impulse_dump_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("impulse_dump_top_coins", settings.get("max_symbols", 200)) or 200)), anomaly_tf=str(settings.get("impulse_dump_anomaly_timeframe", "1h")), confirm_tf=str(settings.get("impulse_dump_confirm_timeframe", "15m")))
+                    await impulse_dump_progress_message(app, 10)
                 if base_strategy_mode == "all":
                     scanner.last_strategy_reason = "mode=ALL: scanning momentum+pullback+reversal (liquidity_retest is manual-only)"
                 elif base_strategy_mode == "hybrid":
@@ -4629,6 +4847,8 @@ async def trading_loop(app):
                 effective_settings["effective_strategy_mode"] = effective_strategy
                 if quick_bounce_cycle:
                     await quick_bounce_progress_message(app, 50)
+                if impulse_dump_cycle:
+                    await impulse_dump_progress_message(app, 50)
                 candidates = await scanner.candidates(ex, effective_settings)
                 if quick_bounce_cycle:
                     log_event(
@@ -4643,6 +4863,19 @@ async def trading_loop(app):
                     await quick_bounce_progress_message(app, 100, done=True)
                     await quick_bounce_summary_message(app, settings, candidates)
                     await quick_bounce_progress_message(app, 100, clear=True)
+                if impulse_dump_cycle:
+                    log_event(
+                        "impulse_dump_scan_done",
+                        stage="scan",
+                        ok=True,
+                        candidates=len(candidates or []),
+                        symbols=[str(c.get("symbol", "")) for c in (candidates or [])[:10]],
+                        reject_reasons=getattr(scanner, "last_reject_top_reasons", []),
+                        errors=getattr(scanner, "last_cycle_errors", 0),
+                    )
+                    await impulse_dump_progress_message(app, 100, done=True)
+                    await impulse_dump_summary_message(app, settings, candidates)
+                    await impulse_dump_progress_message(app, 100, clear=True)
                 if scanner.last_slowdown_sec:
                     scanner.last_reject_reason = f"scanner adaptive slowdown {scanner.last_slowdown_sec}s after {scanner.last_cycle_errors} errors"
                     await update_scanner_status(app, settings, status="scanner slowdown", force=True)
@@ -4772,6 +5005,22 @@ async def trading_loop(app):
                             )
                             await notify_admin(app, open_text, key=f"quick_bounce_opened_{plan.symbol}_{int(time.time()*1000)}")
                             await quick_bounce_summary_message(app, settings, candidates, opened_note=open_text)
+                        elif impulse_dump_cycle:
+                            open_text = format_impulse_dump_opened(plan, placed)
+                            log_event(
+                                "impulse_dump_opened",
+                                stage="entry",
+                                ok=True,
+                                symbol=str(plan.symbol),
+                                side=str(plan.side),
+                                entry_price=float(getattr(plan, "entry_price", 0) or 0),
+                                take_price=float(getattr(plan, "take_price", 0) or 0),
+                                stop_price=float(getattr(plan, "stop_price", 0) or 0),
+                                leverage=int(float(getattr(plan, "leverage", 0) or 0)),
+                                placed=placed,
+                            )
+                            await notify_admin(app, open_text, key=f"impulse_dump_opened_{plan.symbol}_{int(time.time()*1000)}")
+                            await impulse_dump_summary_message(app, settings, candidates, opened_note=open_text)
                         else:
                             await notify_admin(
                                 app,
@@ -4784,6 +5033,8 @@ async def trading_loop(app):
                         scanner.last_reject_reason = f"{plan.symbol}: execution rejected: {reason}"
                         if quick_bounce_cycle:
                             log_event("quick_bounce_execution_rejected", stage="entry", ok=False, symbol=str(plan.symbol), side=str(plan.side), reason=reason[:500], placed=placed)
+                        if impulse_dump_cycle:
+                            log_event("impulse_dump_execution_rejected", stage="entry", ok=False, symbol=str(plan.symbol), side=str(plan.side), reason=reason[:500], placed=placed)
                         if 'protection' in placed or 'position closed' in reason.lower():
                             close = placed.get('close') or {}
                             pnl = close.get('pnl_usdt')

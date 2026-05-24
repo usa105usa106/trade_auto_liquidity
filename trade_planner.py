@@ -81,6 +81,14 @@ class TradePlanner:
                 "tp_mult": 1.0,
                 "sl_mult": 1.0,
             },
+            "impulse_dump": {
+                "min_tp": 4.0,
+                "max_tp": 7.0,
+                "min_sl": 2.0,
+                "max_sl": 2.0,
+                "tp_mult": 1.0,
+                "sl_mult": 1.0,
+            },
             "liquidity_retest": {
                 # v0082: not a scalp profile. SL comes from the liquidity zone/wick,
                 # TP is adaptive RR (2R/3R/4R). These bands are safety clamps only.
@@ -164,6 +172,18 @@ class TradePlanner:
             candidate["trade_margin_pct"] = float(settings.get("quick_bounce_trade_margin_pct", os.getenv("QUICK_BOUNCE_TRADE_MARGIN_PCT", "0.10")) or 0.10)
             candidate["max_open_positions"] = int(float(settings.get("quick_bounce_max_open_positions", os.getenv("QUICK_BOUNCE_MAX_OPEN_POSITIONS", "5")) or 5))
             candidate["leverage"] = int(float(settings.get("quick_bounce_leverage", os.getenv("QUICK_BOUNCE_LEVERAGE", "10")) or 10))
+        elif strategy in {"impulse_dump"}:
+            details = candidate.get("score_details") or {}
+            sl_pct = max(0.01, float(details.get("sl_pct", settings.get("impulse_dump_sl_pct", os.getenv("IMPULSE_DUMP_SL_PCT", "2.0"))) or 2.0))
+            # TP is the remaining move to total -10% from the pre-dump anchor.
+            tp_pct = max(0.5, float(details.get("tp_pct", 4.0) or 4.0))
+            tp_pct = clamp(tp_pct, 4.0, 7.0)
+            rr = round(tp_pct / sl_pct, 6) if sl_pct > 0 else 1.0
+            candidate["score_details"] = dict(details)
+            candidate["score_details"].update({"sl_pct": sl_pct, "tp_pct": tp_pct, "rr": rr})
+            candidate["trade_margin_pct"] = float(settings.get("impulse_dump_trade_margin_pct", os.getenv("IMPULSE_DUMP_TRADE_MARGIN_PCT", "0.10")) or 0.10)
+            candidate["max_open_positions"] = int(float(settings.get("impulse_dump_max_open_positions", os.getenv("IMPULSE_DUMP_MAX_OPEN_POSITIONS", "5")) or 5))
+            candidate["leverage"] = int(float(settings.get("impulse_dump_leverage", os.getenv("IMPULSE_DUMP_LEVERAGE", "10")) or 10))
         elif strategy in {"ai_scalping", "boost_scalping"}:
             # v0126: AI no longer opens on direction alone. The engine attaches
             # structure/ATR based distances after a sweep/reclaim setup gate.
@@ -270,7 +290,7 @@ class TradePlanner:
             stop = price * (1 + sl_pct / 100.0)
             take = price * (1 - tp_pct / 100.0)
 
-        order_type = "market" if strategy in {"momentum", "ai_scalping", "boost_scalping", "quick_bounce"} else "limit"
+        order_type = "market" if strategy in {"momentum", "ai_scalping", "boost_scalping", "quick_bounce", "impulse_dump"} else "limit"
         lr_rr = float(candidate.get("liquidity_retest_rr") or (details.get("adaptive_rr") if isinstance(details, dict) else 0) or 0)
         lr_zone_low = float(details.get("zone_low") or 0) if isinstance(details, dict) else 0.0
         lr_zone_high = float(details.get("zone_high") or 0) if isinstance(details, dict) else 0.0

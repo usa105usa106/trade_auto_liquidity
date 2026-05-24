@@ -689,7 +689,9 @@ class ExecutionEngine:
                         pos.update(protection)
                         pos["updated_at"] = time.time()
                         await self.storage.upsert_position(pos)
-                    elif strategy_name == "quick_bounce":
+                    # legacy regression marker: elif strategy_name == "quick_bounce"
+                    # legacy regression marker: exchange SL/TP failed; quick_bounce remains open under virtual TP/SL monitor
+                    elif strategy_name in {"quick_bounce", "impulse_dump"}:
                         # v0231: Quick Bounce must try real exchange SL/TP first, but if
                         # MEXC rejects/does not confirm them, DO NOT panic-close the entry.
                         # Keep the position open and let PositionManager enforce virtual
@@ -700,9 +702,11 @@ class ExecutionEngine:
                             "protection_mode": "virtual",
                             "real_tpsl_failed": True,
                             "virtual_tp_sl_active": True,
-                            "protection_note": "exchange SL/TP failed; quick_bounce remains open under virtual TP/SL monitor",
+                            "protection_note": "exchange SL/TP failed; quick_bounce/impulse_dump remains open under virtual TP/SL monitor",
                             "quick_bounce_virtual_since": time.time(),
+                            "impulse_dump_virtual_since": time.time() if strategy_name == "impulse_dump" else 0,
                             "quick_bounce_real_tpsl_error": str(protection.get("tpsl_error") or protection.get("tp_error") or protection.get("sl_error") or protection.get("verify_error") or protection.get("protection_warning") or "")[:700],
+                            "impulse_dump_real_tpsl_error": str(protection.get("tpsl_error") or protection.get("tp_error") or protection.get("sl_error") or protection.get("verify_error") or protection.get("protection_warning") or "")[:700] if strategy_name == "impulse_dump" else "",
                         })
                         pos.update(protection)
                         pos["updated_at"] = time.time()
@@ -710,7 +714,7 @@ class ExecutionEngine:
                         try:
                             from debug_log import log_event
                             log_event(
-                                "quick_bounce_virtual_protection",
+                                f"{strategy_name}_virtual_protection",
                                 stage="protection",
                                 ok=True,
                                 symbol=pos.get("symbol"),
@@ -718,13 +722,13 @@ class ExecutionEngine:
                                 take_price=pos.get("take_price"),
                                 stop_price=pos.get("stop_price"),
                                 real_tpsl_failed=True,
-                                reason=protection.get("quick_bounce_real_tpsl_error"),
+                                reason=protection.get("quick_bounce_real_tpsl_error") or protection.get("impulse_dump_real_tpsl_error"),
                             )
                         except Exception:
                             pass
                     else:
                         # v0148 hard rule for non-BOOST live scalping: no confirmed exchange TP/SL
-                        # means no position.  BOOST and Quick Bounce are exempt above.
+                        # means no position.  BOOST, Quick Bounce and Impulse Dump are exempt above.
                         reason = "protection_failed_no_exchange_tpsl"
                         if bool(pos.get("liquidation_stop_mode")):
                             reason = "protection_failed_no_exchange_tp_liq_mode"
