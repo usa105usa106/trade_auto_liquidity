@@ -1,3 +1,9 @@
+## v0242 IMPULSE DUMP HYBRID TP CONTEXT
+
+- `🔻 импульсный слив`: TP now uses 24h drop only when the coin is red on 24h.
+- If 24h is green/flat, TP uses the local 4h swing high dump context.
+- SL remains fixed at 2% from the current/filled entry price.
+
 
 ## v0238 QUICK BOUNCE SPREAD 0.30
 

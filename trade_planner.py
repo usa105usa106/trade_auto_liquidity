@@ -322,4 +322,5 @@ class TradePlanner:
             liquidity_retest_zone_low=lr_zone_low,
             liquidity_retest_zone_high=lr_zone_high,
             liquidity_retest_reason=lr_reason,
+            signal_details=dict(candidate.get("score_details") or {}),
         )

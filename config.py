@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0241 IMPULSE DUMP 24H CONTEXT TP")
+VERSION = os.getenv("BOT_VERSION", "0246 IMPULSE DUMP FINAL TP 4-7 BY TRIGGER TF")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -167,8 +167,8 @@ class Defaults:
     impulse_dump_total_drop_target_pct: float = env_float("IMPULSE_DUMP_TOTAL_DROP_TARGET_PCT", 10.0)
     impulse_dump_min_drop_pct: float = env_float("IMPULSE_DUMP_MIN_DROP_PCT", 3.0)
     impulse_dump_max_drop_pct: float = env_float("IMPULSE_DUMP_MAX_DROP_PCT", 6.0)
-    impulse_dump_15m_min_drop_pct: float = env_float("IMPULSE_DUMP_15M_MIN_DROP_PCT", 1.0)
-    impulse_dump_15m_max_drop_pct: float = env_float("IMPULSE_DUMP_15M_MAX_DROP_PCT", 3.0)
+    impulse_dump_15m_min_drop_pct: float = env_float("IMPULSE_DUMP_15M_MIN_DROP_PCT", 0.1)
+    impulse_dump_15m_max_drop_pct: float = env_float("IMPULSE_DUMP_15M_MAX_DROP_PCT", 6.0)
     impulse_dump_4h_max_drop_pct: float = env_float("IMPULSE_DUMP_4H_MAX_DROP_PCT", 6.0)
     impulse_dump_24h_max_drop_pct: float = env_float("IMPULSE_DUMP_24H_MAX_DROP_PCT", 6.0)
     impulse_dump_time_stop_sec: int = env_int("IMPULSE_DUMP_TIME_STOP_SEC", 86400)

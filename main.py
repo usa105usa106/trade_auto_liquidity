@@ -580,6 +580,16 @@ def format_impulse_dump_opened(plan, placed: dict) -> str:
     stop = float(pos.get("stop_price") or plan.stop_price)
     take = float(pos.get("take_price") or plan.take_price)
     _notional, margin, leverage, _margin_type = _position_money_fields(pos)
+    details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else getattr(plan, "signal_details", {})
+    details = details if isinstance(details, dict) else {}
+    trigger_tf = str(details.get("trigger_tf") or "unknown")
+    trigger_note = str(details.get("trigger_note") or "")
+    move15 = details.get("move_15m_pct")
+    move1h = details.get("move_1h_pct")
+    move4h = details.get("move_4h_pct")
+    change24 = details.get("change_24h_pct")
+    tp_context = str(details.get("tp_context_source") or "")
+    tp_context_ru = "24h минус" if tp_context == "24h_red" else ("local high 4h" if tp_context == "local_4h_high" else tp_context)
     protection_mode = str(pos.get("protection_mode") or "unknown").lower()
     if protection_mode in {"exchange", "exchange_planorder", "exchange_planorder_pending_verify"}:
         protection_line = "защита: реальные SL/TP на бирже"
@@ -587,12 +597,23 @@ def format_impulse_dump_opened(plan, placed: dict) -> str:
         protection_line = "защита: виртуальные SL/TP"
     else:
         protection_line = f"защита: {protection_mode}"
+    def _pct_line(name, value):
+        try:
+            return f"{name}: {float(value):+.2f}%"
+        except Exception:
+            return f"{name}: n/a"
     return "\n".join([
         f"🔻 Открыл SHORT {_qb_symbol(plan.symbol)}",
         f"${margin:.2f} плечо x{leverage}",
         f"вход ${_fmt_price(entry)}",
         f"стоп ${_fmt_price(stop)}",
         f"тейк ${_fmt_price(take)}",
+        f"условие: {trigger_tf}" + (f" ({trigger_note})" if trigger_note else ""),
+        _pct_line("15m", move15),
+        _pct_line("1h", move1h),
+        _pct_line("4h", move4h),
+        _pct_line("24h", change24),
+        f"тейк считается от: {tp_context_ru}",
         protection_line,
     ])
 
@@ -3525,7 +3546,7 @@ async def impulse_dump_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "impulse_dump_min_drop_pct": 3.0,
         "impulse_dump_max_drop_pct": 6.0,
         "impulse_dump_15m_min_drop_pct": 1.0,
-        "impulse_dump_15m_max_drop_pct": 3.0,
+        "impulse_dump_15m_max_drop_pct": 6.0,
         "impulse_dump_4h_max_drop_pct": 6.0,
         "impulse_dump_24h_max_drop_pct": 6.0,
         "impulse_dump_time_stop_sec": 86400,

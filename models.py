@@ -40,4 +40,5 @@ class TradePlan:
     liquidity_retest_zone_low: float = 0.0
     liquidity_retest_zone_high: float = 0.0
     liquidity_retest_reason: str = ""
+    signal_details: dict = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)

@@ -91,8 +91,8 @@ class SignalEngine:
         self.quick_bounce_btc_max_pump_1h_pct = float(os.getenv("QUICK_BOUNCE_BTC_MAX_PUMP_1H_PCT", "2.0"))
         self.impulse_dump_min_drop_pct = float(os.getenv("IMPULSE_DUMP_MIN_DROP_PCT", "3.0"))
         self.impulse_dump_max_drop_pct = float(os.getenv("IMPULSE_DUMP_MAX_DROP_PCT", "6.0"))
-        self.impulse_dump_15m_min_drop_pct = float(os.getenv("IMPULSE_DUMP_15M_MIN_DROP_PCT", "1.0"))
-        self.impulse_dump_15m_max_drop_pct = float(os.getenv("IMPULSE_DUMP_15M_MAX_DROP_PCT", "3.0"))
+        self.impulse_dump_15m_min_drop_pct = float(os.getenv("IMPULSE_DUMP_15M_MIN_DROP_PCT", "0.1"))
+        self.impulse_dump_15m_max_drop_pct = float(os.getenv("IMPULSE_DUMP_15M_MAX_DROP_PCT", "6.0"))
         self.impulse_dump_4h_max_drop_pct = float(os.getenv("IMPULSE_DUMP_4H_MAX_DROP_PCT", "6.0"))
         self.impulse_dump_24h_max_drop_pct = float(os.getenv("IMPULSE_DUMP_24H_MAX_DROP_PCT", "6.0"))
         self.impulse_dump_total_drop_target_pct = float(os.getenv("IMPULSE_DUMP_TOTAL_DROP_TARGET_PCT", "10.0"))
@@ -568,11 +568,11 @@ class SignalEngine:
         return None
 
     def _impulse_dump(self, symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=None, ticker=None, market_context=None):
-        """Cascade SHORT mode, v0241.
+        """Cascade SHORT mode, v0246.
 
-        15m/1h decide the entry moment. 4h/24h prevent late shorts.
-        TP is calculated from the 24h total drop target, not leveraged ROI:
-        if 24h is already -5%, target is about another -5% from entry.
+        24h is only a late-entry filter. Entry is either fast 15m panic dump
+        or slow 15m red move confirmed by 1h/4h. TP is calculated from the
+        timeframe that triggered the trade: TP = clamp(10 - entry_drop, 4, 7).
         SL is always +2% from the actual/current entry price for SHORT.
         """
         out = []
@@ -615,6 +615,7 @@ class SignalEngine:
         closes15 = [float(c[4]) for c in candles]
         vols15 = [float(c[5]) for c in candles]
         closes1h = [float(c[4]) for c in candles_1h]
+        highs1h = [float(c[2]) for c in candles_1h]
 
         # Entry timing filters.
         move_15m_pct = pct(closes15[-1], closes15[-2]) if len(closes15) >= 2 else 0.0
@@ -635,6 +636,12 @@ class SignalEngine:
         drop4h_abs = abs(move_4h_pct) if move_4h_pct < 0 else 0.0
         drop24_abs = abs(change_24h_pct) if change_24h_pct < 0 else 0.0
 
+        # v0242: if the coin is still green/flat on 24h, a 24h percentage is not
+        # a valid dump anchor. Use the last 4h local swing high instead, so a coin
+        # that pumped earlier and is now dumping still gets a sane TP.
+        local_high_4h = max(highs1h[-5:]) if highs1h else close
+        local_drop_4h_abs = ((local_high_4h - close) / local_high_4h * 100.0) if local_high_4h > 0 and close < local_high_4h else 0.0
+
         min15 = abs(self.impulse_dump_15m_min_drop_pct)
         max15 = abs(self.impulse_dump_15m_max_drop_pct)
         min1h = abs(self.impulse_dump_min_drop_pct)
@@ -643,15 +650,32 @@ class SignalEngine:
         max24h = abs(self.impulse_dump_24h_max_drop_pct)
 
         if not (min15 <= drop15_abs <= max15):
-            self.last_impulse_dump_reject_reason = f"15m drop outside 1-3% move15={move_15m_pct:+.2f}%"
+            self.last_impulse_dump_reject_reason = f"15m drop outside 0.1-6% move15={move_15m_pct:+.2f}%"
             return out
-        if not (min1h <= drop1h_abs <= max1h):
-            self.last_impulse_dump_reject_reason = f"1h drop outside 3-6% move1h={move_1h_pct:+.2f}%"
+
+        # v0244 two-speed entry logic:
+        # A) fast panic dump: if 15m drop is already 3-6%, it is the main trigger;
+        #    1h/4h confirmation is not required.
+        # B) slow dump: if 15m drop is only 0.1-3%, require 1h OR 4h in the 3-6% range.
+        one_hour_in_range = min1h <= drop1h_abs <= max1h
+        four_hour_in_range = min1h <= drop4h_abs <= max1h
+        fast_15m_trigger = min1h <= drop15_abs <= max15
+        slow_15m_trigger = min15 <= drop15_abs < min1h
+        if not (fast_15m_trigger or (slow_15m_trigger and (one_hour_in_range or four_hour_in_range))):
+            self.last_impulse_dump_reject_reason = (
+                f"impulse dump trigger not met move15={move_15m_pct:+.2f}% "
+                f"move1h={move_1h_pct:+.2f}% move4h={move_4h_pct:+.2f}% "
+                f"fast15={fast_15m_trigger} confirm1h={one_hour_in_range} confirm4h={four_hour_in_range}"
+            )
             return out
+        # 4h is allowed as an alternate/late-entry guard, but never if the dump is already
+        # beyond the late-entry cap. Fast 15m panic still respects this cap.
         if drop4h_abs > max4h:
             self.last_impulse_dump_reject_reason = f"4h drop late {drop4h_abs:.2f}% > {max4h:.2f}% move4h={move_4h_pct:+.2f}%"
             return out
-        if drop24_abs > max24h:
+        # 24h late-entry guard applies only when the 24h context is red. If the coin
+        # is green/flat on 24h, TP uses the local 4h high instead.
+        if change_24h_pct < 0 and drop24_abs > max24h:
             self.last_impulse_dump_reject_reason = f"24h drop late {drop24_abs:.2f}% > {max24h:.2f}% change24h={change_24h_pct:+.2f}%"
             return out
 
@@ -670,31 +694,69 @@ class SignalEngine:
             self.last_impulse_dump_reject_reason = f"no 15m continuation move15={move_15m_pct:+.2f}% move1h={move_1h_pct:+.2f}% red={last_red} lower_low={lower_low} weak_bounce_failed={weak_bounce_failed} vol={local_vol_ratio:.2f}"
             return out
 
-        # TP is remaining clean price move to total -10% on 24h context.
-        tp_pct = self.impulse_dump_total_drop_target_pct - drop24_abs
-        tp_pct = max(0.5, tp_pct)
-        # Practical guardrails from the strategy brief: after 3-6% dump, catch 7-4% more.
-        tp_pct = max(4.0, min(7.0, tp_pct))
-        # SL is always from entry/current price, not from 24h context.
+        # v0246 final TP model:
+        # 24h is only a late-entry filter. TP is calculated from the timeframe that
+        # actually triggered the SHORT: 10% total target minus that timeframe's drop.
+        # Guardrails are hard: TP can never leave 4-7% from entry.
+        if fast_15m_trigger:
+            trigger_tf = "15m_fast"
+            trigger_note = "15m -3%...-6%"
+            entry_drop_pct = drop15_abs
+        elif one_hour_in_range and four_hour_in_range:
+            # If both confirm, use the larger confirmed dump as the context.
+            # This gives the closer/safer TP while staying inside the 4-7% rule.
+            entry_drop_pct = max(drop1h_abs, drop4h_abs)
+            trigger_tf = "1h+4h_confirm"
+            trigger_note = "15m red + 1h/4h -3%...-6%"
+        elif one_hour_in_range:
+            trigger_tf = "1h_confirm"
+            trigger_note = "15m red + 1h -3%...-6%"
+            entry_drop_pct = drop1h_abs
+        else:
+            trigger_tf = "4h_confirm"
+            trigger_note = "15m red + 4h -3%...-6%"
+            entry_drop_pct = drop4h_abs
+
+        raw_tp_pct = self.impulse_dump_total_drop_target_pct - entry_drop_pct
+        tp_pct = max(4.0, min(7.0, raw_tp_pct))
+        effective_target_price = close * (1.0 - tp_pct / 100.0)
+        target_price = effective_target_price
+        tp_context_source = "entry_trigger_tf"
+        tp_context_drop_pct = entry_drop_pct
         sl_pct = max(0.01, self.impulse_dump_sl_pct)
         rr = round(tp_pct / sl_pct, 6) if sl_pct > 0 else 1.0
-        score = 72 + min(10, (drop1h_abs - min1h) * 2.0) + min(8, max(0, local_vol_ratio - 1) * 5) + (3 if imbalance < 0 else 0) + (2 if lower_low else 0)
+        active_drop_abs = entry_drop_pct
+        score = 72 + min(10, (active_drop_abs - min1h) * 2.0) + min(8, max(0, local_vol_ratio - 1) * 5) + (3 if imbalance < 0 else 0) + (2 if lower_low else 0)
         out.append(self._base(symbol, "SHORT", "impulse_dump", close, score, spread_pct, depth_usdt, atrp, {
-            "setup": "15m_1h_dump_short_24h_context",
+            "setup": "15m_fast_or_1h_4h_slow_dump_short_hybrid_tp_context",
             "move_15m_pct": round(move_15m_pct, 3),
             "move_1h_pct": round(move_1h_pct, 3),
             "move_4h_pct": round(move_4h_pct, 3),
             "change_24h_pct": round(change_24h_pct, 3),
-            "current_drop_pct": round(drop1h_abs, 3),
+            "current_drop_pct": round(active_drop_abs, 3),
+            "fast_15m_trigger": fast_15m_trigger,
+            "slow_15m_trigger": slow_15m_trigger,
+            "one_hour_in_range": one_hour_in_range,
+            "four_hour_in_range": four_hour_in_range,
             "drop_24h_pct": round(drop24_abs, 3),
+            "local_high_4h": round(local_high_4h, 8),
+            "local_drop_4h_pct": round(local_drop_4h_abs, 3),
+            "trigger_tf": trigger_tf,
+            "trigger_note": trigger_note,
+            "tp_context_source": tp_context_source,
+            "tp_context_drop_pct": round(tp_context_drop_pct, 3),
+            "entry_drop_pct": round(entry_drop_pct, 3),
             "target_total_drop_pct": round(self.impulse_dump_total_drop_target_pct, 3),
+            "target_price_raw": round(target_price, 8),
+            "effective_target_price": round(effective_target_price, 8),
+            "raw_tp_pct": round(raw_tp_pct, 4),
             "tp_pct": round(tp_pct, 4),
             "sl_pct": round(sl_pct, 4),
             "rr": rr,
             "volume_ratio": round(local_vol_ratio, 3),
             "quote_volume_24h": round(quote_vol, 2),
             "btc_change_1h_pct": btc_change_1h,
-            "anomaly_tf": "1h", "confirm_tf": "15m", "context_tf": "24h",
+            "anomaly_tf": "15m_fast_or_1h_4h_slow", "confirm_tf": "15m", "context_tf": "24h_or_local_4h",
         }))
         return out
 
