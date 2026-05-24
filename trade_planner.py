@@ -89,6 +89,14 @@ class TradePlanner:
                 "tp_mult": 1.0,
                 "sl_mult": 1.0,
             },
+            "orderflow_impulse": {
+                "min_tp": float(os.getenv("ORDERFLOW_IMPULSE_TP_PCT", "2.0")),
+                "max_tp": float(os.getenv("ORDERFLOW_IMPULSE_TP_PCT", "2.0")),
+                "min_sl": float(os.getenv("ORDERFLOW_IMPULSE_SL_PCT", "1.0")),
+                "max_sl": float(os.getenv("ORDERFLOW_IMPULSE_SL_PCT", "1.0")),
+                "tp_mult": 1.0,
+                "sl_mult": 1.0,
+            },
             "liquidity_retest": {
                 # v0082: not a scalp profile. SL comes from the liquidity zone/wick,
                 # TP is adaptive RR (2R/3R/4R). These bands are safety clamps only.
@@ -172,6 +180,16 @@ class TradePlanner:
             candidate["trade_margin_pct"] = float(settings.get("quick_bounce_trade_margin_pct", os.getenv("QUICK_BOUNCE_TRADE_MARGIN_PCT", "0.10")) or 0.10)
             candidate["max_open_positions"] = int(float(settings.get("quick_bounce_max_open_positions", os.getenv("QUICK_BOUNCE_MAX_OPEN_POSITIONS", "5")) or 5))
             candidate["leverage"] = int(float(settings.get("quick_bounce_leverage", os.getenv("QUICK_BOUNCE_LEVERAGE", "10")) or 10))
+        elif strategy in {"orderflow_impulse"}:
+            details = candidate.get("score_details") or {}
+            sl_pct = max(0.01, float(details.get("sl_pct", settings.get("orderflow_impulse_sl_pct", os.getenv("ORDERFLOW_IMPULSE_SL_PCT", "1.0"))) or 1.0))
+            tp_pct = max(0.01, float(details.get("tp_pct", settings.get("orderflow_impulse_tp_pct", os.getenv("ORDERFLOW_IMPULSE_TP_PCT", "2.0"))) or 2.0))
+            rr = round(tp_pct / sl_pct, 6) if sl_pct > 0 else 1.0
+            candidate["score_details"] = dict(details)
+            candidate["score_details"].update({"sl_pct": sl_pct, "tp_pct": tp_pct, "rr": rr})
+            candidate["trade_margin_pct"] = float(settings.get("orderflow_impulse_trade_margin_pct", os.getenv("ORDERFLOW_IMPULSE_TRADE_MARGIN_PCT", "0.10")) or 0.10)
+            candidate["max_open_positions"] = int(float(settings.get("orderflow_impulse_max_open_positions", os.getenv("ORDERFLOW_IMPULSE_MAX_OPEN_POSITIONS", "3")) or 3))
+            candidate["leverage"] = int(float(settings.get("orderflow_impulse_leverage", os.getenv("ORDERFLOW_IMPULSE_LEVERAGE", "10")) or 10))
         elif strategy in {"impulse_dump"}:
             details = candidate.get("score_details") or {}
             sl_pct = max(0.01, float(details.get("sl_pct", settings.get("impulse_dump_sl_pct", os.getenv("IMPULSE_DUMP_SL_PCT", "2.0"))) or 2.0))
@@ -290,7 +308,7 @@ class TradePlanner:
             stop = price * (1 + sl_pct / 100.0)
             take = price * (1 - tp_pct / 100.0)
 
-        order_type = "market" if strategy in {"momentum", "ai_scalping", "boost_scalping", "quick_bounce", "impulse_dump"} else "limit"
+        order_type = "market" if strategy in {"momentum", "ai_scalping", "boost_scalping", "quick_bounce", "impulse_dump", "orderflow_impulse"} else "limit"
         lr_rr = float(candidate.get("liquidity_retest_rr") or (details.get("adaptive_rr") if isinstance(details, dict) else 0) or 0)
         lr_zone_low = float(details.get("zone_low") or 0) if isinstance(details, dict) else 0.0
         lr_zone_high = float(details.get("zone_high") or 0) if isinstance(details, dict) else 0.0

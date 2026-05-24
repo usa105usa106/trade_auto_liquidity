@@ -621,6 +621,126 @@ def format_impulse_dump_opened(plan, placed: dict) -> str:
         protection_line,
     ])
 
+
+async def orderflow_impulse_progress_message(app, pct: int, *, done: bool = False, clear: bool = False) -> None:
+    chat_id = first_admin_id()
+    if not chat_id:
+        return
+    old_id = app.bot_data.get("orderflow_impulse_progress_message_id")
+    if old_id:
+        try:
+            await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_id)), timeout=4)
+        except Exception as e:
+            log.debug("orderflow impulse progress delete skipped: %s", e)
+        app.bot_data["orderflow_impulse_progress_message_id"] = None
+    if clear:
+        log_event("orderflow_impulse_progress", stage="clear", ok=True, pct=pct)
+        return
+    text = f"✅ Закончил сканирование {pct}%" if done else f"🔍 Сканирование {pct}%..."
+    try:
+        msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=text), timeout=6)
+        app.bot_data["orderflow_impulse_progress_message_id"] = getattr(msg, "message_id", None)
+        log_event("orderflow_impulse_progress", stage="done" if done else "scan", ok=True, pct=pct, message_id=getattr(msg, "message_id", None))
+    except Exception as e:
+        log.warning("orderflow impulse progress send failed: %s", e)
+        log_event("orderflow_impulse_progress_error", stage="send", ok=False, pct=pct, error=str(e)[:300])
+
+
+async def orderflow_impulse_summary_message(app, settings: dict, candidates: list[dict] | None = None, *, opened_note: str = "") -> None:
+    chat_id = first_admin_id()
+    if not chat_id:
+        return
+    candidates = candidates or []
+    try:
+        positions = await storage.positions()
+    except Exception:
+        positions = []
+    positions = [p for p in positions if str(p.get("strategy", "")).lower() == "orderflow_impulse"]
+    open_names = [_qb_symbol(p.get("symbol")) for p in positions]
+    max_slots = int(float(settings.get("orderflow_impulse_max_open_positions", settings.get("max_open_positions", 3)) or 3))
+    found = int(getattr(scanner, "last_ai_candidates_count", 0) or len(candidates))
+    chosen = [_qb_symbol(c.get("symbol")) for c in candidates[:max_slots]]
+    free_slots = max(0, max_slots - len(positions))
+    picked_now = chosen[:free_slots]
+    reserve = chosen[free_slots:free_slots + 1]
+    try:
+        since = time.time() - 86400
+        trades = [t for t in await storage.trade_rows(since=since) if str(t.get("strategy", "")).lower() == "orderflow_impulse"]
+    except Exception:
+        trades = []
+    closed = [_qb_symbol(t.get("symbol")) for t in trades[-8:]]
+    killed = [_qb_symbol(t.get("symbol")) for t in trades if "time" in str(t.get("reason", "")).lower() or "time" in str(t.get("result", "")).lower()]
+    pnl = sum(float(t.get("pnl_usdt") or 0) for t in trades)
+    lines = [
+        "📊 ORDERFLOW IMPULSE",
+        "",
+        f"Сканирование: Binance spot top {int(float(settings.get('orderflow_impulse_top_coins', settings.get('max_symbols', 50)) or 50))}",
+        f"Нашёл монет по условиям в круге: {found}",
+        "Выбраны лучшие: " + (", ".join(picked_now) if picked_now else "нет"),
+    ]
+    if reserve:
+        lines.append(f"Лучший кандидат при освобождении слота: {reserve[0]}")
+    lines += [
+        "Открытые на бирже: " + (", ".join(open_names) if open_names else "нет"),
+        "Закрытые на бирже: " + (", ".join(closed) if closed else "нет"),
+        f"Заполнены {len(positions)}/{max_slots} слотов",
+        "Убитые за 4 часа: " + (", ".join(killed[-5:]) if killed else "нет"),
+        f"Общий плюс по закрытым монетам: ${pnl:+.2f}",
+    ]
+    if opened_note:
+        lines += ["", opened_note]
+    text = "\n".join(lines)[:3900]
+    old_id = app.bot_data.get("orderflow_impulse_summary_message_id")
+    if old_id:
+        try:
+            await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_id)), timeout=4)
+        except Exception as e:
+            log.debug("orderflow impulse summary delete skipped: %s", e)
+    try:
+        msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=text), timeout=6)
+        app.bot_data["orderflow_impulse_summary_message_id"] = getattr(msg, "message_id", None)
+        log_event("orderflow_impulse_summary", stage="sent", ok=True, found=found, chosen=chosen, open_symbols=open_names, closed_symbols=closed[-8:], time_killed=killed[-5:], slots=f"{len(positions)}/{max_slots}", closed_pnl_usdt=round(pnl, 4), message_id=getattr(msg, "message_id", None))
+    except Exception as e:
+        log.warning("orderflow impulse summary send failed: %s", e)
+        log_event("orderflow_impulse_summary_error", stage="send", ok=False, error=str(e)[:300])
+
+
+def format_orderflow_impulse_opened(plan, placed: dict) -> str:
+    pos = placed.get("position") if isinstance(placed, dict) else None
+    pos = pos if isinstance(pos, dict) else plan.__dict__
+    entry = float(pos.get("entry_price") or plan.entry_price)
+    stop = float(pos.get("stop_price") or plan.stop_price)
+    take = float(pos.get("take_price") or plan.take_price)
+    _notional, margin, leverage, _margin_type = _position_money_fields(pos)
+    side = str(pos.get("side") or getattr(plan, "side", "")).upper()
+    details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else getattr(plan, "signal_details", {})
+    details = details if isinstance(details, dict) else {}
+    protection_mode = str(pos.get("protection_mode") or "unknown").lower()
+    protection_line = "защита: реальные SL/TP на бирже" if protection_mode in {"exchange", "exchange_planorder", "exchange_planorder_pending_verify"} else ("защита: виртуальные SL/TP" if protection_mode in {"virtual", "local_monitoring"} else f"защита: {protection_mode}")
+    def _pct_line(name, value):
+        try:
+            return f"{name}: {float(value):+.2f}%"
+        except Exception:
+            return f"{name}: n/a"
+    return "\n".join([
+        f"📊 Открыл {side} {_qb_symbol(plan.symbol)}",
+        f"${margin:.2f} плечо x{leverage}",
+        f"вход ${_fmt_price(entry)}",
+        f"стоп ${_fmt_price(stop)}",
+        f"тейк ${_fmt_price(take)}",
+        _pct_line("trend 15m", details.get("trend_15m_pct")),
+        _pct_line("trend 1h", details.get("trend_1h_pct")),
+        f"futures OB imbalance: {float(details.get('orderbook_imbalance') or 0):+.3f}",
+        f"futures volume ratio: {float(details.get('volume_ratio') or 0):.2f}x",
+        _pct_line("Binance spot move", details.get("spot_move_pct")),
+        f"Binance spot delta: {float(details.get('spot_delta_ratio') or 0):+.3f}",
+        f"Binance spot OB imbalance: {float(details.get('spot_orderbook_imbalance') or 0):+.3f}",
+        f"Binance spot volume: {float(details.get('spot_volume_ratio') or 0):.2f}x",
+        _pct_line("TP от входа", details.get("tp_pct")),
+        _pct_line("SL от входа", details.get("sl_pct")),
+        protection_line,
+    ])
+
 def trigger_scan_now(app, reason: str = "manual") -> None:
     """Wake the trading loop immediately instead of waiting scan_interval_sec.
 
@@ -3598,6 +3718,72 @@ async def impulse_dump_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_MENU,
     )
 
+
+async def orderflow_impulse_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    global running, entries_enabled, trading_task, position_task
+    s = await storage.all_settings()
+    enabled = str(s.get("strategy_mode", "hybrid")).lower() == "orderflow_impulse" and _bool_setting(s, "orderflow_impulse_enabled", False)
+    if enabled:
+        await storage.set("orderflow_impulse_enabled", False, bump_revision=False)
+        await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+        trigger_scan_now(context.application, reason="orderflow_impulse:off")
+        await reply(update, "○ Orderflow impulse OFF\nСканер остановлен, новые сделки не открываются. Открытые позиции продолжают сопровождаться до TP/SL/4h.", reply_markup=MAIN_MENU)
+        return
+
+    updates = {
+        "orderflow_impulse_enabled": True,
+        "quick_bounce_enabled": False,
+        "impulse_dump_enabled": False,
+        "strategy_mode": "orderflow_impulse",
+        "universe_mode": "top-50",
+        "max_symbols": 50,
+        "scan_interval_sec": 60,
+        "symbol_refresh_sec": 300,
+        "max_open_positions": 3,
+        "trade_margin_pct": 0.10,
+        "orderflow_impulse_trade_margin_pct": 0.10,
+        "mexc_order_leverage": 10,
+        "orderflow_impulse_leverage": 10,
+        "orderflow_impulse_tp_pct": 2.0,
+        "orderflow_impulse_sl_pct": 1.0,
+        "orderflow_impulse_time_stop_sec": 14400,
+        "orderflow_impulse_top_coins": 50,
+        "orderflow_impulse_max_open_positions": 3,
+        "orderflow_impulse_min_volume_ratio": 2.0,
+        "orderflow_impulse_min_trend_pct": 0.25,
+        "orderflow_impulse_min_imbalance_abs": 0.08,
+        "orderflow_impulse_max_spread_pct": 0.20,
+        "orderflow_impulse_min_24h_volume_usdt": 50000000.0,
+        "scan_market_source": "mexc_binance",
+        "spot_confirmation_enabled": True,
+        "auto_strategy_adaptation": False,
+        "regime_adaptation": False,
+        "liquidity_runner_enabled": False,
+        "mirror_mode": "off",
+        "session_filter_enabled": False,
+        "america_short_bias_enabled": False,
+        "openai_analysis_enabled": False,
+    }
+    for k, v in updates.items():
+        await storage.set(k, v, bump_revision=False)
+    await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+    scanner.last_refresh = 0
+    entries_enabled = True
+    running = True
+    if trading_task is None or trading_task.done():
+        trading_task = context.application.create_task(trading_loop(context.application))
+    if position_task is None or position_task.done():
+        position_task = context.application.create_task(position_management_loop(context.application))
+    trigger_scan_now(context.application, reason="orderflow_impulse:on")
+    await reply(
+        update,
+        "✅ Orderflow impulse ON\n"
+        "Binance spot top-50, trend + spot/CVD delta proxy + super volume + orderbook imbalance.\n"
+        "До 3 сделок, 10% депозита на монету, x10 isolated. SL 1%, TP 2%, time-stop 4h.",
+        reply_markup=MAIN_MENU,
+    )
+
 def _button_text_key(text: str) -> str:
     """Normalize Telegram reply-keyboard text.
 
@@ -3626,6 +3812,7 @@ def _button_mapping():
         ("🤖 AI BTC/ETH scalping", ai_scalping_toggle_cmd), ("AI BTC/ETH scalping", ai_scalping_toggle_cmd),
         ("⚡ быстрый отскок", quick_bounce_cmd), ("быстрый отскок", quick_bounce_cmd), ("Быстрый отскок", quick_bounce_cmd),
         ("🔻 импульсный слив", impulse_dump_cmd), ("импульсный слив", impulse_dump_cmd), ("Импульсный слив", impulse_dump_cmd),
+        ("📊 orderflow impulse", orderflow_impulse_cmd), ("orderflow impulse", orderflow_impulse_cmd), ("Orderflow impulse", orderflow_impulse_cmd),
         ("🚀 BOOST MODE", boost_start_cmd), ("BOOST MODE", boost_start_cmd),
         ("🛑 STOP BOOST", boost_stop_cmd), ("STOP BOOST", boost_stop_cmd),
         ("📊 BOOST STATUS", boost_status_cmd), ("BOOST STATUS", boost_status_cmd),
@@ -3938,6 +4125,16 @@ async def fetch_spot_data_for_candidate(ex, candidate: dict, settings: dict | No
         await client.load_markets()
         candles = await client.fetch_ohlcv(spot_symbol, timeframe="1m", limit=25)
         ticker = await client.fetch_ticker(spot_symbol)
+        orderbook = None
+        trades = []
+        try:
+            orderbook = await client.fetch_order_book(spot_symbol, limit=20)
+        except Exception:
+            orderbook = None
+        try:
+            trades = await client.fetch_trades(spot_symbol, limit=100)
+        except Exception:
+            trades = []
 
         if not candles or len(candles) < 5:
             return None
@@ -3945,12 +4142,39 @@ async def fetch_spot_data_for_candidate(ex, candidate: dict, settings: dict | No
         closes = [float(c[4]) for c in candles]
         avg = sum(vols[:-1]) / max(1, len(vols[:-1]))
         move = (closes[-1] - closes[-2]) / closes[-2] * 100 if closes[-2] else 0
+        bid_vol = ask_vol = 0.0
+        if isinstance(orderbook, dict):
+            bid_vol = sum(float(p) * float(q) for p, q in (orderbook.get("bids") or [])[:20])
+            ask_vol = sum(float(p) * float(q) for p, q in (orderbook.get("asks") or [])[:20])
+        ob_imb = ((bid_vol - ask_vol) / (bid_vol + ask_vol)) if (bid_vol + ask_vol) > 0 else 0.0
+        buy_vol = sell_vol = 0.0
+        for tr in trades or []:
+            try:
+                amount = float(tr.get("amount") or 0)
+                price = float(tr.get("price") or 0)
+                notional = amount * price
+                side = str(tr.get("side") or "").lower()
+                if side == "buy":
+                    buy_vol += notional
+                elif side == "sell":
+                    sell_vol += notional
+            except Exception:
+                pass
+        delta = buy_vol - sell_vol
+        delta_ratio = (delta / (buy_vol + sell_vol)) if (buy_vol + sell_vol) > 0 else 0.0
         return {
             "spot_source": spot_source,
             "spot_price": float(ticker.get("last") or closes[-1]),
             "spot_volume_now": vols[-1],
             "spot_volume_avg": avg,
             "spot_price_change_pct": move,
+            "spot_orderbook_imbalance": ob_imb,
+            "spot_bid_depth_usdt": bid_vol,
+            "spot_ask_depth_usdt": ask_vol,
+            "spot_delta_usdt": delta,
+            "spot_delta_ratio": delta_ratio,
+            "spot_buy_volume_usdt": buy_vol,
+            "spot_sell_volume_usdt": sell_vol,
         }
     except Exception as e:
         log.debug("%s spot confirmation data failed for %s: %s", spot_source, symbol, e)
@@ -4823,6 +5047,7 @@ async def trading_loop(app):
                 scanner.last_effective_strategy = effective_strategy
                 quick_bounce_cycle = base_strategy_mode == "quick_bounce"
                 impulse_dump_cycle = base_strategy_mode == "impulse_dump"
+                orderflow_impulse_cycle = base_strategy_mode == "orderflow_impulse"
                 if quick_bounce_cycle and not _bool_setting(settings, "quick_bounce_enabled", False):
                     scanner.last_signal_summary = "quick_bounce OFF: scanner stopped"
                     scanner.last_reject_reason = "Press ⚡ быстрый отскок again to resume scanning. Existing positions are still managed."
@@ -4834,6 +5059,12 @@ async def trading_loop(app):
                     scanner.last_reject_reason = "Press 🔻 импульсный слив again to resume scanning. Existing positions are still managed."
                     await update_scanner_status(app, settings, status="impulse dump off")
                     await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 900)))
+                    continue
+                if orderflow_impulse_cycle and not _bool_setting(settings, "orderflow_impulse_enabled", False):
+                    scanner.last_signal_summary = "orderflow_impulse OFF: scanner stopped"
+                    scanner.last_reject_reason = "Press 📊 orderflow impulse again to resume scanning. Existing positions are still managed."
+                    await update_scanner_status(app, settings, status="orderflow impulse off")
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 60)))
                     continue
                 if impulse_dump_cycle:
                     # Stop this mode until the next day after 3 stop-losses in a row.
@@ -4864,6 +5095,9 @@ async def trading_loop(app):
                 if impulse_dump_cycle:
                     log_event("impulse_dump_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("impulse_dump_top_coins", settings.get("max_symbols", 200)) or 200)), anomaly_tf=str(settings.get("impulse_dump_anomaly_timeframe", "1h")), confirm_tf=str(settings.get("impulse_dump_confirm_timeframe", "15m")))
                     await impulse_dump_progress_message(app, 10)
+                if orderflow_impulse_cycle:
+                    log_event("orderflow_impulse_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("orderflow_impulse_top_coins", settings.get("max_symbols", 50)) or 50)), source="binance_spot_orderflow")
+                    await orderflow_impulse_progress_message(app, 10)
                 if base_strategy_mode == "all":
                     scanner.last_strategy_reason = "mode=ALL: scanning momentum+pullback+reversal (liquidity_retest is manual-only)"
                 elif base_strategy_mode == "hybrid":
@@ -4905,6 +5139,19 @@ async def trading_loop(app):
                     await impulse_dump_progress_message(app, 100, done=True)
                     await impulse_dump_summary_message(app, settings, candidates)
                     await impulse_dump_progress_message(app, 100, clear=True)
+                if orderflow_impulse_cycle:
+                    log_event(
+                        "orderflow_impulse_scan_done",
+                        stage="scan",
+                        ok=True,
+                        candidates=len(candidates or []),
+                        symbols=[str(c.get("symbol", "")) for c in (candidates or [])[:10]],
+                        reject_reasons=getattr(scanner, "last_reject_top_reasons", []),
+                        errors=getattr(scanner, "last_cycle_errors", 0),
+                    )
+                    await orderflow_impulse_progress_message(app, 100, done=True)
+                    await orderflow_impulse_summary_message(app, settings, candidates)
+                    await orderflow_impulse_progress_message(app, 100, clear=True)
                 if scanner.last_slowdown_sec:
                     scanner.last_reject_reason = f"scanner adaptive slowdown {scanner.last_slowdown_sec}s after {scanner.last_cycle_errors} errors"
                     await update_scanner_status(app, settings, status="scanner slowdown", force=True)
@@ -4939,6 +5186,26 @@ async def trading_loop(app):
                     spot_enabled = bool(settings.get("spot_confirmation_enabled", True))
                     spot_data = await fetch_spot_data_for_candidate(ex, cand, settings) if spot_enabled else None
                     cand = SpotConfirmationEngine(enabled=spot_enabled).apply(cand, spot_data)
+                    if orderflow_impulse_cycle:
+                        sd = cand.get("score_details") if isinstance(cand.get("score_details"), dict) else {}
+                        log_event(
+                            "orderflow_impulse_spot_check",
+                            stage="spot",
+                            ok=bool(cand.get("spot_confirmed", False)),
+                            symbol=str(original_symbol),
+                            side=str(cand.get("side", "")),
+                            spot_source=str(sd.get("spot_source") or (spot_data or {}).get("spot_source") or "unknown"),
+                            spot_move_pct=sd.get("spot_move_pct", cand.get("spot_move_pct")),
+                            spot_volume_ratio=sd.get("spot_volume_ratio", cand.get("spot_volume_ratio")),
+                            spot_delta_ratio=sd.get("spot_delta_ratio", cand.get("spot_delta_ratio")),
+                            spot_delta_usdt=sd.get("spot_delta_usdt", cand.get("spot_delta_usdt")),
+                            spot_orderbook_imbalance=sd.get("spot_orderbook_imbalance", cand.get("spot_orderbook_imbalance")),
+                            futures_trend_15m_pct=sd.get("trend_15m_pct"),
+                            futures_trend_1h_pct=sd.get("trend_1h_pct"),
+                            futures_orderbook_imbalance=sd.get("orderbook_imbalance"),
+                            futures_volume_ratio=sd.get("volume_ratio"),
+                            reason=str(cand.get("spot_reason", ""))[:180],
+                        )
                     cand["strategy_mode"] = base_strategy_mode
                     cand["effective_strategy_mode"] = effective_strategy
 
@@ -5050,6 +5317,36 @@ async def trading_loop(app):
                             )
                             await notify_admin(app, open_text, key=f"impulse_dump_opened_{plan.symbol}_{int(time.time()*1000)}")
                             await impulse_dump_summary_message(app, settings, candidates, opened_note=open_text)
+                        elif orderflow_impulse_cycle:
+                            open_text = format_orderflow_impulse_opened(plan, placed)
+                            _of_details = getattr(plan, "signal_details", {}) if hasattr(plan, "signal_details") else {}
+                            _of_details = _of_details if isinstance(_of_details, dict) else {}
+                            log_event(
+                                "orderflow_impulse_opened",
+                                stage="entry",
+                                ok=True,
+                                symbol=str(plan.symbol),
+                                side=str(plan.side),
+                                entry_price=float(getattr(plan, "entry_price", 0) or 0),
+                                take_price=float(getattr(plan, "take_price", 0) or 0),
+                                stop_price=float(getattr(plan, "stop_price", 0) or 0),
+                                leverage=int(float(getattr(plan, "leverage", 0) or 0)),
+                                tp_pct=_of_details.get("tp_pct"),
+                                sl_pct=_of_details.get("sl_pct"),
+                                futures_trend_15m_pct=_of_details.get("trend_15m_pct"),
+                                futures_trend_1h_pct=_of_details.get("trend_1h_pct"),
+                                futures_orderbook_imbalance=_of_details.get("orderbook_imbalance"),
+                                futures_volume_ratio=_of_details.get("volume_ratio"),
+                                spot_source=_of_details.get("spot_source"),
+                                spot_move_pct=_of_details.get("spot_move_pct"),
+                                spot_volume_ratio=_of_details.get("spot_volume_ratio"),
+                                spot_delta_ratio=_of_details.get("spot_delta_ratio"),
+                                spot_delta_usdt=_of_details.get("spot_delta_usdt"),
+                                spot_orderbook_imbalance=_of_details.get("spot_orderbook_imbalance"),
+                                placed=placed,
+                            )
+                            await notify_admin(app, open_text, key=f"orderflow_impulse_opened_{plan.symbol}_{int(time.time()*1000)}")
+                            await orderflow_impulse_summary_message(app, settings, candidates, opened_note=open_text)
                         else:
                             await notify_admin(
                                 app,

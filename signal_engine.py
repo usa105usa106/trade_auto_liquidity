@@ -102,6 +102,13 @@ class SignalEngine:
         self.impulse_dump_min_24h_volume_usdt = float(os.getenv("IMPULSE_DUMP_MIN_24H_VOLUME_USDT", "20000000"))
         self.impulse_dump_btc_filter_enabled = str(os.getenv("IMPULSE_DUMP_BTC_FILTER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
         self.impulse_dump_btc_max_pump_1h_pct = float(os.getenv("IMPULSE_DUMP_BTC_MAX_PUMP_1H_PCT", "1.5"))
+        self.orderflow_impulse_tp_pct = float(os.getenv("ORDERFLOW_IMPULSE_TP_PCT", "2.0"))
+        self.orderflow_impulse_sl_pct = float(os.getenv("ORDERFLOW_IMPULSE_SL_PCT", "1.0"))
+        self.orderflow_impulse_min_volume_ratio = float(os.getenv("ORDERFLOW_IMPULSE_MIN_VOLUME_RATIO", "2.0"))
+        self.orderflow_impulse_min_trend_pct = float(os.getenv("ORDERFLOW_IMPULSE_MIN_TREND_PCT", "0.25"))
+        self.orderflow_impulse_min_imbalance_abs = float(os.getenv("ORDERFLOW_IMPULSE_MIN_IMBALANCE_ABS", "0.08"))
+        self.orderflow_impulse_max_spread_pct = float(os.getenv("ORDERFLOW_IMPULSE_MAX_SPREAD_PCT", "0.20"))
+        self.orderflow_impulse_min_24h_volume_usdt = float(os.getenv("ORDERFLOW_IMPULSE_MIN_24H_VOLUME_USDT", "50000000"))
 
     @staticmethod
     def _truthy(value, default: bool = False) -> bool:
@@ -166,6 +173,13 @@ class SignalEngine:
         self.impulse_dump_min_24h_volume_usdt = self._float_setting(settings, "impulse_dump_min_24h_volume_usdt", self.impulse_dump_min_24h_volume_usdt)
         self.impulse_dump_btc_filter_enabled = self._truthy(settings.get("impulse_dump_btc_filter_enabled"), self.impulse_dump_btc_filter_enabled)
         self.impulse_dump_btc_max_pump_1h_pct = self._float_setting(settings, "impulse_dump_btc_max_pump_1h_pct", self.impulse_dump_btc_max_pump_1h_pct)
+        self.orderflow_impulse_tp_pct = self._float_setting(settings, "orderflow_impulse_tp_pct", self.orderflow_impulse_tp_pct)
+        self.orderflow_impulse_sl_pct = self._float_setting(settings, "orderflow_impulse_sl_pct", self.orderflow_impulse_sl_pct)
+        self.orderflow_impulse_min_volume_ratio = self._float_setting(settings, "orderflow_impulse_min_volume_ratio", self.orderflow_impulse_min_volume_ratio)
+        self.orderflow_impulse_min_trend_pct = self._float_setting(settings, "orderflow_impulse_min_trend_pct", self.orderflow_impulse_min_trend_pct)
+        self.orderflow_impulse_min_imbalance_abs = self._float_setting(settings, "orderflow_impulse_min_imbalance_abs", self.orderflow_impulse_min_imbalance_abs)
+        self.orderflow_impulse_max_spread_pct = self._float_setting(settings, "orderflow_impulse_max_spread_pct", self.orderflow_impulse_max_spread_pct)
+        self.orderflow_impulse_min_24h_volume_usdt = self._float_setting(settings, "orderflow_impulse_min_24h_volume_usdt", self.orderflow_impulse_min_24h_volume_usdt)
         self._apply_liquidity_retest_quality_profile()
 
     def _apply_liquidity_retest_quality_profile(self) -> None:
@@ -273,6 +287,9 @@ class SignalEngine:
         if preferred_strategy == "impulse_dump":
             candles_1h = (mtf_candles or {}).get("1h") if isinstance(mtf_candles, dict) else None
             candidates += self._impulse_dump(symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=candles_1h, ticker=ticker, market_context=market_context)
+        if preferred_strategy == "orderflow_impulse":
+            candles_1h = (mtf_candles or {}).get("1h") if isinstance(mtf_candles, dict) else None
+            candidates += self._orderflow_impulse(symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=candles_1h, ticker=ticker, market_context=market_context)
 
         raw_candidates = list(candidates)
         candidates = [c for c in candidates if c["confidence"] >= self.min_confidence]
@@ -286,6 +303,8 @@ class SignalEngine:
                 self.last_reject_reason = getattr(self, "last_quick_bounce_reject_reason", "quick_bounce filters: no anomaly + reversal")
             elif preferred_strategy == "impulse_dump":
                 self.last_reject_reason = getattr(self, "last_impulse_dump_reject_reason", "impulse_dump filters: no 3-6% dump continuation")
+            elif preferred_strategy == "orderflow_impulse":
+                self.last_reject_reason = getattr(self, "last_orderflow_impulse_reject_reason", "orderflow_impulse filters: no trend + volume + imbalance alignment")
             else:
                 self.last_reject_reason = "no strategy setup"
             return None
@@ -566,6 +585,74 @@ class SignalEngine:
             except Exception:
                 continue
         return None
+
+    def _orderflow_impulse(self, symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=None, ticker=None, market_context=None):
+        """Orderflow impulse mode.
+
+        Uses the existing scanner data plus Binance spot confirmation later in the
+        pipeline. The signal itself requires: trend + super volume + orderbook
+        imbalance aligned in one direction. TP/SL are fixed by the strategy
+        profile: TP 2%, SL 1%, x10, 10% margin, max 3 trades.
+        """
+        out = []
+        self.last_orderflow_impulse_reject_reason = "not enough candles"
+        if len(candles) < 24:
+            return out
+        if spread_pct > self.orderflow_impulse_max_spread_pct:
+            self.last_orderflow_impulse_reject_reason = f"spread high {spread_pct:.3f}% > {self.orderflow_impulse_max_spread_pct:.3f}%"
+            return out
+        quote_vol = 0.0
+        if isinstance(ticker, dict):
+            info = ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
+            for key in ("quoteVolume", "quote_volume", "amount24", "volume24", "quoteVolume24h"):
+                try:
+                    quote_vol = float(ticker.get(key) or info.get(key) or 0)
+                    if quote_vol > 0:
+                        break
+                except Exception:
+                    pass
+        if quote_vol and quote_vol < self.orderflow_impulse_min_24h_volume_usdt:
+            self.last_orderflow_impulse_reject_reason = f"24h volume low {quote_vol:.0f} < {self.orderflow_impulse_min_24h_volume_usdt:.0f}"
+            return out
+
+        closes = [float(c[4]) for c in candles]
+        vols = [float(c[5]) for c in candles]
+        trend_15m_pct = pct(closes[-1], closes[-4]) if len(closes) >= 4 else 0.0
+        trend_1h_pct = 0.0
+        if candles_1h and len(candles_1h) >= 2:
+            trend_1h_pct = pct(close, float(candles_1h[-2][4]))
+        trend_pct = trend_1h_pct if abs(trend_1h_pct) >= abs(trend_15m_pct) else trend_15m_pct
+        recent_vol = mean(vols[-3:]) if len(vols) >= 3 else vols[-1]
+        base_vol = mean(vols[-24:-3]) if len(vols) >= 27 else mean(vols[:-3] or vols)
+        volume_ratio = (recent_vol / base_vol) if base_vol else vol_ratio
+        imb = float(imbalance or 0.0)
+        min_trend = abs(self.orderflow_impulse_min_trend_pct)
+        min_imb = abs(self.orderflow_impulse_min_imbalance_abs)
+        if volume_ratio < self.orderflow_impulse_min_volume_ratio:
+            self.last_orderflow_impulse_reject_reason = f"volume low {volume_ratio:.2f} < {self.orderflow_impulse_min_volume_ratio:.2f}"
+            return out
+        side = None
+        if trend_pct >= min_trend and imb >= min_imb:
+            side = "LONG"
+        elif trend_pct <= -min_trend and imb <= -min_imb:
+            side = "SHORT"
+        else:
+            self.last_orderflow_impulse_reject_reason = f"no trend/orderbook alignment trend={trend_pct:+.3f}% imbalance={imb:+.3f} vol={volume_ratio:.2f}"
+            return out
+        score = 70 + min(12, abs(trend_pct) * 6) + min(12, max(0, volume_ratio - 1) * 4) + min(8, abs(imb) * 40)
+        out.append(self._base(symbol, side, "orderflow_impulse", close, score, spread_pct, depth_usdt, atrp, {
+            "setup": "trend_plus_spot_delta_volume_orderbook_imbalance",
+            "trend_15m_pct": round(trend_15m_pct, 4),
+            "trend_1h_pct": round(trend_1h_pct, 4),
+            "trigger_trend_pct": round(trend_pct, 4),
+            "orderbook_imbalance": round(imb, 4),
+            "volume_ratio": round(volume_ratio, 3),
+            "tp_pct": round(self.orderflow_impulse_tp_pct, 4),
+            "sl_pct": round(self.orderflow_impulse_sl_pct, 4),
+            "rr": round(self.orderflow_impulse_tp_pct / self.orderflow_impulse_sl_pct, 4) if self.orderflow_impulse_sl_pct else 2.0,
+            "source": "Binance spot confirmation + scanner orderflow proxy",
+        }))
+        return out
 
     def _impulse_dump(self, symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=None, ticker=None, market_context=None):
         """Cascade SHORT mode, v0247.

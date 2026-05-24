@@ -10,6 +10,7 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["🤖 AI BTC/ETH scalping"],
     ["⚡ быстрый отскок"],
     ["🔻 импульсный слив"],
+    ["📊 orderflow impulse"],
     ["🚀 BOOST MODE", "🛑 STOP BOOST"],
     ["📊 BOOST STATUS", "📊 AI Stats"],
     ["⚙️ MEXC"],

@@ -408,6 +408,7 @@ class PositionManager:
             is_ai_scalping = strategy == "ai_scalping"
             is_boost_scalping = strategy == "boost_scalping"
             is_impulse_dump = strategy == "impulse_dump"
+            is_orderflow_impulse = strategy == "orderflow_impulse"
             liquidation_stop_mode = bool(pos.get("liquidation_stop_mode")) and is_ai_scalping
             ai_manage_only_tpsl = str(await self._setting("ai_scalping_manage_only_tpsl", os.getenv("AI_SCALPING_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
             boost_manage_only_tpsl = str(await self._setting("boost_manage_only_tpsl", os.getenv("BOOST_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
@@ -417,7 +418,8 @@ class PositionManager:
             # breakeven moves; those can close after a leveraged PnL percentage
             # before the price reaches the calculated dump target.
             impulse_manage_only_tpsl = str(await self._setting("impulse_dump_manage_only_tpsl", os.getenv("IMPULSE_DUMP_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
-            manage_only_tpsl = (is_ai_scalping and ai_manage_only_tpsl) or (is_boost_scalping and boost_manage_only_tpsl) or (is_impulse_dump and impulse_manage_only_tpsl)
+            orderflow_manage_only_tpsl = str(await self._setting("orderflow_impulse_manage_only_tpsl", os.getenv("ORDERFLOW_IMPULSE_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
+            manage_only_tpsl = (is_ai_scalping and ai_manage_only_tpsl) or (is_boost_scalping and boost_manage_only_tpsl) or (is_impulse_dump and impulse_manage_only_tpsl) or (is_orderflow_impulse and orderflow_manage_only_tpsl)
             policy = await self._refresh_scalp_policy()
             policy.update_best_pnl(pos, pnl)
             if manage_only_tpsl:
@@ -613,6 +615,12 @@ class PositionManager:
                 dump_time_stop = int(await self._setting("impulse_dump_time_stop_sec", os.getenv("IMPULSE_DUMP_TIME_STOP_SEC", "86400")) or 86400)
                 if dump_time_stop > 0 and now - opened >= dump_time_stop:
                     ev = await self._close_and_event(pos, "time_stop", "impulse_dump_time_stop", live, price)
+                    if ev: events.append(ev)
+                    continue
+            if strategy == "orderflow_impulse":
+                of_time_stop = int(await self._setting("orderflow_impulse_time_stop_sec", os.getenv("ORDERFLOW_IMPULSE_TIME_STOP_SEC", "14400")) or 14400)
+                if of_time_stop > 0 and now - opened >= of_time_stop:
+                    ev = await self._close_and_event(pos, "time_stop", "orderflow_impulse_time_stop", live, price)
                     if ev: events.append(ev)
                     continue
             if not is_liquidity_retest:
