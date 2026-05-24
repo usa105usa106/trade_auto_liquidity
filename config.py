@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0246 IMPULSE DUMP FINAL TP 4-7 BY TRIGGER TF")
+VERSION = os.getenv("BOT_VERSION", "0249 IMPULSE DUMP AUDIT FIX")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)

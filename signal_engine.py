@@ -568,7 +568,7 @@ class SignalEngine:
         return None
 
     def _impulse_dump(self, symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=None, ticker=None, market_context=None):
-        """Cascade SHORT mode, v0246.
+        """Cascade SHORT mode, v0247.
 
         24h is only a late-entry filter. Entry is either fast 15m panic dump
         or slow 15m red move confirmed by 1h/4h. TP is calculated from the
@@ -668,8 +668,12 @@ class SignalEngine:
                 f"fast15={fast_15m_trigger} confirm1h={one_hour_in_range} confirm4h={four_hour_in_range}"
             )
             return out
-        # 4h is allowed as an alternate/late-entry guard, but never if the dump is already
-        # beyond the late-entry cap. Fast 15m panic still respects this cap.
+        # Late-entry guards: even a fast 15m panic is rejected if the wider
+        # 1h/4h/24h context is already beyond -6%. This prevents entering a short
+        # after the move is already exhausted, e.g. 15m=-5.7% but 1h=-8.8%.
+        if drop1h_abs > max1h:
+            self.last_impulse_dump_reject_reason = f"1h drop late {drop1h_abs:.2f}% > {max1h:.2f}% move1h={move_1h_pct:+.2f}%"
+            return out
         if drop4h_abs > max4h:
             self.last_impulse_dump_reject_reason = f"4h drop late {drop4h_abs:.2f}% > {max4h:.2f}% move4h={move_4h_pct:+.2f}%"
             return out
@@ -694,7 +698,7 @@ class SignalEngine:
             self.last_impulse_dump_reject_reason = f"no 15m continuation move15={move_15m_pct:+.2f}% move1h={move_1h_pct:+.2f}% red={last_red} lower_low={lower_low} weak_bounce_failed={weak_bounce_failed} vol={local_vol_ratio:.2f}"
             return out
 
-        # v0246 final TP model:
+        # v0247 final TP model:
         # 24h is only a late-entry filter. TP is calculated from the timeframe that
         # actually triggered the SHORT: 10% total target minus that timeframe's drop.
         # Guardrails are hard: TP can never leave 4-7% from entry.

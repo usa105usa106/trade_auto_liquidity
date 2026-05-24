@@ -278,6 +278,39 @@ class ProtectionEngine:
                     "checked_at": time.time(),
                 }
 
+            # v0248: Quick Bounce uses MEXC /planorder/place; Impulse Dump uses
+            # MEXC native /stoporder/place attached to a position.  Both can lag
+            # in list/open-orders endpoints right after placement.  If the entry
+            # code already posted native TP/SL successfully, keep the position
+            # EXCHANGE PROTECTED during a short indexing grace period instead of
+            # showing a false LOCAL PROTECTION/MISSING warning or trying to
+            # restore/cancel orders.
+            strategy_l = str(pos.get("strategy") or "").lower()
+            is_impulse_dump = strategy_l == "impulse_dump"
+            if is_impulse_dump and (pos.get("tpsl_native_direct_posted") or pos.get("tpsl_native_direct_raw")):
+                try:
+                    opened_at = float(pos.get("opened_at") or pos.get("created_at") or 0)
+                except Exception:
+                    opened_at = 0.0
+                tp_price = float(pos.get("take_price") or 0)
+                sl_price = float(pos.get("stop_price") or 0)
+                raw = pos.get("tpsl_native_direct_raw") if isinstance(pos.get("tpsl_native_direct_raw"), dict) else {}
+                native_id = str(raw.get("id") or raw.get("data") or pos.get("tp_order_id") or "MEXC_NATIVE_TPSL")
+                grace = 180.0
+                if tp_price > 0 and sl_price > 0 and (not opened_at or time.time() - opened_at < grace):
+                    return {
+                        "tp_exists": True,
+                        "sl_exists": True,
+                        "take_profit_ok": True,
+                        "stop_loss_ok": True,
+                        "tp_order_id": pos.get("tp_order_id") or native_id,
+                        "sl_order_id": pos.get("sl_order_id") or native_id,
+                        "protection_status": "EXCHANGE PROTECTED",
+                        "protection_mode": "exchange_native_tpsl_pending_verify",
+                        "protection_note": "MEXC native stoporder TP/SL accepted; open_orders verification in grace period",
+                        "checked_at": time.time(),
+                    }
+
             # v0233 Quick Bounce uses MEXC /planorder/place for standalone
             # reduce-only TP/SL. Those orders do NOT appear in
             # /stoporder/open_orders, so checking generic open orders can produce
@@ -285,7 +318,7 @@ class ProtectionEngine:
             # Verify the exact saved planorder ids first and trust them while
             # active. This also prevents watchdog reattach/cancel loops and
             # duplicate TP/SL orders.
-            is_quick_bounce = str(pos.get("strategy") or "").lower() == "quick_bounce"
+            is_quick_bounce = strategy_l == "quick_bounce"
             if is_quick_bounce and hasattr(self.exchange_client, "mexc_find_active_plan_order"):
                 tp_id = str(pos.get("tp_order_id") or "").strip()
                 sl_id_qb = str(pos.get("sl_order_id") or "").strip()
@@ -340,12 +373,13 @@ class ProtectionEngine:
         # If exchange TP/SL are not confirmed, keep the position open and do
         # NOT cancel/recreate planorders from the watchdog; that can duplicate
         # orders or remove a valid backstop while MEXC list endpoints lag.
-        if str(pos.get("strategy") or "").lower() == "quick_bounce":
+        if str(pos.get("strategy") or "").lower() in {"quick_bounce", "impulse_dump"}:
             out["protection_status"] = "VIRTUAL_PROTECTED"
             out["protection_mode"] = "virtual"
             out["virtual_tp_sl_active"] = True
             out["quick_bounce_no_reattach"] = True
-            out["protection_note"] = "Quick Bounce uses local TP/SL fallback; watchdog does not reattach/cancel planorders"
+            out["impulse_dump_no_reattach"] = str(pos.get("strategy") or "").lower() == "impulse_dump"
+            out["protection_note"] = "Quick Bounce/Impulse Dump use local TP/SL fallback; watchdog does not reattach/cancel exchange orders"
             return out
         liq_mode = bool(pos.get("liquidation_stop_mode")) and str(pos.get("strategy") or "").lower() == "ai_scalping"
         try:

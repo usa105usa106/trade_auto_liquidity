@@ -588,8 +588,10 @@ def format_impulse_dump_opened(plan, placed: dict) -> str:
     move1h = details.get("move_1h_pct")
     move4h = details.get("move_4h_pct")
     change24 = details.get("change_24h_pct")
+    tp_pct = details.get("tp_pct")
+    sl_pct = details.get("sl_pct")
     tp_context = str(details.get("tp_context_source") or "")
-    tp_context_ru = "24h минус" if tp_context == "24h_red" else ("local high 4h" if tp_context == "local_4h_high" else tp_context)
+    tp_context_ru = "таймфрейм входа" if tp_context == "entry_trigger_tf" else ("24h минус" if tp_context == "24h_red" else ("local high 4h" if tp_context == "local_4h_high" else tp_context))
     protection_mode = str(pos.get("protection_mode") or "unknown").lower()
     if protection_mode in {"exchange", "exchange_planorder", "exchange_planorder_pending_verify"}:
         protection_line = "защита: реальные SL/TP на бирже"
@@ -613,6 +615,8 @@ def format_impulse_dump_opened(plan, placed: dict) -> str:
         _pct_line("1h", move1h),
         _pct_line("4h", move4h),
         _pct_line("24h", change24),
+        _pct_line("TP от входа", tp_pct),
+        _pct_line("SL от входа", sl_pct),
         f"тейк считается от: {tp_context_ru}",
         protection_line,
     ])
@@ -3545,7 +3549,7 @@ async def impulse_dump_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "impulse_dump_total_drop_target_pct": 10.0,
         "impulse_dump_min_drop_pct": 3.0,
         "impulse_dump_max_drop_pct": 6.0,
-        "impulse_dump_15m_min_drop_pct": 1.0,
+        "impulse_dump_15m_min_drop_pct": 0.1,
         "impulse_dump_15m_max_drop_pct": 6.0,
         "impulse_dump_4h_max_drop_pct": 6.0,
         "impulse_dump_24h_max_drop_pct": 6.0,
