@@ -1,5 +1,6 @@
 import time
 import os
+from debug_log import log_event
 from scalp_exit_engine import ScalpExitPolicy
 from protection_engine import ProtectionEngine
 
@@ -206,6 +207,21 @@ class PositionManager:
                 pass
             return None
         res = await self.execution_engine.close_position(pos, reason, live, price)
+        try:
+            if str(pos.get("strategy", "")).lower() == "quick_bounce":
+                log_event(
+                    "quick_bounce_closed",
+                    stage="exit",
+                    ok=bool(isinstance(res, dict) and res.get("ok")),
+                    symbol=str(symbol),
+                    side=str(pos.get("side", "")),
+                    reason=str(reason),
+                    event_type=str(event_type),
+                    exit_price=float(price or 0),
+                    result=res,
+                )
+        except Exception:
+            pass
         if isinstance(res, dict) and res.get("ok"):
             # Close is terminal locally. Remove any stale local row again and rely
             # on /positions or sync to restore it only if exchange still has a
@@ -473,8 +489,8 @@ class PositionManager:
                     if fast_enabled:
                         age_sec = max(0.0, now - opened)
                         min_age = float(await self._setting("boost_fast_profit_min_age_sec", 3) or 3)
-                        min_pct = float(await self._setting("boost_fast_profit_min_pct", 0.018) or 0.018)
-                        ex_min = float(await self._setting("boost_fast_profit_exchange_min_pct", 0.004) or 0.004)
+                        min_pct = float(await self._setting("boost_fast_profit_min_pct", 0.11) or 0.11)
+                        ex_min = float(await self._setting("boost_fast_profit_exchange_min_pct", 0.09) or 0.09)
                         max_hold = float(await self._setting("boost_fast_profit_max_hold_sec", 24) or 24)
                         trail_start = float(await self._setting("boost_fast_trailing_start_pct", 0.030) or 0.030)
                         trail_giveback = float(await self._setting("boost_fast_trailing_giveback_pct", 0.010) or 0.010)
@@ -520,7 +536,7 @@ class PositionManager:
             if side=="LONG":
                 if take and price>=take:
                     if live and strategy == "boost_scalping":
-                        min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.015) or 0.0)
+                        min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.09) or 0.09)
                         ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, min_profit)
                         if not ok_profit:
                             pos["boost_tp_skip_reason"] = why_profit
@@ -551,7 +567,7 @@ class PositionManager:
             else:
                 if take and price<=take:
                     if live and strategy == "boost_scalping":
-                        min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.015) or 0.0)
+                        min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.09) or 0.09)
                         ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, min_profit)
                         if not ok_profit:
                             pos["boost_tp_skip_reason"] = why_profit
@@ -579,6 +595,12 @@ class PositionManager:
                         ev = await self._close_and_event(pos, "sl", "stop_loss", live, price)
                         if ev: events.append(ev)
                         continue
+            if strategy == "quick_bounce":
+                qb_time_stop = int(await self._setting("quick_bounce_time_stop_sec", os.getenv("QUICK_BOUNCE_TIME_STOP_SEC", "43200")) or 43200)
+                if qb_time_stop > 0 and now - opened >= qb_time_stop:
+                    ev = await self._close_and_event(pos, "time_stop", "quick_bounce_time_stop", live, price)
+                    if ev: events.append(ev)
+                    continue
             if not is_liquidity_retest:
                 if manage_only_tpsl:
                     # v0181: For AI scalping and BOOST, do not choke a live trade with

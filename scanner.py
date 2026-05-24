@@ -359,12 +359,18 @@ class Scanner:
             return self.last_regime or {"regime": "LOW_VOLATILITY", "source": "fallback"}
 
     async def candidates(self, exchange_client, settings: dict) -> list[dict]:
-        tf = os.getenv("SIGNAL_OHLCV_TIMEFRAME", "1m")
-        limit = int(os.getenv("SIGNAL_OHLCV_LIMIT", "60"))
         preferred_strategy = str(settings.get("effective_strategy_mode") or settings.get("strategy_mode", "hybrid")).lower()
+        if preferred_strategy == "quick_bounce":
+            tf = str(settings.get("quick_bounce_confirm_timeframe", settings.get("quick_bounce_timeframe", os.getenv("QUICK_BOUNCE_CONFIRM_TIMEFRAME", "15m"))) or "15m")
+            limit = int(settings.get("quick_bounce_ohlcv_limit", os.getenv("QUICK_BOUNCE_OHLCV_LIMIT", "80")) or 80)
+        else:
+            tf = os.getenv("SIGNAL_OHLCV_TIMEFRAME", "1m")
+            limit = int(os.getenv("SIGNAL_OHLCV_LIMIT", "60"))
         regime = str(settings.get("market_regime") or self.last_regime.get("regime", "LOW_VOLATILITY"))
         base_max = int(os.getenv("SIGNAL_MAX_CANDIDATES_PER_CYCLE", "8"))
-        if bool(settings.get("regime_adaptation", True)):
+        if preferred_strategy == "quick_bounce":
+            base_max = int(settings.get("quick_bounce_max_candidates", os.getenv("QUICK_BOUNCE_MAX_CANDIDATES", "5")) or 5)
+        if bool(settings.get("regime_adaptation", True)) and preferred_strategy != "quick_bounce":
             if regime == "HIGH_VOLATILITY":
                 max_candidates = max(2, int(base_max * 0.75))
             elif regime == "CHOPPY":
@@ -381,6 +387,15 @@ class Scanner:
         scanned = 0
         reject_counts = Counter()
         reject_examples = defaultdict(list)
+        market_context = {}
+        if preferred_strategy == "quick_bounce" and bool(settings.get("quick_bounce_btc_filter_enabled", True)):
+            try:
+                btc_tf = str(settings.get("quick_bounce_anomaly_timeframe", os.getenv("QUICK_BOUNCE_ANOMALY_TIMEFRAME", "1h")) or "1h")
+                btc_candles = await exchange_client.fetch_ohlcv("BTC/USDT:USDT", timeframe=btc_tf, limit=3)
+                if btc_candles and len(btc_candles) >= 2:
+                    market_context["btc_change_1h_pct"] = (float(btc_candles[-1][4]) - float(btc_candles[-2][4])) / max(float(btc_candles[-2][4]), 1e-12) * 100.0
+            except Exception as e:
+                log.debug("quick_bounce BTC filter unavailable: %s", e)
 
         def _record_reject(symbol: str, reason: str) -> None:
             reason = str(reason or "unknown").strip()[:90] or "unknown"
@@ -405,6 +420,23 @@ class Scanner:
                     if not candles:
                         _record_reject(symbol, "no candles")
                         return None
+                    mtf_candles = None
+                    ticker = None
+                    if preferred_strategy == "quick_bounce":
+                        try:
+                            anomaly_tf = str(settings.get("quick_bounce_anomaly_timeframe", os.getenv("QUICK_BOUNCE_ANOMALY_TIMEFRAME", "1h")) or "1h")
+                            anomaly_limit = int(settings.get("quick_bounce_anomaly_ohlcv_limit", os.getenv("QUICK_BOUNCE_ANOMALY_OHLCV_LIMIT", "48")) or 48)
+                            mtf_candles = {"1h": await exchange_client.fetch_ohlcv(symbol, timeframe=anomaly_tf, limit=anomaly_limit)}
+                        except Exception as e:
+                            errors += 1
+                            _record_reject(symbol, "1h candles error")
+                            log.debug("quick_bounce 1h candles unavailable for %s: %s", symbol, e)
+                            return None
+                        try:
+                            ticker = await exchange_client.fetch_ticker(symbol)
+                        except Exception as e:
+                            _record_reject(symbol, "ticker unavailable")
+                            log.debug("quick_bounce ticker unavailable for %s: %s", symbol, e)
                     try:
                         orderbook = await exchange_client.fetch_order_book(symbol, limit=20)
                     except Exception as e:
@@ -415,9 +447,11 @@ class Scanner:
                     candidate = self.engine.analyze_symbol(
                         symbol=symbol,
                         candles=candles,
-                        ticker=None,
+                        ticker=ticker,
                         orderbook=orderbook,
                         preferred_strategy=preferred_strategy,
+                        mtf_candles=mtf_candles,
+                        market_context=market_context,
                     )
                     if candidate:
                         candidate["market_regime"] = regime
@@ -440,7 +474,7 @@ class Scanner:
             batch = symbols[i:i + batch_size]
             results = await asyncio.gather(*(scan_one(sym) for sym in batch), return_exceptions=False)
             out.extend([r for r in results if r])
-            if len(out) >= max_candidates:
+            if len(out) >= max_candidates and preferred_strategy != "quick_bounce":
                 break
 
         self._record_cycle_health(scanned, errors, settings)

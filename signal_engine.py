@@ -80,6 +80,15 @@ class SignalEngine:
         self.liquidity_retest_min_mtf_score = float(os.getenv("LIQUIDITY_RETEST_MIN_MTF_SCORE", "-0.25"))
         self.liquidity_retest_require_clean_path = str(os.getenv("LIQUIDITY_RETEST_REQUIRE_CLEAN_PATH", "false")).lower() in {"1", "true", "yes", "on"}
         self.liquidity_retest_quality_mode = str(os.getenv("LIQUIDITY_RETEST_QUALITY_MODE", "a_plus") or "a_plus").lower()
+        self.quick_bounce_drop_4h_pct = float(os.getenv("QUICK_BOUNCE_DROP_4H_PCT", "5.0"))
+        self.quick_bounce_pump_4h_pct = float(os.getenv("QUICK_BOUNCE_PUMP_4H_PCT", "5.0"))
+        self.quick_bounce_reversal_pct = float(os.getenv("QUICK_BOUNCE_REVERSAL_PCT", "1.0"))
+        self.quick_bounce_min_volume_ratio = float(os.getenv("QUICK_BOUNCE_MIN_VOLUME_RATIO", "1.15"))
+        self.quick_bounce_max_spread_pct = float(os.getenv("QUICK_BOUNCE_MAX_SPREAD_PCT", "0.20"))
+        self.quick_bounce_min_24h_volume_usdt = float(os.getenv("QUICK_BOUNCE_MIN_24H_VOLUME_USDT", "20000000"))
+        self.quick_bounce_btc_filter_enabled = str(os.getenv("QUICK_BOUNCE_BTC_FILTER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
+        self.quick_bounce_btc_max_drop_1h_pct = float(os.getenv("QUICK_BOUNCE_BTC_MAX_DROP_1H_PCT", "2.0"))
+        self.quick_bounce_btc_max_pump_1h_pct = float(os.getenv("QUICK_BOUNCE_BTC_MAX_PUMP_1H_PCT", "2.0"))
 
     @staticmethod
     def _truthy(value, default: bool = False) -> bool:
@@ -122,6 +131,15 @@ class SignalEngine:
         self.liquidity_retest_min_mtf_score = self._float_setting(settings, "liquidity_retest_min_mtf_score", self.liquidity_retest_min_mtf_score)
         self.liquidity_retest_require_clean_path = self._truthy(settings.get("liquidity_retest_require_clean_path"), self.liquidity_retest_require_clean_path)
         self.liquidity_retest_quality_mode = str(settings.get("liquidity_retest_quality_mode", self.liquidity_retest_quality_mode) or "a_plus").lower()
+        self.quick_bounce_drop_4h_pct = self._float_setting(settings, "quick_bounce_drop_4h_pct", self.quick_bounce_drop_4h_pct)
+        self.quick_bounce_pump_4h_pct = self._float_setting(settings, "quick_bounce_pump_4h_pct", self.quick_bounce_pump_4h_pct)
+        self.quick_bounce_reversal_pct = self._float_setting(settings, "quick_bounce_reversal_pct", self.quick_bounce_reversal_pct)
+        self.quick_bounce_min_volume_ratio = self._float_setting(settings, "quick_bounce_min_volume_ratio", self.quick_bounce_min_volume_ratio)
+        self.quick_bounce_max_spread_pct = self._float_setting(settings, "quick_bounce_max_spread_pct", self.quick_bounce_max_spread_pct)
+        self.quick_bounce_min_24h_volume_usdt = self._float_setting(settings, "quick_bounce_min_24h_volume_usdt", self.quick_bounce_min_24h_volume_usdt)
+        self.quick_bounce_btc_filter_enabled = self._truthy(settings.get("quick_bounce_btc_filter_enabled"), self.quick_bounce_btc_filter_enabled)
+        self.quick_bounce_btc_max_drop_1h_pct = self._float_setting(settings, "quick_bounce_btc_max_drop_1h_pct", self.quick_bounce_btc_max_drop_1h_pct)
+        self.quick_bounce_btc_max_pump_1h_pct = self._float_setting(settings, "quick_bounce_btc_max_pump_1h_pct", self.quick_bounce_btc_max_pump_1h_pct)
         self._apply_liquidity_retest_quality_profile()
 
     def _apply_liquidity_retest_quality_profile(self) -> None:
@@ -172,6 +190,8 @@ class SignalEngine:
         ticker: dict | None = None,
         orderbook: dict | None = None,
         preferred_strategy: str = "hybrid",
+        mtf_candles: dict | None = None,
+        market_context: dict | None = None,
     ) -> dict | None:
         self.last_reject_reason = "-"
         if not candles or len(candles) < max(30, self.breakout_lookback + 5):
@@ -221,6 +241,9 @@ class SignalEngine:
         # It is not a scalp mode; user enables it explicitly for SMC-style tests.
         if preferred_strategy == "liquidity_retest":
             candidates += self._liquidity_retest(symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance)
+        if preferred_strategy == "quick_bounce":
+            candles_1h = (mtf_candles or {}).get("1h") if isinstance(mtf_candles, dict) else None
+            candidates += self._quick_bounce(symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=candles_1h, ticker=ticker, market_context=market_context)
 
         raw_candidates = list(candidates)
         candidates = [c for c in candidates if c["confidence"] >= self.min_confidence]
@@ -230,6 +253,8 @@ class SignalEngine:
                 self.last_reject_reason = f"confidence {float(best.get('confidence', 0)):.1f} < {self.min_confidence:.1f}"
             elif preferred_strategy == "liquidity_retest":
                 self.last_reject_reason = getattr(self, "last_liquidity_retest_reject_reason", "liquidity_retest filters: no valid sweep/reclaim/retest/RR")
+            elif preferred_strategy == "quick_bounce":
+                self.last_reject_reason = getattr(self, "last_quick_bounce_reject_reason", "quick_bounce filters: no anomaly + reversal")
             else:
                 self.last_reject_reason = "no strategy setup"
             return None
@@ -484,6 +509,108 @@ class SignalEngine:
             return False
         blockers = [l for l in lows[-8:-1] if target < l < close]
         return len(blockers) <= 2
+
+
+    def _quick_bounce(self, symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=None, ticker=None, market_context=None):
+        """Fast anomaly bounce mode, v0227.
+
+        1h candles detect the abnormal 4-hour move; 15m candles confirm the
+        first bounce/pullback. BTC, 24h volume and spread filters protect the
+        mode from broad market dumps and illiquid symbols.
+        """
+        out = []
+        self.last_quick_bounce_reject_reason = "not enough candles"
+        if len(candles) < 12:
+            return out
+        candles_1h = candles_1h or candles
+        if len(candles_1h) < 5:
+            return out
+        if spread_pct > self.quick_bounce_max_spread_pct:
+            self.last_quick_bounce_reject_reason = f"spread high {spread_pct:.3f}% > {self.quick_bounce_max_spread_pct:.3f}%"
+            return out
+
+        quote_vol = 0.0
+        if isinstance(ticker, dict):
+            for key in ("quoteVolume", "quote_volume", "amount24", "volume24"):
+                try:
+                    quote_vol = float(ticker.get(key) or 0)
+                    if quote_vol > 0:
+                        break
+                except Exception:
+                    pass
+        if quote_vol and quote_vol < self.quick_bounce_min_24h_volume_usdt:
+            self.last_quick_bounce_reject_reason = f"24h volume low {quote_vol:.0f} < {self.quick_bounce_min_24h_volume_usdt:.0f}"
+            return out
+
+        btc_change_1h = None
+        if isinstance(market_context, dict):
+            try:
+                btc_change_1h = float(market_context.get("btc_change_1h_pct"))
+            except Exception:
+                btc_change_1h = None
+        btc_allows_long = True
+        btc_allows_short = True
+        if self.quick_bounce_btc_filter_enabled and btc_change_1h is not None:
+            btc_allows_long = btc_change_1h > -abs(self.quick_bounce_btc_max_drop_1h_pct)
+            btc_allows_short = btc_change_1h < abs(self.quick_bounce_btc_max_pump_1h_pct)
+
+        opens15 = [float(c[1]) for c in candles]
+        highs15 = [float(c[2]) for c in candles]
+        lows15 = [float(c[3]) for c in candles]
+        closes15 = [float(c[4]) for c in candles]
+        vols15 = [float(c[5]) for c in candles]
+
+        highs1h = [float(c[2]) for c in candles_1h]
+        lows1h = [float(c[3]) for c in candles_1h]
+        closes1h = [float(c[4]) for c in candles_1h]
+        lookback_1h = min(len(candles_1h), 5)  # 4 completed hours + current hour.
+        start_1h = closes1h[-lookback_1h]
+        local_low_1h = min(lows1h[-lookback_1h:])
+        local_high_1h = max(highs1h[-lookback_1h:])
+        move_4h_pct = pct(close, start_1h)
+
+        confirm_15m = min(len(candles), 8)  # last ~2h for first bounce/pullback.
+        local_low_15m = min(lows15[-confirm_15m:])
+        local_high_15m = max(highs15[-confirm_15m:])
+        bounce_from_low = pct(close, local_low_15m) if local_low_15m > 0 else 0.0
+        pullback_from_high = pct(local_high_15m, close) if close > 0 else 0.0
+        last_green = closes15[-1] > opens15[-1] and closes15[-1] > closes15[-2]
+        last_red = closes15[-1] < opens15[-1] and closes15[-1] < closes15[-2]
+        recent_vol = mean(vols15[-4:]) if len(vols15) >= 4 else vols15[-1]
+        base_vol = mean(vols15[-20:-4]) if len(vols15) >= 24 else mean(vols15[:-4] or vols15)
+        local_vol_ratio = (recent_vol / base_vol) if base_vol else vol_ratio
+        if local_vol_ratio < self.quick_bounce_min_volume_ratio:
+            self.last_quick_bounce_reject_reason = f"volume low {local_vol_ratio:.2f} < {self.quick_bounce_min_volume_ratio:.2f}"
+
+        long_ok = (btc_allows_long and
+                   move_4h_pct <= -abs(self.quick_bounce_drop_4h_pct) and
+                   bounce_from_low >= self.quick_bounce_reversal_pct and
+                   last_green and local_vol_ratio >= self.quick_bounce_min_volume_ratio)
+        short_ok = (btc_allows_short and
+                    move_4h_pct >= abs(self.quick_bounce_pump_4h_pct) and
+                    pullback_from_high >= self.quick_bounce_reversal_pct and
+                    last_red and local_vol_ratio >= self.quick_bounce_min_volume_ratio)
+        if long_ok:
+            score = 70 + min(12, abs(move_4h_pct) * 1.2) + min(8, bounce_from_low * 2.0) + min(6, max(0, local_vol_ratio - 1) * 4) + (3 if imbalance > 0 else 0)
+            out.append(self._base(symbol, "LONG", "quick_bounce", close, score, spread_pct, depth_usdt, atrp, {
+                "setup": "1h_drop_15m_bounce", "move_4h_pct": round(move_4h_pct, 3), "bounce_from_low_pct": round(bounce_from_low, 3),
+                "volume_ratio": round(local_vol_ratio, 3), "quote_volume_24h": round(quote_vol, 2), "btc_change_1h_pct": btc_change_1h,
+                "anomaly_tf": "1h", "confirm_tf": "15m", "tp_pct": 2.0, "sl_pct": 2.0,
+            }))
+        if short_ok:
+            score = 70 + min(12, abs(move_4h_pct) * 1.2) + min(8, pullback_from_high * 2.0) + min(6, max(0, local_vol_ratio - 1) * 4) + (3 if imbalance < 0 else 0)
+            out.append(self._base(symbol, "SHORT", "quick_bounce", close, score, spread_pct, depth_usdt, atrp, {
+                "setup": "1h_pump_15m_pullback", "move_4h_pct": round(move_4h_pct, 3), "pullback_from_high_pct": round(pullback_from_high, 3),
+                "volume_ratio": round(local_vol_ratio, 3), "quote_volume_24h": round(quote_vol, 2), "btc_change_1h_pct": btc_change_1h,
+                "anomaly_tf": "1h", "confirm_tf": "15m", "tp_pct": 2.0, "sl_pct": 2.0,
+            }))
+        if not out:
+            btc_note = f" btc1h={btc_change_1h:+.2f}%" if btc_change_1h is not None else ""
+            self.last_quick_bounce_reject_reason = (
+                f"no 1h/15m reversal move4h={move_4h_pct:+.2f}% bounce15={bounce_from_low:.2f}% "
+                f"pullback15={pullback_from_high:.2f}% vol={local_vol_ratio:.2f} green={last_green} red={last_red}{btc_note}"
+            )
+        return out
 
     def _liquidity_retest(self, symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance):
         """Video-style SMC Liquidity Retest mode.

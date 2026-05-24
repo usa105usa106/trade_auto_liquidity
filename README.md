@@ -1,3 +1,11 @@
+
+## v0231 QUICK BOUNCE REAL TPSL FALLBACK
+
+- Quick Bounce сначала пытается поставить реальные SL/TP на бирже.
+- Если реальные SL/TP не подтвердились, сделка НЕ закрывается.
+- Позиция переводится в `protection_mode=virtual` и сопровождается виртуальными TP/SL + 12h time-stop.
+- `/log` показывает открытия сделок, TP/SL, real/virtual protection и ошибки постановки SL/TP.
+
 ## v0191 REAL ASYNC BOOST COMMAND FIX
 
 - Restored fast BOOST live panel as one bottom Telegram message.

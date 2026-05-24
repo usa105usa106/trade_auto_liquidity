@@ -1190,6 +1190,12 @@ class ExchangeClient:
         endpoints and ignore unsupported variants instead of hiding normal data.
         """
         candidates = []
+        # v0224 fast path: /stoporder/list/orders repeatedly returns [] on current
+        # MEXC futures and adds ~1-2s latency per protection/rotation check.
+        # Keep the live TP/SL endpoints that matter now: planorder emergency SL,
+        # stoporder/open_orders, and position/stop_orders.  Legacy stoporder/list
+        # can be re-enabled only if MEXC changes visibility again.
+        include_legacy_stop_list = str(os.getenv("MEXC_LEGACY_STOPORDER_LIST", "0")).lower() in {"1", "true", "yes", "on"}
         if symbol:
             msym = self._mexc_symbol(symbol)
             candidates.extend([
@@ -1198,20 +1204,26 @@ class ExchangeClient:
                 ("/api/v1/private/planorder/list/orders", {"symbol": msym, "state": 1, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/planorder/list/orders", {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/stoporder/open_orders", {"symbol": msym}),
-                ("/api/v1/private/stoporder/list/orders", {"symbol": msym, "state": 1, "is_finished": 0, "page_num": 1, "page_size": 100}),
-                ("/api/v1/private/stoporder/list/orders", {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/position/stop_orders", {"symbol": msym}),
             ])
+            if include_legacy_stop_list:
+                candidates.extend([
+                    ("/api/v1/private/stoporder/list/orders", {"symbol": msym, "state": 1, "is_finished": 0, "page_num": 1, "page_size": 100}),
+                    ("/api/v1/private/stoporder/list/orders", {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100}),
+                ])
         else:
             candidates.extend([
                 ("/api/v1/private/order/list/open_orders", {}),
                 ("/api/v1/private/planorder/list/orders", {"state": 1, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/planorder/list/orders", {"is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/stoporder/open_orders", {}),
-                ("/api/v1/private/stoporder/list/orders", {"state": 1, "is_finished": 0, "page_num": 1, "page_size": 100}),
-                ("/api/v1/private/stoporder/list/orders", {"is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/position/stop_orders", {}),
             ])
+            if include_legacy_stop_list:
+                candidates.extend([
+                    ("/api/v1/private/stoporder/list/orders", {"state": 1, "is_finished": 0, "page_num": 1, "page_size": 100}),
+                    ("/api/v1/private/stoporder/list/orders", {"is_finished": 0, "page_num": 1, "page_size": 100}),
+                ])
         orders = []
         errors = []
         for path, query in candidates:

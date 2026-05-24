@@ -357,6 +357,135 @@ async def create_fresh_scanner_status(app, settings: dict, status: str = "waitin
         log.warning("fresh scanner status send failed: %s", e)
 
 
+async def quick_bounce_progress_message(app, pct: int, *, done: bool = False, clear: bool = False) -> None:
+    """Move the quick-bounce scan progress to the bottom with only 3 updates.
+
+    We delete the previous progress message and send a fresh one for 10/50/100%.
+    This keeps the chat current without high-frequency Telegram edits.
+    """
+    chat_id = first_admin_id()
+    if not chat_id:
+        return
+    old_id = app.bot_data.get("quick_bounce_progress_message_id")
+    if old_id:
+        try:
+            await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_id)), timeout=4)
+        except Exception as e:
+            log.debug("quick bounce progress delete skipped: %s", e)
+        app.bot_data["quick_bounce_progress_message_id"] = None
+    if clear:
+        log_event("quick_bounce_progress", stage="clear", ok=True, pct=pct)
+        return
+    text = f"✅ Закончил сканирование {pct}%" if done else f"🔍 Сканирование {pct}%..."
+    try:
+        msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=text), timeout=6)
+        app.bot_data["quick_bounce_progress_message_id"] = getattr(msg, "message_id", None)
+        log_event("quick_bounce_progress", stage="done" if done else "scan", ok=True, pct=pct, message_id=getattr(msg, "message_id", None))
+    except Exception as e:
+        log.warning("quick bounce progress send failed: %s", e)
+        log_event("quick_bounce_progress_error", stage="send", ok=False, pct=pct, error=str(e)[:300])
+
+
+def _qb_symbol(symbol: str) -> str:
+    return str(symbol or "-").replace("/USDT:USDT", "").replace("/USDT", "").replace("_USDT", "").upper()
+
+
+async def quick_bounce_summary_message(app, settings: dict, candidates: list[dict] | None = None, *, opened_note: str = "") -> None:
+    """Keep one quick-bounce summary panel at the bottom: delete old, send new."""
+    chat_id = first_admin_id()
+    if not chat_id:
+        return
+    candidates = candidates or []
+    try:
+        positions = await storage.positions()
+    except Exception:
+        positions = []
+    qb_positions = [p for p in positions if str(p.get("strategy", "")).lower() == "quick_bounce"]
+    open_names = [_qb_symbol(p.get("symbol")) for p in qb_positions]
+    max_slots = int(float(settings.get("quick_bounce_max_open_positions", settings.get("max_open_positions", 5)) or 5))
+    found = int(getattr(scanner, "last_ai_candidates_count", 0) or len(candidates))
+    chosen = [_qb_symbol(c.get("symbol")) for c in candidates[:max_slots]]
+    free_slots = max(0, max_slots - len(qb_positions))
+    picked_now = chosen[:free_slots]
+    reserve = chosen[free_slots:free_slots + 1]
+    try:
+        since = time.time() - 86400
+        trades = [t for t in await storage.trade_rows(since=since) if str(t.get("strategy", "")).lower() == "quick_bounce"]
+    except Exception:
+        trades = []
+    closed = [_qb_symbol(t.get("symbol")) for t in trades[-8:]]
+    killed = [_qb_symbol(t.get("symbol")) for t in trades if "time" in str(t.get("reason", "")).lower() or "time" in str(t.get("result", "")).lower()]
+    pnl = sum(float(t.get("pnl_usdt") or 0) for t in trades)
+    lines = [
+        "⚡ БЫСТРЫЙ ОТСКОК",
+        "",
+        f"Сканирование: топ {int(float(settings.get('quick_bounce_top_coins', settings.get('max_symbols', 200)) or 200))}",
+        f"Нашёл монет по условиям в круге: {found}",
+        "Выбраны лучшие: " + (", ".join(picked_now) if picked_now else "нет"),
+    ]
+    if reserve:
+        lines.append(f"Лучший кандидат при освобождении слота: {reserve[0]}")
+    lines += [
+        "Открытые на бирже: " + (", ".join(open_names) if open_names else "нет"),
+        "Закрытые на бирже: " + (", ".join(closed) if closed else "нет"),
+        f"Заполнены {len(qb_positions)}/{max_slots} слотов",
+        "Убитые за 12 часов: " + (", ".join(killed[-5:]) if killed else "нет"),
+        f"Общий плюс по закрытым монетам: ${pnl:+.2f}",
+    ]
+    if opened_note:
+        lines += ["", opened_note]
+    text = "\n".join(lines)[:3900]
+    old_id = app.bot_data.get("quick_bounce_summary_message_id")
+    if old_id:
+        try:
+            await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_id)), timeout=4)
+        except Exception as e:
+            log.debug("quick bounce summary delete skipped: %s", e)
+    try:
+        msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=text), timeout=6)
+        app.bot_data["quick_bounce_summary_message_id"] = getattr(msg, "message_id", None)
+        log_event(
+            "quick_bounce_summary",
+            stage="sent",
+            ok=True,
+            found=found,
+            chosen=chosen,
+            open_symbols=open_names,
+            closed_symbols=closed[-8:],
+            time_killed=killed[-5:],
+            slots=f"{len(qb_positions)}/{max_slots}",
+            closed_pnl_usdt=round(pnl, 4),
+            message_id=getattr(msg, "message_id", None),
+        )
+    except Exception as e:
+        log.warning("quick bounce summary send failed: %s", e)
+        log_event("quick_bounce_summary_error", stage="send", ok=False, error=str(e)[:300])
+
+
+def format_quick_bounce_opened(plan, placed: dict) -> str:
+    pos = placed.get("position") if isinstance(placed, dict) else None
+    pos = pos if isinstance(pos, dict) else plan.__dict__
+    entry = float(pos.get("entry_price") or plan.entry_price)
+    stop = float(pos.get("stop_price") or plan.stop_price)
+    take = float(pos.get("take_price") or plan.take_price)
+    _notional, margin, leverage, _margin_type = _position_money_fields(pos)
+    protection_mode = str(pos.get("protection_mode") or "unknown").lower()
+    if protection_mode == "exchange":
+        protection_line = "защита: реальные SL/TP на бирже"
+    elif protection_mode == "virtual":
+        protection_line = "защита: виртуальные SL/TP"
+    else:
+        protection_line = f"защита: {protection_mode}"
+    return "\n".join([
+        f"🟢 Открыл {_qb_symbol(plan.symbol)}",
+        f"${margin:.2f} плечо x{leverage}",
+        f"вход ${_fmt_price(entry)}",
+        f"стоп ${_fmt_price(stop)}",
+        f"тейк ${_fmt_price(take)}",
+        protection_line,
+    ])
+
+
 def trigger_scan_now(app, reason: str = "manual") -> None:
     """Wake the trading loop immediately instead of waiting scan_interval_sec.
 
@@ -1746,7 +1875,7 @@ async def _boost_start_worker(app):
             "boost_momentum_decay_min_profit_pct": 0.075,
             "boost_min_tp_pct": 0.12,
             "boost_max_tp_pct": 0.55,
-            "boost_live_min_exchange_profit_pct": 0.055,
+            "boost_live_min_exchange_profit_pct": 0.09,
             "boost_min_quote_volume_usdt": 1200000.0,
             "boost_min_atr_pct": 0.08,
             "boost_max_spread_pct": 0.035,
@@ -1780,10 +1909,10 @@ async def _boost_start_worker(app):
             "boost_no_forced_negative_close": True,
             "boost_hunter_trade_rare_search_often": True,
             "boost_rotate_only_if_profit": True,
-            "boost_min_profit_to_rotate_pct": 0.055,
-            "boost_rotate_strength_multiplier": 1.18,
-            "boost_rotate_min_score_gap": 7.0,
-            "boost_rotate_cooldown_sec": 25,
+            "boost_min_profit_to_rotate_pct": 0.040,
+            "boost_rotate_strength_multiplier": 1.12,
+            "boost_rotate_min_score_gap": 5.0,
+            "boost_rotate_cooldown_sec": 1,
             # v0199: automatic two-mode rotation. NORMAL rotates only from profit;
             # RESCUE is OFF by default in live: BOOST must not harvest losses.
             # It can be enabled manually only after testing, with strict limits.
@@ -2735,12 +2864,14 @@ async def cancel_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global entries_enabled
     if not allowed(update): return
-    entries_enabled = False
+    s = await storage.all_settings()
+    quick_bounce_active = str(s.get("strategy_mode", "hybrid")).lower() == "quick_bounce" and _bool_setting(s, "quick_bounce_enabled", False)
+    entries_enabled = bool(quick_bounce_active)
     _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
-    await storage.set("strategy_mode", "hybrid", bump_revision=False)
-    await reply(update, "⏳ Close all positions: command received. BOOST/new entries are OFF.", reply_markup=MAIN_MENU)
-    s = await storage.all_settings()
+    if not quick_bounce_active:
+        await storage.set("strategy_mode", "hybrid", bump_revision=False)
+    await reply(update, "⏳ Close all positions: command received." + (" Быстрый отскок останется ON и продолжит новые сканы." if quick_bounce_active else " BOOST/new entries are OFF."), reply_markup=MAIN_MENU)
     try:
         ex = await _await_with_timeout(get_exchange(s), 6, "exchange init")
         exec_engine = ExecutionEngine(storage, ex)
@@ -3175,6 +3306,83 @@ async def ai_scalping_toggle_cmd(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=MAIN_MENU,
     )
 
+
+async def quick_bounce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    global running, entries_enabled, trading_task, position_task
+    s = await storage.all_settings()
+    enabled = str(s.get("strategy_mode", "hybrid")).lower() == "quick_bounce" and _bool_setting(s, "quick_bounce_enabled", False)
+    if enabled:
+        # Toggle OFF means: stop scanner/new entries only. Existing quick_bounce
+        # positions keep their TP/SL/time-stop management. Pressing the same
+        # button again re-enables the scanner with the same quick_bounce preset.
+        await storage.set("quick_bounce_enabled", False, bump_revision=False)
+        await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+        trigger_scan_now(context.application, reason="quick_bounce:off")
+        await reply(update, "○ Быстрый отскок OFF\nСканер остановлен, новые сделки не открываются. Открытые позиции продолжают сопровождаться до TP/SL/12h.", reply_markup=MAIN_MENU)
+        return
+
+    updates = {
+        "quick_bounce_enabled": True,
+        "strategy_mode": "quick_bounce",
+        "universe_mode": "top-200",
+        "max_symbols": 200,
+        "scan_interval_sec": 900,
+        "symbol_refresh_sec": 900,
+        "max_open_positions": 5,
+        "trade_margin_pct": 0.10,
+        "quick_bounce_trade_margin_pct": 0.10,
+        "mexc_order_leverage": 10,
+        "quick_bounce_leverage": 10,
+        "quick_bounce_tp_pct": 2.0,
+        "quick_bounce_sl_pct": 2.0,
+        "quick_bounce_time_stop_sec": 43200,
+        "quick_bounce_top_coins": 200,
+        "quick_bounce_max_open_positions": 5,
+        "quick_bounce_max_candidates": 5,
+        "quick_bounce_drop_4h_pct": 5.0,
+        "quick_bounce_pump_4h_pct": 5.0,
+        "quick_bounce_reversal_pct": 1.0,
+        "quick_bounce_min_volume_ratio": 1.15,
+        "quick_bounce_max_spread_pct": 0.20,
+        "quick_bounce_min_24h_volume_usdt": 20000000.0,
+        "quick_bounce_btc_filter_enabled": True,
+        "quick_bounce_btc_max_drop_1h_pct": 2.0,
+        "quick_bounce_btc_max_pump_1h_pct": 2.0,
+        "quick_bounce_anomaly_timeframe": "1h",
+        "quick_bounce_confirm_timeframe": "15m",
+        "cooldown_after_close_sec": 21600,
+        "quick_bounce_cooldown_after_close_sec": 21600,
+        "max_daily_loss_pct": 5.0,
+        "quick_bounce_max_daily_loss_pct": 5.0,
+        "auto_strategy_adaptation": False,
+        "regime_adaptation": False,
+        "liquidity_runner_enabled": False,
+        "mirror_mode": "off",
+        "spot_confirmation_enabled": False,
+        "session_filter_enabled": False,
+        "america_short_bias_enabled": False,
+        "openai_analysis_enabled": False,
+    }
+    for k, v in updates.items():
+        await storage.set(k, v, bump_revision=False)
+    await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+    scanner.last_refresh = 0
+    entries_enabled = True
+    running = True
+    if trading_task is None or trading_task.done():
+        trading_task = context.application.create_task(trading_loop(context.application))
+    if position_task is None or position_task.done():
+        position_task = context.application.create_task(position_management_loop(context.application))
+    trigger_scan_now(context.application, reason="quick_bounce:on")
+    await reply(
+        update,
+        "✅ Быстрый отскок ON\n"
+        "Топ-200, скан 15m, до 5 сделок, 10% депозита на сделку, 10x isolated.\n"
+        "TP +2%, SL -2%, time-stop 12h. Остальные режимы отключены.",
+        reply_markup=MAIN_MENU,
+    )
+
 def _button_text_key(text: str) -> str:
     """Normalize Telegram reply-keyboard text.
 
@@ -3201,6 +3409,7 @@ def _button_mapping():
         ("🔐 API", api_cmd), ("API", api_cmd),
         ("📊 AI Stats", ai_stats_cmd), ("AI Stats", ai_stats_cmd),
         ("🤖 AI BTC/ETH scalping", ai_scalping_toggle_cmd), ("AI BTC/ETH scalping", ai_scalping_toggle_cmd),
+        ("⚡ быстрый отскок", quick_bounce_cmd), ("быстрый отскок", quick_bounce_cmd), ("Быстрый отскок", quick_bounce_cmd),
         ("🚀 BOOST MODE", boost_start_cmd), ("BOOST MODE", boost_start_cmd),
         ("🛑 STOP BOOST", boost_stop_cmd), ("STOP BOOST", boost_stop_cmd),
         ("📊 BOOST STATUS", boost_status_cmd), ("BOOST STATUS", boost_status_cmd),
@@ -3367,7 +3576,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key == "universe_mode":
             await _safe_edit_message_text(q.message, "🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], new_rev, new_settings.get("universe_mode")))
         elif key == "strategy_mode":
-            await _safe_edit_message_text(q.message, "📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("AI BTC/ETH scalp","ai_scalping"),("🚀 Boost 0-fee","boost_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], new_rev, new_settings.get("strategy_mode")))
+            await _safe_edit_message_text(q.message, "📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("⚡ Быстрый отскок","quick_bounce"),("AI BTC/ETH scalp","ai_scalping"),("🚀 Boost 0-fee","boost_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], new_rev, new_settings.get("strategy_mode")))
         elif key == "scan_market_source":
             await _safe_edit_message_text(q.message, "📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], new_rev, new_settings.get("scan_market_source", "mexc_binance")))
         elif key == "scan_interval_sec":
@@ -3447,7 +3656,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif name == "universe":
             await _safe_edit_message_text(q.message, "🌐 Universe", reply_markup=choices_menu("universe_mode", [("Top-50","top-50"),("Top-100","top-100"),("Top-200","top-200"),("Top-300","top-300"),("Adaptive","adaptive")], rev, s.get("universe_mode")))
         elif name == "strategy":
-            await _safe_edit_message_text(q.message, "📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("AI BTC/ETH scalp","ai_scalping"),("🚀 Boost 0-fee","boost_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], rev, s.get("strategy_mode")))
+            await _safe_edit_message_text(q.message, "📈 Strategy", reply_markup=choices_menu("strategy_mode", [("Momentum","momentum"),("Pullback","pullback"),("Reversal","reversal"),("Liquidity Retest","liquidity_retest"),("⚡ Быстрый отскок","quick_bounce"),("AI BTC/ETH scalp","ai_scalping"),("🚀 Boost 0-fee","boost_scalping"),("Hybrid adaptive","hybrid"),("All strategies","all")], rev, s.get("strategy_mode")))
         elif name == "marketsource":
             await _safe_edit_message_text(q.message, "📡 Фьючи | Спот", reply_markup=choices_menu("scan_market_source", [("Binance фьючи + Binance спот","binance_binance"),("MEXC фьючи + MEXC спот","mexc_mexc"),("MEXC фьючи + Binance спот","mexc_binance")], rev, s.get("scan_market_source", "mexc_binance")))
         elif name == "scan":
@@ -4009,7 +4218,7 @@ async def trading_loop(app):
                                 min_profit = float(settings.get("boost_min_profit_to_rotate_pct", 0.04) or 0.04)
                                 only_profit = _bool_setting(settings, "boost_rotate_only_if_profit", True)
                                 last_rot = float(app.bot_data.get("boost_last_rotation_ts", 0) or 0)
-                                cd = float(settings.get("boost_rotate_cooldown_sec", 20) or 20)
+                                cd = max(0.0, float(settings.get("boost_rotate_cooldown_sec", 1) or 1))
                                 cooldown_ok = time.time() - last_rot >= cd
                                 # v0199: Always keep scanning while a BOOST position is active.
                                 # NORMAL rotation: current position is already in real profit.
@@ -4396,6 +4605,16 @@ async def trading_loop(app):
                     enabled=bool(settings.get("auto_strategy_adaptation", True)),
                 )
                 scanner.last_effective_strategy = effective_strategy
+                quick_bounce_cycle = base_strategy_mode == "quick_bounce"
+                if quick_bounce_cycle and not _bool_setting(settings, "quick_bounce_enabled", False):
+                    scanner.last_signal_summary = "quick_bounce OFF: scanner stopped"
+                    scanner.last_reject_reason = "Press ⚡ быстрый отскок again to resume scanning. Existing positions are still managed."
+                    await update_scanner_status(app, settings, status="quick bounce off")
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 900)))
+                    continue
+                if quick_bounce_cycle:
+                    log_event("quick_bounce_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("quick_bounce_top_coins", settings.get("max_symbols", 200)) or 200)), anomaly_tf=str(settings.get("quick_bounce_anomaly_timeframe", "1h")), confirm_tf=str(settings.get("quick_bounce_confirm_timeframe", "15m")))
+                    await quick_bounce_progress_message(app, 10)
                 if base_strategy_mode == "all":
                     scanner.last_strategy_reason = "mode=ALL: scanning momentum+pullback+reversal (liquidity_retest is manual-only)"
                 elif base_strategy_mode == "hybrid":
@@ -4406,7 +4625,22 @@ async def trading_loop(app):
                 effective_settings["market_regime"] = regime_info.get("regime", "LOW_VOLATILITY")
                 effective_settings["market_regime_info"] = regime_info
                 effective_settings["effective_strategy_mode"] = effective_strategy
+                if quick_bounce_cycle:
+                    await quick_bounce_progress_message(app, 50)
                 candidates = await scanner.candidates(ex, effective_settings)
+                if quick_bounce_cycle:
+                    log_event(
+                        "quick_bounce_scan_done",
+                        stage="scan",
+                        ok=True,
+                        candidates=len(candidates or []),
+                        symbols=[str(c.get("symbol", "")) for c in (candidates or [])[:10]],
+                        reject_reasons=getattr(scanner, "last_reject_top_reasons", []),
+                        errors=getattr(scanner, "last_cycle_errors", 0),
+                    )
+                    await quick_bounce_progress_message(app, 100, done=True)
+                    await quick_bounce_summary_message(app, settings, candidates)
+                    await quick_bounce_progress_message(app, 100, clear=True)
                 if scanner.last_slowdown_sec:
                     scanner.last_reject_reason = f"scanner adaptive slowdown {scanner.last_slowdown_sec}s after {scanner.last_cycle_errors} errors"
                     await update_scanner_status(app, settings, status="scanner slowdown", force=True)
@@ -4520,15 +4754,34 @@ async def trading_loop(app):
                         scanner.last_reject_reason = f"opened {plan.symbol} {plan.side}"
                         opened_this_cycle = True
                         await update_scanner_status(app, settings, status="position opened", force=True)
-                        await notify_admin(
-                            app,
-                            format_position_opened(plan, placed, live, ai_verdict if ai_enabled else None),
-                            key="position_opened",
-                        )
+                        if quick_bounce_cycle:
+                            open_text = format_quick_bounce_opened(plan, placed)
+                            log_event(
+                                "quick_bounce_opened",
+                                stage="entry",
+                                ok=True,
+                                symbol=str(plan.symbol),
+                                side=str(plan.side),
+                                entry_price=float(getattr(plan, "entry_price", 0) or 0),
+                                take_price=float(getattr(plan, "take_price", 0) or 0),
+                                stop_price=float(getattr(plan, "stop_price", 0) or 0),
+                                leverage=int(float(getattr(plan, "leverage", 0) or 0)),
+                                placed=placed,
+                            )
+                            await notify_admin(app, open_text, key=f"quick_bounce_opened_{plan.symbol}_{int(time.time()*1000)}")
+                            await quick_bounce_summary_message(app, settings, candidates, opened_note=open_text)
+                        else:
+                            await notify_admin(
+                                app,
+                                format_position_opened(plan, placed, live, ai_verdict if ai_enabled else None),
+                                key="position_opened",
+                            )
                         await send_trade_chart(app, ex, plan, settings)
                     else:
                         reason = str(placed.get('reason', 'unknown'))
                         scanner.last_reject_reason = f"{plan.symbol}: execution rejected: {reason}"
+                        if quick_bounce_cycle:
+                            log_event("quick_bounce_execution_rejected", stage="entry", ok=False, symbol=str(plan.symbol), side=str(plan.side), reason=reason[:500], placed=placed)
                         if 'protection' in placed or 'position closed' in reason.lower():
                             close = placed.get('close') or {}
                             pnl = close.get('pnl_usdt')

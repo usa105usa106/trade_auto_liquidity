@@ -104,6 +104,29 @@ DEFAULT_SETTINGS = {
     "ai_scalping_liq_buffer_pct": DEFAULTS.ai_scalping_liq_buffer_pct,
     "ai_scalping_liq_max_leverage": DEFAULTS.ai_scalping_liq_max_leverage,
     "trade_margin_pct": DEFAULTS.trade_margin_pct,
+    "quick_bounce_enabled": DEFAULTS.quick_bounce_enabled,
+    "quick_bounce_top_coins": DEFAULTS.quick_bounce_top_coins,
+    "quick_bounce_scan_interval_sec": DEFAULTS.quick_bounce_scan_interval_sec,
+    "quick_bounce_trade_margin_pct": DEFAULTS.quick_bounce_trade_margin_pct,
+    "quick_bounce_max_open_positions": DEFAULTS.quick_bounce_max_open_positions,
+    "quick_bounce_leverage": DEFAULTS.quick_bounce_leverage,
+    "quick_bounce_tp_pct": DEFAULTS.quick_bounce_tp_pct,
+    "quick_bounce_sl_pct": DEFAULTS.quick_bounce_sl_pct,
+    "quick_bounce_time_stop_sec": DEFAULTS.quick_bounce_time_stop_sec,
+    "quick_bounce_drop_4h_pct": DEFAULTS.quick_bounce_drop_4h_pct,
+    "quick_bounce_pump_4h_pct": DEFAULTS.quick_bounce_pump_4h_pct,
+    "quick_bounce_reversal_pct": DEFAULTS.quick_bounce_reversal_pct,
+    "quick_bounce_min_volume_ratio": DEFAULTS.quick_bounce_min_volume_ratio,
+    "quick_bounce_max_spread_pct": DEFAULTS.quick_bounce_max_spread_pct,
+    "quick_bounce_min_24h_volume_usdt": DEFAULTS.quick_bounce_min_24h_volume_usdt,
+    "quick_bounce_btc_filter_enabled": DEFAULTS.quick_bounce_btc_filter_enabled,
+    "quick_bounce_btc_max_drop_1h_pct": DEFAULTS.quick_bounce_btc_max_drop_1h_pct,
+    "quick_bounce_btc_max_pump_1h_pct": DEFAULTS.quick_bounce_btc_max_pump_1h_pct,
+    "quick_bounce_cooldown_after_close_sec": DEFAULTS.quick_bounce_cooldown_after_close_sec,
+    "quick_bounce_max_daily_loss_pct": DEFAULTS.quick_bounce_max_daily_loss_pct,
+    "quick_bounce_anomaly_timeframe": DEFAULTS.quick_bounce_anomaly_timeframe,
+    "quick_bounce_confirm_timeframe": DEFAULTS.quick_bounce_confirm_timeframe,
+    "quick_bounce_max_candidates": DEFAULTS.quick_bounce_max_candidates,
     "boost_zero_fee_scanner_enabled": DEFAULTS.boost_zero_fee_scanner_enabled,
     "boost_balance_share": DEFAULTS.boost_balance_share,
     "boost_trade_margin_pct": 0.35,
@@ -115,8 +138,8 @@ DEFAULT_SETTINGS = {
     # v0219: HUNTER fast profit extraction. These are PRICE-move pct,
     # not leveraged ROE. Exchange uPnL must still confirm real profit.
     "boost_fast_profit_enabled": True,
-    "boost_fast_profit_min_pct": 0.012,
-    "boost_fast_profit_exchange_min_pct": 0.002,
+    "boost_fast_profit_min_pct": 0.11,
+    "boost_fast_profit_exchange_min_pct": 0.09,
     "boost_fast_profit_min_age_sec": 2,
     "boost_fast_profit_max_hold_sec": 12,
     "boost_fast_trailing_start_pct": 0.022,
@@ -292,8 +315,8 @@ class Storage:
         try:
             if await self.get("v0222_fast_profit_real_migrated") is None:
                 await self.set("boost_fast_profit_enabled", True, bump_revision=False)
-                await self.set("boost_fast_profit_min_pct", 0.012, bump_revision=False)
-                await self.set("boost_fast_profit_exchange_min_pct", 0.002, bump_revision=False)
+                await self.set("boost_fast_profit_min_pct", 0.11, bump_revision=False)
+                await self.set("boost_fast_profit_exchange_min_pct", 0.09, bump_revision=False)
                 await self.set("boost_fast_profit_min_age_sec", 2, bump_revision=False)
                 await self.set("boost_fast_profit_max_hold_sec", 12, bump_revision=False)
                 await self.set("boost_fast_trailing_start_pct", 0.022, bump_revision=False)
@@ -301,6 +324,18 @@ class Storage:
                 await self.set("boost_momentum_decay_profit_pct", 0.006, bump_revision=False)
                 await self.set("boost_fast_profit_wait_event_cooldown_sec", 999999, bump_revision=False)
                 await self.set("v0222_fast_profit_real_migrated", True, bump_revision=False)
+        except Exception:
+            pass
+        # v0225: fee-aware BOOST profit gate. Tiny +0.01%/+0.03% moves can be
+        # negative on the real balance after taker fees/slippage. Force live
+        # profit extraction to wait for a fee-covered exchange move.
+        try:
+            if await self.get("v0225_fee_aware_profit_migrated") is None:
+                await self.set("boost_fast_profit_min_pct", 0.11, bump_revision=False)
+                await self.set("boost_fast_profit_exchange_min_pct", 0.09, bump_revision=False)
+                await self.set("boost_live_min_exchange_profit_pct", 0.09, bump_revision=False)
+                await self.set("boost_min_profit_to_rotate_pct", 0.09, bump_revision=False)
+                await self.set("v0225_fee_aware_profit_migrated", True, bump_revision=False)
         except Exception:
             pass
 

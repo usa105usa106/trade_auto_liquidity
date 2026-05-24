@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0221 ACTIVE MANAGE FIX")
+VERSION = os.getenv("BOT_VERSION", "0231 QUICK BOUNCE REAL TPSL FALLBACK")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -131,6 +131,30 @@ class Defaults:
     ai_scalping_liq_max_leverage: int = env_int("AI_SCALPING_LIQ_MAX_LEVERAGE", 200)
     ai_scalping_protection_delay_sec: float = env_float("AI_SCALPING_PROTECTION_DELAY_SEC", 3.0)
     trade_margin_pct: float = env_float("TRADE_MARGIN_PCT", 0.10)
+
+    quick_bounce_enabled: bool = env_bool("QUICK_BOUNCE_ENABLED", False)
+    quick_bounce_top_coins: int = env_int("QUICK_BOUNCE_TOP_COINS", 200)
+    quick_bounce_scan_interval_sec: int = env_int("QUICK_BOUNCE_SCAN_INTERVAL_SEC", 900)
+    quick_bounce_trade_margin_pct: float = env_float("QUICK_BOUNCE_TRADE_MARGIN_PCT", 0.10)
+    quick_bounce_max_open_positions: int = env_int("QUICK_BOUNCE_MAX_OPEN_POSITIONS", 5)
+    quick_bounce_leverage: int = env_int("QUICK_BOUNCE_LEVERAGE", 10)
+    quick_bounce_tp_pct: float = env_float("QUICK_BOUNCE_TP_PCT", 2.0)
+    quick_bounce_sl_pct: float = env_float("QUICK_BOUNCE_SL_PCT", 2.0)
+    quick_bounce_time_stop_sec: int = env_int("QUICK_BOUNCE_TIME_STOP_SEC", 43200)
+    quick_bounce_drop_4h_pct: float = env_float("QUICK_BOUNCE_DROP_4H_PCT", 5.0)
+    quick_bounce_pump_4h_pct: float = env_float("QUICK_BOUNCE_PUMP_4H_PCT", 5.0)
+    quick_bounce_reversal_pct: float = env_float("QUICK_BOUNCE_REVERSAL_PCT", 1.0)
+    quick_bounce_min_volume_ratio: float = env_float("QUICK_BOUNCE_MIN_VOLUME_RATIO", 1.15)
+    quick_bounce_max_spread_pct: float = env_float("QUICK_BOUNCE_MAX_SPREAD_PCT", 0.20)
+    quick_bounce_min_24h_volume_usdt: float = env_float("QUICK_BOUNCE_MIN_24H_VOLUME_USDT", 20000000.0)
+    quick_bounce_btc_filter_enabled: bool = env_bool("QUICK_BOUNCE_BTC_FILTER_ENABLED", True)
+    quick_bounce_btc_max_drop_1h_pct: float = env_float("QUICK_BOUNCE_BTC_MAX_DROP_1H_PCT", 2.0)
+    quick_bounce_btc_max_pump_1h_pct: float = env_float("QUICK_BOUNCE_BTC_MAX_PUMP_1H_PCT", 2.0)
+    quick_bounce_cooldown_after_close_sec: int = env_int("QUICK_BOUNCE_COOLDOWN_AFTER_CLOSE_SEC", 21600)
+    quick_bounce_max_daily_loss_pct: float = env_float("QUICK_BOUNCE_MAX_DAILY_LOSS_PCT", 5.0)
+    quick_bounce_anomaly_timeframe: str = os.getenv("QUICK_BOUNCE_ANOMALY_TIMEFRAME", "1h")
+    quick_bounce_confirm_timeframe: str = os.getenv("QUICK_BOUNCE_CONFIRM_TIMEFRAME", "15m")
+    quick_bounce_max_candidates: int = env_int("QUICK_BOUNCE_MAX_CANDIDATES", 5)
 
     # v0175 Boost Whitelist Commands: /boost_list accepts BTC,ETH,SOL format and /boost_list_del clears trusted zero-fee symbols.
     boost_zero_fee_scanner_enabled: bool = env_bool("BOOST_ZERO_FEE_SCANNER_ENABLED", True)

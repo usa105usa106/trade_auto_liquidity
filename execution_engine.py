@@ -670,9 +670,42 @@ class ExecutionEngine:
                         pos.update(protection)
                         pos["updated_at"] = time.time()
                         await self.storage.upsert_position(pos)
+                    elif strategy_name == "quick_bounce":
+                        # v0231: Quick Bounce must try real exchange SL/TP first, but if
+                        # MEXC rejects/does not confirm them, DO NOT panic-close the entry.
+                        # Keep the position open and let PositionManager enforce virtual
+                        # TP/SL/time-stop. This matches the requested fallback behavior.
+                        protection.update({
+                            "ok": True,
+                            "protection_status": "VIRTUAL_PROTECTED",
+                            "protection_mode": "virtual",
+                            "real_tpsl_failed": True,
+                            "virtual_tp_sl_active": True,
+                            "protection_note": "exchange SL/TP failed; quick_bounce remains open under virtual TP/SL monitor",
+                            "quick_bounce_virtual_since": time.time(),
+                            "quick_bounce_real_tpsl_error": str(protection.get("tpsl_error") or protection.get("tp_error") or protection.get("sl_error") or protection.get("verify_error") or protection.get("protection_warning") or "")[:700],
+                        })
+                        pos.update(protection)
+                        pos["updated_at"] = time.time()
+                        await self.storage.upsert_position(pos)
+                        try:
+                            from debug_log import log_event
+                            log_event(
+                                "quick_bounce_virtual_protection",
+                                stage="protection",
+                                ok=True,
+                                symbol=pos.get("symbol"),
+                                side=pos.get("side"),
+                                take_price=pos.get("take_price"),
+                                stop_price=pos.get("stop_price"),
+                                real_tpsl_failed=True,
+                                reason=protection.get("quick_bounce_real_tpsl_error"),
+                            )
+                        except Exception:
+                            pass
                     else:
                         # v0148 hard rule for non-BOOST live scalping: no confirmed exchange TP/SL
-                        # means no position.  BOOST is exempt above.
+                        # means no position.  BOOST and Quick Bounce are exempt above.
                         reason = "protection_failed_no_exchange_tpsl"
                         if bool(pos.get("liquidation_stop_mode")):
                             reason = "protection_failed_no_exchange_tp_liq_mode"
@@ -1291,7 +1324,10 @@ class ExecutionEngine:
         close_attempts = []
         strategy = str(pos.get("strategy") or "").lower()
         live_boost = bool(live and strategy == "boost_scalping")
-        live_cash_before = await self._balance_cash_usdt() if live_boost else None
+        # v0225: take a real futures cash snapshot for every LIVE close, not only
+        # BOOST. Local mark-price PnL does not include MEXC fees/slippage and can
+        # report a fake win while the account balance is down.
+        live_cash_before = await self._balance_cash_usdt() if live else None
         if live:
             try:
                 # Close the exact exchange row/holdVol when available and keep
@@ -1332,22 +1368,31 @@ class ExecutionEngine:
             notional = abs(float(pos.get("qty") or 0) * entry)
         pnl_usdt = pnl_pct / 100.0 * notional
         pnl_source = "local_price"
-        if live_boost and live_cash_before is not None:
+        if live and live_cash_before is not None:
             # Let MEXC settle the market close, then use the actual cash delta.
-            # This prevents Telegram/session BOOST bank from showing a fake win
-            # when local price said +0.04% but live slippage closed negative.
+            # This prevents Telegram/session stats from showing a fake win when
+            # local mark price is positive but fees/slippage make balance negative.
             try:
-                await asyncio.sleep(float(os.getenv("BOOST_REALIZED_PNL_SETTLE_SEC", "0.8")))
+                await asyncio.sleep(float(os.getenv("BOOST_REALIZED_PNL_SETTLE_SEC", "2.2")))
             except Exception:
                 pass
-            live_cash_after = await self._balance_cash_usdt()
+            live_cash_after = None
+            # MEXC can return one stale balance right after a close. Sample a few
+            # times and use the last valid cashBalance-like value.
+            for _ in range(3):
+                live_cash_after = await self._balance_cash_usdt()
+                if live_cash_after is not None:
+                    try:
+                        await asyncio.sleep(0.35)
+                    except Exception:
+                        pass
             if live_cash_after is not None:
                 delta = float(live_cash_after) - float(live_cash_before)
-                # Ignore impossible huge deltas caused by a stale balance read, but
-                # accept small negative/positive real execution differences.
+                # Ignore impossible huge deltas caused by a stale/wrong balance read,
+                # but accept small negative/positive real execution differences.
                 if abs(delta) <= max(10.0, abs(notional) * 0.25 + 2.0):
                     pnl_usdt = delta
-                    pnl_source = "exchange_cash_delta"
+                    pnl_source = "exchange_cash_delta_after_fees"
                     if notional > 0:
                         pnl_pct = (pnl_usdt / notional) * 100.0
 
