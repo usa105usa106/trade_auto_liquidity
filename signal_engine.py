@@ -91,6 +91,10 @@ class SignalEngine:
         self.quick_bounce_btc_max_pump_1h_pct = float(os.getenv("QUICK_BOUNCE_BTC_MAX_PUMP_1H_PCT", "2.0"))
         self.impulse_dump_min_drop_pct = float(os.getenv("IMPULSE_DUMP_MIN_DROP_PCT", "3.0"))
         self.impulse_dump_max_drop_pct = float(os.getenv("IMPULSE_DUMP_MAX_DROP_PCT", "6.0"))
+        self.impulse_dump_15m_min_drop_pct = float(os.getenv("IMPULSE_DUMP_15M_MIN_DROP_PCT", "1.0"))
+        self.impulse_dump_15m_max_drop_pct = float(os.getenv("IMPULSE_DUMP_15M_MAX_DROP_PCT", "3.0"))
+        self.impulse_dump_4h_max_drop_pct = float(os.getenv("IMPULSE_DUMP_4H_MAX_DROP_PCT", "6.0"))
+        self.impulse_dump_24h_max_drop_pct = float(os.getenv("IMPULSE_DUMP_24H_MAX_DROP_PCT", "6.0"))
         self.impulse_dump_total_drop_target_pct = float(os.getenv("IMPULSE_DUMP_TOTAL_DROP_TARGET_PCT", "10.0"))
         self.impulse_dump_sl_pct = float(os.getenv("IMPULSE_DUMP_SL_PCT", "2.0"))
         self.impulse_dump_min_volume_ratio = float(os.getenv("IMPULSE_DUMP_MIN_VOLUME_RATIO", "1.05"))
@@ -151,6 +155,10 @@ class SignalEngine:
         self.quick_bounce_btc_max_pump_1h_pct = self._float_setting(settings, "quick_bounce_btc_max_pump_1h_pct", self.quick_bounce_btc_max_pump_1h_pct)
         self.impulse_dump_min_drop_pct = self._float_setting(settings, "impulse_dump_min_drop_pct", self.impulse_dump_min_drop_pct)
         self.impulse_dump_max_drop_pct = self._float_setting(settings, "impulse_dump_max_drop_pct", self.impulse_dump_max_drop_pct)
+        self.impulse_dump_15m_min_drop_pct = self._float_setting(settings, "impulse_dump_15m_min_drop_pct", self.impulse_dump_15m_min_drop_pct)
+        self.impulse_dump_15m_max_drop_pct = self._float_setting(settings, "impulse_dump_15m_max_drop_pct", self.impulse_dump_15m_max_drop_pct)
+        self.impulse_dump_4h_max_drop_pct = self._float_setting(settings, "impulse_dump_4h_max_drop_pct", self.impulse_dump_4h_max_drop_pct)
+        self.impulse_dump_24h_max_drop_pct = self._float_setting(settings, "impulse_dump_24h_max_drop_pct", self.impulse_dump_24h_max_drop_pct)
         self.impulse_dump_total_drop_target_pct = self._float_setting(settings, "impulse_dump_total_drop_target_pct", self.impulse_dump_total_drop_target_pct)
         self.impulse_dump_sl_pct = self._float_setting(settings, "impulse_dump_sl_pct", self.impulse_dump_sl_pct)
         self.impulse_dump_min_volume_ratio = self._float_setting(settings, "impulse_dump_min_volume_ratio", self.impulse_dump_min_volume_ratio)
@@ -534,14 +542,38 @@ class SignalEngine:
         return len(blockers) <= 2
 
 
-    def _impulse_dump(self, symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=None, ticker=None, market_context=None):
-        """Cascade SHORT mode.
+    @staticmethod
+    def _ticker_change_24h_pct(ticker) -> float | None:
+        """Extract 24h percent change from common CCXT/MEXC ticker shapes.
 
-        Finds coins that have already fallen 3-6% over the 1h/4h context and
-        only shorts if 15m confirms continuation. TP is not a fixed 10% from
-        entry: it targets about -10% total move from the pre-dump anchor, so a
-        -4% current dump gets about 6% more TP, while a -6% current dump gets
-        about 4% more TP.
+        MEXC often returns riseFallRate/changeRate as a fraction (-0.05 = -5%).
+        Some REST/CCXT shapes return percent already (-5 = -5%).
+        """
+        if not isinstance(ticker, dict):
+            return None
+        info = ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
+        for key in ("percentage", "change24h", "priceChangePercent", "riseFallRate", "changeRate"):
+            val = ticker.get(key, None)
+            if val is None:
+                val = info.get(key, None)
+            if val is None:
+                continue
+            try:
+                pct_val = float(val)
+                if abs(pct_val) <= 1.0:
+                    pct_val *= 100.0
+                return pct_val
+            except Exception:
+                continue
+        return None
+
+    def _impulse_dump(self, symbol, close, candles, vol_ratio, atrp, spread_pct, depth_usdt, imbalance, candles_1h=None, ticker=None, market_context=None):
+        """Cascade SHORT mode, v0241.
+
+        15m/1h decide the entry moment. 4h/24h prevent late shorts.
+        TP is calculated from the 24h total drop target, not leveraged ROI:
+        if 24h is already -5%, target is about another -5% from entry.
+        SL is always +2% from the actual/current entry price for SHORT.
         """
         out = []
         self.last_impulse_dump_reject_reason = "not enough candles"
@@ -556,9 +588,10 @@ class SignalEngine:
 
         quote_vol = 0.0
         if isinstance(ticker, dict):
-            for key in ("quoteVolume", "quote_volume", "amount24", "volume24"):
+            info = ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
+            for key in ("quoteVolume", "quote_volume", "amount24", "volume24", "quoteVolume24h"):
                 try:
-                    quote_vol = float(ticker.get(key) or 0)
+                    quote_vol = float(ticker.get(key) or info.get(key) or 0)
                     if quote_vol > 0:
                         break
                 except Exception:
@@ -578,18 +611,49 @@ class SignalEngine:
             return out
 
         opens15 = [float(c[1]) for c in candles]
-        highs15 = [float(c[2]) for c in candles]
         lows15 = [float(c[3]) for c in candles]
         closes15 = [float(c[4]) for c in candles]
         vols15 = [float(c[5]) for c in candles]
         closes1h = [float(c[4]) for c in candles_1h]
 
-        lookback_1h = min(len(candles_1h), 5)
-        anchor = closes1h[-lookback_1h]
-        move_4h_pct = pct(close, anchor)
-        drop_abs = abs(move_4h_pct) if move_4h_pct < 0 else 0.0
-        min_drop = abs(self.impulse_dump_min_drop_pct)
-        max_drop = abs(self.impulse_dump_max_drop_pct)
+        # Entry timing filters.
+        move_15m_pct = pct(closes15[-1], closes15[-2]) if len(closes15) >= 2 else 0.0
+        move_1h_pct = pct(close, closes1h[-2]) if len(closes1h) >= 2 else 0.0
+        anchor_4h = closes1h[-5] if len(closes1h) >= 5 else closes1h[0]
+        move_4h_pct = pct(close, anchor_4h)
+
+        # 24h context: prefer ticker 24h change, fallback to 1h candles.
+        change_24h_pct = self._ticker_change_24h_pct(ticker)
+        if change_24h_pct is None and len(closes1h) >= 25:
+            change_24h_pct = pct(close, closes1h[-25])
+        if change_24h_pct is None:
+            # Conservative fallback: use 4h drop as context when 24h is unavailable.
+            change_24h_pct = move_4h_pct
+
+        drop15_abs = abs(move_15m_pct) if move_15m_pct < 0 else 0.0
+        drop1h_abs = abs(move_1h_pct) if move_1h_pct < 0 else 0.0
+        drop4h_abs = abs(move_4h_pct) if move_4h_pct < 0 else 0.0
+        drop24_abs = abs(change_24h_pct) if change_24h_pct < 0 else 0.0
+
+        min15 = abs(self.impulse_dump_15m_min_drop_pct)
+        max15 = abs(self.impulse_dump_15m_max_drop_pct)
+        min1h = abs(self.impulse_dump_min_drop_pct)
+        max1h = abs(self.impulse_dump_max_drop_pct)
+        max4h = abs(self.impulse_dump_4h_max_drop_pct)
+        max24h = abs(self.impulse_dump_24h_max_drop_pct)
+
+        if not (min15 <= drop15_abs <= max15):
+            self.last_impulse_dump_reject_reason = f"15m drop outside 1-3% move15={move_15m_pct:+.2f}%"
+            return out
+        if not (min1h <= drop1h_abs <= max1h):
+            self.last_impulse_dump_reject_reason = f"1h drop outside 3-6% move1h={move_1h_pct:+.2f}%"
+            return out
+        if drop4h_abs > max4h:
+            self.last_impulse_dump_reject_reason = f"4h drop late {drop4h_abs:.2f}% > {max4h:.2f}% move4h={move_4h_pct:+.2f}%"
+            return out
+        if drop24_abs > max24h:
+            self.last_impulse_dump_reject_reason = f"24h drop late {drop24_abs:.2f}% > {max24h:.2f}% change24h={change_24h_pct:+.2f}%"
+            return out
 
         recent_vol = mean(vols15[-4:]) if len(vols15) >= 4 else vols15[-1]
         base_vol = mean(vols15[-20:-4]) if len(vols15) >= 24 else mean(vols15[:-4] or vols15)
@@ -602,24 +666,27 @@ class SignalEngine:
         lower_low = lows15[-1] <= min(lows15[-5:-1]) if len(lows15) >= 6 else False
         weak_bounce_failed = closes15[-1] < mean(closes15[-4:-1]) if len(closes15) >= 5 else False
         continuation_ok = last_red or lower_low or weak_bounce_failed
-
-        if not (min_drop <= drop_abs <= max_drop):
-            self.last_impulse_dump_reject_reason = f"drop outside 3-6% move4h={move_4h_pct:+.2f}%"
-            return out
         if not continuation_ok:
-            self.last_impulse_dump_reject_reason = f"no 15m continuation move4h={move_4h_pct:+.2f}% red={last_red} lower_low={lower_low} weak_bounce_failed={weak_bounce_failed} vol={local_vol_ratio:.2f}"
+            self.last_impulse_dump_reject_reason = f"no 15m continuation move15={move_15m_pct:+.2f}% move1h={move_1h_pct:+.2f}% red={last_red} lower_low={lower_low} weak_bounce_failed={weak_bounce_failed} vol={local_vol_ratio:.2f}"
             return out
 
-        tp_pct = max(0.5, self.impulse_dump_total_drop_target_pct - drop_abs)
-        # User target: entry after -3..-6%, then catch remaining 7..4% to total -10%.
+        # TP is remaining clean price move to total -10% on 24h context.
+        tp_pct = self.impulse_dump_total_drop_target_pct - drop24_abs
+        tp_pct = max(0.5, tp_pct)
+        # Practical guardrails from the strategy brief: after 3-6% dump, catch 7-4% more.
         tp_pct = max(4.0, min(7.0, tp_pct))
+        # SL is always from entry/current price, not from 24h context.
         sl_pct = max(0.01, self.impulse_dump_sl_pct)
         rr = round(tp_pct / sl_pct, 6) if sl_pct > 0 else 1.0
-        score = 72 + min(10, (drop_abs - min_drop) * 2.0) + min(8, max(0, local_vol_ratio - 1) * 5) + (3 if imbalance < 0 else 0) + (2 if lower_low else 0)
+        score = 72 + min(10, (drop1h_abs - min1h) * 2.0) + min(8, max(0, local_vol_ratio - 1) * 5) + (3 if imbalance < 0 else 0) + (2 if lower_low else 0)
         out.append(self._base(symbol, "SHORT", "impulse_dump", close, score, spread_pct, depth_usdt, atrp, {
-            "setup": "3_6pct_dump_short_continuation",
+            "setup": "15m_1h_dump_short_24h_context",
+            "move_15m_pct": round(move_15m_pct, 3),
+            "move_1h_pct": round(move_1h_pct, 3),
             "move_4h_pct": round(move_4h_pct, 3),
-            "current_drop_pct": round(drop_abs, 3),
+            "change_24h_pct": round(change_24h_pct, 3),
+            "current_drop_pct": round(drop1h_abs, 3),
+            "drop_24h_pct": round(drop24_abs, 3),
             "target_total_drop_pct": round(self.impulse_dump_total_drop_target_pct, 3),
             "tp_pct": round(tp_pct, 4),
             "sl_pct": round(sl_pct, 4),
@@ -627,7 +694,7 @@ class SignalEngine:
             "volume_ratio": round(local_vol_ratio, 3),
             "quote_volume_24h": round(quote_vol, 2),
             "btc_change_1h_pct": btc_change_1h,
-            "anomaly_tf": "1h", "confirm_tf": "15m",
+            "anomaly_tf": "1h", "confirm_tf": "15m", "context_tf": "24h",
         }))
         return out
 

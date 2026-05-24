@@ -3524,6 +3524,10 @@ async def impulse_dump_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "impulse_dump_total_drop_target_pct": 10.0,
         "impulse_dump_min_drop_pct": 3.0,
         "impulse_dump_max_drop_pct": 6.0,
+        "impulse_dump_15m_min_drop_pct": 1.0,
+        "impulse_dump_15m_max_drop_pct": 3.0,
+        "impulse_dump_4h_max_drop_pct": 6.0,
+        "impulse_dump_24h_max_drop_pct": 6.0,
         "impulse_dump_time_stop_sec": 86400,
         "impulse_dump_top_coins": 200,
         "impulse_dump_max_open_positions": 5,
@@ -3565,7 +3569,7 @@ async def impulse_dump_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         "✅ Импульсный слив ON\n"
         "Топ-200, скан 15m, только SHORT, падение 3–6% за 1h/4h, до 5 сделок, 10% депозита, 10x isolated.\n"
-        "SL +2% от входа, TP до общего падения ≈10%, time-stop 24h. После 3 SL подряд режим стоп до следующего дня.",
+        "SL +2% от входа, TP считается до общего 24h падения ≈10%, time-stop 24h. После 3 SL подряд режим стоп до следующего дня.",
         reply_markup=MAIN_MENU,
     )
 

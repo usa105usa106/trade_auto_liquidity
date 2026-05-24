@@ -407,10 +407,17 @@ class PositionManager:
             is_liquidity_retest = strategy == "liquidity_retest"
             is_ai_scalping = strategy == "ai_scalping"
             is_boost_scalping = strategy == "boost_scalping"
+            is_impulse_dump = strategy == "impulse_dump"
             liquidation_stop_mode = bool(pos.get("liquidation_stop_mode")) and is_ai_scalping
             ai_manage_only_tpsl = str(await self._setting("ai_scalping_manage_only_tpsl", os.getenv("AI_SCALPING_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
             boost_manage_only_tpsl = str(await self._setting("boost_manage_only_tpsl", os.getenv("BOOST_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
-            manage_only_tpsl = (is_ai_scalping and ai_manage_only_tpsl) or (is_boost_scalping and boost_manage_only_tpsl)
+            # v0240: impulse_dump must be closed only by its explicit PRICE
+            # targets (exchange/local TP and SL), 24h hard timeout, or manual
+            # close. Do not apply generic scalp ROI/trailing/smart time-stop or
+            # breakeven moves; those can close after a leveraged PnL percentage
+            # before the price reaches the calculated dump target.
+            impulse_manage_only_tpsl = str(await self._setting("impulse_dump_manage_only_tpsl", os.getenv("IMPULSE_DUMP_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
+            manage_only_tpsl = (is_ai_scalping and ai_manage_only_tpsl) or (is_boost_scalping and boost_manage_only_tpsl) or (is_impulse_dump and impulse_manage_only_tpsl)
             policy = await self._refresh_scalp_policy()
             policy.update_best_pnl(pos, pnl)
             if manage_only_tpsl:

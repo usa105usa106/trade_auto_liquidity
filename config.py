@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0239 IMPULSE DUMP MODE")
+VERSION = os.getenv("BOT_VERSION", "0241 IMPULSE DUMP 24H CONTEXT TP")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -167,6 +167,10 @@ class Defaults:
     impulse_dump_total_drop_target_pct: float = env_float("IMPULSE_DUMP_TOTAL_DROP_TARGET_PCT", 10.0)
     impulse_dump_min_drop_pct: float = env_float("IMPULSE_DUMP_MIN_DROP_PCT", 3.0)
     impulse_dump_max_drop_pct: float = env_float("IMPULSE_DUMP_MAX_DROP_PCT", 6.0)
+    impulse_dump_15m_min_drop_pct: float = env_float("IMPULSE_DUMP_15M_MIN_DROP_PCT", 1.0)
+    impulse_dump_15m_max_drop_pct: float = env_float("IMPULSE_DUMP_15M_MAX_DROP_PCT", 3.0)
+    impulse_dump_4h_max_drop_pct: float = env_float("IMPULSE_DUMP_4H_MAX_DROP_PCT", 6.0)
+    impulse_dump_24h_max_drop_pct: float = env_float("IMPULSE_DUMP_24H_MAX_DROP_PCT", 6.0)
     impulse_dump_time_stop_sec: int = env_int("IMPULSE_DUMP_TIME_STOP_SEC", 86400)
     impulse_dump_min_volume_ratio: float = env_float("IMPULSE_DUMP_MIN_VOLUME_RATIO", 1.05)
     impulse_dump_max_spread_pct: float = env_float("IMPULSE_DUMP_MAX_SPREAD_PCT", 0.30)
@@ -179,6 +183,7 @@ class Defaults:
     impulse_dump_anomaly_timeframe: str = os.getenv("IMPULSE_DUMP_ANOMALY_TIMEFRAME", "1h")
     impulse_dump_confirm_timeframe: str = os.getenv("IMPULSE_DUMP_CONFIRM_TIMEFRAME", "15m")
     impulse_dump_max_candidates: int = env_int("IMPULSE_DUMP_MAX_CANDIDATES", 5)
+    impulse_dump_manage_only_tpsl: bool = env_bool("IMPULSE_DUMP_MANAGE_ONLY_TPSL", True)
 
     # v0175 Boost Whitelist Commands: /boost_list accepts BTC,ETH,SOL format and /boost_list_del clears trusted zero-fee symbols.
     boost_zero_fee_scanner_enabled: bool = env_bool("BOOST_ZERO_FEE_SCANNER_ENABLED", True)
