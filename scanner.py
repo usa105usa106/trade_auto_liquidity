@@ -502,7 +502,7 @@ class Scanner:
 
         self.engine.configure_from_settings(settings)
         top_n = int(float(settings.get("orderflow_impulse_top_coins", 100) or 100))
-        min_quote = float(settings.get("orderflow_impulse_min_24h_volume_usdt", 20000000.0) or 0)
+        min_quote = float(settings.get("orderflow_impulse_min_24h_volume_usdt", 5000000.0) or 0)
         min_vol_ratio = float(settings.get("orderflow_impulse_min_volume_ratio", 1.5) or 1.5)
         # v0256: previous builds wrote 2.0 into persistent settings when the
         # button was toggled. For the agreed orderflow mode, cap the live
@@ -776,11 +776,15 @@ class Scanner:
 
         self.engine.configure_from_settings(settings)
         top_n = int(float(settings.get("cascade_hunter_top_coins", 100) or 100))
-        min_quote = float(settings.get("cascade_hunter_min_24h_volume_usdt", 15000000.0) or 0)
+        min_quote = float(settings.get("cascade_hunter_min_24h_volume_usdt", 5000000.0) or 0)
         # Keep the old setting name so Telegram/settings stay compatible. On
         # spot this means minimum cascade-pressure notional, not real futures
         # liquidation prints.
-        min_pressure_usd = float(settings.get("cascade_hunter_min_liq_usd_1m", 100000.0) or 100000.0)
+        # Adaptive pressure filter for Binance SPOT proxy:
+        # fixed USD thresholds are too weak for BTC and too strict/noisy for small alts.
+        # Use pressure as a share of the last 5 minutes quote volume instead.
+        min_pressure_ratio = float(settings.get("cascade_hunter_min_pressure_ratio", 0.035) or 0.035)
+        min_pressure_usd = float(settings.get("cascade_hunter_min_liq_usd_1m", 30000.0) or 30000.0)  # legacy/stat only
         min_vol_ratio = float(settings.get("cascade_hunter_min_volume_ratio", 1.8) or 1.8)
         min_move = abs(float(settings.get("cascade_hunter_min_price_move_pct", 0.25) or 0.25))
         max_spread = abs(float(settings.get("cascade_hunter_max_spread_pct", 0.25) or 0.25))
@@ -872,7 +876,8 @@ class Scanner:
                     "prefilter_no_mexc_futures": prefilter_no_futures,
                     "selected_for_cascade": len(selected),
                     "min_24h_volume_usdt": min_quote,
-                    "min_pressure_usd": min_pressure_usd,
+                    "min_pressure_usd_legacy": min_pressure_usd,
+                    "min_pressure_ratio": min_pressure_ratio,
                 }
                 sem=asyncio.Semaphore(self._concurrency_limit(settings))
 
@@ -915,6 +920,8 @@ class Scanner:
                             ob_imb=(bid_depth-ask_depth)/(bid_depth+ask_depth) if (bid_depth+ask_depth)>0 else 0.0
                             # Spot-only proxy for liquidation-cascade pressure.
                             pressure_usd=total*max(0.0, abs(delta_ratio))*max(1.0, min(vol_ratio, 6.0))
+                            volume_5m_usd=sum(vols[-5:]) * last if vols and last else 0.0
+                            pressure_ratio=pressure_usd / max(volume_5m_usd, 1.0)
                             side=None; liq_side=""
                             if price_move >= min_move and delta_ratio > 0 and ob_imb > -0.20:
                                 side="LONG"; liq_side="BUY"
@@ -922,13 +929,13 @@ class Scanner:
                                 side="SHORT"; liq_side="SELL"
                             if spread>max_spread:
                                 record(spot_symbol, f"spot spread high {spread:.3f}% > {max_spread:.3f}%"); return None
-                            if pressure_usd<min_pressure_usd:
-                                record(spot_symbol, f"pressure weak {pressure_usd:.0f} < {min_pressure_usd:.0f}"); return None
+                            if pressure_ratio < min_pressure_ratio:
+                                record(spot_symbol, f"pressure weak ratio {pressure_ratio:.4f} < {min_pressure_ratio:.4f}"); return None
                             if vol_ratio<min_vol_ratio:
                                 record(spot_symbol, f"volume low {vol_ratio:.2f} < {min_vol_ratio:.2f}"); return None
                             if not side:
                                 record(spot_symbol, f"no acceleration move={price_move:+.3f} delta={delta_ratio:+.3f} imb={ob_imb:+.3f}"); return None
-                            score=70+min(12,pressure_usd/max(min_pressure_usd,1)*3)+min(10,abs(price_move)*10)+min(8,(vol_ratio-1)*4)+min(8,abs(delta_ratio)*20)+min(4,abs(ob_imb)*20)
+                            score=70+min(12,pressure_ratio*100.0)+min(10,abs(price_move)*10)+min(8,(vol_ratio-1)*4)+min(8,abs(delta_ratio)*20)+min(4,abs(ob_imb)*20)
                             details={
                                 "setup":"binance_spot_cascade_pressure",
                                 "spot_source":"binance_spot_public_rest",
@@ -938,6 +945,9 @@ class Scanner:
                                 "liq_usd_90s":round(pressure_usd,2),
                                 "cascade_pressure_usd":round(pressure_usd,2),
                                 "real_liquidations":"unavailable_on_spot",
+                                "pressure_ratio":round(pressure_ratio,6),
+                                "volume_5m_usdt":round(volume_5m_usd,2),
+                                "min_pressure_ratio":round(min_pressure_ratio,6),
                                 "price_move_2m_pct":round(price_move,4),
                                 "volume_ratio":round(vol_ratio,4),
                                 "delta_ratio":round(delta_ratio,5),
@@ -971,7 +981,7 @@ class Scanner:
         self.last_cascade_scan_stats={
             **getattr(self,"last_cascade_prefilter_stats",{}),
             "checked_symbols":scanned,"errors":errors,"candidates":len(out),"top_coins":top_n,
-            "min_liq_usd_1m":min_pressure_usd,"min_24h_volume_usdt":min_quote,
+            "min_liq_usd_1m_legacy":min_pressure_usd,"min_pressure_ratio":min_pressure_ratio,"min_24h_volume_usdt":min_quote,
             "source":"binance_spot_public_rest",
         }
         self.last_reject_top_reasons=reject_counts.most_common(8)
@@ -991,7 +1001,7 @@ class Scanner:
         import aiohttp, socket
         from urllib.parse import urlencode
         top_n = int(float(settings.get("knife_reversal_top_coins", settings.get("multi_strategy_top_coins", 100)) or 100))
-        min_quote = float(settings.get("knife_reversal_min_24h_volume_usdt", 20000000.0) or 0)
+        min_quote = float(settings.get("knife_reversal_min_24h_volume_usdt", 5000000.0) or 0)
         min_wick_pct = float(settings.get("knife_reversal_min_wick_pct", 1.20) or 1.20)
         min_reclaim_pct = float(settings.get("knife_reversal_min_reclaim_pct", 50.0) or 50.0)
         min_vol_ratio = float(settings.get("knife_reversal_min_volume_ratio", 2.0) or 2.0)

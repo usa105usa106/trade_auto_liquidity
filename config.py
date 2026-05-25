@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0275 SPOT MODES FIRST SCAN GUARD FIX")
+VERSION = os.getenv("BOT_VERSION", "0277 CASCADE ADAPTIVE PRESSURE")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -199,7 +199,7 @@ class Defaults:
     orderflow_impulse_min_trend_pct: float = env_float("ORDERFLOW_IMPULSE_MIN_TREND_PCT", 0.25)
     orderflow_impulse_min_imbalance_abs: float = env_float("ORDERFLOW_IMPULSE_MIN_IMBALANCE_ABS", 0.08)
     orderflow_impulse_max_spread_pct: float = env_float("ORDERFLOW_IMPULSE_MAX_SPREAD_PCT", 0.20)
-    orderflow_impulse_min_24h_volume_usdt: float = env_float("ORDERFLOW_IMPULSE_MIN_24H_VOLUME_USDT", 20000000.0)
+    orderflow_impulse_min_24h_volume_usdt: float = env_float("ORDERFLOW_IMPULSE_MIN_24H_VOLUME_USDT", 5000000.0)
     orderflow_impulse_manage_only_tpsl: bool = env_bool("ORDERFLOW_IMPULSE_MANAGE_ONLY_TPSL", True)
 
 
@@ -212,11 +212,12 @@ class Defaults:
     cascade_hunter_tp_pct: float = env_float("CASCADE_HUNTER_TP_PCT", 4.0)
     cascade_hunter_sl_pct: float = env_float("CASCADE_HUNTER_SL_PCT", 2.0)
     cascade_hunter_time_stop_sec: int = env_int("CASCADE_HUNTER_TIME_STOP_SEC", 14400)
-    cascade_hunter_min_liq_usd_1m: float = env_float("CASCADE_HUNTER_MIN_LIQ_USD_1M", 100000.0)
+    cascade_hunter_min_liq_usd_1m: float = env_float("CASCADE_HUNTER_MIN_LIQ_USD_1M", 30000.0)  # legacy/stat only after v0277
+    cascade_hunter_min_pressure_ratio: float = env_float("CASCADE_HUNTER_MIN_PRESSURE_RATIO", 0.035)
     cascade_hunter_min_volume_ratio: float = env_float("CASCADE_HUNTER_MIN_VOLUME_RATIO", 1.8)
     cascade_hunter_min_price_move_pct: float = env_float("CASCADE_HUNTER_MIN_PRICE_MOVE_PCT", 0.25)
     cascade_hunter_max_spread_pct: float = env_float("CASCADE_HUNTER_MAX_SPREAD_PCT", 0.25)
-    cascade_hunter_min_24h_volume_usdt: float = env_float("CASCADE_HUNTER_MIN_24H_VOLUME_USDT", 15000000.0)
+    cascade_hunter_min_24h_volume_usdt: float = env_float("CASCADE_HUNTER_MIN_24H_VOLUME_USDT", 5000000.0)
     cascade_hunter_tp1_r: float = env_float("CASCADE_HUNTER_TP1_R", 1.0)
     cascade_hunter_tp2_r: float = env_float("CASCADE_HUNTER_TP2_R", 2.0)
     cascade_hunter_tp1_fraction: float = env_float("CASCADE_HUNTER_TP1_FRACTION", 0.50)
@@ -229,7 +230,7 @@ class Defaults:
     knife_reversal_leverage: int = env_int("KNIFE_REVERSAL_LEVERAGE", 10)
     knife_reversal_tp_pct: float = env_float("KNIFE_REVERSAL_TP_PCT", 5.0)
     knife_reversal_wick_sl_buffer_pct: float = env_float("KNIFE_REVERSAL_WICK_SL_BUFFER_PCT", 0.20)
-    knife_reversal_min_24h_volume_usdt: float = env_float("KNIFE_REVERSAL_MIN_24H_VOLUME_USDT", 20000000.0)
+    knife_reversal_min_24h_volume_usdt: float = env_float("KNIFE_REVERSAL_MIN_24H_VOLUME_USDT", 5000000.0)
     knife_reversal_min_wick_pct: float = env_float("KNIFE_REVERSAL_MIN_WICK_PCT", 1.20)
     knife_reversal_min_reclaim_pct: float = env_float("KNIFE_REVERSAL_MIN_RECLAIM_PCT", 50.0)
     knife_reversal_min_volume_ratio: float = env_float("KNIFE_REVERSAL_MIN_VOLUME_RATIO", 2.0)
