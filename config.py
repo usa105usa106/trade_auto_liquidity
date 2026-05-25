@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0255 ORDERFLOW CLEAN LOGS VOLUME TUNE")
+VERSION = os.getenv("BOT_VERSION", "0257 ORDERFLOW TOP100 20M STRICT INTERVAL LOGS")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -187,7 +187,7 @@ class Defaults:
 
 
     orderflow_impulse_enabled: bool = env_bool("ORDERFLOW_IMPULSE_ENABLED", False)
-    orderflow_impulse_top_coins: int = env_int("ORDERFLOW_IMPULSE_TOP_COINS", 50)
+    orderflow_impulse_top_coins: int = env_int("ORDERFLOW_IMPULSE_TOP_COINS", 100)
     orderflow_impulse_scan_interval_sec: int = env_int("ORDERFLOW_IMPULSE_SCAN_INTERVAL_SEC", 60)
     orderflow_impulse_trade_margin_pct: float = env_float("ORDERFLOW_IMPULSE_TRADE_MARGIN_PCT", 0.10)
     orderflow_impulse_max_open_positions: int = env_int("ORDERFLOW_IMPULSE_MAX_OPEN_POSITIONS", 3)
@@ -199,7 +199,7 @@ class Defaults:
     orderflow_impulse_min_trend_pct: float = env_float("ORDERFLOW_IMPULSE_MIN_TREND_PCT", 0.25)
     orderflow_impulse_min_imbalance_abs: float = env_float("ORDERFLOW_IMPULSE_MIN_IMBALANCE_ABS", 0.08)
     orderflow_impulse_max_spread_pct: float = env_float("ORDERFLOW_IMPULSE_MAX_SPREAD_PCT", 0.20)
-    orderflow_impulse_min_24h_volume_usdt: float = env_float("ORDERFLOW_IMPULSE_MIN_24H_VOLUME_USDT", 50000000.0)
+    orderflow_impulse_min_24h_volume_usdt: float = env_float("ORDERFLOW_IMPULSE_MIN_24H_VOLUME_USDT", 20000000.0)
     orderflow_impulse_manage_only_tpsl: bool = env_bool("ORDERFLOW_IMPULSE_MANAGE_ONLY_TPSL", True)
 
     # v0175 Boost Whitelist Commands: /boost_list accepts BTC,ETH,SOL format and /boost_list_del clears trusted zero-fee symbols.

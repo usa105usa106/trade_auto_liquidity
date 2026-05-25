@@ -502,8 +502,8 @@ class Scanner:
         from urllib.parse import urlencode
 
         self.engine.configure_from_settings(settings)
-        top_n = int(float(settings.get("orderflow_impulse_top_coins", 50) or 50))
-        min_quote = float(settings.get("orderflow_impulse_min_24h_volume_usdt", 50000000.0) or 0)
+        top_n = int(float(settings.get("orderflow_impulse_top_coins", 100) or 100))
+        min_quote = float(settings.get("orderflow_impulse_min_24h_volume_usdt", 20000000.0) or 0)
         min_vol_ratio = float(settings.get("orderflow_impulse_min_volume_ratio", 1.5) or 1.5)
         # v0256: previous builds wrote 2.0 into persistent settings when the
         # button was toggled. For the agreed orderflow mode, cap the live

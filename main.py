@@ -674,7 +674,7 @@ async def orderflow_impulse_summary_message(app, settings: dict, candidates: lis
     lines = [
         "📊 ORDERFLOW IMPULSE",
         "",
-        f"Сканирование: Binance spot top {int(float(settings.get('orderflow_impulse_top_coins', settings.get('max_symbols', 50)) or 50))}",
+        f"Сканирование: Binance spot top {int(float(settings.get('orderflow_impulse_top_coins', settings.get('max_symbols', 100)) or 100))}",
         f"Нашёл монет по условиям в круге: {found}",
         "Выбраны лучшие: " + (", ".join(picked_now) if picked_now else "нет"),
     ]
@@ -3734,8 +3734,8 @@ async def orderflow_impulse_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         "quick_bounce_enabled": False,
         "impulse_dump_enabled": False,
         "strategy_mode": "orderflow_impulse",
-        "universe_mode": "top-50",
-        "max_symbols": 50,
+        "universe_mode": "top-100",
+        "max_symbols": 100,
         "scan_interval_sec": 60,
         "symbol_refresh_sec": 300,
         "max_open_positions": 3,
@@ -3746,13 +3746,14 @@ async def orderflow_impulse_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         "orderflow_impulse_tp_pct": 2.0,
         "orderflow_impulse_sl_pct": 1.0,
         "orderflow_impulse_time_stop_sec": 14400,
-        "orderflow_impulse_top_coins": 50,
+        "orderflow_impulse_top_coins": 100,
         "orderflow_impulse_max_open_positions": 3,
         "orderflow_impulse_min_volume_ratio": 1.5,
+        "orderflow_impulse_scan_interval_sec": 60,
         "orderflow_impulse_min_trend_pct": 0.25,
         "orderflow_impulse_min_imbalance_abs": 0.08,
         "orderflow_impulse_max_spread_pct": 0.20,
-        "orderflow_impulse_min_24h_volume_usdt": 50000000.0,
+        "orderflow_impulse_min_24h_volume_usdt": 20000000.0,
         "scan_market_source": "mexc_binance",
         "spot_confirmation_enabled": True,
         "auto_strategy_adaptation": False,
@@ -4820,6 +4821,8 @@ async def trading_loop(app):
                             scanner.last_reject_reason = f"BOOST balance precheck warning {e}"
                             await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                             continue
+                    if orderflow_impulse_cycle:
+                        log_event("orderflow_impulse_open_attempt", stage="entry", ok=True, symbol=str(plan.symbol), side=str(plan.side), live=bool(live), margin_pct=float(settings.get("orderflow_impulse_trade_margin_pct", settings.get("trade_margin_pct", 0.10)) or 0.10), leverage=int(float(getattr(plan, "leverage", settings.get("orderflow_impulse_leverage", 10)) or 10)))
                     try:
                         placed = await _await_with_timeout(exec_engine.place_entry(plan, live), 25, "boost place_entry")
                     except Exception as e:
@@ -5094,7 +5097,7 @@ async def trading_loop(app):
                     log_event("impulse_dump_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("impulse_dump_top_coins", settings.get("max_symbols", 200)) or 200)), anomaly_tf=str(settings.get("impulse_dump_anomaly_timeframe", "1h")), confirm_tf=str(settings.get("impulse_dump_confirm_timeframe", "15m")))
                     await impulse_dump_progress_message(app, 10)
                 if orderflow_impulse_cycle:
-                    log_event("orderflow_impulse_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("orderflow_impulse_top_coins", settings.get("max_symbols", 50)) or 50)), source="binance_spot_orderflow")
+                    log_event("orderflow_impulse_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("orderflow_impulse_top_coins", settings.get("max_symbols", 100)) or 100)), source="binance_spot_orderflow")
                     await orderflow_impulse_progress_message(app, 10)
                 if base_strategy_mode == "all":
                     scanner.last_strategy_reason = "mode=ALL: scanning momentum+pullback+reversal (liquidity_retest is manual-only)"
@@ -5226,8 +5229,10 @@ async def trading_loop(app):
 
                     if not cand.get("allowed_by_session", True):
                         scanner.last_reject_reason = f"{original_symbol}: session filter blocked"
+                        if orderflow_impulse_cycle:
+                            log_event("orderflow_impulse_open_skipped", stage="session", ok=False, symbol=str(original_symbol), reason="session filter blocked")
                         continue
-                    if spot_enabled and not cand.get("spot_confirmed", True):
+                    if (not orderflow_impulse_cycle) and spot_enabled and not cand.get("spot_confirmed", True):
                         scanner.last_reject_reason = (
                             f"{original_symbol}: spot confirmation failed "
                             f"({cand.get('spot_confirmation', 'WEAK')}: {cand.get('spot_reason', '-')})"
@@ -5241,12 +5246,36 @@ async def trading_loop(app):
                     mf_ok, mf_reason = risk.market_filters(cand, settings)
                     if not mf_ok:
                         scanner.last_reject_reason = f"{original_symbol}: market filter blocked: {mf_reason}"
+                        if orderflow_impulse_cycle:
+                            log_event("orderflow_impulse_open_skipped", stage="market_filter", ok=False, symbol=str(original_symbol), reason=str(mf_reason)[:500])
                         continue
 
                     plan = TradePlanner().make_plan(cand, settings, equity_usdt=equity)
                     if not plan:
                         scanner.last_reject_reason = f"{original_symbol}: planner returned no trade"
+                        if orderflow_impulse_cycle:
+                            log_event("orderflow_impulse_open_skipped", stage="planner", ok=False, symbol=str(original_symbol), reason="planner returned no trade")
                         continue
+
+                    if orderflow_impulse_cycle:
+                        _d = getattr(plan, "signal_details", {}) if hasattr(plan, "signal_details") else {}
+                        _d = _d if isinstance(_d, dict) else {}
+                        log_event(
+                            "orderflow_impulse_candidate_selected",
+                            stage="candidate",
+                            ok=True,
+                            symbol=str(plan.symbol),
+                            side=str(plan.side),
+                            confidence=float(getattr(plan, "confidence", 0) or cand.get("confidence", 0) or 0),
+                            spot_symbol=_d.get("spot_symbol"),
+                            spot_move_pct=_d.get("spot_move_pct"),
+                            spot_volume_ratio=_d.get("spot_volume_ratio"),
+                            spot_delta_ratio=_d.get("spot_delta_ratio"),
+                            spot_orderbook_imbalance=_d.get("spot_orderbook_imbalance"),
+                            entry_price=float(getattr(plan, "entry_price", 0) or 0),
+                            take_price=float(getattr(plan, "take_price", 0) or 0),
+                            stop_price=float(getattr(plan, "stop_price", 0) or 0),
+                        )
 
                     ai_enabled = bool(settings.get("openai_analysis_enabled", False))
                     ai_show = bool(settings.get("openai_show_decisions", False))
@@ -5291,6 +5320,8 @@ async def trading_loop(app):
                         cand["openai_confidence"] = ai_verdict.confidence
                         cand["openai_reason"] = ai_verdict.reason
 
+                    if orderflow_impulse_cycle:
+                        log_event("orderflow_impulse_open_attempt", stage="entry", ok=True, symbol=str(plan.symbol), side=str(plan.side), live=bool(live), margin_pct=float(settings.get("orderflow_impulse_trade_margin_pct", settings.get("trade_margin_pct", 0.10)) or 0.10), leverage=int(float(getattr(plan, "leverage", settings.get("orderflow_impulse_leverage", 10)) or 10)))
                     try:
                         placed = await _await_with_timeout(exec_engine.place_entry(plan, live), 25, "boost place_entry")
                     except Exception as e:
@@ -5376,6 +5407,8 @@ async def trading_loop(app):
                             log_event("quick_bounce_execution_rejected", stage="entry", ok=False, symbol=str(plan.symbol), side=str(plan.side), reason=reason[:500], placed=placed)
                         if impulse_dump_cycle:
                             log_event("impulse_dump_execution_rejected", stage="entry", ok=False, symbol=str(plan.symbol), side=str(plan.side), reason=reason[:500], placed=placed)
+                        if orderflow_impulse_cycle:
+                            log_event("orderflow_impulse_execution_rejected", stage="entry", ok=False, symbol=str(plan.symbol), side=str(plan.side), reason=reason[:500], placed=placed)
                         if 'protection' in placed or 'position closed' in reason.lower():
                             close = placed.get('close') or {}
                             pnl = close.get('pnl_usdt')
@@ -5396,7 +5429,13 @@ async def trading_loop(app):
                 elif candidates:
                     await update_scanner_status(app, settings, status="scanning")
 
-                await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 5)))
+                _sleep_sec = int(settings.get("scan_interval_sec", 5) or 5)
+                if orderflow_impulse_cycle:
+                    _sleep_sec = int(settings.get("orderflow_impulse_scan_interval_sec", settings.get("scan_interval_sec", 60)) or 60)
+                    # v0257: orderflow scans must respect the configured interval.
+                    # If the user sets 1 minute, make a real 60s pause after each completed cycle.
+                    _sleep_sec = max(60, _sleep_sec)
+                await sleep_until_next_scan(app, _sleep_sec)
             except Exception as e:
                 log.exception("trading loop error: %s", e)
                 await asyncio.sleep(5)

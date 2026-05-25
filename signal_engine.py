@@ -108,7 +108,7 @@ class SignalEngine:
         self.orderflow_impulse_min_trend_pct = float(os.getenv("ORDERFLOW_IMPULSE_MIN_TREND_PCT", "0.25"))
         self.orderflow_impulse_min_imbalance_abs = float(os.getenv("ORDERFLOW_IMPULSE_MIN_IMBALANCE_ABS", "0.08"))
         self.orderflow_impulse_max_spread_pct = float(os.getenv("ORDERFLOW_IMPULSE_MAX_SPREAD_PCT", "0.20"))
-        self.orderflow_impulse_min_24h_volume_usdt = float(os.getenv("ORDERFLOW_IMPULSE_MIN_24H_VOLUME_USDT", "50000000"))
+        self.orderflow_impulse_min_24h_volume_usdt = float(os.getenv("ORDERFLOW_IMPULSE_MIN_24H_VOLUME_USDT", "20000000"))
 
     @staticmethod
     def _truthy(value, default: bool = False) -> bool:
