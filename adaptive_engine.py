@@ -1,6 +1,6 @@
 from collections import defaultdict
 
-STRATEGIES = ["momentum", "pullback", "reversal", "liquidity_retest", "quick_bounce", "impulse_dump", "orderflow_impulse", "hybrid", "all"]
+STRATEGIES = ["momentum", "pullback", "reversal", "liquidity_retest", "quick_bounce", "impulse_dump", "orderflow_impulse", "cascade_hunter", "hybrid", "all"]
 
 def safe_div(a, b, default=0.0):
     return a / b if b else default

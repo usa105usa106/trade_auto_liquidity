@@ -697,7 +697,7 @@ class ExecutionEngine:
                         await self.storage.upsert_position(pos)
                     # legacy regression marker: elif strategy_name == "quick_bounce"
                     # legacy regression marker: exchange SL/TP failed; quick_bounce remains open under virtual TP/SL monitor
-                    elif strategy_name in {"quick_bounce", "impulse_dump", "orderflow_impulse"}:
+                    elif strategy_name in {"quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal"}:
                         # v0231: Quick Bounce must try real exchange SL/TP first, but if
                         # MEXC rejects/does not confirm them, DO NOT panic-close the entry.
                         # Keep the position open and let PositionManager enforce virtual
@@ -708,13 +708,13 @@ class ExecutionEngine:
                             "protection_mode": "virtual",
                             "real_tpsl_failed": True,
                             "virtual_tp_sl_active": True,
-                            "protection_note": "exchange SL/TP failed; quick_bounce/impulse_dump/orderflow_impulse remains open under virtual TP/SL monitor",
+                            "protection_note": "exchange SL/TP failed; quick_bounce/impulse_dump/orderflow_impulse/knife_reversal/cascade_hunter remains open under virtual TP/SL monitor",
                             "quick_bounce_virtual_since": time.time(),
                             "impulse_dump_virtual_since": time.time() if strategy_name == "impulse_dump" else 0,
-                            "orderflow_impulse_virtual_since": time.time() if strategy_name == "orderflow_impulse" else 0,
+                            "orderflow_impulse_virtual_since": time.time() if strategy_name in {"orderflow_impulse", "knife_reversal", "cascade_hunter"} else 0,
                             "quick_bounce_real_tpsl_error": str(protection.get("tpsl_error") or protection.get("tp_error") or protection.get("sl_error") or protection.get("verify_error") or protection.get("protection_warning") or "")[:700],
                             "impulse_dump_real_tpsl_error": str(protection.get("tpsl_error") or protection.get("tp_error") or protection.get("sl_error") or protection.get("verify_error") or protection.get("protection_warning") or "")[:700] if strategy_name == "impulse_dump" else "",
-                            "orderflow_impulse_real_tpsl_error": str(protection.get("tpsl_error") or protection.get("tp_error") or protection.get("sl_error") or protection.get("verify_error") or protection.get("protection_warning") or "")[:700] if strategy_name == "orderflow_impulse" else "",
+                            "orderflow_impulse_real_tpsl_error": str(protection.get("tpsl_error") or protection.get("tp_error") or protection.get("sl_error") or protection.get("verify_error") or protection.get("protection_warning") or "")[:700] if strategy_name in {"orderflow_impulse", "knife_reversal", "cascade_hunter"} else "",
                         })
                         pos.update(protection)
                         pos["updated_at"] = time.time()
@@ -954,6 +954,27 @@ class ExecutionEngine:
     async def _create_take_profit_market_order(self, symbol: str, side: str, qty: float, take_price: float) -> dict:
         return await self._create_trigger_market_order(symbol, side, qty, take_price, "tp")
 
+    async def _create_cascade_split_tp_orders(self, pos: dict, close_side: str, qty: float) -> dict:
+        """CASCADE HUNTER uses two non-trailing take-profits: TP1 50% at 1R, TP2 rest at 2R."""
+        tp1 = float(pos.get("partial_take_price") or 0)
+        tp2 = float(pos.get("final_take_price") or pos.get("take_price") or 0)
+        frac = max(0.01, min(0.99, float(pos.get("partial_take_fraction") or 0.50)))
+        qty1 = max(0.0, qty * frac)
+        qty2 = max(0.0, qty - qty1)
+        out = {"tp1_price": tp1, "tp2_price": tp2, "tp1_fraction": frac, "tp1_qty": qty1, "tp2_qty": qty2}
+        if tp1 <= 0 or tp2 <= 0 or qty1 <= 0 or qty2 <= 0:
+            out["tp_error"] = "missing cascade split TP price/qty"
+            return out
+        o1 = await self._create_take_profit_market_order(pos["symbol"], close_side, qty1, tp1)
+        o2 = await self._create_take_profit_market_order(pos["symbol"], close_side, qty2, tp2)
+        out.update({
+            "tp1_order_id": o1.get("id"),
+            "tp2_order_id": o2.get("id"),
+            "tp_order_id": ",".join([x for x in [str(o1.get("id") or ""), str(o2.get("id") or "")] if x]),
+            "tp_raw": {"tp1": o1, "tp2": o2},
+        })
+        return out
+
     async def _verify_exchange_protection(self, pos: dict, tp_order_id: str = "", sl_order_id: str = "") -> dict:
         """Confirm that both TP and SL are actually visible on exchange.
 
@@ -1138,6 +1159,29 @@ class ExecutionEngine:
                 except Exception as e:
                     out["sl_error"] = str(e)[:800]
                     log_event("error_boost_emergency_sl", symbol=symbol, side=side, qty=qty, stop_price=sl, attempt=i + 1, error=str(e), ok=False)
+            elif strategy_name_for_protection == "cascade_hunter":
+                # Split TP mode: TP1 closes 50% at 1R, TP2 closes the remaining 50% at 2R.
+                # Do not use MEXC native by-position TP/SL here because it supports one TP only.
+                try:
+                    split = await self._create_cascade_split_tp_orders(pos, side, qty)
+                    out.update(split)
+                    if split.get("tp_error"):
+                        out["tp_error"] = split.get("tp_error")
+                except Exception as e:
+                    out["tp_error"] = str(e)[:800]
+                    log_event("error_cascade_split_tp", symbol=symbol, side=side, qty=qty, tp1=pos.get("partial_take_price"), tp2=pos.get("take_price"), attempt=i + 1, error=str(e), ok=False)
+                try:
+                    if sl > 0:
+                        log_event("cascade_split_sl_request", symbol=symbol, side=side, qty=qty, stop_price=sl, attempt=i + 1)
+                        order = await self._create_stop_market_order(symbol, side, qty, sl)
+                        out["sl_order_id"] = order.get("id")
+                        out["sl_raw"] = order
+                    else:
+                        out["sl_error"] = "missing stop_price"
+                except Exception as e:
+                    out["sl_error"] = str(e)[:800]
+                    log_event("error_cascade_split_sl", symbol=symbol, side=side, qty=qty, trigger_price=sl, attempt=i + 1, error=str(e), ok=False)
+
             elif str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc" and hasattr(self.exchange_client, "mexc_place_tpsl_by_position"):
                 # v0160: MEXC native by-position TP/SL FIRST, using confirmed live position row.
                 # Use /api/v1/private/stoporder/place with positionId + holdVol;
@@ -1245,6 +1289,15 @@ class ExecutionEngine:
                     out["protection_mode"] = "exchange_emergency_sl_only"
                     out["boost_unsafe_position"] = False
                     out["boost_defensive_mode"] = False
+                elif strategy_name_for_protection == "cascade_hunter" and out.get("tp1_order_id") and out.get("tp2_order_id") and out.get("sl_order_id"):
+                    out["tp_exists"] = True
+                    out["sl_exists"] = True
+                    out["take_profit_ok"] = True
+                    out["stop_loss_ok"] = True
+                    out["ok"] = True
+                    out["protection_status"] = "EXCHANGE PROTECTED"
+                    out["protection_mode"] = "exchange_split_tp"
+                    out["protection_note"] = "Cascade split TP verified by returned planorder ids: TP1 50% at 1R, TP2 rest at 2R"
                 else:
                     verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), str(out.get("sl_order_id") or ""))
                     out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})

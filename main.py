@@ -705,6 +705,23 @@ async def orderflow_impulse_summary_message(app, settings: dict, candidates: lis
         log_event("orderflow_impulse_summary_error", stage="send", ok=False, error=str(e)[:300])
 
 
+def format_knife_reversal_opened(plan, placed: dict) -> str:
+    d = getattr(plan, "signal_details", {}) if hasattr(plan, "signal_details") else {}
+    d = d if isinstance(d, dict) else {}
+    return (
+        "🗡 KNIFE REVERSAL OPENED\n"
+        f"{getattr(plan, 'symbol', '-')} {getattr(plan, 'side', '-')}\n"
+        f"Entry: {float(getattr(plan, 'entry_price', 0) or 0):.8g}\n"
+        f"TP: {float(getattr(plan, 'take_price', 0) or 0):.8g} (+5%)\n"
+        f"SL: {float(getattr(plan, 'stop_price', 0) or 0):.8g} (below wick)\n"
+        f"Wick: {d.get('wick_pct', '-')}% | Reclaim: {d.get('reclaim_pct', '-')}%\n"
+        f"Delta: {d.get('spot_delta_ratio', '-')} | Book: {d.get('spot_orderbook_imbalance', '-')}\n"
+        f"Margin: {float(getattr(plan, 'expected_margin_usdt', 0) or 0):.4g} USDT | Lev: {int(float(getattr(plan, 'leverage', 0) or 0))}x"
+    )
+
+def format_multi_strategy_opened(plan, placed: dict) -> str:
+    return "🧠 MULTI STRATEGY\n" + format_orderflow_impulse_opened(plan, placed) if str(getattr(plan, 'strategy', '')).lower() == 'orderflow_impulse' else "🧠 MULTI STRATEGY\n" + format_knife_reversal_opened(plan, placed)
+
 def format_orderflow_impulse_opened(plan, placed: dict) -> str:
     pos = placed.get("position") if isinstance(placed, dict) else None
     pos = pos if isinstance(pos, dict) else plan.__dict__
@@ -3722,6 +3739,138 @@ async def impulse_dump_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+async def knife_reversal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    enabled = str(s.get("strategy_mode", "hybrid")).lower() == "knife_reversal" and _bool_setting(s, "knife_reversal_enabled", False)
+    if enabled:
+        for _k, _v in {"knife_reversal_enabled": False, "settings_revision": int(s.get("settings_revision", 1) or 1) + 1}.items():
+            await storage.set(_k, _v, bump_revision=False)
+        trigger_scan_now(context.application, reason="knife_reversal:off")
+        await update.message.reply_text("🗡 knife_reversal OFF. Existing positions are still managed.", reply_markup=MAIN_MENU)
+        return
+    updates = {
+        "knife_reversal_enabled": True, "orderflow_impulse_enabled": False, "multi_strategy_enabled": False,
+        "strategy_mode": "knife_reversal", "auto_strategy_adaptation": False, "regime_adaptation": False,
+        "max_open_positions": 3, "scan_interval_sec": 60,
+        "knife_reversal_top_coins": 100, "knife_reversal_scan_interval_sec": 60,
+        "knife_reversal_trade_margin_pct": 0.10, "knife_reversal_max_open_positions": 3, "knife_reversal_leverage": 10,
+        "knife_reversal_tp_pct": 5.0, "knife_reversal_wick_sl_buffer_pct": 0.20,
+        "knife_reversal_min_reclaim_pct": 50.0, "knife_reversal_min_volume_ratio": 2.0,
+        "settings_revision": int(s.get("settings_revision", 1) or 1) + 1,
+    }
+    for _k, _v in updates.items():
+        await storage.set(_k, _v, bump_revision=False)
+    trigger_scan_now(context.application, reason="knife_reversal:on")
+    await update.message.reply_text(
+        "🗡 knife_reversal ON\n"
+        "Скан: Binance spot top-100 каждые 60s.\n"
+        "Вход: LONG после сильного нижнего фитиля и reclaim ≥50%.\n"
+        "TP: 5%. SL: чуть ниже low фитиля. AI-check: по тумблеру настроек.",
+        reply_markup=MAIN_MENU,
+    )
+
+async def multi_strategy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    s = await storage.all_settings()
+    enabled = str(s.get("strategy_mode", "hybrid")).lower() == "multi_strategy" and _bool_setting(s, "multi_strategy_enabled", False)
+    if enabled:
+        for _k, _v in {"multi_strategy_enabled": False, "settings_revision": int(s.get("settings_revision", 1) or 1) + 1}.items():
+            await storage.set(_k, _v, bump_revision=False)
+        trigger_scan_now(context.application, reason="multi_strategy:off")
+        await update.message.reply_text("🧠 multi_strategy OFF. Existing positions are still managed.", reply_markup=MAIN_MENU)
+        return
+    updates = {
+        "multi_strategy_enabled": True, "orderflow_impulse_enabled": True, "knife_reversal_enabled": True,
+        "strategy_mode": "multi_strategy", "auto_strategy_adaptation": False, "regime_adaptation": False,
+        "max_open_positions": 3, "scan_interval_sec": 60, "multi_strategy_top_coins": 100, "multi_strategy_scan_interval_sec": 60, "multi_strategy_max_open_positions": 3,
+        "orderflow_impulse_top_coins": 100, "orderflow_impulse_scan_interval_sec": 60, "orderflow_impulse_max_open_positions": 3,
+        "knife_reversal_top_coins": 100, "knife_reversal_scan_interval_sec": 60, "knife_reversal_max_open_positions": 3,
+        "knife_reversal_tp_pct": 5.0, "knife_reversal_wick_sl_buffer_pct": 0.20,
+        "settings_revision": int(s.get("settings_revision", 1) or 1) + 1,
+    }
+    for _k, _v in updates.items():
+        await storage.set(_k, _v, bump_revision=False)
+    trigger_scan_now(context.application, reason="multi_strategy:on")
+    await update.message.reply_text(
+        "🧠 multi_strategy ON\n"
+        "Сканирует orderflow_impulse + knife_reversal: top-100 каждые 60s.\n"
+        "Общие 3 слота. AI-check общий тумблером настроек. Открывается strongest setup.",
+        reply_markup=MAIN_MENU,
+    )
+
+
+async def cascade_hunter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    global running, entries_enabled, trading_task, position_task
+    s = await storage.all_settings()
+    enabled = str(s.get("strategy_mode", "hybrid")).lower() == "cascade_hunter" and _bool_setting(s, "cascade_hunter_enabled", False)
+    if enabled:
+        await storage.set("cascade_hunter_enabled", False, bump_revision=False)
+        await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+        trigger_scan_now(context.application, reason="cascade_hunter:off")
+        await reply(update, "○ Cascade hunter OFF\nСканер остановлен, новые сделки не открываются. Открытые позиции продолжают сопровождаться до TP/SL/time-stop.", reply_markup=MAIN_MENU)
+        return
+
+    updates = {
+        "cascade_hunter_enabled": True,
+        "orderflow_impulse_enabled": False,
+        "knife_reversal_enabled": False,
+        "multi_strategy_enabled": False,
+        "quick_bounce_enabled": False,
+        "impulse_dump_enabled": False,
+        "strategy_mode": "cascade_hunter",
+        "universe_mode": "top-100",
+        "max_symbols": 100,
+        "scan_interval_sec": 60,
+        "symbol_refresh_sec": 300,
+        "max_open_positions": 3,
+        "trade_margin_pct": 0.10,
+        "cascade_hunter_trade_margin_pct": 0.10,
+        "mexc_order_leverage": 10,
+        "cascade_hunter_leverage": 10,
+        "cascade_hunter_tp_pct": 4.0,
+        "cascade_hunter_sl_pct": 2.0,
+        "cascade_hunter_tp1_r": 1.0,
+        "cascade_hunter_tp2_r": 2.0,
+        "cascade_hunter_tp1_fraction": 0.50,
+        "cascade_hunter_time_stop_sec": 14400,
+        "cascade_hunter_top_coins": 100,
+        "cascade_hunter_max_open_positions": 3,
+        "cascade_hunter_scan_interval_sec": 60,
+        "cascade_hunter_min_liq_usd_1m": 100000.0,
+        "cascade_hunter_min_volume_ratio": 1.8,
+        "cascade_hunter_min_price_move_pct": 0.25,
+        "cascade_hunter_max_spread_pct": 0.25,
+        "cascade_hunter_min_24h_volume_usdt": 15000000.0,
+        "scan_market_source": "mexc_binance",
+        "spot_confirmation_enabled": False,
+        "auto_strategy_adaptation": False,
+        "regime_adaptation": False,
+        "liquidity_runner_enabled": False,
+        "mirror_mode": "off",
+        "session_filter_enabled": False,
+        "america_short_bias_enabled": False,
+    }
+    for k, v in updates.items():
+        await storage.set(k, v, bump_revision=False)
+    await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+    scanner.last_refresh = 0
+    entries_enabled = True
+    running = True
+    if trading_task is None or trading_task.done():
+        trading_task = context.application.create_task(trading_loop(context.application))
+    if position_task is None or position_task.done():
+        position_task = context.application.create_task(position_management_loop(context.application))
+    trigger_scan_now(context.application, reason="cascade_hunter:on")
+    await reply(update,
+        "✅ Cascade hunter ON\n"
+        "Binance futures top-100 каждые 60s: ликвидации + ускорение цены + volume spike + delta.\n"
+        "Выбирает 1–3 лучших. До 3 сделок, 10% баланса на сделку, x10 isolated. AI-check работает по общему тумблеру настроек.",
+        reply_markup=MAIN_MENU,
+    )
+
 async def orderflow_impulse_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     global running, entries_enabled, trading_task, position_task
@@ -3817,6 +3966,9 @@ def _button_mapping():
         ("⚡ быстрый отскок", quick_bounce_cmd), ("быстрый отскок", quick_bounce_cmd), ("Быстрый отскок", quick_bounce_cmd),
         ("🔻 импульсный слив", impulse_dump_cmd), ("импульсный слив", impulse_dump_cmd), ("Импульсный слив", impulse_dump_cmd),
         ("📊 orderflow impulse", orderflow_impulse_cmd), ("orderflow impulse", orderflow_impulse_cmd), ("Orderflow impulse", orderflow_impulse_cmd),
+        ("🌊 cascade hunter", cascade_hunter_cmd), ("cascade hunter", cascade_hunter_cmd), ("Cascade hunter", cascade_hunter_cmd),
+        ("🗡 knife reversal", knife_reversal_cmd), ("knife reversal", knife_reversal_cmd), ("Knife reversal", knife_reversal_cmd),
+        ("🧠 multi strategy", multi_strategy_cmd), ("multi strategy", multi_strategy_cmd), ("Multi strategy", multi_strategy_cmd),
         ("🚀 BOOST MODE", boost_start_cmd), ("BOOST MODE", boost_start_cmd),
         ("🛑 STOP BOOST", boost_stop_cmd), ("STOP BOOST", boost_stop_cmd),
         ("📊 BOOST STATUS", boost_status_cmd), ("BOOST STATUS", boost_status_cmd),
@@ -4826,8 +4978,6 @@ async def trading_loop(app):
                             scanner.last_reject_reason = f"BOOST balance precheck warning {e}"
                             await sleep_until_next_scan(app, int(settings.get("boost_scan_interval_sec", 1)))
                             continue
-                    if orderflow_impulse_cycle:
-                        log_event("orderflow_impulse_open_attempt", stage="entry", ok=True, symbol=str(plan.symbol), side=str(plan.side), live=bool(live), margin_pct=float(settings.get("orderflow_impulse_trade_margin_pct", settings.get("trade_margin_pct", 0.10)) or 0.10), leverage=int(float(getattr(plan, "leverage", settings.get("orderflow_impulse_leverage", 10)) or 10)))
                     try:
                         placed = await _await_with_timeout(exec_engine.place_entry(plan, live), 25, "boost place_entry")
                     except Exception as e:
@@ -5054,6 +5204,10 @@ async def trading_loop(app):
                 quick_bounce_cycle = base_strategy_mode == "quick_bounce"
                 impulse_dump_cycle = base_strategy_mode == "impulse_dump"
                 orderflow_impulse_cycle = base_strategy_mode == "orderflow_impulse"
+                cascade_hunter_cycle = base_strategy_mode == "cascade_hunter"
+                knife_reversal_cycle = base_strategy_mode == "knife_reversal"
+                multi_strategy_cycle = base_strategy_mode == "multi_strategy"
+                special_native_cycle = orderflow_impulse_cycle or cascade_hunter_cycle or knife_reversal_cycle or multi_strategy_cycle
                 if quick_bounce_cycle and not _bool_setting(settings, "quick_bounce_enabled", False):
                     scanner.last_signal_summary = "quick_bounce OFF: scanner stopped"
                     scanner.last_reject_reason = "Press ⚡ быстрый отскок again to resume scanning. Existing positions are still managed."
@@ -5070,6 +5224,24 @@ async def trading_loop(app):
                     scanner.last_signal_summary = "orderflow_impulse OFF: scanner stopped"
                     scanner.last_reject_reason = "Press 📊 orderflow impulse again to resume scanning. Existing positions are still managed."
                     await update_scanner_status(app, settings, status="orderflow impulse off")
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 60)))
+                    continue
+                if cascade_hunter_cycle and not _bool_setting(settings, "cascade_hunter_enabled", False):
+                    scanner.last_signal_summary = "cascade_hunter OFF: scanner stopped"
+                    scanner.last_reject_reason = "Press 🌊 cascade hunter again to resume scanning. Existing positions are still managed."
+                    await update_scanner_status(app, settings, status="cascade hunter off")
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 60)))
+                    continue
+                if knife_reversal_cycle and not _bool_setting(settings, "knife_reversal_enabled", False):
+                    scanner.last_signal_summary = "knife_reversal OFF: scanner stopped"
+                    scanner.last_reject_reason = "Press 🗡 knife reversal again to resume scanning. Existing positions are still managed."
+                    await update_scanner_status(app, settings, status="knife reversal off")
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 60)))
+                    continue
+                if multi_strategy_cycle and not _bool_setting(settings, "multi_strategy_enabled", False):
+                    scanner.last_signal_summary = "multi_strategy OFF: scanner stopped"
+                    scanner.last_reject_reason = "Press 🧠 multi strategy again to resume scanning. Existing positions are still managed."
+                    await update_scanner_status(app, settings, status="multi strategy off")
                     await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 60)))
                     continue
                 if impulse_dump_cycle:
@@ -5104,6 +5276,12 @@ async def trading_loop(app):
                 if orderflow_impulse_cycle:
                     log_event("orderflow_impulse_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("orderflow_impulse_top_coins", settings.get("max_symbols", 100)) or 100)), source="binance_spot_orderflow")
                     await orderflow_impulse_progress_message(app, 10)
+                if cascade_hunter_cycle:
+                    log_event("cascade_hunter_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("cascade_hunter_top_coins", settings.get("max_symbols", 100)) or 100)), source="binance_futures_liquidations")
+                if knife_reversal_cycle:
+                    log_event("knife_reversal_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("knife_reversal_top_coins", 100) or 100)), source="binance_spot_wick_reclaim")
+                if multi_strategy_cycle:
+                    log_event("multi_strategy_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("multi_strategy_top_coins", 100) or 100)), source="orderflow_impulse+knife_reversal")
                 if base_strategy_mode == "all":
                     scanner.last_strategy_reason = "mode=ALL: scanning momentum+pullback+reversal (liquidity_retest is manual-only)"
                 elif base_strategy_mode == "hybrid":
@@ -5113,6 +5291,9 @@ async def trading_loop(app):
                 effective_settings = dict(settings)
                 effective_settings["market_regime"] = regime_info.get("regime", "LOW_VOLATILITY")
                 effective_settings["market_regime_info"] = regime_info
+                if special_native_cycle:
+                    effective_strategy = base_strategy_mode
+                    scanner.last_effective_strategy = effective_strategy
                 effective_settings["effective_strategy_mode"] = effective_strategy
                 if quick_bounce_cycle:
                     await quick_bounce_progress_message(app, 50)
@@ -5145,6 +5326,8 @@ async def trading_loop(app):
                     await impulse_dump_progress_message(app, 100, done=True)
                     await impulse_dump_summary_message(app, settings, candidates)
                     await impulse_dump_progress_message(app, 100, clear=True)
+                if cascade_hunter_cycle:
+                    log_event("cascade_hunter_scan_done", stage="scan", ok=True, candidates=len(candidates or []), symbols=[str(c.get("symbol", "")) for c in (candidates or [])[:10]], reject_reasons=getattr(scanner, "last_reject_top_reasons", []), stats=getattr(scanner, "last_cascade_scan_stats", {}), errors=getattr(scanner, "last_cycle_errors", 0))
                 if orderflow_impulse_cycle:
                     log_event(
                         "orderflow_impulse_scan_done",
@@ -5159,6 +5342,10 @@ async def trading_loop(app):
                     await orderflow_impulse_progress_message(app, 100, done=True)
                     await orderflow_impulse_summary_message(app, settings, candidates)
                     await orderflow_impulse_progress_message(app, 100, clear=True)
+                if knife_reversal_cycle:
+                    log_event("knife_reversal_scan_done", stage="scan", ok=True, candidates=len(candidates or []), symbols=[str(c.get("symbol", "")) for c in (candidates or [])[:10]], reject_reasons=getattr(scanner, "last_reject_top_reasons", []), stats=getattr(scanner, "last_knife_scan_stats", {}), errors=getattr(scanner, "last_cycle_errors", 0))
+                if multi_strategy_cycle:
+                    log_event("multi_strategy_scan_done", stage="scan", ok=True, candidates=len(candidates or []), symbols=[str(c.get("symbol", "")) for c in (candidates or [])[:10]], stats=getattr(scanner, "last_multi_strategy_stats", {}), errors=getattr(scanner, "last_cycle_errors", 0))
                 if scanner.last_slowdown_sec:
                     scanner.last_reject_reason = f"scanner adaptive slowdown {scanner.last_slowdown_sec}s after {scanner.last_cycle_errors} errors"
                     await update_scanner_status(app, settings, status="scanner slowdown", force=True)
@@ -5208,8 +5395,8 @@ async def trading_loop(app):
                         window_minutes=240,
                     ).apply(cand, settings)
 
-                    if orderflow_impulse_cycle:
-                        # v0252: orderflow_impulse is Binance-spot-native.
+                    if special_native_cycle and str(cand.get("strategy", "")).lower() in {"orderflow_impulse", "knife_reversal", "cascade_hunter"}:
+                        # v0268: orderflow_impulse/knife_reversal are Binance-spot-native.
                         # Do not create a MEXC futures candidate and then run a second
                         # spot confirmation pass; that caused symbol mismatches like
                         # RENDER/RNDR and "Spot data unavailable". The candidate already
@@ -5221,7 +5408,7 @@ async def trading_loop(app):
                         cand["spot_reason"] = "Binance spot native orderflow scan passed"
                         sd = cand.get("score_details") if isinstance(cand.get("score_details"), dict) else {}
                         log_event(
-                            "orderflow_impulse_spot_check",
+                            ("knife_reversal_spot_check" if str(cand.get("strategy", "")).lower() == "knife_reversal" else "cascade_hunter_spot_check" if str(cand.get("strategy", "")).lower() == "cascade_hunter" else "orderflow_impulse_spot_check"),
                             stage="spot_native",
                             ok=True,
                             symbol=str(original_symbol),
@@ -5234,7 +5421,7 @@ async def trading_loop(app):
                             spot_delta_usdt=sd.get("spot_delta_usdt"),
                             spot_orderbook_imbalance=sd.get("spot_orderbook_imbalance"),
                             spot_spread_pct=sd.get("spot_spread_pct"),
-                            reason="Binance spot native orderflow passed; MEXC futures execution only",
+                            reason="Binance spot native setup passed; MEXC futures execution only",
                         )
                     else:
                         spot_enabled = bool(settings.get("spot_confirmation_enabled", True))
@@ -5242,21 +5429,26 @@ async def trading_loop(app):
                         cand = SpotConfirmationEngine(enabled=spot_enabled).apply(cand, spot_data)
                     cand["strategy_mode"] = base_strategy_mode
                     cand["effective_strategy_mode"] = effective_strategy
-                    if orderflow_impulse_cycle:
-                        # v0265: force orderflow_impulse to use its own 3-slot model.
-                        # Session/global settings must not silently downgrade this mode to one trade.
-                        of_max_slots = int(float(settings.get("orderflow_impulse_max_open_positions", 3) or 3))
-                        cand["strategy"] = "orderflow_impulse"
-                        cand["max_open_positions"] = of_max_slots
-                        cand["trade_margin_pct"] = float(settings.get("orderflow_impulse_trade_margin_pct", 0.10) or 0.10)
-                        cand["leverage"] = int(float(settings.get("orderflow_impulse_leverage", 10) or 10))
+                    if special_native_cycle:
+                        common_slots = int(float(settings.get("multi_strategy_max_open_positions", settings.get("cascade_hunter_max_open_positions", settings.get("orderflow_impulse_max_open_positions", 3))) or 3))
+                        st_name = str(cand.get("strategy", "orderflow_impulse")).lower()
+                        cand["max_open_positions"] = common_slots
+                        if st_name == "knife_reversal":
+                            cand["trade_margin_pct"] = float(settings.get("knife_reversal_trade_margin_pct", 0.10) or 0.10)
+                            cand["leverage"] = int(float(settings.get("knife_reversal_leverage", 10) or 10))
+                        elif st_name == "cascade_hunter":
+                            cand["trade_margin_pct"] = float(settings.get("cascade_hunter_trade_margin_pct", 0.10) or 0.10)
+                            cand["leverage"] = int(float(settings.get("cascade_hunter_leverage", 10) or 10))
+                        else:
+                            cand["trade_margin_pct"] = float(settings.get("orderflow_impulse_trade_margin_pct", 0.10) or 0.10)
+                            cand["leverage"] = int(float(settings.get("orderflow_impulse_leverage", 10) or 10))
 
                     if not cand.get("allowed_by_session", True):
                         scanner.last_reject_reason = f"{original_symbol}: session filter blocked"
                         if orderflow_impulse_cycle:
                             log_event("orderflow_impulse_open_skipped", stage="session", ok=False, symbol=str(original_symbol), reason="session filter blocked")
                         continue
-                    if (not orderflow_impulse_cycle) and spot_enabled and not cand.get("spot_confirmed", True):
+                    if (not special_native_cycle) and spot_enabled and not cand.get("spot_confirmed", True):
                         scanner.last_reject_reason = (
                             f"{original_symbol}: spot confirmation failed "
                             f"({cand.get('spot_confirmation', 'WEAK')}: {cand.get('spot_reason', '-')})"
@@ -5275,14 +5467,10 @@ async def trading_loop(app):
                         continue
 
                     plan = TradePlanner().make_plan(cand, settings, equity_usdt=equity)
-                    if orderflow_impulse_cycle and plan:
-                        # v0265 hard guarantee: orderflow_impulse can open up to 3 different symbols.
-                        # This protects the mode from stale DB/global max_open_positions=1.
-                        of_max_slots = int(float(settings.get("orderflow_impulse_max_open_positions", 3) or 3))
+                    if special_native_cycle and plan:
+                        common_slots = int(float(settings.get("multi_strategy_max_open_positions", settings.get("cascade_hunter_max_open_positions", settings.get("orderflow_impulse_max_open_positions", 3))) or 3))
                         try:
-                            plan.strategy = "orderflow_impulse"
-                            plan.max_open_positions = of_max_slots
-                            plan.leverage = int(float(settings.get("orderflow_impulse_leverage", getattr(plan, "leverage", 10)) or 10))
+                            plan.max_open_positions = common_slots
                         except Exception:
                             pass
                     if not plan:
@@ -5395,8 +5583,8 @@ async def trading_loop(app):
                         cand["openai_confidence"] = ai_verdict.confidence
                         cand["openai_reason"] = ai_verdict.reason
 
-                    if orderflow_impulse_cycle:
-                        log_event("orderflow_impulse_open_attempt", stage="entry", ok=True, symbol=str(plan.symbol), side=str(plan.side), live=bool(live), margin_pct=float(settings.get("orderflow_impulse_trade_margin_pct", settings.get("trade_margin_pct", 0.10)) or 0.10), leverage=int(float(getattr(plan, "leverage", settings.get("orderflow_impulse_leverage", 10)) or 10)))
+                    if special_native_cycle:
+                        log_event(("multi_strategy_open_attempt" if multi_strategy_cycle else "knife_reversal_open_attempt" if str(getattr(plan, "strategy", "")).lower() == "knife_reversal" else "cascade_hunter_open_attempt" if str(getattr(plan, "strategy", "")).lower() == "cascade_hunter" else "orderflow_impulse_open_attempt"), stage="entry", ok=True, symbol=str(plan.symbol), side=str(plan.side), strategy=str(getattr(plan, "strategy", "")), live=bool(live), margin_pct=float(getattr(plan, "expected_margin_usdt", 0) or 0), leverage=int(float(getattr(plan, "leverage", 10) or 10)))
                     try:
                         placed = await _await_with_timeout(exec_engine.place_entry(plan, live), 25, "boost place_entry")
                     except Exception as e:
@@ -5438,6 +5626,17 @@ async def trading_loop(app):
                             )
                             await notify_admin(app, open_text, key=f"impulse_dump_opened_{plan.symbol}_{int(time.time()*1000)}")
                             await impulse_dump_summary_message(app, settings, candidates, opened_note=open_text)
+                        elif cascade_hunter_cycle:
+                            log_event("cascade_hunter_opened", stage="entry", ok=True, symbol=str(plan.symbol), side=str(plan.side), entry_price=float(getattr(plan, "entry_price", 0) or 0), take_price=float(getattr(plan, "take_price", 0) or 0), stop_price=float(getattr(plan, "stop_price", 0) or 0), leverage=int(float(getattr(plan, "leverage", 0) or 0)), placed=placed)
+                            await notify_admin(app, format_position_opened(plan, placed, live, ai_verdict if ai_enabled else None), key=f"cascade_hunter_opened_{plan.symbol}_{int(time.time()*1000)}")
+                        elif multi_strategy_cycle:
+                            open_text = format_multi_strategy_opened(plan, placed)
+                            log_event("multi_strategy_opened", stage="entry", ok=True, symbol=str(plan.symbol), side=str(plan.side), strategy=str(getattr(plan, "strategy", "")), placed=placed)
+                            await notify_admin(app, open_text, key=f"multi_strategy_opened_{plan.symbol}_{int(time.time()*1000)}")
+                        elif knife_reversal_cycle or str(getattr(plan, "strategy", "")).lower() == "knife_reversal":
+                            open_text = format_knife_reversal_opened(plan, placed)
+                            log_event("knife_reversal_opened", stage="entry", ok=True, symbol=str(plan.symbol), side=str(plan.side), entry_price=float(getattr(plan, "entry_price", 0) or 0), take_price=float(getattr(plan, "take_price", 0) or 0), stop_price=float(getattr(plan, "stop_price", 0) or 0), leverage=int(float(getattr(plan, "leverage", 0) or 0)), placed=placed)
+                            await notify_admin(app, open_text, key=f"knife_reversal_opened_{plan.symbol}_{int(time.time()*1000)}")
                         elif orderflow_impulse_cycle:
                             open_text = format_orderflow_impulse_opened(plan, placed)
                             _of_details = getattr(plan, "signal_details", {}) if hasattr(plan, "signal_details") else {}
@@ -5484,6 +5683,8 @@ async def trading_loop(app):
                             log_event("impulse_dump_execution_rejected", stage="entry", ok=False, symbol=str(plan.symbol), side=str(plan.side), reason=reason[:500], placed=placed)
                         if orderflow_impulse_cycle:
                             log_event("orderflow_impulse_execution_rejected", stage="entry", ok=False, symbol=str(plan.symbol), side=str(plan.side), reason=reason[:500], placed=placed)
+                        if cascade_hunter_cycle:
+                            log_event("cascade_hunter_execution_rejected", stage="entry", ok=False, symbol=str(plan.symbol), side=str(plan.side), reason=reason[:500], placed=placed)
                         if 'protection' in placed or 'position closed' in reason.lower():
                             close = placed.get('close') or {}
                             pnl = close.get('pnl_usdt')
@@ -5564,6 +5765,7 @@ def build_app():
     app.add_handler(CommandHandler("boost_start", _wrap_command(boost_start_cmd, "/boost_start")))
     app.add_handler(CommandHandler("boost_stop", _wrap_command(boost_stop_cmd, "/boost_stop")))
     app.add_handler(CommandHandler("boost_status", _wrap_command(boost_status_cmd, "/boost_status")))
+    app.add_handler(CommandHandler("cascade_hunter", _wrap_command(cascade_hunter_cmd, "/cascade_hunter")))
     app.add_handler(CommandHandler("boost_rotation", _wrap_command(boost_rotation_cmd, "/boost_rotation")))
     app.add_handler(CommandHandler("boost_list", _wrap_command(boost_list_cmd, "/boost_list")))
     app.add_handler(CommandHandler("boost_list_del", _wrap_command(boost_list_del_cmd, "/boost_list_del")))

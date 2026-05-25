@@ -753,11 +753,337 @@ class Scanner:
         self.last_reject_reason = "; ".join([f"{r}:{c}" for r, c in self.last_reject_top_reasons[:3]]) or "no Binance spot orderflow setup"
         return out[:max_candidates]
 
+
+
+    async def _cascade_hunter_candidates(self, exchange_client, settings: dict, max_candidates: int) -> list[dict]:
+        """Binance USD-M liquidation-cascade scanner; MEXC futures is execution only.
+
+        Uses public Binance futures data:
+        - /fapi/v1/ticker/24hr for top-100 universe
+        - /fapi/v1/klines, depth, aggTrades for acceleration/volume/orderbook
+        - /fapi/v1/allForceOrders when available for recent public liquidation prints
+        - /fapi/v1/openInterest and premiumIndex for context
+        """
+        import aiohttp
+        import socket
+        from urllib.parse import urlencode
+
+        self.engine.configure_from_settings(settings)
+        top_n = int(float(settings.get("cascade_hunter_top_coins", 100) or 100))
+        min_quote = float(settings.get("cascade_hunter_min_24h_volume_usdt", 15000000.0) or 0)
+        min_liq_usd = float(settings.get("cascade_hunter_min_liq_usd_1m", 100000.0) or 100000.0)
+        min_vol_ratio = float(settings.get("cascade_hunter_min_volume_ratio", 1.8) or 1.8)
+        min_move = abs(float(settings.get("cascade_hunter_min_price_move_pct", 0.25) or 0.25))
+        max_spread = abs(float(settings.get("cascade_hunter_max_spread_pct", 0.25) or 0.25))
+        tp_pct = float(settings.get("cascade_hunter_tp_pct", 2.5) or 2.5)
+        sl_pct = float(settings.get("cascade_hunter_sl_pct", 1.2) or 1.2)
+        reject_counts = Counter(); reject_examples = defaultdict(list)
+        errors = 0; scanned = 0; last_error = ""
+
+        def record(symbol: str, reason: str) -> None:
+            reason = str(reason or "unknown")[:260]
+            bucket = reason.split(":", 1)[0]
+            for prefix in ("volume low", "no mexc futures", "spread high", "no acceleration", "liq weak", "binance futures unavailable", "data unavailable"):
+                if reason.startswith(prefix): bucket = prefix; break
+            reject_counts[bucket] += 1
+            if len(reject_examples[bucket]) < 3:
+                reject_examples[bucket].append(f"{symbol}->{reason}")
+
+        def to_futures_symbol(binance_id: str) -> str | None:
+            sid = str(binance_id or "").upper()
+            if not sid.endswith("USDT") or len(sid) <= 4: return None
+            base = sid[:-4]
+            if base.endswith(("UP", "DOWN", "BULL", "BEAR")) or base in {"USDC","FDUSD","TUSD","BUSD","DAI","USDP"}: return None
+            return self._binance_spot_to_futures_symbol(f"{base}/USDT", exchange_client)
+
+        proxy_enabled = bool(settings.get("proxy_enabled", False)); proxy_url = str(settings.get("proxy_url", "") or "")
+        proxy = proxy_url if proxy_enabled and proxy_url else None
+        bases = [b.strip().rstrip("/") for b in str(settings.get("binance_futures_base_urls") or os.getenv("BINANCE_FUTURES_BASE_URLS", "https://fapi.binance.com")).split(",") if b.strip()]
+        timeout = aiohttp.ClientTimeout(total=float(settings.get("binance_futures_timeout_sec", os.getenv("BINANCE_FUTURES_TIMEOUT_SEC", "7")) or 7))
+
+        async def get_json(session, path: str, params: dict | None = None, *, optional: bool = False):
+            nonlocal last_error
+            params = params or {}; qs = ("?" + urlencode(params)) if params else ""
+            errs=[]
+            for base in bases:
+                try:
+                    async with session.get(f"{base}{path}{qs}", proxy=proxy) as resp:
+                        text = await resp.text()
+                        if resp.status != 200:
+                            errs.append(f"{resp.status}:{text[:120]}"); continue
+                        return await resp.json(content_type=None)
+                except Exception as e:
+                    errs.append(f"{type(e).__name__}:{e}")
+            last_error = "; ".join(errs)[-500:]
+            if optional: return None
+            raise RuntimeError(last_error or f"Binance futures REST failed {path}")
+
+        out=[]
+        try:
+            headers={"User-Agent":"Mozilla/5.0 liquidity-bot cascade-hunter"}
+            connector=aiohttp.TCPConnector(family=socket.AF_INET, ttl_dns_cache=300)
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector, trust_env=True) as session:
+                tickers = await get_json(session, "/fapi/v1/ticker/24hr")
+                ranked=[]
+                for t in tickers or []:
+                    sid=str(t.get("symbol") or "").upper()
+                    try: qv=float(t.get("quoteVolume") or 0)
+                    except Exception: qv=0
+                    if qv < min_quote:
+                        continue
+                    fut=to_futures_symbol(sid)
+                    if not fut:
+                        continue
+                    pct=abs(float(t.get("priceChangePercent") or 0))
+                    ranked.append((qv*(1+min(pct,30)/100.0), sid, fut, t))
+                ranked.sort(reverse=True, key=lambda x:x[0]); selected=ranked[:top_n]
+                self.last_scan_source="binance_futures_cascade_hunter_rest"
+                self.last_total_markets=len(tickers or []); self.last_filtered_markets=len(ranked); self.last_requested_symbols=top_n; self.last_selected_symbols=len(selected)
+                self.hot_symbols=[fut for _,_,fut,_ in selected]
+                sem=asyncio.Semaphore(self._concurrency_limit(settings))
+
+                async def scan_one(binance_id: str, futures_symbol: str, ticker: dict):
+                    nonlocal scanned, errors
+                    async with sem:
+                        scanned += 1
+                        try:
+                            candles=await get_json(session,"/fapi/v1/klines",{"symbol":binance_id,"interval":"1m","limit":30})
+                            if not candles or len(candles)<10: record(binance_id,"data unavailable: candles"); return None
+                            orderbook=await get_json(session,"/fapi/v1/depth",{"symbol":binance_id,"limit":20}, optional=True) or {}
+                            trades=await get_json(session,"/fapi/v1/aggTrades",{"symbol":binance_id,"limit":200}, optional=True) or []
+                            liqs=await get_json(session,"/fapi/v1/allForceOrders",{"symbol":binance_id,"limit":50}, optional=True) or []
+                            oi_now=await get_json(session,"/fapi/v1/openInterest",{"symbol":binance_id}, optional=True) or {}
+                            funding=await get_json(session,"/fapi/v1/premiumIndex",{"symbol":binance_id}, optional=True) or {}
+                            closes=[float(c[4]) for c in candles]; vols=[float(c[5]) for c in candles]
+                            last=closes[-1]; prev=closes[-3] if len(closes)>=3 else closes[-2]
+                            price_move=((last-prev)/prev*100.0) if prev else 0.0
+                            recent_vol=sum(vols[-3:])/3; avg_vol=sum(vols[:-3] or vols)/max(1,len(vols[:-3] or vols)); vol_ratio=recent_vol/avg_vol if avg_vol else 0
+                            bids=(orderbook.get("bids") or [])[:20]; asks=(orderbook.get("asks") or [])[:20]
+                            bid_depth=sum(float(p)*float(q) for p,q in bids); ask_depth=sum(float(p)*float(q) for p,q in asks)
+                            bb=float(bids[0][0]) if bids else 0; ba=float(asks[0][0]) if asks else 0; mid=(bb+ba)/2 if bb and ba else last
+                            spread=((ba-bb)/mid*100.0) if mid else 999
+                            buy=sell=0.0
+                            for tr in trades or []:
+                                try:
+                                    notional=float(tr.get("p") or 0)*float(tr.get("q") or 0)
+                                    if bool(tr.get("m")): sell += notional
+                                    else: buy += notional
+                                except Exception: pass
+                            delta=(buy-sell); total=buy+sell; delta_ratio=delta/total if total else 0.0
+                            now_ms=int(time.time()*1000); liq_buy=liq_sell=0.0
+                            for x in liqs if isinstance(liqs, list) else []:
+                                try:
+                                    t=int(x.get("time") or x.get("T") or 0)
+                                    if t and now_ms-t>90_000: continue
+                                    px=float(x.get("averagePrice") or x.get("price") or 0); qty=float(x.get("executedQty") or x.get("origQty") or 0)
+                                    usd=px*qty; side=str(x.get("side") or x.get("S") or "").upper()
+                                    # SELL liquidation = longs force-sold -> possible SHORT continuation. BUY = shorts squeezed -> possible LONG.
+                                    if side == "BUY": liq_buy += usd
+                                    elif side == "SELL": liq_sell += usd
+                                except Exception: pass
+                            liq_side="BUY" if liq_buy>=liq_sell else "SELL"; liq_usd=max(liq_buy, liq_sell)
+                            side="LONG" if liq_side=="BUY" else "SHORT"
+                            direction_ok=(side=="LONG" and price_move>=min_move and delta_ratio>0) or (side=="SHORT" and price_move<=-min_move and delta_ratio<0)
+                            if spread>max_spread: record(binance_id, f"spread high {spread:.3f}"); return None
+                            if liq_usd<min_liq_usd: record(binance_id, f"liq weak {liq_usd:.0f} < {min_liq_usd:.0f}"); return None
+                            if vol_ratio<min_vol_ratio: record(binance_id, f"volume low {vol_ratio:.2f}"); return None
+                            if not direction_ok: record(binance_id, f"no acceleration move={price_move:+.3f} delta={delta_ratio:+.3f} liq={liq_side}"); return None
+                            oi_val=float(oi_now.get("openInterest") or 0) if isinstance(oi_now,dict) else 0.0
+                            fund=float(funding.get("lastFundingRate") or 0) if isinstance(funding,dict) else 0.0
+                            score=70+min(12,liq_usd/max(min_liq_usd,1)*4)+min(10,abs(price_move)*10)+min(8,(vol_ratio-1)*4)+min(8,abs(delta_ratio)*20)
+                            details={"setup":"binance_futures_liquidation_cascade","futures_source":"binance_futures_public_rest","binance_symbol":binance_id,"liq_side":liq_side,"liq_usd_90s":round(liq_usd,2),"liq_buy_usd":round(liq_buy,2),"liq_sell_usd":round(liq_sell,2),"price_move_2m_pct":round(price_move,4),"volume_ratio":round(vol_ratio,4),"delta_ratio":round(delta_ratio,5),"delta_usdt":round(delta,2),"buy_volume_usdt":round(buy,2),"sell_volume_usdt":round(sell,2),"bid_depth_usdt":round(bid_depth,2),"ask_depth_usdt":round(ask_depth,2),"spread_pct":round(spread,4),"open_interest":round(oi_val,4),"funding_rate":round(fund,8),"tp_pct":round(tp_pct,4),"sl_pct":round(sl_pct,4),"rr":round(tp_pct/sl_pct,4) if sl_pct else 2.0,"source":"Binance futures liquidation cascade; MEXC futures execution only"}
+                            return self.engine._base(futures_symbol, side, "cascade_hunter", last, score, spread, bid_depth+ask_depth, 0.0, details)
+                        except Exception as e:
+                            errors += 1; record(binance_id, f"data unavailable: {type(e).__name__}"); return None
+                batch=max(self._concurrency_limit(settings)*2,1)
+                for i in range(0,len(selected),batch):
+                    res=await asyncio.gather(*(scan_one(sid,fut,t) for _score,sid,fut,t in selected[i:i+batch]), return_exceptions=False)
+                    out.extend([r for r in res if r])
+                    if len(out)>=max_candidates: break
+        except Exception as e:
+            errors += 1; self.last_refresh_error=f"cascade_hunter Binance futures failed: {type(e).__name__}: {e}; last={last_error}"[:700]
+            record("BINANCE", f"binance futures unavailable: {type(e).__name__}: {last_error or str(e)}")
+        self._record_cycle_health(scanned, errors, settings)
+        self.last_ai_candidates_count=len(out)
+        self.last_cascade_scan_stats={"checked_symbols":scanned,"errors":errors,"candidates":len(out),"top_coins":top_n,"min_liq_usd_1m":min_liq_usd,"min_24h_volume_usdt":min_quote}
+        self.last_reject_top_reasons=reject_counts.most_common(8)
+        ex=[]
+        for reason,_ in self.last_reject_top_reasons[:4]: ex.extend(reject_examples.get(reason,[])[:2])
+        self.last_reject_examples=ex[:8]
+        self.last_reject_reason="; ".join([f"{r}:{c}" for r,c in self.last_reject_top_reasons[:3]]) or "no cascade hunter setup"
+        self.last_signal_summary=f"Binance futures cascade candidates={len(out)} scanned={scanned}"
+        out.sort(key=lambda c: float(c.get("confidence",0)), reverse=True)
+        return out[:max_candidates]
+
+    async def _knife_reversal_candidates(self, exchange_client, settings: dict, max_candidates: int) -> list[dict]:
+        """Binance spot liquidation-wick scanner; MEXC futures is execution only.
+        LONG only: strong downside wick/flush, >=50% reclaim, volume spike, positive delta, bid imbalance.
+        """
+        import aiohttp, socket
+        from urllib.parse import urlencode
+        top_n = int(float(settings.get("knife_reversal_top_coins", settings.get("multi_strategy_top_coins", 100)) or 100))
+        min_quote = float(settings.get("knife_reversal_min_24h_volume_usdt", 20000000.0) or 0)
+        min_wick_pct = float(settings.get("knife_reversal_min_wick_pct", 1.20) or 1.20)
+        min_reclaim_pct = float(settings.get("knife_reversal_min_reclaim_pct", 50.0) or 50.0)
+        min_vol_ratio = float(settings.get("knife_reversal_min_volume_ratio", 2.0) or 2.0)
+        min_delta = float(settings.get("knife_reversal_min_delta_ratio", 0.05) or 0.05)
+        min_imb = float(settings.get("knife_reversal_min_imbalance", 0.08) or 0.08)
+        max_spread = float(settings.get("knife_reversal_max_spread_pct", 0.25) or 0.25)
+        tp_pct = float(settings.get("knife_reversal_tp_pct", 5.0) or 5.0)
+        sl_buffer = float(settings.get("knife_reversal_wick_sl_buffer_pct", 0.20) or 0.20)
+        reject_counts = Counter(); reject_examples = defaultdict(list)
+        scanned = errors = 0; out = []; last_error = ""
+        def record(sym, reason):
+            reason = str(reason or "unknown")[:90]
+            bucket = reason.split(":",1)[0]
+            for pref in ("volume low", "no mexc futures", "wick low", "reclaim low", "delta weak", "book weak", "spread high"):
+                if reason.startswith(pref): bucket = pref; break
+            reject_counts[bucket]+=1
+            if len(reject_examples[bucket])<3: reject_examples[bucket].append(f"{sym}->{reason}")
+        def to_futures(spot_symbol: str) -> str | None:
+            base = spot_symbol[:-4] if spot_symbol.endswith("USDT") else spot_symbol.split("/")[0]
+            for s in (f"{base}/USDT:USDT", f"{base}/USDT"):
+                if not getattr(exchange_client, "markets", None) or s in exchange_client.markets:
+                    return s
+            return None
+        async def get_json(session, path, params=None):
+            nonlocal last_error
+            url = "https://api.binance.com" + path
+            if params: url += "?" + urlencode(params)
+            async with session.get(url) as r:
+                txt = await r.text(); last_error = txt[:220]
+                if r.status >= 400: raise RuntimeError(f"binance {r.status}: {last_error}")
+                return await r.json(content_type=None)
+        try:
+            if hasattr(exchange_client, "load_markets"):
+                try: await exchange_client.load_markets()
+                except Exception: pass
+            timeout = aiohttp.ClientTimeout(total=float(settings.get("binance_spot_timeout_sec", "7") or 7))
+            headers={"User-Agent":"Mozilla/5.0 liquidity-bot"}
+            connector=aiohttp.TCPConnector(family=socket.AF_INET, ttl_dns_cache=300)
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector, trust_env=True) as session:
+                tickers = await get_json(session, "/api/v3/ticker/24hr")
+                ranked=[]
+                for t in tickers or []:
+                    sym=str(t.get("symbol") or "")
+                    if not sym.endswith("USDT") or any(x in sym for x in ("UPUSDT","DOWNUSDT","BULLUSDT","BEARUSDT")): continue
+                    try: qv=float(t.get("quoteVolume") or 0)
+                    except Exception: qv=0
+                    if qv < min_quote:
+                        record(sym,"volume low"); continue
+                    fut=to_futures(sym)
+                    if not fut:
+                        record(sym,"no mexc futures"); continue
+                    ranked.append((qv,sym,fut))
+                ranked.sort(reverse=True, key=lambda x:x[0]); selected=ranked[:top_n]
+                self.hot_symbols=[f for _,_,f in selected]
+                sem=asyncio.Semaphore(self._concurrency_limit(settings))
+                async def scan_one(spot_id, futures_symbol):
+                    nonlocal scanned, errors
+                    async with sem:
+                        scanned += 1
+                        try:
+                            candles = await get_json(session, "/api/v3/klines", {"symbol":spot_id,"interval":"1m","limit":40})
+                            if not candles or len(candles)<12: record(spot_id,"no candles"); return None
+                            ob = await get_json(session, "/api/v3/depth", {"symbol":spot_id,"limit":20})
+                            try: trades=await get_json(session,"/api/v3/aggTrades",{"symbol":spot_id,"limit":200})
+                            except Exception: trades=[]
+                            lows=[float(c[3]) for c in candles]; highs=[float(c[2]) for c in candles]; closes=[float(c[4]) for c in candles]; opens=[float(c[1]) for c in candles]; vols=[float(c[5]) for c in candles]
+                            # Use the last closed candle if possible to avoid entering before reclaim is real.
+                            idx=-2 if len(candles)>=3 else -1
+                            o,h,l,c = opens[idx], highs[idx], lows[idx], closes[idx]
+                            if l <= 0: return None
+                            lower_wick = max(0.0, min(o,c)-l)
+                            wick_pct = lower_wick / l * 100.0
+                            reclaim_pct = ((c-l)/lower_wick*100.0) if lower_wick>0 else 0.0
+                            recent_vol = sum(vols[idx-2:idx+1]) / 3 if len(vols)>=5 else vols[idx]
+                            base_vols = vols[:-5] or vols
+                            avg_vol = sum(base_vols)/max(1,len(base_vols))
+                            vol_ratio = recent_vol/avg_vol if avg_vol else 0.0
+                            bids=(ob.get("bids") or [])[:20] if isinstance(ob,dict) else []
+                            asks=(ob.get("asks") or [])[:20] if isinstance(ob,dict) else []
+                            bid_depth=sum(float(p)*float(q) for p,q in bids); ask_depth=sum(float(p)*float(q) for p,q in asks)
+                            imb=(bid_depth-ask_depth)/(bid_depth+ask_depth) if bid_depth+ask_depth>0 else 0.0
+                            bb=float(bids[0][0]) if bids else 0.0; ba=float(asks[0][0]) if asks else 0.0
+                            mid=(bb+ba)/2 if bb and ba else c
+                            spread=((ba-bb)/mid*100.0) if mid else 999
+                            buy=sell=0.0
+                            for tr in trades or []:
+                                try:
+                                    notional=float(tr.get("p") or 0)*float(tr.get("q") or 0)
+                                    if bool(tr.get("m")): sell+=notional
+                                    else: buy+=notional
+                                except Exception: pass
+                            total=buy+sell; delta=buy-sell; dr=delta/total if total>0 else 0.0
+                            if spread>max_spread: record(spot_id,f"spread high {spread:.3f}"); return None
+                            if wick_pct<min_wick_pct: record(spot_id,f"wick low {wick_pct:.2f}"); return None
+                            if reclaim_pct<min_reclaim_pct: record(spot_id,f"reclaim low {reclaim_pct:.1f}"); return None
+                            if vol_ratio<min_vol_ratio: record(spot_id,f"volume low {vol_ratio:.2f}"); return None
+                            if dr<min_delta: record(spot_id,f"delta weak {dr:+.3f}"); return None
+                            if imb<min_imb: record(spot_id,f"book weak {imb:+.3f}"); return None
+                            score=72+min(10,wick_pct*2)+min(10,(reclaim_pct-50)/5)+min(8,(vol_ratio-1)*3)+min(8,imb*40)+min(7,dr*25)
+                            stop_price = l * (1 - sl_buffer/100.0)
+                            details={
+                                "setup":"knife_reversal_wick_reclaim", "spot_source":"binance_spot_public_rest", "spot_symbol":spot_id,
+                                "wick_low":round(l,8), "wick_pct":round(wick_pct,4), "reclaim_pct":round(reclaim_pct,2),
+                                "spot_volume_ratio":round(vol_ratio,4), "spot_delta_ratio":round(dr,5), "spot_delta_usdt":round(delta,2),
+                                "spot_buy_volume_usdt":round(buy,2), "spot_sell_volume_usdt":round(sell,2),
+                                "spot_orderbook_imbalance":round(imb,5), "spot_bid_depth_usdt":round(bid_depth,2), "spot_ask_depth_usdt":round(ask_depth,2),
+                                "spot_spread_pct":round(spread,4), "tp_pct":round(tp_pct,4), "sl_buffer_pct":round(sl_buffer,4),
+                                "custom_stop_price":round(stop_price,8), "source":"Binance spot wick reclaim; MEXC futures execution only",
+                            }
+                            return self.engine._base(futures_symbol,"LONG","knife_reversal",c,score,spread,bid_depth+ask_depth,0.0,details)
+                        except Exception as e:
+                            errors += 1; record(spot_id, f"spot data unavailable: {type(e).__name__}"); return None
+                batch=max(self._concurrency_limit(settings)*2,1)
+                for i in range(0,len(selected),batch):
+                    results=await asyncio.gather(*(scan_one(sym,fut) for _qv,sym,fut in selected[i:i+batch]), return_exceptions=False)
+                    out.extend([r for r in results if r])
+                    if len(out)>=max_candidates: break
+        except Exception as e:
+            errors += 1; self.last_refresh_error=f"knife_reversal Binance REST failed: {type(e).__name__}: {e}; last={last_error}"[:700]
+        self._record_cycle_health(scanned, errors, settings)
+        self.last_knife_scan_stats={"checked_symbols":scanned,"errors":errors,"candidates":len(out),"top_coins":top_n,"min_24h_volume_usdt":min_quote}
+        self.last_reject_top_reasons=reject_counts.most_common(8)
+        self.last_reject_reason="; ".join([f"{r}:{c}" for r,c in self.last_reject_top_reasons[:3]]) or "no knife reversal setup"
+        out.sort(key=lambda c: float(c.get("confidence",0)), reverse=True)
+        return out[:max_candidates]
+
+    async def _multi_strategy_candidates(self, exchange_client, settings: dict, max_candidates: int) -> list[dict]:
+        st = dict(settings)
+        st["orderflow_impulse_top_coins"] = int(float(settings.get("multi_strategy_top_coins", settings.get("orderflow_impulse_top_coins", 100)) or 100))
+        st["knife_reversal_top_coins"] = int(float(settings.get("multi_strategy_top_coins", settings.get("knife_reversal_top_coins", 100)) or 100))
+        each = max(max_candidates, 3)
+        results = await asyncio.gather(
+            self._orderflow_impulse_candidates(exchange_client, st, each),
+            self._knife_reversal_candidates(exchange_client, st, each),
+            return_exceptions=True,
+        )
+        out=[]
+        for r in results:
+            if isinstance(r, list): out.extend(r)
+        seen=set(); uniq=[]
+        for c in sorted(out, key=lambda x: float(x.get("confidence",0)), reverse=True):
+            sym=str(c.get("symbol"));
+            if sym in seen: continue
+            seen.add(sym); uniq.append(c)
+        self.last_multi_strategy_stats={"candidates":len(uniq),"orderflow":len(results[0]) if isinstance(results[0],list) else 0,"knife":len(results[1]) if isinstance(results[1],list) else 0}
+        return uniq[:max_candidates]
+
     async def candidates(self, exchange_client, settings: dict) -> list[dict]:
         preferred_strategy = str(settings.get("effective_strategy_mode") or settings.get("strategy_mode", "hybrid")).lower()
         if preferred_strategy == "orderflow_impulse":
             base_max = int(settings.get("orderflow_impulse_max_candidates", os.getenv("ORDERFLOW_IMPULSE_MAX_CANDIDATES", "3")) or 3)
             return await self._orderflow_impulse_candidates(exchange_client, settings, base_max)
+        if preferred_strategy == "cascade_hunter":
+            base_max = int(settings.get("cascade_hunter_max_candidates", os.getenv("CASCADE_HUNTER_MAX_CANDIDATES", "3")) or 3)
+            return await self._cascade_hunter_candidates(exchange_client, settings, base_max)
+        if preferred_strategy == "knife_reversal":
+            base_max = int(settings.get("knife_reversal_max_candidates", os.getenv("KNIFE_REVERSAL_MAX_CANDIDATES", "3")) or 3)
+            return await self._knife_reversal_candidates(exchange_client, settings, base_max)
+        if preferred_strategy == "multi_strategy":
+            base_max = int(settings.get("multi_strategy_max_candidates", os.getenv("MULTI_STRATEGY_MAX_CANDIDATES", "3")) or 3)
+            return await self._multi_strategy_candidates(exchange_client, settings, base_max)
         if preferred_strategy in {"quick_bounce", "impulse_dump"}:
             prefix = "quick_bounce" if preferred_strategy == "quick_bounce" else "impulse_dump"
             env_prefix = "QUICK_BOUNCE" if preferred_strategy == "quick_bounce" else "IMPULSE_DUMP"

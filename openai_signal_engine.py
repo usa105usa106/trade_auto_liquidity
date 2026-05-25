@@ -114,6 +114,8 @@ def compact_signal_payload(candidate: dict, plan: Any, settings: dict) -> dict:
     symbol = getattr(plan, "symbol", candidate.get("symbol"))
     side = getattr(plan, "side", candidate.get("side"))
     strategy = str(getattr(plan, "strategy", candidate.get("strategy")) or "").lower()
+    if str(candidate.get("strategy_mode") or candidate.get("effective_strategy_mode") or "").lower() == "multi_strategy":
+        strategy = "multi_strategy"
     entry = float(getattr(plan, "entry_price", 0) or 0)
     sl = float(getattr(plan, "stop_price", 0) or 0)
     tp = float(getattr(plan, "take_price", 0) or 0)
@@ -141,6 +143,27 @@ def compact_signal_payload(candidate: dict, plan: Any, settings: dict) -> dict:
     ]
     if strategy == "liquidity_retest":
         selected_details = _pick(details, liquidity_details)
+    elif strategy == "knife_reversal":
+        return {
+            "s": symbol, "side": side, "st": strategy,
+            "c": _compact_float(candidate.get("confidence", getattr(plan, "confidence", 0)), 3),
+            "px": _compact_float(entry, 8),
+            "kr": {
+                "wick": _compact_float(details.get("wick_pct", 0), 3),
+                "recl": _compact_float(details.get("reclaim_pct", 0), 2),
+                "vr": _compact_float(details.get("spot_volume_ratio", details.get("volume_ratio", 0)), 3),
+                "dr": _compact_float(details.get("spot_delta_ratio", 0), 4),
+                "du": _compact_float(details.get("spot_delta_usdt", 0), 1),
+                "buy": _compact_float(details.get("spot_buy_volume_usdt", 0), 1),
+                "sell": _compact_float(details.get("spot_sell_volume_usdt", 0), 1),
+                "obi": _compact_float(details.get("spot_orderbook_imbalance", 0), 4),
+                "bid": _compact_float(details.get("spot_bid_depth_usdt", 0), 1),
+                "ask": _compact_float(details.get("spot_ask_depth_usdt", 0), 1),
+                "spr": _compact_float(details.get("spot_spread_pct", candidate.get("spread_pct", 0)), 4),
+            },
+        }
+    elif strategy == "multi_strategy":
+        return {"s": symbol, "side": side, "st": strategy, "c": _compact_float(candidate.get("confidence", getattr(plan, "confidence", 0)), 3), "px": _compact_float(entry, 8), "src": str(details.get("setup") or "")[:32], "m": _pick(details, ["spot_move_pct","spot_volume_ratio","spot_delta_ratio","spot_orderbook_imbalance","wick_pct","reclaim_pct","spot_spread_pct"])}
     elif strategy == "orderflow_impulse":
         # Ultra-compact AI payload for this mode.
         # Sends only confirmation inputs: direction, trend/impulse, volume,
@@ -288,6 +311,46 @@ def build_orderflow_impulse_prompt(payload: dict, strength: str) -> tuple[str, s
     return system, json.dumps(prompt, separators=(",", ":"), ensure_ascii=False), max_tokens
 
 
+
+def build_cascade_hunter_prompt(payload: dict, strength: str) -> tuple[str, str, int]:
+    strict = {
+        "weak": "Reject only obvious fake cascades: no liquidation burst, no price acceleration, weak volume, spread high, or move already exhausted.",
+        "medium": "Approve only if liquidation pressure, price acceleration, volume and direction are coherent and not too late.",
+        "strong": "Approve only A-quality early liquidation cascade with strong liq burst, acceleration, volume, clean spread, and no exhaustion."
+    }[strength]
+    system = "Crypto futures LIQUIDATION CASCADE validator. Levels fixed. JSON only."
+    prompt = {"t":"approve_or_reject_cascade_hunter","mode":strength,"rule":strict,"fields":"liq_usd,liq_side,pm price move,vr volume ratio,oi OI change,funding,spr spread,score","reject":["liq_weak","no_acceleration","volume_weak","late_exhausted","spread_high","direction_conflict"],"reply_schema":{"approve":True,"confidence":0.0,"reason":"max 8 words"},"sig":payload}
+    return system, json.dumps(prompt, separators=(",",":"), ensure_ascii=False), (60 if strength == "weak" else 80 if strength == "medium" else 100)
+
+def build_knife_reversal_prompt(payload: dict, strength: str) -> tuple[str, str, int]:
+    strict = {
+        "weak": "Reject only obvious false knife bounces: weak reclaim, weak delta, weak bid book, low volume, high spread.",
+        "medium": "Approve only if panic wick is reclaimed and buyers confirm with volume, positive delta and bid imbalance.",
+        "strong": "Approve only A-quality liquidation sweep bounce: large wick, strong reclaim, strong buy delta, bid depth, clean spread.",
+    }[strength]
+    system = "Crypto futures KNIFE REVERSAL validator. LONG only after wick reclaim. JSON only."
+    prompt = {
+        "t":"approve_or_reject_knife_reversal",
+        "mode":strength,
+        "rule":strict,
+        "fields":"kr: wick %,recl reclaim %,vr vol,dr delta,du delta $,buy/sell $,obi book,bid/ask depth,spr spread",
+        "reject":["no_real_flush","reclaim_weak","delta_weak","book_weak","volume_weak","spread_high","true_breakdown"],
+        "reply_schema":{"approve":True,"confidence":0.0,"reason":"max 8 words"},
+        "sig":payload,
+    }
+    return system, json.dumps(prompt, separators=(",", ":"), ensure_ascii=False), (70 if strength == "weak" else 90 if strength == "medium" else 120)
+
+
+def build_multi_strategy_prompt(payload: dict, strength: str) -> tuple[str, str, int]:
+    strict = {
+        "weak": "Approve if setup metrics are coherent and no obvious contradiction.",
+        "medium": "Approve only if the candidate is one of the stronger current impulse/reversal setups.",
+        "strong": "Approve only top-quality setup with clear edge, aligned volume/delta/book and clean spread.",
+    }[strength]
+    system = "Crypto futures MULTI-STRATEGY validator. Judge the selected best setup only. JSON only."
+    prompt = {"t":"approve_or_reject_multi_strategy","mode":strength,"rule":strict,"reject":["weak_edge","metrics_conflict","spread_high","late_or_failed_reclaim"],"reply_schema":{"approve":True,"confidence":0.0,"reason":"max 8 words"},"sig":payload}
+    return system, json.dumps(prompt, separators=(",", ":"), ensure_ascii=False), (70 if strength == "weak" else 90 if strength == "medium" else 120)
+
 def build_prompt(candidate: dict, plan: Any, settings: dict) -> tuple[str, str, int, str]:
     strength = active_strength(settings)
     payload = compact_signal_payload(candidate, plan, settings)
@@ -296,6 +359,12 @@ def build_prompt(candidate: dict, plan: Any, settings: dict) -> tuple[str, str, 
         system, prompt, max_tokens = build_liquidity_retest_prompt(payload, strength)
     elif strategy == "orderflow_impulse":
         system, prompt, max_tokens = build_orderflow_impulse_prompt(payload, strength)
+    elif strategy == "cascade_hunter":
+        system, prompt, max_tokens = build_cascade_hunter_prompt(payload, strength)
+    elif strategy == "knife_reversal":
+        system, prompt, max_tokens = build_knife_reversal_prompt(payload, strength)
+    elif strategy == "multi_strategy":
+        system, prompt, max_tokens = build_multi_strategy_prompt(payload, strength)
     else:
         system, prompt, max_tokens = build_scalp_prompt(payload, strength)
     return system, prompt, max_tokens, strength

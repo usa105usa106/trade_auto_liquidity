@@ -89,6 +89,14 @@ class TradePlanner:
                 "tp_mult": 1.0,
                 "sl_mult": 1.0,
             },
+            "cascade_hunter": {
+                "min_tp": float(os.getenv("CASCADE_HUNTER_TP_PCT", "4.0")),
+                "max_tp": float(os.getenv("CASCADE_HUNTER_TP_PCT", "4.0")),
+                "min_sl": float(os.getenv("CASCADE_HUNTER_SL_PCT", "2.0")),
+                "max_sl": float(os.getenv("CASCADE_HUNTER_SL_PCT", "2.0")),
+                "tp_mult": 1.0,
+                "sl_mult": 1.0,
+            },
             "orderflow_impulse": {
                 "min_tp": float(os.getenv("ORDERFLOW_IMPULSE_TP_PCT", "2.0")),
                 "max_tp": float(os.getenv("ORDERFLOW_IMPULSE_TP_PCT", "2.0")),
@@ -180,6 +188,21 @@ class TradePlanner:
             candidate["trade_margin_pct"] = float(settings.get("quick_bounce_trade_margin_pct", os.getenv("QUICK_BOUNCE_TRADE_MARGIN_PCT", "0.10")) or 0.10)
             candidate["max_open_positions"] = int(float(settings.get("quick_bounce_max_open_positions", os.getenv("QUICK_BOUNCE_MAX_OPEN_POSITIONS", "5")) or 5))
             candidate["leverage"] = int(float(settings.get("quick_bounce_leverage", os.getenv("QUICK_BOUNCE_LEVERAGE", "10")) or 10))
+        elif strategy in {"cascade_hunter"}:
+            details = candidate.get("score_details") or {}
+            # CASCADE HUNTER: fixed SL distance, two RR targets.
+            # Example LONG entry 100, SL 98 => risk 2; TP1=102 for 50%, TP2=104 for the rest.
+            sl_pct = max(0.01, float(settings.get("cascade_hunter_sl_pct", os.getenv("CASCADE_HUNTER_SL_PCT", "2.0")) or 2.0))
+            tp1_r = max(0.1, float(settings.get("cascade_hunter_tp1_r", os.getenv("CASCADE_HUNTER_TP1_R", "1.0")) or 1.0))
+            tp2_r = max(tp1_r, float(settings.get("cascade_hunter_tp2_r", os.getenv("CASCADE_HUNTER_TP2_R", "2.0")) or 2.0))
+            tp1_fraction = max(0.01, min(0.99, float(settings.get("cascade_hunter_tp1_fraction", os.getenv("CASCADE_HUNTER_TP1_FRACTION", "0.50")) or 0.50)))
+            tp_pct = sl_pct * tp2_r
+            rr = round(tp2_r, 6)
+            candidate["score_details"] = dict(details)
+            candidate["score_details"].update({"sl_pct": sl_pct, "tp_pct": tp_pct, "tp1_r": tp1_r, "tp2_r": tp2_r, "tp1_fraction": tp1_fraction, "rr": rr})
+            candidate["trade_margin_pct"] = float(settings.get("cascade_hunter_trade_margin_pct", os.getenv("CASCADE_HUNTER_TRADE_MARGIN_PCT", "0.10")) or 0.10)
+            candidate["max_open_positions"] = int(float(settings.get("cascade_hunter_max_open_positions", os.getenv("CASCADE_HUNTER_MAX_OPEN_POSITIONS", "3")) or 3))
+            candidate["leverage"] = int(float(settings.get("cascade_hunter_leverage", os.getenv("CASCADE_HUNTER_LEVERAGE", "10")) or 10))
         elif strategy in {"orderflow_impulse"}:
             details = candidate.get("score_details") or {}
             # ORDERFLOW IMPULSE fixed risk from real entry: TP 2%, SL 3%.
@@ -192,6 +215,20 @@ class TradePlanner:
             candidate["trade_margin_pct"] = float(settings.get("orderflow_impulse_trade_margin_pct", os.getenv("ORDERFLOW_IMPULSE_TRADE_MARGIN_PCT", "0.10")) or 0.10)
             candidate["max_open_positions"] = int(float(settings.get("orderflow_impulse_max_open_positions", os.getenv("ORDERFLOW_IMPULSE_MAX_OPEN_POSITIONS", "3")) or 3))
             candidate["leverage"] = int(float(settings.get("orderflow_impulse_leverage", os.getenv("ORDERFLOW_IMPULSE_LEVERAGE", "10")) or 10))
+        elif strategy in {"knife_reversal"}:
+            details = candidate.get("score_details") or {}
+            tp_pct = max(0.01, float(settings.get("knife_reversal_tp_pct", os.getenv("KNIFE_REVERSAL_TP_PCT", "5.0")) or 5.0))
+            custom_stop = float(details.get("custom_stop_price") or 0) if isinstance(details, dict) else 0.0
+            if side == "LONG" and custom_stop > 0 and custom_stop < price:
+                sl_pct = max(0.01, (price - custom_stop) / price * 100.0)
+            else:
+                sl_pct = max(0.01, float(settings.get("knife_reversal_fallback_sl_pct", os.getenv("KNIFE_REVERSAL_FALLBACK_SL_PCT", "2.0")) or 2.0))
+            rr = round(tp_pct / sl_pct, 6) if sl_pct > 0 else 1.0
+            candidate["score_details"] = dict(details)
+            candidate["score_details"].update({"sl_pct": sl_pct, "tp_pct": tp_pct, "rr": rr})
+            candidate["trade_margin_pct"] = float(settings.get("knife_reversal_trade_margin_pct", os.getenv("KNIFE_REVERSAL_TRADE_MARGIN_PCT", "0.10")) or 0.10)
+            candidate["max_open_positions"] = int(float(settings.get("multi_strategy_max_open_positions", settings.get("knife_reversal_max_open_positions", os.getenv("KNIFE_REVERSAL_MAX_OPEN_POSITIONS", "3"))) or 3))
+            candidate["leverage"] = int(float(settings.get("knife_reversal_leverage", os.getenv("KNIFE_REVERSAL_LEVERAGE", "10")) or 10))
         elif strategy in {"impulse_dump"}:
             details = candidate.get("score_details") or {}
             sl_pct = max(0.01, float(details.get("sl_pct", settings.get("impulse_dump_sl_pct", os.getenv("IMPULSE_DUMP_SL_PCT", "2.0"))) or 2.0))
@@ -292,8 +329,8 @@ class TradePlanner:
         else:
             max_notional_by_margin = max_margin_per_position * leverage
             notional_ceiling = self.max_order_usdt
-            if strategy == "orderflow_impulse":
-                # ORDERFLOW: user expects fixed isolated margin allocation: 10% of balance per trade.
+            if strategy in {"orderflow_impulse", "knife_reversal", "cascade_hunter"}:
+                # ORDERFLOW/KNIFE: user expects fixed isolated margin allocation: 10% of balance per trade.
                 # Do not let risk_pct sizing or MAX_ORDER_USDT shrink it to a tiny notional.
                 # Example: equity 100 USDT, margin 10%, lev 10x => notional 100 USDT, margin 10 USDT.
                 notional_ceiling = max_notional_by_margin
@@ -304,21 +341,35 @@ class TradePlanner:
                 # Account is too small for the configured leverage/min order.
                 return None
 
-            if strategy == "orderflow_impulse":
+            if strategy in {"orderflow_impulse", "knife_reversal", "cascade_hunter"}:
                 notional = max(self.min_order_usdt, max_notional_by_margin)
             else:
                 notional = clamp(risk_notional, self.min_order_usdt, notional_ceiling)
             expected_margin = notional / leverage if leverage > 0 else notional
         qty = notional / price
 
+        partial_take = 0.0
+        final_take = 0.0
+        partial_fraction = 0.0
         if side == "LONG":
             stop = price * (1 - sl_pct / 100.0)
             take = price * (1 + tp_pct / 100.0)
         else:
             stop = price * (1 + sl_pct / 100.0)
             take = price * (1 - tp_pct / 100.0)
+        if strategy == "cascade_hunter":
+            risk_abs = abs(price - stop)
+            tp1_r = float(candidate.get("score_details", {}).get("tp1_r", 1.0) or 1.0)
+            partial_fraction = float(candidate.get("score_details", {}).get("tp1_fraction", 0.50) or 0.50)
+            partial_fraction = max(0.01, min(0.99, partial_fraction))
+            if side == "LONG":
+                partial_take = price + risk_abs * tp1_r
+                final_take = take
+            else:
+                partial_take = price - risk_abs * tp1_r
+                final_take = take
 
-        order_type = "market" if strategy in {"momentum", "ai_scalping", "boost_scalping", "quick_bounce", "impulse_dump", "orderflow_impulse"} else "limit"
+        order_type = "market" if strategy in {"momentum", "ai_scalping", "boost_scalping", "quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter"} else "limit"
         lr_rr = float(candidate.get("liquidity_retest_rr") or (details.get("adaptive_rr") if isinstance(details, dict) else 0) or 0)
         lr_zone_low = float(details.get("zone_low") or 0) if isinstance(details, dict) else 0.0
         lr_zone_high = float(details.get("zone_high") or 0) if isinstance(details, dict) else 0.0
@@ -331,6 +382,9 @@ class TradePlanner:
             entry_price=price,
             stop_price=stop,
             take_price=take,
+            partial_take_price=partial_take,
+            partial_take_fraction=partial_fraction,
+            final_take_price=final_take,
             risk_pct=risk_pct,
             confidence=float(candidate.get("confidence", 0)),
             strategy=strategy,

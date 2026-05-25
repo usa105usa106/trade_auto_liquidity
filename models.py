@@ -24,6 +24,9 @@ class TradePlan:
     risk_pct: float
     confidence: float
     strategy: str
+    partial_take_price: float = 0.0
+    partial_take_fraction: float = 0.0
+    final_take_price: float = 0.0
     mirror_used: bool = False
     session: str = "NORMAL"
     max_open_positions: int = 999
