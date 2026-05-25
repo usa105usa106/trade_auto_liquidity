@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0277 CASCADE ADAPTIVE PRESSURE")
+VERSION = os.getenv("BOT_VERSION", "0278 CASCADE STRICT PREFILTER")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -213,11 +213,14 @@ class Defaults:
     cascade_hunter_sl_pct: float = env_float("CASCADE_HUNTER_SL_PCT", 2.0)
     cascade_hunter_time_stop_sec: int = env_int("CASCADE_HUNTER_TIME_STOP_SEC", 14400)
     cascade_hunter_min_liq_usd_1m: float = env_float("CASCADE_HUNTER_MIN_LIQ_USD_1M", 30000.0)  # legacy/stat only after v0277
-    cascade_hunter_min_pressure_ratio: float = env_float("CASCADE_HUNTER_MIN_PRESSURE_RATIO", 0.035)
-    cascade_hunter_min_volume_ratio: float = env_float("CASCADE_HUNTER_MIN_VOLUME_RATIO", 1.8)
-    cascade_hunter_min_price_move_pct: float = env_float("CASCADE_HUNTER_MIN_PRICE_MOVE_PCT", 0.25)
-    cascade_hunter_max_spread_pct: float = env_float("CASCADE_HUNTER_MAX_SPREAD_PCT", 0.25)
+    cascade_hunter_min_pressure_ratio: float = env_float("CASCADE_HUNTER_MIN_PRESSURE_RATIO", 0.070)
+    cascade_hunter_min_volume_ratio: float = env_float("CASCADE_HUNTER_MIN_VOLUME_RATIO", 2.2)
+    cascade_hunter_min_price_move_pct: float = env_float("CASCADE_HUNTER_MIN_PRICE_MOVE_PCT", 0.45)
+    cascade_hunter_max_spread_pct: float = env_float("CASCADE_HUNTER_MAX_SPREAD_PCT", 0.12)
     cascade_hunter_min_24h_volume_usdt: float = env_float("CASCADE_HUNTER_MIN_24H_VOLUME_USDT", 5000000.0)
+    cascade_hunter_max_price_move_pct: float = env_float("CASCADE_HUNTER_MAX_PRICE_MOVE_PCT", 1.80)
+    cascade_hunter_min_delta_ratio_abs: float = env_float("CASCADE_HUNTER_MIN_DELTA_RATIO_ABS", 0.20)
+    cascade_hunter_min_score: float = env_float("CASCADE_HUNTER_MIN_SCORE", 86.0)
     cascade_hunter_tp1_r: float = env_float("CASCADE_HUNTER_TP1_R", 1.0)
     cascade_hunter_tp2_r: float = env_float("CASCADE_HUNTER_TP2_R", 2.0)
     cascade_hunter_tp1_fraction: float = env_float("CASCADE_HUNTER_TP1_FRACTION", 0.50)

@@ -783,11 +783,14 @@ class Scanner:
         # Adaptive pressure filter for Binance SPOT proxy:
         # fixed USD thresholds are too weak for BTC and too strict/noisy for small alts.
         # Use pressure as a share of the last 5 minutes quote volume instead.
-        min_pressure_ratio = float(settings.get("cascade_hunter_min_pressure_ratio", 0.035) or 0.035)
+        min_pressure_ratio = float(settings.get("cascade_hunter_min_pressure_ratio", 0.070) or 0.070)
         min_pressure_usd = float(settings.get("cascade_hunter_min_liq_usd_1m", 30000.0) or 30000.0)  # legacy/stat only
-        min_vol_ratio = float(settings.get("cascade_hunter_min_volume_ratio", 1.8) or 1.8)
-        min_move = abs(float(settings.get("cascade_hunter_min_price_move_pct", 0.25) or 0.25))
-        max_spread = abs(float(settings.get("cascade_hunter_max_spread_pct", 0.25) or 0.25))
+        min_vol_ratio = float(settings.get("cascade_hunter_min_volume_ratio", 2.2) or 2.2)
+        min_move = abs(float(settings.get("cascade_hunter_min_price_move_pct", 0.45) or 0.45))
+        max_spread = abs(float(settings.get("cascade_hunter_max_spread_pct", 0.12) or 0.12))
+        max_move = abs(float(settings.get("cascade_hunter_max_price_move_pct", 1.80) or 1.80))
+        min_delta_abs = abs(float(settings.get("cascade_hunter_min_delta_ratio_abs", 0.20) or 0.20))
+        min_score = float(settings.get("cascade_hunter_min_score", 86.0) or 86.0)
         tp_pct = float(settings.get("cascade_hunter_tp_pct", 2.5) or 2.5)
         sl_pct = float(settings.get("cascade_hunter_sl_pct", 2.0) or 2.0)
         reject_counts = Counter(); reject_examples = defaultdict(list)
@@ -798,6 +801,7 @@ class Scanner:
             bucket = reason.split(":", 1)[0]
             for prefix in (
                 "spot spread high", "pressure weak", "volume low", "no acceleration",
+                "delta weak", "move too late", "score weak",
                 "spot data unavailable", "mexc futures symbol missing", "binance spot unavailable",
             ):
                 if reason.startswith(prefix):
@@ -878,6 +882,12 @@ class Scanner:
                     "min_24h_volume_usdt": min_quote,
                     "min_pressure_usd_legacy": min_pressure_usd,
                     "min_pressure_ratio": min_pressure_ratio,
+                    "min_volume_ratio": min_vol_ratio,
+                    "min_price_move_pct": min_move,
+                    "max_price_move_pct": max_move,
+                    "min_delta_ratio_abs": min_delta_abs,
+                    "max_spread_pct": max_spread,
+                    "min_score": min_score,
                 }
                 sem=asyncio.Semaphore(self._concurrency_limit(settings))
 
@@ -929,13 +939,19 @@ class Scanner:
                                 side="SHORT"; liq_side="SELL"
                             if spread>max_spread:
                                 record(spot_symbol, f"spot spread high {spread:.3f}% > {max_spread:.3f}%"); return None
+                            if abs(price_move) > max_move:
+                                record(spot_symbol, f"move too late {abs(price_move):.3f}% > {max_move:.3f}%"); return None
                             if pressure_ratio < min_pressure_ratio:
                                 record(spot_symbol, f"pressure weak ratio {pressure_ratio:.4f} < {min_pressure_ratio:.4f}"); return None
                             if vol_ratio<min_vol_ratio:
                                 record(spot_symbol, f"volume low {vol_ratio:.2f} < {min_vol_ratio:.2f}"); return None
+                            if abs(delta_ratio)<min_delta_abs:
+                                record(spot_symbol, f"delta weak {abs(delta_ratio):.3f} < {min_delta_abs:.3f}"); return None
                             if not side:
                                 record(spot_symbol, f"no acceleration move={price_move:+.3f} delta={delta_ratio:+.3f} imb={ob_imb:+.3f}"); return None
                             score=70+min(12,pressure_ratio*100.0)+min(10,abs(price_move)*10)+min(8,(vol_ratio-1)*4)+min(8,abs(delta_ratio)*20)+min(4,abs(ob_imb)*20)
+                            if score < min_score:
+                                record(spot_symbol, f"score weak {score:.1f} < {min_score:.1f}"); return None
                             details={
                                 "setup":"binance_spot_cascade_pressure",
                                 "spot_source":"binance_spot_public_rest",
@@ -948,6 +964,9 @@ class Scanner:
                                 "pressure_ratio":round(pressure_ratio,6),
                                 "volume_5m_usdt":round(volume_5m_usd,2),
                                 "min_pressure_ratio":round(min_pressure_ratio,6),
+                                "max_price_move_pct":round(max_move,4),
+                                "min_delta_ratio_abs":round(min_delta_abs,4),
+                                "min_score":round(min_score,2),
                                 "price_move_2m_pct":round(price_move,4),
                                 "volume_ratio":round(vol_ratio,4),
                                 "delta_ratio":round(delta_ratio,5),
@@ -972,7 +991,6 @@ class Scanner:
                 for i in range(0,len(selected),batch):
                     res=await asyncio.gather(*(scan_one(spot,sid,fut,t) for _score,spot,sid,fut,t in selected[i:i+batch]), return_exceptions=False)
                     out.extend([r for r in res if r])
-                    if len(out)>=max_candidates: break
         except Exception as e:
             errors += 1; self.last_refresh_error=f"cascade_hunter Binance spot failed: {type(e).__name__}: {e}; last={last_error}"[:700]
             record("BINANCE", f"binance spot unavailable: {type(e).__name__}: {last_error or str(e)}")
