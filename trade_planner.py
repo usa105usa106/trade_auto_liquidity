@@ -292,14 +292,22 @@ class TradePlanner:
         else:
             max_notional_by_margin = max_margin_per_position * leverage
             notional_ceiling = self.max_order_usdt
-            if self._bool_setting(settings, "margin_allocation_enabled", True):
+            if strategy == "orderflow_impulse":
+                # ORDERFLOW: user expects fixed isolated margin allocation: 10% of balance per trade.
+                # Do not let risk_pct sizing or MAX_ORDER_USDT shrink it to a tiny notional.
+                # Example: equity 100 USDT, margin 10%, lev 10x => notional 100 USDT, margin 10 USDT.
+                notional_ceiling = max_notional_by_margin
+            elif self._bool_setting(settings, "margin_allocation_enabled", True):
                 notional_ceiling = min(notional_ceiling, max_notional_by_margin)
 
             if notional_ceiling < self.min_order_usdt:
-                # Account is too small for the configured number of slots/leverage/min order.
+                # Account is too small for the configured leverage/min order.
                 return None
 
-            notional = clamp(risk_notional, self.min_order_usdt, notional_ceiling)
+            if strategy == "orderflow_impulse":
+                notional = max(self.min_order_usdt, max_notional_by_margin)
+            else:
+                notional = clamp(risk_notional, self.min_order_usdt, notional_ceiling)
             expected_margin = notional / leverage if leverage > 0 else notional
         qty = notional / price
 

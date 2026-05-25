@@ -5188,7 +5188,17 @@ async def trading_loop(app):
 
                 opened_this_cycle = False
                 scanner.last_ai_check_symbols = []
-                scanner.last_openai_analysis_status = "AI analysis: pending" if bool(settings.get("openai_analysis_enabled", False)) else "AI analysis: OFF"
+                # Keep /log read-only and token-free. Do not overwrite the last real
+                # OpenAI verdict with "pending" when there is no candidate or when
+                # a later scan does not actually call OpenAI. This keeps /log showing
+                # the last completed AI check instead of a misleading stale pending state.
+                ai_enabled_cycle = bool(settings.get("openai_analysis_enabled", False))
+                if not ai_enabled_cycle:
+                    scanner.last_openai_analysis_status = "AI analysis: OFF"
+                elif candidates:
+                    prev_ai_status = str(getattr(scanner, "last_openai_analysis_status", "") or "")
+                    if not prev_ai_status or prev_ai_status in {"AI analysis: OFF", "AI analysis: no cached check yet"}:
+                        scanner.last_openai_analysis_status = "AI analysis: waiting for candidate check"
                 for cand in candidates:
                     original_symbol = cand.get("symbol")
                     cand = MirrorEngine(str(settings.get("mirror_mode", "off"))).apply(cand, adaptive_stats)
@@ -5232,6 +5242,14 @@ async def trading_loop(app):
                         cand = SpotConfirmationEngine(enabled=spot_enabled).apply(cand, spot_data)
                     cand["strategy_mode"] = base_strategy_mode
                     cand["effective_strategy_mode"] = effective_strategy
+                    if orderflow_impulse_cycle:
+                        # v0265: force orderflow_impulse to use its own 3-slot model.
+                        # Session/global settings must not silently downgrade this mode to one trade.
+                        of_max_slots = int(float(settings.get("orderflow_impulse_max_open_positions", 3) or 3))
+                        cand["strategy"] = "orderflow_impulse"
+                        cand["max_open_positions"] = of_max_slots
+                        cand["trade_margin_pct"] = float(settings.get("orderflow_impulse_trade_margin_pct", 0.10) or 0.10)
+                        cand["leverage"] = int(float(settings.get("orderflow_impulse_leverage", 10) or 10))
 
                     if not cand.get("allowed_by_session", True):
                         scanner.last_reject_reason = f"{original_symbol}: session filter blocked"
@@ -5257,6 +5275,16 @@ async def trading_loop(app):
                         continue
 
                     plan = TradePlanner().make_plan(cand, settings, equity_usdt=equity)
+                    if orderflow_impulse_cycle and plan:
+                        # v0265 hard guarantee: orderflow_impulse can open up to 3 different symbols.
+                        # This protects the mode from stale DB/global max_open_positions=1.
+                        of_max_slots = int(float(settings.get("orderflow_impulse_max_open_positions", 3) or 3))
+                        try:
+                            plan.strategy = "orderflow_impulse"
+                            plan.max_open_positions = of_max_slots
+                            plan.leverage = int(float(settings.get("orderflow_impulse_leverage", getattr(plan, "leverage", 10)) or 10))
+                        except Exception:
+                            pass
                     if not plan:
                         scanner.last_reject_reason = f"{original_symbol}: planner returned no trade"
                         if orderflow_impulse_cycle:
@@ -5283,6 +5311,19 @@ async def trading_loop(app):
                             stop_price=float(getattr(plan, "stop_price", 0) or 0),
                         )
 
+                    # Pre-entry eligibility before OpenAI: do not spend AI tokens and do not show
+                    # an "AI approved" message for a candidate that cannot be opened due to
+                    # duplicate symbol, occupied slots, or exchange-side position limits.
+                    try:
+                        pre_ok, pre_reason = await exec_engine.can_enter(plan.symbol, int(getattr(plan, "max_open_positions", 999)), live=live)
+                    except Exception as e:
+                        pre_ok, pre_reason = False, f"pre-entry check failed: {e}"
+                    if not pre_ok:
+                        scanner.last_reject_reason = f"{plan.symbol}: pre-entry blocked before AI: {pre_reason}"
+                        if orderflow_impulse_cycle:
+                            log_event("orderflow_impulse_open_skipped", stage="pre_entry", ok=False, symbol=str(plan.symbol), side=str(plan.side), reason=str(pre_reason)[:500])
+                        continue
+
                     ai_enabled = bool(settings.get("openai_analysis_enabled", False))
                     ai_show = bool(settings.get("openai_show_decisions", False))
                     ai_message_id = None
@@ -5297,6 +5338,11 @@ async def trading_loop(app):
                     if ai_enabled:
                         try:
                             scanner.last_ai_check_symbols.append(str(plan.symbol))
+                        except Exception:
+                            pass
+                    if ai_enabled:
+                        try:
+                            scanner.last_openai_analysis_status = f"AI analysis: checking {plan.symbol} {plan.side}"[:500]
                         except Exception:
                             pass
                     ai_verdict = await ai_signal_engine.validate(cand, plan, settings)

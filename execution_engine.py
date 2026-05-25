@@ -109,10 +109,16 @@ class ExecutionEngine:
             # exchange position must block a new entry until it is closed/rotated.
             try:
                 rows = await self.exchange_client.fetch_positions()
+                exchange_open = 0
+                requested = str(symbol or "").replace("/", "_").replace(":USDT", "").upper()
                 for row in rows or []:
                     if self.exchange_position_qty(row) > 0:
-                        row_sym = str(row.get("symbol") or row.get("mexc_symbol") or "")
-                        return False, f"exchange position already open: {row_sym or 'unknown'}"
+                        exchange_open += 1
+                        row_sym = str(row.get("symbol") or row.get("mexc_symbol") or "").replace("/", "_").replace(":USDT", "").upper()
+                        if row_sym and row_sym == requested:
+                            return False, f"exchange position already open: {row_sym}"
+                if exchange_open >= int(max_open_positions):
+                    return False, f"max exchange positions reached ({exchange_open}/{int(max_open_positions)})"
             except Exception as e:
                 return False, f"cannot verify exchange positions: {e}"
             try:
