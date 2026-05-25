@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0257 ORDERFLOW TOP100 20M STRICT INTERVAL LOGS")
+VERSION = os.getenv("BOT_VERSION", "0258 ORDERFLOW TOP100 60S SAFE VIRTUAL TPSL")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)

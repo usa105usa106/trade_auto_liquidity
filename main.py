@@ -3778,7 +3778,7 @@ async def orderflow_impulse_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     await reply(
         update,
         "✅ Orderflow impulse ON\n"
-        "Binance spot top-50, trend + spot/CVD delta proxy + super volume + orderbook imbalance.\n"
+        "Binance spot top-100, scan every 60 sec, trend + spot/CVD delta proxy + super volume + orderbook imbalance.\n"
         "До 3 сделок, 10% депозита на монету, x10 isolated. SL 1%, TP 2%, time-stop 4h.",
         reply_markup=MAIN_MENU,
     )
@@ -5432,7 +5432,7 @@ async def trading_loop(app):
                 _sleep_sec = int(settings.get("scan_interval_sec", 5) or 5)
                 if orderflow_impulse_cycle:
                     _sleep_sec = int(settings.get("orderflow_impulse_scan_interval_sec", settings.get("scan_interval_sec", 60)) or 60)
-                    # v0257: orderflow scans must respect the configured interval.
+                    # v0258: orderflow scans must respect the configured 60-second interval.
                     # If the user sets 1 minute, make a real 60s pause after each completed cycle.
                     _sleep_sec = max(60, _sleep_sec)
                 await sleep_until_next_scan(app, _sleep_sec)

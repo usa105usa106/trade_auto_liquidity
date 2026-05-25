@@ -278,16 +278,17 @@ class ProtectionEngine:
                     "checked_at": time.time(),
                 }
 
-            # v0248: Quick Bounce uses MEXC /planorder/place; Impulse Dump uses
-            # MEXC native /stoporder/place attached to a position.  Both can lag
+            # v0258: Quick Bounce uses MEXC /planorder/place; Impulse Dump and
+            # Orderflow Impulse use MEXC native /stoporder/place attached to a
+            # position. These endpoints can lag
             # in list/open-orders endpoints right after placement.  If the entry
             # code already posted native TP/SL successfully, keep the position
             # EXCHANGE PROTECTED during a short indexing grace period instead of
             # showing a false LOCAL PROTECTION/MISSING warning or trying to
             # restore/cancel orders.
             strategy_l = str(pos.get("strategy") or "").lower()
-            is_impulse_dump = strategy_l == "impulse_dump"
-            if is_impulse_dump and (pos.get("tpsl_native_direct_posted") or pos.get("tpsl_native_direct_raw")):
+            is_native_tpsl_strategy = strategy_l in {"impulse_dump", "orderflow_impulse"}
+            if is_native_tpsl_strategy and (pos.get("tpsl_native_direct_posted") or pos.get("tpsl_native_direct_raw")):
                 try:
                     opened_at = float(pos.get("opened_at") or pos.get("created_at") or 0)
                 except Exception:
@@ -369,17 +370,22 @@ class ProtectionEngine:
         out = await self.check(pos)
         if out.get("protection_status") in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP", "EMERGENCY SL ONLY"} or not reattach or not live or not self.execution_engine:
             return out
-        # v0233: Quick Bounce fallback is intentionally virtual monitoring.
-        # If exchange TP/SL are not confirmed, keep the position open and do
-        # NOT cancel/recreate planorders from the watchdog; that can duplicate
-        # orders or remove a valid backstop while MEXC list endpoints lag.
-        if str(pos.get("strategy") or "").lower() in {"quick_bounce", "impulse_dump"}:
+        # v0258: Quick Bounce / Impulse Dump / Orderflow Impulse fallback is
+        # intentionally virtual monitoring. If exchange TP/SL are not confirmed,
+        # keep the position open and do NOT cancel/recreate orders from the
+        # watchdog. If TP/SL were already placed, the bot must not touch them;
+        # if placement failed or cannot be verified, local virtual TP/SL handles
+        # the exit without auto-closing the trade.
+        strategy_l = str(pos.get("strategy") or "").lower()
+        if strategy_l in {"quick_bounce", "impulse_dump", "orderflow_impulse"}:
             out["protection_status"] = "VIRTUAL_PROTECTED"
             out["protection_mode"] = "virtual"
             out["virtual_tp_sl_active"] = True
-            out["quick_bounce_no_reattach"] = True
-            out["impulse_dump_no_reattach"] = str(pos.get("strategy") or "").lower() == "impulse_dump"
-            out["protection_note"] = "Quick Bounce/Impulse Dump use local TP/SL fallback; watchdog does not reattach/cancel exchange orders"
+            out["quick_bounce_no_reattach"] = strategy_l == "quick_bounce"
+            out["impulse_dump_no_reattach"] = strategy_l == "impulse_dump"
+            out["orderflow_impulse_no_reattach"] = strategy_l == "orderflow_impulse"
+            out["reattach_skipped"] = "strategy_uses_virtual_tpsl_fallback"
+            out["protection_note"] = "Strategy uses virtual TP/SL fallback; watchdog does not cancel, reattach, or auto-close the position"
             return out
         liq_mode = bool(pos.get("liquidation_stop_mode")) and str(pos.get("strategy") or "").lower() == "ai_scalping"
         try:

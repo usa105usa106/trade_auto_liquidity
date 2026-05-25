@@ -272,7 +272,6 @@ class Scanner:
                 # scanning fresh REST data.
                 source = "mexc_futures_rest"
                 if ws_error:
-                    source = "mexc_futures_rest_after_ws_empty"
                     self.last_universe_target_reason = f"REST fallback used after websocket issue: {ws_error[:120]}"
                 self.last_refresh_error = ""
                 return tickers, source
