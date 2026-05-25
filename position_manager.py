@@ -618,7 +618,7 @@ class PositionManager:
                     if ev: events.append(ev)
                     continue
             if strategy == "orderflow_impulse":
-                of_time_stop = int(await self._setting("orderflow_impulse_time_stop_sec", os.getenv("ORDERFLOW_IMPULSE_TIME_STOP_SEC", "14400")) or 14400)
+                of_time_stop = int(await self._setting("orderflow_impulse_time_stop_sec", os.getenv("ORDERFLOW_IMPULSE_TIME_STOP_SEC", "86400")) or 86400)
                 if of_time_stop > 0 and now - opened >= of_time_stop:
                     ev = await self._close_and_event(pos, "time_stop", "orderflow_impulse_time_stop", live, price)
                     if ev: events.append(ev)

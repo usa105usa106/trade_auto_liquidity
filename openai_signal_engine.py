@@ -126,6 +126,12 @@ def compact_signal_payload(candidate: dict, plan: Any, settings: dict) -> dict:
         "move_1m", "move_5m", "momentum_5m_pct", "breakout", "weak_filter",
         "ema9", "ema21", "reclaim", "upper_wick", "lower_wick", "sweep",
     ]
+    orderflow_details = [
+        "spot_move_pct", "spot_volume_ratio", "spot_orderbook_imbalance",
+        "spot_delta_ratio", "spot_delta_usdt", "spot_spread_pct",
+        "volume_ratio", "trend_15m_pct", "trend_1h_pct", "orderbook_imbalance",
+        "min_volume_ratio", "min_trend_pct", "min_imbalance_abs",
+    ]
     liquidity_details = [
         "setup", "rr_reason", "adaptive_rr", "target_rr", "zone_low", "zone_high", "zone_type",
         "zone_quality", "zone_intact", "mtf_score", "bos", "choch", "bos_level", "bos_strength_pct",
@@ -133,7 +139,46 @@ def compact_signal_payload(candidate: dict, plan: Any, settings: dict) -> dict:
         "retest_rejection_wick", "clean_path", "liquidity_target", "sweep", "sweep_wick",
         "sweep_index", "displacement_index", "reclaim_pct", "fvg_low", "fvg_high", "imbalance",
     ]
-    selected_details = _pick(details, liquidity_details if strategy == "liquidity_retest" else common_details)
+    if strategy == "liquidity_retest":
+        selected_details = _pick(details, liquidity_details)
+    elif strategy == "orderflow_impulse":
+        # Ultra-compact AI payload for this mode.
+        # Sends only confirmation inputs: direction, trend/impulse, volume,
+        # delta, order book pressure/depth and spread. No TP/SL/signal age.
+        selected_details = _pick(details, orderflow_details)
+        spot_move = details.get("spot_move_pct", details.get("trigger_trend_pct", 0))
+        spot_vr = details.get("spot_volume_ratio", details.get("volume_ratio", 0))
+        spot_obi = details.get("spot_orderbook_imbalance", details.get("orderbook_imbalance", 0))
+        spot_spread = details.get("spot_spread_pct", candidate.get("spread_pct", details.get("spread_pct", 0)))
+        return {
+            "s": symbol,
+            "side": side,
+            "st": strategy,
+            "c": _compact_float(candidate.get("confidence", getattr(plan, "confidence", 0)), 3),
+            "px": _compact_float(entry, 8),
+            "of": {
+                "src": str(details.get("spot_source") or "binance_spot"),
+                "ss": str(details.get("spot_symbol") or "")[:18],
+                "mv": _compact_float(spot_move, 4),
+                "vr": _compact_float(spot_vr, 3),
+                "dr": _compact_float(details.get("spot_delta_ratio", 0), 4),
+                "du": _compact_float(details.get("spot_delta_usdt", 0), 1),
+                "buy": _compact_float(details.get("spot_buy_volume_usdt", 0), 1),
+                "sell": _compact_float(details.get("spot_sell_volume_usdt", 0), 1),
+                "obi": _compact_float(spot_obi, 4),
+                "bid": _compact_float(details.get("spot_bid_depth_usdt", 0), 1),
+                "ask": _compact_float(details.get("spot_ask_depth_usdt", 0), 1),
+                "spr": _compact_float(spot_spread, 4),
+            },
+            "ctx": {
+                "tr15": _compact_float(details.get("trend_15m_pct", spot_move), 4),
+                "tr1h": _compact_float(details.get("trend_1h_pct", 0), 4),
+                "fvr": _compact_float(details.get("volume_ratio", spot_vr), 3),
+                "fobi": _compact_float(details.get("orderbook_imbalance", spot_obi), 4),
+            },
+        }
+    else:
+        selected_details = _pick(details, common_details)
 
     return {
         "symbol": symbol,
@@ -220,12 +265,37 @@ def build_liquidity_retest_prompt(payload: dict, strength: str) -> tuple[str, st
     return system, json.dumps(prompt, separators=(",", ":"), ensure_ascii=False), max_tokens
 
 
+def build_orderflow_impulse_prompt(payload: dict, strength: str) -> tuple[str, str, int]:
+    strict = {
+        "weak": "Reject only obvious bad orderflow impulses: weak spot delta, weak volume, opposite book pressure, late/overextended move, or bad spread.",
+        "medium": "Approve only if Binance spot impulse is fresh: volume spike, delta and orderbook match side, futures context agrees, and spread is acceptable.",
+        "strong": "Approve only high-quality orderflow continuation: strong aligned spot delta/book/volume, no late chase, no clear opposing wall, and clean continuation context.",
+    }[strength]
+    system = (
+        "Crypto futures ORDERFLOW IMPULSE validator. Levels are fixed. "
+        "Approve only if side agrees with trend/move, delta, volume spike and book pressure. JSON only."
+    )
+    prompt = {
+        "t": "approve_or_reject_orderflow_impulse",
+        "mode": strength,
+        "rule": strict,
+        "fields": "of:mv trend %,vr vol ratio,dr delta ratio,du delta $,buy/sell $,obi book imbalance,bid/ask depth,spr spread; ctx:tr15,tr1h,fvr,fobi",
+        "reject": ["delta_against", "book_against", "volume_weak", "trend_conflict", "late_chase", "spread_high"],
+        "reply_schema": {"approve": True, "confidence": 0.0, "reason": "max 8 words"},
+        "sig": payload,
+    }
+    max_tokens = 70 if strength == "weak" else 90 if strength == "medium" else 120
+    return system, json.dumps(prompt, separators=(",", ":"), ensure_ascii=False), max_tokens
+
+
 def build_prompt(candidate: dict, plan: Any, settings: dict) -> tuple[str, str, int, str]:
     strength = active_strength(settings)
     payload = compact_signal_payload(candidate, plan, settings)
-    strategy = str(payload.get("strategy") or "").lower()
+    strategy = str(payload.get("strategy") or payload.get("st") or "").lower()
     if strategy == "liquidity_retest":
         system, prompt, max_tokens = build_liquidity_retest_prompt(payload, strength)
+    elif strategy == "orderflow_impulse":
+        system, prompt, max_tokens = build_orderflow_impulse_prompt(payload, strength)
     else:
         system, prompt, max_tokens = build_scalp_prompt(payload, strength)
     return system, prompt, max_tokens, strength

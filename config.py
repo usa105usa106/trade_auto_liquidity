@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0258 ORDERFLOW TOP100 60S SAFE VIRTUAL TPSL")
+VERSION = os.getenv("BOT_VERSION", "0262 ORDERFLOW AI PROMPT CLEAN")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -193,8 +193,8 @@ class Defaults:
     orderflow_impulse_max_open_positions: int = env_int("ORDERFLOW_IMPULSE_MAX_OPEN_POSITIONS", 3)
     orderflow_impulse_leverage: int = env_int("ORDERFLOW_IMPULSE_LEVERAGE", 10)
     orderflow_impulse_tp_pct: float = env_float("ORDERFLOW_IMPULSE_TP_PCT", 2.0)
-    orderflow_impulse_sl_pct: float = env_float("ORDERFLOW_IMPULSE_SL_PCT", 1.0)
-    orderflow_impulse_time_stop_sec: int = env_int("ORDERFLOW_IMPULSE_TIME_STOP_SEC", 14400)
+    orderflow_impulse_sl_pct: float = env_float("ORDERFLOW_IMPULSE_SL_PCT", 3.0)
+    orderflow_impulse_time_stop_sec: int = env_int("ORDERFLOW_IMPULSE_TIME_STOP_SEC", 86400)
     orderflow_impulse_min_volume_ratio: float = env_float("ORDERFLOW_IMPULSE_MIN_VOLUME_RATIO", 1.5)
     orderflow_impulse_min_trend_pct: float = env_float("ORDERFLOW_IMPULSE_MIN_TREND_PCT", 0.25)
     orderflow_impulse_min_imbalance_abs: float = env_float("ORDERFLOW_IMPULSE_MIN_IMBALANCE_ABS", 0.08)

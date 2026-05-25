@@ -513,7 +513,7 @@ class Scanner:
         min_imb = abs(float(settings.get("orderflow_impulse_min_imbalance_abs", 0.08) or 0.08))
         max_spread = abs(float(settings.get("orderflow_impulse_max_spread_pct", 0.20) or 0.20))
         tp_pct = float(settings.get("orderflow_impulse_tp_pct", 2.0) or 2.0)
-        sl_pct = float(settings.get("orderflow_impulse_sl_pct", 1.0) or 1.0)
+        sl_pct = float(settings.get("orderflow_impulse_sl_pct", 3.0) or 3.0)
         reject_counts = Counter()
         reject_examples = defaultdict(list)
         errors = 0

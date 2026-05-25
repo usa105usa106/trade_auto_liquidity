@@ -92,8 +92,8 @@ class TradePlanner:
             "orderflow_impulse": {
                 "min_tp": float(os.getenv("ORDERFLOW_IMPULSE_TP_PCT", "2.0")),
                 "max_tp": float(os.getenv("ORDERFLOW_IMPULSE_TP_PCT", "2.0")),
-                "min_sl": float(os.getenv("ORDERFLOW_IMPULSE_SL_PCT", "1.0")),
-                "max_sl": float(os.getenv("ORDERFLOW_IMPULSE_SL_PCT", "1.0")),
+                "min_sl": float(os.getenv("ORDERFLOW_IMPULSE_SL_PCT", "3.0")),
+                "max_sl": float(os.getenv("ORDERFLOW_IMPULSE_SL_PCT", "3.0")),
                 "tp_mult": 1.0,
                 "sl_mult": 1.0,
             },
@@ -182,8 +182,10 @@ class TradePlanner:
             candidate["leverage"] = int(float(settings.get("quick_bounce_leverage", os.getenv("QUICK_BOUNCE_LEVERAGE", "10")) or 10))
         elif strategy in {"orderflow_impulse"}:
             details = candidate.get("score_details") or {}
-            sl_pct = max(0.01, float(details.get("sl_pct", settings.get("orderflow_impulse_sl_pct", os.getenv("ORDERFLOW_IMPULSE_SL_PCT", "1.0"))) or 1.0))
-            tp_pct = max(0.01, float(details.get("tp_pct", settings.get("orderflow_impulse_tp_pct", os.getenv("ORDERFLOW_IMPULSE_TP_PCT", "2.0"))) or 2.0))
+            # ORDERFLOW IMPULSE fixed risk from real entry: TP 2%, SL 3%.
+            # Ignore stale candidate details so old DB/cached signals cannot revert SL to 1%.
+            sl_pct = max(0.01, float(settings.get("orderflow_impulse_sl_pct", os.getenv("ORDERFLOW_IMPULSE_SL_PCT", "3.0")) or 3.0))
+            tp_pct = max(0.01, float(settings.get("orderflow_impulse_tp_pct", os.getenv("ORDERFLOW_IMPULSE_TP_PCT", "2.0")) or 2.0))
             rr = round(tp_pct / sl_pct, 6) if sl_pct > 0 else 1.0
             candidate["score_details"] = dict(details)
             candidate["score_details"].update({"sl_pct": sl_pct, "tp_pct": tp_pct, "rr": rr})

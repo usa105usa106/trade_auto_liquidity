@@ -684,7 +684,7 @@ async def orderflow_impulse_summary_message(app, settings: dict, candidates: lis
         "Открытые на бирже: " + (", ".join(open_names) if open_names else "нет"),
         "Закрытые на бирже: " + (", ".join(closed) if closed else "нет"),
         f"Заполнены {len(positions)}/{max_slots} слотов",
-        "Убитые за 4 часа: " + (", ".join(killed[-5:]) if killed else "нет"),
+        "Убитые за 24 часа: " + (", ".join(killed[-5:]) if killed else "нет"),
         f"Общий плюс по закрытым монетам: ${pnl:+.2f}",
     ]
     if opened_note:
@@ -1314,9 +1314,14 @@ async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 n = max(20, min(300, int(context.args[0])))
             except Exception:
                 n = 80
-        text = tail_important(lines=n, max_chars=3500)
+        text = tail_important(lines=n, max_chars=3300)
+        # /log is read-only: never calls OpenAI, only shows cached last AI verdict.
+        ai_line = str(getattr(scanner, "last_openai_analysis_status", "") or "")
+        if not ai_line:
+            ai_line = "AI analysis: no cached check yet"
         # Telegram message limit is 4096. Keep it copyable and readable.
-        await reply(update, "🧾 Last bot logs:\n```\n" + text[-3400:] + "\n```", reply_markup=MAIN_MENU)
+        msg = "🧾 Last bot logs:\n```\n" + ai_line[:500] + "\n" + text[-3200:] + "\n```"
+        await reply(update, msg, reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"/log error: {e}", reply_markup=MAIN_MENU)
 
@@ -3726,7 +3731,7 @@ async def orderflow_impulse_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         await storage.set("orderflow_impulse_enabled", False, bump_revision=False)
         await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
         trigger_scan_now(context.application, reason="orderflow_impulse:off")
-        await reply(update, "○ Orderflow impulse OFF\nСканер остановлен, новые сделки не открываются. Открытые позиции продолжают сопровождаться до TP/SL/4h.", reply_markup=MAIN_MENU)
+        await reply(update, "○ Orderflow impulse OFF\nСканер остановлен, новые сделки не открываются. Открытые позиции продолжают сопровождаться до TP/SL/24h.", reply_markup=MAIN_MENU)
         return
 
     updates = {
@@ -3744,8 +3749,8 @@ async def orderflow_impulse_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         "mexc_order_leverage": 10,
         "orderflow_impulse_leverage": 10,
         "orderflow_impulse_tp_pct": 2.0,
-        "orderflow_impulse_sl_pct": 1.0,
-        "orderflow_impulse_time_stop_sec": 14400,
+        "orderflow_impulse_sl_pct": 3.0,
+        "orderflow_impulse_time_stop_sec": 86400,
         "orderflow_impulse_top_coins": 100,
         "orderflow_impulse_max_open_positions": 3,
         "orderflow_impulse_min_volume_ratio": 1.5,
@@ -5009,11 +5014,11 @@ async def trading_loop(app):
                                 msg = (
                                     "🛑 AI scalp aborted after entry\n"
                                     f"{getattr(plan, 'symbol', b)} {getattr(plan, 'side', '-')}\n"
-                                    "Reason: exchange TP/SL not confirmed. Position was closed immediately.\n"
+                                    "Reason: exchange TP/SL not confirmed. Position stays open under virtual TP/SL monitor.\n"
                                     f"PnL: {pnl:.4f} USDT ({pp:.3f}%)" if isinstance(pnl, (int, float)) and isinstance(pp, (int, float)) else
                                     "🛑 AI scalp aborted after entry\n"
                                     f"{getattr(plan, 'symbol', b)} {getattr(plan, 'side', '-')}\n"
-                                    "Reason: exchange TP/SL not confirmed. Position was closed immediately."
+                                    "Reason: exchange TP/SL not confirmed. Position stays open under virtual TP/SL monitor."
                                 )
                                 await notify_admin(app, msg, key=f"ai_scalp_aborted_{b}")
 
@@ -5183,6 +5188,7 @@ async def trading_loop(app):
 
                 opened_this_cycle = False
                 scanner.last_ai_check_symbols = []
+                scanner.last_openai_analysis_status = "AI analysis: pending" if bool(settings.get("openai_analysis_enabled", False)) else "AI analysis: OFF"
                 for cand in candidates:
                     original_symbol = cand.get("symbol")
                     cand = MirrorEngine(str(settings.get("mirror_mode", "off"))).apply(cand, adaptive_stats)
@@ -5295,6 +5301,29 @@ async def trading_loop(app):
                             pass
                     ai_verdict = await ai_signal_engine.validate(cand, plan, settings)
                     if ai_enabled:
+                        try:
+                            scanner.last_openai_analysis_status = (
+                                f"AI analysis: {plan.symbol} {plan.side} "
+                                f"{'APPROVED' if ai_verdict.approved else 'REJECTED'} "
+                                f"model={ai_verdict.model} mode={ai_verdict.mode} "
+                                f"conf={ai_verdict.confidence:.2f} "
+                                f"reason={ai_verdict.reason or ai_verdict.error or '-'}"
+                            )[:500]
+                            log_event(
+                                "openai_analysis_check",
+                                stage="entry_filter",
+                                ok=bool(ai_verdict.ok),
+                                approved=bool(ai_verdict.approved),
+                                symbol=str(plan.symbol),
+                                side=str(plan.side),
+                                strategy=str(getattr(plan, "strategy", cand.get("strategy", "")) or ""),
+                                model=str(ai_verdict.model),
+                                mode=str(ai_verdict.mode),
+                                confidence=float(ai_verdict.confidence or 0),
+                                reason=str(ai_verdict.reason or ai_verdict.error or "")[:300],
+                            )
+                        except Exception:
+                            pass
                         if ai_show:
                             ai_message_id = await send_or_edit_ai_decision(
                                 app,
@@ -5416,11 +5445,11 @@ async def trading_loop(app):
                             msg = (
                                 "🛑 Trade aborted after entry\n"
                                 f"{plan.symbol} {plan.side}\n"
-                                "Reason: exchange TP/SL not confirmed. Position was closed immediately.\n"
+                                "Reason: exchange TP/SL not confirmed. Position stays open under virtual TP/SL monitor.\n"
                                 f"PnL: {pnl:.4f} USDT ({pp:.3f}%)" if isinstance(pnl, (int, float)) and isinstance(pp, (int, float)) else
                                 "🛑 Trade aborted after entry\n"
                                 f"{plan.symbol} {plan.side}\n"
-                                "Reason: exchange TP/SL not confirmed. Position was closed immediately."
+                                "Reason: exchange TP/SL not confirmed. Position stays open under virtual TP/SL monitor."
                             )
                             await notify_admin(app, msg, key=f"trade_aborted_{plan.symbol}")
 

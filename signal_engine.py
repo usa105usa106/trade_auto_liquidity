@@ -103,7 +103,7 @@ class SignalEngine:
         self.impulse_dump_btc_filter_enabled = str(os.getenv("IMPULSE_DUMP_BTC_FILTER_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
         self.impulse_dump_btc_max_pump_1h_pct = float(os.getenv("IMPULSE_DUMP_BTC_MAX_PUMP_1H_PCT", "1.5"))
         self.orderflow_impulse_tp_pct = float(os.getenv("ORDERFLOW_IMPULSE_TP_PCT", "2.0"))
-        self.orderflow_impulse_sl_pct = float(os.getenv("ORDERFLOW_IMPULSE_SL_PCT", "1.0"))
+        self.orderflow_impulse_sl_pct = float(os.getenv("ORDERFLOW_IMPULSE_SL_PCT", "3.0"))
         self.orderflow_impulse_min_volume_ratio = float(os.getenv("ORDERFLOW_IMPULSE_MIN_VOLUME_RATIO", "1.5"))
         self.orderflow_impulse_min_trend_pct = float(os.getenv("ORDERFLOW_IMPULSE_MIN_TREND_PCT", "0.25"))
         self.orderflow_impulse_min_imbalance_abs = float(os.getenv("ORDERFLOW_IMPULSE_MIN_IMBALANCE_ABS", "0.08"))
