@@ -316,27 +316,24 @@ async def update_scanner_status(app, settings: dict, status: str = "scanning", l
     if not chat_id:
         return
     now = time.time()
-    # Do not edit Telegram too often; it can rate-limit noisy loops.
+    # Do not update Telegram too often; sending a fresh bottom message every loop
+    # can rate-limit noisy scans. Force updates still move the card immediately.
     if not force and now - float(app.bot_data.get("scanner_status_last_edit", 0) or 0) < 5:
         return
     text = _scan_status_text(settings, status, last_signal, last_decision)
-    msg_id = app.bot_data.get("scanner_status_message_id")
+    old_msg_id = app.bot_data.get("scanner_status_message_id")
+    if old_msg_id:
+        try:
+            await app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id))
+        except Exception as e:
+            # The message may be already deleted/too old; send the new card anyway.
+            log.debug("scanner status delete skipped: %s", e)
     try:
-        if msg_id:
-            await app.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
-        else:
-            msg = await app.bot.send_message(chat_id=chat_id, text=text)
-            app.bot_data["scanner_status_message_id"] = msg.message_id
+        msg = await app.bot.send_message(chat_id=chat_id, text=text)
+        app.bot_data["scanner_status_message_id"] = msg.message_id
         app.bot_data["scanner_status_last_edit"] = now
     except Exception as e:
-        # If the old message cannot be edited, create a new live-status message once.
-        log.warning("scanner status edit failed: %s", e)
-        try:
-            msg = await app.bot.send_message(chat_id=chat_id, text=text)
-            app.bot_data["scanner_status_message_id"] = msg.message_id
-            app.bot_data["scanner_status_last_edit"] = now
-        except Exception as e2:
-            log.warning("scanner status send failed: %s", e2)
+        log.warning("scanner status send failed: %s", e)
 
 async def create_fresh_scanner_status(app, settings: dict, status: str = "waiting next scan") -> None:
     """Create a new scanner live-status message at the bottom of the chat.
@@ -349,6 +346,12 @@ async def create_fresh_scanner_status(app, settings: dict, status: str = "waitin
     if not chat_id:
         return
     text = _scan_status_text(settings, status)
+    old_msg_id = app.bot_data.get("scanner_status_message_id")
+    if old_msg_id:
+        try:
+            await app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id))
+        except Exception as e:
+            log.debug("fresh scanner status delete skipped: %s", e)
     try:
         msg = await app.bot.send_message(chat_id=chat_id, text=text)
         app.bot_data["scanner_status_message_id"] = msg.message_id
@@ -4587,6 +4590,7 @@ async def trading_loop(app):
                 mode_name = str(settings.get("strategy_mode", "hybrid")).lower()
                 ai_mode = mode_name == "ai_scalping"
                 boost_mode = mode_name == "boost_scalping" and _is_boost_runtime_armed(app, settings)
+                native_spot_scan_mode = mode_name in {"orderflow_impulse", "cascade_hunter", "knife_reversal", "multi_strategy"}
                 live = bool(settings.get("live_trading", False))
                 if boost_mode:
                     # BOOST must not get stuck on ccxt.load_markets()/exchange init.
@@ -4619,7 +4623,7 @@ async def trading_loop(app):
                 # v0114: AI BTC/ETH scalping must not run the adaptive universe
                 # scanner at all. It uses direct BTC_USDT/ETH_USDT market data and
                 # should not emit websocket empty-cache errors from the legacy scanner.
-                if not (ai_mode or boost_mode) and time.time() - scanner.last_refresh > int(settings.get("symbol_refresh_sec", 300)):
+                if not (ai_mode or boost_mode or native_spot_scan_mode) and time.time() - scanner.last_refresh > int(settings.get("symbol_refresh_sec", 300)):
                     await update_scanner_status(app, settings, status="refreshing universe", force=True)
                     await scanner.refresh_symbols(ex, settings, ws_supervisor=ws)
                     if scanner.last_refresh_error:
@@ -4634,13 +4638,14 @@ async def trading_loop(app):
                     else:
                         scanner.last_reject_reason = "universe refreshed"
                     await update_scanner_status(app, settings, status="universe ready", force=True)
-                elif ai_mode or boost_mode:
-                    # Clear stale legacy scanner state so status is not displayed as
-                    # ai_scalping -> reversal/adaptive loaded 110.
-                    scanner.last_effective_strategy = "boost_scalping" if boost_mode else "ai_scalping"
+                elif ai_mode or boost_mode or native_spot_scan_mode:
+                    # Clear stale legacy futures-universe state so native Binance-SPOT modes
+                    # never show MEXC/Binance futures refresh errors or block on futures scans.
+                    scanner.last_effective_strategy = "boost_scalping" if boost_mode else (mode_name if native_spot_scan_mode else "ai_scalping")
                     scanner.last_refresh_error = ""
-                    scanner.last_cycle_scanned = 2
-                    scanner.last_cycle_errors = 0
+                    if ai_mode or boost_mode:
+                        scanner.last_cycle_scanned = 2
+                        scanner.last_cycle_errors = 0
 
                 # 3) Manual new-entry gate. /stop pauses entries while keeping
                 # position management alive; /panic is the full loop stop.
@@ -5285,11 +5290,11 @@ async def trading_loop(app):
                     log_event("orderflow_impulse_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("orderflow_impulse_top_coins", settings.get("max_symbols", 100)) or 100)), source="binance_spot_orderflow")
                     await orderflow_impulse_progress_message(app, 10)
                 if cascade_hunter_cycle:
-                    log_event("cascade_hunter_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("cascade_hunter_top_coins", settings.get("max_symbols", 100)) or 100)), source="binance_futures_liquidations")
+                    log_event("cascade_hunter_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("cascade_hunter_top_coins", settings.get("max_symbols", 100)) or 100)), source="binance_spot_cascade_pressure")
                 if knife_reversal_cycle:
                     log_event("knife_reversal_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("knife_reversal_top_coins", 100) or 100)), source="binance_spot_wick_reclaim")
                 if multi_strategy_cycle:
-                    log_event("multi_strategy_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("multi_strategy_top_coins", 100) or 100)), source="orderflow_impulse+knife_reversal")
+                    log_event("multi_strategy_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("multi_strategy_top_coins", 100) or 100)), source="binance_spot_orderflow+binance_spot_knife_reversal")
                 if base_strategy_mode == "all":
                     scanner.last_strategy_reason = "mode=ALL: scanning momentum+pullback+reversal (liquidity_retest is manual-only)"
                 elif base_strategy_mode == "hybrid":
@@ -5360,11 +5365,11 @@ async def trading_loop(app):
                     await asyncio.sleep(scanner.last_slowdown_sec)
                 if candidates:
                     top = candidates[0]
-                    if orderflow_impulse_cycle:
+                    if special_native_cycle:
                         scanner.last_signal_summary = (
                             f"Binance spot native candidate: {top.get('symbol')} {top.get('side')} "
                             f"conf={top.get('confidence')} strategy={top.get('strategy', effective_strategy)} "
-                            f"mode={effective_strategy} count={len(candidates)}"
+                            f"mode={effective_strategy} count={len(candidates)} | MEXC futures execution"
                         )
                     else:
                         scanner.last_signal_summary = (
