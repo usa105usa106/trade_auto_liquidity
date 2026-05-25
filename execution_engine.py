@@ -1110,7 +1110,7 @@ class ExecutionEngine:
             # visible in every endpoint. Only do destructive cleanup after several
             # failed attempts, and only when explicitly enabled.
             if (
-                strategy_name_for_protection != "boost_scalping"
+                strategy_name_for_protection not in {"boost_scalping", "quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter"}
                 and i >= 2
                 and os.getenv("PROTECTION_CANCEL_STALE_ON_RETRY", "false").lower() in {"1", "true", "yes", "on"}
                 and hasattr(self.exchange_client, "cancel_all_orders")
@@ -1120,8 +1120,8 @@ class ExecutionEngine:
                 except Exception as e:
                     out["retry_cancel_error"] = str(e)[:240]
                 await asyncio.sleep(delay)
-            elif strategy_name_for_protection == "boost_scalping" and i >= 2:
-                out["retry_cancel_skipped"] = "BOOST/HUNTER emergency-only: never cancel possible planorder backstop"
+            elif strategy_name_for_protection in {"boost_scalping", "quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter"} and i >= 2:
+                out["retry_cancel_skipped"] = "fast strategy protection: never cancel possible existing planorder backstop"
             if liquidation_stop_mode:
                 try:
                     if tp > 0:

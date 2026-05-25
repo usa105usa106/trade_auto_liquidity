@@ -776,7 +776,13 @@ def trigger_scan_now(app, reason: str = "manual") -> None:
 
 
 async def sleep_until_next_scan(app, seconds: int | float) -> None:
-    """Sleep between full scanner cycles, but allow Run/settings to wake it."""
+    """Sleep between full scanner cycles, but allow Run/settings to wake it.
+
+    Important: do not clear a wakeup that was already set before this
+    function started. Mode buttons can fire while the loop is between the
+    end of one cycle and the sleep call; clearing first loses that signal
+    and the bot appears to do nothing until the old interval expires.
+    """
     try:
         delay = max(0.0, float(seconds))
     except Exception:
@@ -785,7 +791,9 @@ async def sleep_until_next_scan(app, seconds: int | float) -> None:
     if ev is None:
         ev = asyncio.Event()
         app.bot_data["scan_wakeup_event"] = ev
-    ev.clear()
+    if ev.is_set():
+        ev.clear()
+        return
     try:
         await asyncio.wait_for(ev.wait(), timeout=delay)
     except asyncio.TimeoutError:

@@ -402,10 +402,12 @@ class ProtectionEngine:
         # cancel_all unless the user explicitly runs Cancel All/Panic.
         is_boost = str(pos.get("strategy") or "").lower() == "boost_scalping"
         emergency_only = self._is_boost_emergency_only(pos)
-        if is_boost or emergency_only:
-            # BOOST/HUNTER must never run cancel_all from watchdog.  It can
-            # delete the only emergency planorder backstop while the bot is live.
-            out["cancel_before_reattach_skipped"] = "BOOST/HUNTER watchdog: never cancel possible emergency planorder backstop"
+        destructive_cancel_enabled = os.getenv("PROTECTION_CANCEL_BEFORE_REATTACH", "false").lower() in {"1", "true", "yes", "on"}
+        if is_boost or emergency_only or not destructive_cancel_enabled:
+            # Never run cancel_all from the watchdog by default.  A cancel_all on
+            # MEXC can delete valid plan/stop/TP-SL orders for live positions.
+            # Keep destructive cleanup manual-only via /cancel_all or /panic.
+            out["cancel_before_reattach_skipped"] = "watchdog_cancel_all_disabled; use /cancel_all or /panic manually"
         else:
             try:
                 if hasattr(self.exchange_client, "cancel_all_orders"):
