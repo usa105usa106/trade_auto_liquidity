@@ -3851,10 +3851,10 @@ async def cascade_hunter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "cascade_hunter_max_open_positions": 3,
         "cascade_hunter_scan_interval_sec": 60,
         "cascade_hunter_min_liq_usd_1m": 30000.0,
-        "cascade_hunter_min_pressure_ratio": 0.035,
-        "cascade_hunter_min_volume_ratio": 1.8,
-        "cascade_hunter_min_price_move_pct": 0.25,
-        "cascade_hunter_max_spread_pct": 0.25,
+        "cascade_hunter_min_pressure_ratio": 0.070,
+        "cascade_hunter_min_volume_ratio": 2.2,
+        "cascade_hunter_min_price_move_pct": 0.45,
+        "cascade_hunter_max_spread_pct": 0.12,
         "cascade_hunter_min_24h_volume_usdt": 5000000.0,
         "scan_market_source": "mexc_binance",
         "spot_confirmation_enabled": False,
@@ -3878,7 +3878,7 @@ async def cascade_hunter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     trigger_scan_now(context.application, reason="cascade_hunter:on")
     await reply(update,
         "✅ Cascade hunter ON\n"
-        "Binance futures top-100 каждые 60s: ликвидации + ускорение цены + volume spike + delta.\n"
+        "Binance SPOT top-100 каждые 60s: pressure + ускорение цены + volume spike + delta; исполнение MEXC futures.\n"
         "Выбирает 1–3 лучших. До 3 сделок, 10% баланса на сделку, x10 isolated. AI-check работает по общему тумблеру настроек.",
         reply_markup=MAIN_MENU,
     )

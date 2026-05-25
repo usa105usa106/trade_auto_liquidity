@@ -182,6 +182,7 @@ DEFAULT_SETTINGS = {
     "cascade_hunter_sl_pct": DEFAULTS.cascade_hunter_sl_pct,
     "cascade_hunter_time_stop_sec": DEFAULTS.cascade_hunter_time_stop_sec,
     "cascade_hunter_min_liq_usd_1m": DEFAULTS.cascade_hunter_min_liq_usd_1m,
+    "cascade_hunter_min_pressure_ratio": DEFAULTS.cascade_hunter_min_pressure_ratio,
     "cascade_hunter_min_volume_ratio": DEFAULTS.cascade_hunter_min_volume_ratio,
     "cascade_hunter_min_price_move_pct": DEFAULTS.cascade_hunter_min_price_move_pct,
     "cascade_hunter_max_spread_pct": DEFAULTS.cascade_hunter_max_spread_pct,
@@ -415,6 +416,20 @@ class Storage:
                 await self.set("boost_live_min_exchange_profit_pct", 0.09, bump_revision=False)
                 await self.set("boost_min_profit_to_rotate_pct", 0.09, bump_revision=False)
                 await self.set("v0225_fee_aware_profit_migrated", True, bump_revision=False)
+        except Exception:
+            pass
+
+
+        # v0279: existing Railway DB/settings could keep old cascade_hunter
+        # thresholds from v0277/v0278 toggle defaults and override the stricter
+        # code defaults. Force the requested strict cascade prefilter once.
+        try:
+            if await self.get("v0279_cascade_strict_settings_migrated") is None:
+                await self.set("cascade_hunter_min_pressure_ratio", 0.070, bump_revision=False)
+                await self.set("cascade_hunter_min_volume_ratio", 2.2, bump_revision=False)
+                await self.set("cascade_hunter_min_price_move_pct", 0.45, bump_revision=False)
+                await self.set("cascade_hunter_max_spread_pct", 0.12, bump_revision=False)
+                await self.set("v0279_cascade_strict_settings_migrated", True, bump_revision=False)
         except Exception:
             pass
 
