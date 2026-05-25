@@ -504,7 +504,7 @@ class Scanner:
         self.engine.configure_from_settings(settings)
         top_n = int(float(settings.get("orderflow_impulse_top_coins", 50) or 50))
         min_quote = float(settings.get("orderflow_impulse_min_24h_volume_usdt", 50000000.0) or 0)
-        min_vol_ratio = float(settings.get("orderflow_impulse_min_volume_ratio", 2.0) or 2.0)
+        min_vol_ratio = float(settings.get("orderflow_impulse_min_volume_ratio", 1.5) or 1.5)
         min_trend = abs(float(settings.get("orderflow_impulse_min_trend_pct", 0.25) or 0.25))
         min_imb = abs(float(settings.get("orderflow_impulse_min_imbalance_abs", 0.08) or 0.08))
         max_spread = abs(float(settings.get("orderflow_impulse_max_spread_pct", 0.20) or 0.20))
@@ -514,6 +514,8 @@ class Scanner:
         reject_examples = defaultdict(list)
         errors = 0
         scanned = 0
+        prefilter_volume_low = 0
+        prefilter_no_futures = 0
         last_error = ""
 
         def record(symbol: str, reason: str) -> None:
@@ -583,11 +585,11 @@ class Scanner:
                             continue
                         qv = self._safe_float(t.get("quoteVolume"), 0.0)
                         if qv < min_quote:
-                            record(sym, f"spot volume low {qv:.0f} < {min_quote:.0f}")
+                            prefilter_volume_low += 1
                             continue
                         fut_sym = self._binance_spot_to_futures_symbol(sym, exchange_client)
                         if not fut_sym:
-                            record(sym, "mexc futures symbol missing")
+                            prefilter_no_futures += 1
                             continue
                         pct_chg = abs(self._safe_float(t.get("priceChangePercent"), 0.0))
                         ranked.append((qv * (1 + min(pct_chg, 20) / 100.0), sym, symbol_id, fut_sym, t))
@@ -600,6 +602,15 @@ class Scanner:
                 self.last_filtered_markets = len(ranked)
                 self.last_requested_symbols = top_n
                 self.last_selected_symbols = len(selected)
+                self.last_orderflow_prefilter_stats = {
+                    "binance_spot_total": len(raw_tickers or []),
+                    "eligible_after_24h_volume": len(ranked),
+                    "prefilter_volume_low": prefilter_volume_low,
+                    "prefilter_no_mexc_futures": prefilter_no_futures,
+                    "selected_for_orderflow": len(selected),
+                    "min_24h_volume_usdt": min_quote,
+                    "min_volume_ratio": min_vol_ratio,
+                }
                 self.hot_symbols = [fut for _, _spot, _sid, fut, _t in selected]
 
                 sem = asyncio.Semaphore(self._concurrency_limit(settings))
@@ -722,6 +733,12 @@ class Scanner:
             record("BINANCE", f"binance rest failed: {type(e).__name__}: {last_error or str(e)}")
         self._record_cycle_health(scanned, errors, settings)
         self.last_ai_candidates_count = len(out)
+        self.last_orderflow_scan_stats = {
+            **getattr(self, "last_orderflow_prefilter_stats", {}),
+            "checked_symbols": scanned,
+            "errors": errors,
+            "candidates": len(out),
+        }
         self.last_reject_top_reasons = reject_counts.most_common(8)
         ex = []
         for reason, _count in self.last_reject_top_reasons[:4]:
@@ -864,6 +881,12 @@ class Scanner:
 
         self._record_cycle_health(scanned, errors, settings)
         self.last_ai_candidates_count = len(out)
+        self.last_orderflow_scan_stats = {
+            **getattr(self, "last_orderflow_prefilter_stats", {}),
+            "checked_symbols": scanned,
+            "errors": errors,
+            "candidates": len(out),
+        }
         self.last_reject_top_reasons = reject_counts.most_common(8)
         ex = []
         for reason, _count in self.last_reject_top_reasons[:4]:

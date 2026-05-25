@@ -5145,6 +5145,7 @@ async def trading_loop(app):
                         candidates=len(candidates or []),
                         symbols=[str(c.get("symbol", "")) for c in (candidates or [])[:10]],
                         reject_reasons=getattr(scanner, "last_reject_top_reasons", []),
+                        stats=getattr(scanner, "last_orderflow_scan_stats", {}),
                         errors=getattr(scanner, "last_cycle_errors", 0),
                     )
                     await orderflow_impulse_progress_message(app, 100, done=True)
