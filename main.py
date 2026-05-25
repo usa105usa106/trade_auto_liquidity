@@ -4684,7 +4684,7 @@ async def trading_loop(app):
                 # WS is an acceleration source, not a hard entry dependency.
                 # If WS is temporarily stale but scanner market data is fresh or REST fallback
                 # has been used recently, entries must not be blocked by WS health alone.
-                market_data_ok = True if (ai_mode or boost_mode) else scanner_market_data_fresh(max_age_sec=max(900, int(settings.get("symbol_refresh_sec", 300)) * 3))
+                market_data_ok = True if (ai_mode or boost_mode or native_spot_scan_mode) else scanner_market_data_fresh(max_age_sec=max(900, int(settings.get("symbol_refresh_sec", 300)) * 3))
                 if not market_data_ok:
                     scanner.last_reject_reason = (
                         f"market data blocked: stale/weak scanner data "
