@@ -488,7 +488,7 @@ class Scanner:
     async def _orderflow_impulse_candidates(self, exchange_client, settings: dict, max_candidates: int) -> list[dict]:
         """Native Binance spot orderflow scanner.
 
-        v0253: do NOT use ccxt.load_markets()/fetch_tickers here because that
+        v0254: do NOT use ccxt.load_markets()/fetch_tickers here because that
         may hit exchangeInfo and fail on some VPS/regions. This scanner uses
         Binance SPOT public REST endpoints directly:
           - /api/v3/ticker/24hr
@@ -498,6 +498,7 @@ class Scanner:
         MEXC futures is used only after a Binance spot signal is found.
         """
         import aiohttp
+        import socket
         from urllib.parse import urlencode
 
         self.engine.configure_from_settings(settings)
@@ -516,7 +517,7 @@ class Scanner:
         last_error = ""
 
         def record(symbol: str, reason: str) -> None:
-            reason = str(reason or "unknown")[:160]
+            reason = str(reason or "unknown")[:260]
             bucket = reason.split(":", 1)[0]
             for prefix in (
                 "spot spread high", "spot volume low", "spot data unavailable",
@@ -533,7 +534,7 @@ class Scanner:
         proxy_enabled = bool(settings.get("proxy_enabled", False))
         proxy_url = str(settings.get("proxy_url", "") or "")
         proxy = proxy_url if proxy_enabled and proxy_url else None
-        bases = [b.strip().rstrip("/") for b in str(settings.get("binance_spot_base_urls") or os.getenv("BINANCE_SPOT_BASE_URLS", "https://api.binance.com,https://api1.binance.com,https://api2.binance.com,https://api3.binance.com")).split(",") if b.strip()]
+        bases = [b.strip().rstrip("/") for b in str(settings.get("binance_spot_base_urls") or os.getenv("BINANCE_SPOT_BASE_URLS", "https://api.binance.com,https://api1.binance.com,https://api2.binance.com,https://api3.binance.com,https://api4.binance.com,https://data-api.binance.vision")).split(",") if b.strip()]
         timeout = aiohttp.ClientTimeout(total=float(settings.get("binance_spot_timeout_sec", os.getenv("BINANCE_SPOT_TIMEOUT_SEC", "7")) or 7))
 
         async def get_json(session, path: str, params: dict | None = None):
@@ -570,7 +571,8 @@ class Scanner:
         out: list[dict] = []
         try:
             headers = {"User-Agent": "Mozilla/5.0 liquidity-bot spot-orderflow"}
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            connector = aiohttp.TCPConnector(family=socket.AF_INET, ttl_dns_cache=300)
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector, trust_env=True) as session:
                 raw_tickers = await get_json(session, "/api/v3/ticker/24hr")
                 ranked = []
                 for t in (raw_tickers or []):
@@ -717,7 +719,7 @@ class Scanner:
             errors += 1
             self.last_refresh_error = f"Binance spot public REST orderflow failed: {type(e).__name__}: {e}; last={last_error}"[:700]
             log.warning("Binance spot public REST orderflow failed: %s last=%s", e, last_error)
-            record("BINANCE", f"binance rest failed: {type(e).__name__}")
+            record("BINANCE", f"binance rest failed: {type(e).__name__}: {last_error or str(e)}")
         self._record_cycle_health(scanned, errors, settings)
         self.last_ai_candidates_count = len(out)
         self.last_reject_top_reasons = reject_counts.most_common(8)
