@@ -728,14 +728,12 @@ def format_orderflow_impulse_opened(plan, placed: dict) -> str:
         f"вход ${_fmt_price(entry)}",
         f"стоп ${_fmt_price(stop)}",
         f"тейк ${_fmt_price(take)}",
-        _pct_line("trend 15m", details.get("trend_15m_pct")),
-        _pct_line("trend 1h", details.get("trend_1h_pct")),
-        f"futures OB imbalance: {float(details.get('orderbook_imbalance') or 0):+.3f}",
-        f"futures volume ratio: {float(details.get('volume_ratio') or 0):.2f}x",
+        f"Binance spot symbol: {details.get('spot_symbol') or 'n/a'}",
         _pct_line("Binance spot move", details.get("spot_move_pct")),
         f"Binance spot delta: {float(details.get('spot_delta_ratio') or 0):+.3f}",
         f"Binance spot OB imbalance: {float(details.get('spot_orderbook_imbalance') or 0):+.3f}",
         f"Binance spot volume: {float(details.get('spot_volume_ratio') or 0):.2f}x",
+        f"Binance spot spread: {float(details.get('spot_spread_pct') or 0):.3f}%",
         _pct_line("TP от входа", details.get("tp_pct")),
         _pct_line("SL от входа", details.get("sl_pct")),
         protection_line,
@@ -5158,11 +5156,18 @@ async def trading_loop(app):
                     await asyncio.sleep(scanner.last_slowdown_sec)
                 if candidates:
                     top = candidates[0]
-                    scanner.last_signal_summary = (
-                        f"futures candidate pending spot: {top.get('symbol')} {top.get('side')} "
-                        f"conf={top.get('confidence')} strategy={top.get('strategy', effective_strategy)} "
-                        f"mode={effective_strategy} count={len(candidates)}"
-                    )
+                    if orderflow_impulse_cycle:
+                        scanner.last_signal_summary = (
+                            f"Binance spot native candidate: {top.get('symbol')} {top.get('side')} "
+                            f"conf={top.get('confidence')} strategy={top.get('strategy', effective_strategy)} "
+                            f"mode={effective_strategy} count={len(candidates)}"
+                        )
+                    else:
+                        scanner.last_signal_summary = (
+                            f"futures candidate pending spot: {top.get('symbol')} {top.get('side')} "
+                            f"conf={top.get('confidence')} strategy={top.get('strategy', effective_strategy)} "
+                            f"mode={effective_strategy} count={len(candidates)}"
+                        )
                 else:
                     scanner.last_signal_summary = "none"
                     # Keep the detailed reject reason collected by scanner/signal_engine.
@@ -5183,29 +5188,38 @@ async def trading_loop(app):
                         window_minutes=240,
                     ).apply(cand, settings)
 
-                    spot_enabled = bool(settings.get("spot_confirmation_enabled", True))
-                    spot_data = await fetch_spot_data_for_candidate(ex, cand, settings) if spot_enabled else None
-                    cand = SpotConfirmationEngine(enabled=spot_enabled).apply(cand, spot_data)
                     if orderflow_impulse_cycle:
+                        # v0252: orderflow_impulse is Binance-spot-native.
+                        # Do not create a MEXC futures candidate and then run a second
+                        # spot confirmation pass; that caused symbol mismatches like
+                        # RENDER/RNDR and "Spot data unavailable". The candidate already
+                        # contains the real Binance spot orderflow metrics; MEXC is only
+                        # used later as the execution venue.
+                        spot_data = None
+                        cand["spot_confirmation"] = "NATIVE_BINANCE_SPOT"
+                        cand["spot_confirmed"] = True
+                        cand["spot_reason"] = "Binance spot native orderflow scan passed"
                         sd = cand.get("score_details") if isinstance(cand.get("score_details"), dict) else {}
                         log_event(
                             "orderflow_impulse_spot_check",
-                            stage="spot",
-                            ok=bool(cand.get("spot_confirmed", False)),
+                            stage="spot_native",
+                            ok=True,
                             symbol=str(original_symbol),
                             side=str(cand.get("side", "")),
-                            spot_source=str(sd.get("spot_source") or (spot_data or {}).get("spot_source") or "unknown"),
-                            spot_move_pct=sd.get("spot_move_pct", cand.get("spot_move_pct")),
-                            spot_volume_ratio=sd.get("spot_volume_ratio", cand.get("spot_volume_ratio")),
-                            spot_delta_ratio=sd.get("spot_delta_ratio", cand.get("spot_delta_ratio")),
-                            spot_delta_usdt=sd.get("spot_delta_usdt", cand.get("spot_delta_usdt")),
-                            spot_orderbook_imbalance=sd.get("spot_orderbook_imbalance", cand.get("spot_orderbook_imbalance")),
-                            futures_trend_15m_pct=sd.get("trend_15m_pct"),
-                            futures_trend_1h_pct=sd.get("trend_1h_pct"),
-                            futures_orderbook_imbalance=sd.get("orderbook_imbalance"),
-                            futures_volume_ratio=sd.get("volume_ratio"),
-                            reason=str(cand.get("spot_reason", ""))[:180],
+                            spot_source=str(sd.get("spot_source") or "binance_spot_native"),
+                            spot_symbol=sd.get("spot_symbol"),
+                            spot_move_pct=sd.get("spot_move_pct"),
+                            spot_volume_ratio=sd.get("spot_volume_ratio"),
+                            spot_delta_ratio=sd.get("spot_delta_ratio"),
+                            spot_delta_usdt=sd.get("spot_delta_usdt"),
+                            spot_orderbook_imbalance=sd.get("spot_orderbook_imbalance"),
+                            spot_spread_pct=sd.get("spot_spread_pct"),
+                            reason="Binance spot native orderflow passed; MEXC futures execution only",
                         )
+                    else:
+                        spot_enabled = bool(settings.get("spot_confirmation_enabled", True))
+                        spot_data = await fetch_spot_data_for_candidate(ex, cand, settings) if spot_enabled else None
+                        cand = SpotConfirmationEngine(enabled=spot_enabled).apply(cand, spot_data)
                     cand["strategy_mode"] = base_strategy_mode
                     cand["effective_strategy_mode"] = effective_strategy
 

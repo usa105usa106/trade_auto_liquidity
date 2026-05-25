@@ -429,8 +429,272 @@ class Scanner:
             log.debug("regime candle detection failed: %s", e)
             return self.last_regime or {"regime": "LOW_VOLATILITY", "source": "fallback"}
 
+
+    def _binance_spot_to_futures_symbol(self, spot_symbol: str, exchange_client=None) -> str | None:
+        """Map Binance spot symbols like RENDER/USDT to a MEXC futures symbol.
+
+        Orderflow impulse is Binance-spot-native for analysis, but execution is
+        still done on MEXC futures. Keep the mapping narrow and deterministic.
+        """
+        raw = str(spot_symbol or "").replace(":USDT", "")
+        if "/" in raw:
+            base, quote = raw.split("/", 1)
+        elif raw.upper().endswith("USDT"):
+            base, quote = raw[:-4], "USDT"
+        else:
+            return None
+        base = base.upper().strip()
+        quote = quote.upper().strip()
+        if quote != "USDT" or not base:
+            return None
+        aliases = {
+            "RNDR": "RENDER",
+            "RENDER": "RENDER",
+            "TON": "TONCOIN",
+            "TONCOIN": "TONCOIN",
+        }
+        candidates = []
+        for b in (base, aliases.get(base, base)):
+            sym = f"{b}/USDT:USDT"
+            if sym not in candidates:
+                candidates.append(sym)
+        try:
+            available = set(exchange_client.futures_market_symbols()) if exchange_client is not None else set()
+        except Exception:
+            available = set()
+        if available:
+            for sym in candidates:
+                if sym in available:
+                    return sym
+            return None
+        return candidates[-1]
+
+    async def _fetch_binance_spot_tickers(self, settings: dict | None = None) -> dict:
+        import ccxt.async_support as ccxt
+        settings = settings or {}
+        cfg = {"enableRateLimit": True, "options": {"defaultType": "spot"}}
+        proxy_enabled = bool(settings.get("proxy_enabled", False))
+        proxy_url = str(settings.get("proxy_url", "") or "")
+        if proxy_enabled and proxy_url:
+            cfg["proxies"] = {"http": proxy_url, "https": proxy_url}
+            cfg["aiohttp_proxy"] = proxy_url
+        exchange = ccxt.binance(cfg)
+        try:
+            await exchange.load_markets()
+            return await exchange.fetch_tickers()
+        finally:
+            await exchange.close()
+
+    async def _orderflow_impulse_candidates(self, exchange_client, settings: dict, max_candidates: int) -> list[dict]:
+        """Native Binance spot orderflow scanner.
+
+        This mode must NOT start from MEXC futures candidates. Binance spot is
+        the source of truth for trend, executed volume/delta and orderbook
+        imbalance; MEXC futures is only the execution venue after a spot signal
+        has passed.
+        """
+        import ccxt.async_support as ccxt
+        self.engine.configure_from_settings(settings)
+        top_n = int(float(settings.get("orderflow_impulse_top_coins", 50) or 50))
+        min_quote = float(settings.get("orderflow_impulse_min_24h_volume_usdt", 50000000.0) or 0)
+        min_vol_ratio = float(settings.get("orderflow_impulse_min_volume_ratio", 2.0) or 2.0)
+        min_trend = abs(float(settings.get("orderflow_impulse_min_trend_pct", 0.25) or 0.25))
+        min_imb = abs(float(settings.get("orderflow_impulse_min_imbalance_abs", 0.08) or 0.08))
+        max_spread = abs(float(settings.get("orderflow_impulse_max_spread_pct", 0.20) or 0.20))
+        tp_pct = float(settings.get("orderflow_impulse_tp_pct", 2.0) or 2.0)
+        sl_pct = float(settings.get("orderflow_impulse_sl_pct", 1.0) or 1.0)
+        reject_counts = Counter()
+        reject_examples = defaultdict(list)
+        errors = 0
+        scanned = 0
+
+        def record(symbol: str, reason: str) -> None:
+            reason = str(reason or "unknown")[:120]
+            bucket = reason.split(":", 1)[0]
+            for prefix in ("spot spread high", "spot volume low", "spot data unavailable", "mexc futures symbol missing", "volume low", "no spot orderflow alignment"):
+                if reason.startswith(prefix):
+                    bucket = prefix
+                    break
+            reject_counts[bucket] += 1
+            if len(reject_examples[bucket]) < 3:
+                reject_examples[bucket].append(f"{symbol}->{reason}")
+
+        proxy_enabled = bool(settings.get("proxy_enabled", False))
+        proxy_url = str(settings.get("proxy_url", "") or "")
+        cfg = {"enableRateLimit": True, "options": {"defaultType": "spot"}}
+        if proxy_enabled and proxy_url:
+            cfg["proxies"] = {"http": proxy_url, "https": proxy_url}
+            cfg["aiohttp_proxy"] = proxy_url
+        client = ccxt.binance(cfg)
+        out: list[dict] = []
+        try:
+            await client.load_markets()
+            tickers = await client.fetch_tickers()
+            ranked = []
+            for sym, t in (tickers or {}).items():
+                try:
+                    if not str(sym).endswith("/USDT"):
+                        continue
+                    base = str(sym).split("/", 1)[0].upper()
+                    # Exclude common leveraged/index/stable pairs from Binance spot scan.
+                    if base.endswith(("UP", "DOWN", "BULL", "BEAR")) or base in {"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP"}:
+                        continue
+                    qv = self._ticker_quote_volume(t)
+                    if qv < min_quote:
+                        record(sym, f"spot volume low {qv:.0f} < {min_quote:.0f}")
+                        continue
+                    fut_sym = self._binance_spot_to_futures_symbol(sym, exchange_client)
+                    if not fut_sym:
+                        record(sym, "mexc futures symbol missing")
+                        continue
+                    pct_chg = abs(self._ticker_pct_change(t))
+                    ranked.append((qv * (1 + min(pct_chg, 20) / 100.0), sym, fut_sym, t))
+                except Exception:
+                    continue
+            ranked.sort(reverse=True)
+            selected = ranked[:top_n]
+            self.last_scan_source = "binance_spot_native_orderflow"
+            self.last_total_markets = len(tickers or {})
+            self.last_filtered_markets = len(ranked)
+            self.last_requested_symbols = top_n
+            self.last_selected_symbols = len(selected)
+            self.hot_symbols = [fut for _, _spot, fut, _t in selected]
+
+            sem = asyncio.Semaphore(self._concurrency_limit(settings))
+
+            async def scan_one(spot_symbol: str, futures_symbol: str, ticker: dict) -> dict | None:
+                nonlocal scanned, errors
+                async with sem:
+                    scanned += 1
+                    try:
+                        candles = await client.fetch_ohlcv(spot_symbol, timeframe="1m", limit=30)
+                        if not candles or len(candles) < 10:
+                            record(spot_symbol, "spot data unavailable: candles")
+                            return None
+                        orderbook = await client.fetch_order_book(spot_symbol, limit=20)
+                        try:
+                            trades = await client.fetch_trades(spot_symbol, limit=120)
+                        except Exception:
+                            trades = []
+                        closes = [float(c[4]) for c in candles]
+                        vols = [float(c[5]) for c in candles]
+                        last = closes[-1]
+                        prev_5m = closes[-6] if len(closes) >= 6 else closes[-2]
+                        spot_move_pct = ((last - prev_5m) / prev_5m * 100.0) if prev_5m else 0.0
+                        recent_vol = sum(vols[-3:]) / max(1, min(3, len(vols)))
+                        base_vols = vols[:-3] or vols
+                        avg_vol = sum(base_vols) / max(1, len(base_vols))
+                        vol_ratio = recent_vol / avg_vol if avg_vol else 0.0
+                        bids = (orderbook.get("bids") or [])[:20] if isinstance(orderbook, dict) else []
+                        asks = (orderbook.get("asks") or [])[:20] if isinstance(orderbook, dict) else []
+                        bid_depth = sum(float(p) * float(q) for p, q in bids)
+                        ask_depth = sum(float(p) * float(q) for p, q in asks)
+                        ob_imb = (bid_depth - ask_depth) / (bid_depth + ask_depth) if (bid_depth + ask_depth) > 0 else 0.0
+                        best_bid = float(bids[0][0]) if bids else 0.0
+                        best_ask = float(asks[0][0]) if asks else 0.0
+                        mid = (best_bid + best_ask) / 2.0 if best_bid and best_ask else last
+                        spread_pct = ((best_ask - best_bid) / mid * 100.0) if mid else 999.0
+                        buy_vol = sell_vol = 0.0
+                        for tr in trades or []:
+                            try:
+                                notional = float(tr.get("amount") or 0) * float(tr.get("price") or 0)
+                                side = str(tr.get("side") or "").lower()
+                                if side == "buy":
+                                    buy_vol += notional
+                                elif side == "sell":
+                                    sell_vol += notional
+                            except Exception:
+                                pass
+                        total_exec = buy_vol + sell_vol
+                        delta = buy_vol - sell_vol
+                        delta_ratio = delta / total_exec if total_exec > 0 else 0.0
+                        if spread_pct > max_spread:
+                            record(spot_symbol, f"spot spread high {spread_pct:.3f}% > {max_spread:.3f}%")
+                            return None
+                        if vol_ratio < min_vol_ratio:
+                            record(spot_symbol, f"volume low {vol_ratio:.2f} < {min_vol_ratio:.2f}")
+                            return None
+                        side = None
+                        if spot_move_pct >= min_trend and delta_ratio > 0 and ob_imb >= min_imb:
+                            side = "LONG"
+                        elif spot_move_pct <= -min_trend and delta_ratio < 0 and ob_imb <= -min_imb:
+                            side = "SHORT"
+                        else:
+                            record(spot_symbol, f"no spot orderflow alignment move={spot_move_pct:+.3f}% delta={delta_ratio:+.3f} imb={ob_imb:+.3f} vol={vol_ratio:.2f}")
+                            return None
+                        score = 70 + min(12, abs(spot_move_pct) * 6) + min(12, max(0, vol_ratio - 1) * 4) + min(8, abs(ob_imb) * 40) + min(8, abs(delta_ratio) * 20)
+                        details = {
+                            "setup": "binance_spot_native_orderflow",
+                            "spot_source": "binance_spot_native",
+                            "spot_symbol": spot_symbol,
+                            "spot_move_pct": round(spot_move_pct, 4),
+                            "spot_volume_ratio": round(vol_ratio, 4),
+                            "spot_orderbook_imbalance": round(ob_imb, 5),
+                            "spot_delta_ratio": round(delta_ratio, 5),
+                            "spot_delta_usdt": round(delta, 4),
+                            "spot_buy_volume_usdt": round(buy_vol, 4),
+                            "spot_sell_volume_usdt": round(sell_vol, 4),
+                            "spot_bid_depth_usdt": round(bid_depth, 4),
+                            "spot_ask_depth_usdt": round(ask_depth, 4),
+                            "spot_spread_pct": round(spread_pct, 4),
+                            "trigger_trend_pct": round(spot_move_pct, 4),
+                            "volume_ratio": round(vol_ratio, 4),
+                            "orderbook_imbalance": round(ob_imb, 5),
+                            "tp_pct": round(tp_pct, 4),
+                            "sl_pct": round(sl_pct, 4),
+                            "rr": round(tp_pct / sl_pct, 4) if sl_pct else 2.0,
+                            "source": "Binance spot native orderflow scan; MEXC futures execution only",
+                        }
+                        return self.engine._base(
+                            futures_symbol,
+                            side,
+                            "orderflow_impulse",
+                            last,
+                            score,
+                            spread_pct,
+                            bid_depth + ask_depth,
+                            0.0,
+                            details,
+                        )
+                    except Exception as e:
+                        errors += 1
+                        record(spot_symbol, "spot data unavailable")
+                        log.debug("orderflow spot scan failed for %s: %s", spot_symbol, e)
+                        return None
+
+            batch_size = max(self._concurrency_limit(settings) * 2, 1)
+            for i in range(0, len(selected), batch_size):
+                batch = selected[i:i + batch_size]
+                results = await asyncio.gather(*(scan_one(spot, fut, tick) for _score, spot, fut, tick in batch), return_exceptions=False)
+                out.extend([r for r in results if r])
+                if len(out) >= max_candidates:
+                    break
+        except Exception as e:
+            errors += 1
+            self.last_refresh_error = f"Binance spot native orderflow failed: {e}"[:500]
+            log.warning("Binance spot native orderflow failed: %s", e)
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+        self._record_cycle_health(scanned, errors, settings)
+        self.last_ai_candidates_count = len(out)
+        self.last_reject_top_reasons = reject_counts.most_common(8)
+        ex = []
+        for reason, _count in self.last_reject_top_reasons[:4]:
+            ex.extend(reject_examples.get(reason, [])[:2])
+        self.last_reject_examples = ex[:8]
+        out.sort(key=lambda c: float(c.get("confidence", 0)), reverse=True)
+        self.last_signal_summary = f"Binance spot native candidates={len(out)}"
+        self.last_reject_reason = "; ".join([f"{r}:{c}" for r, c in self.last_reject_top_reasons[:3]]) or "no Binance spot orderflow setup"
+        return out[:max_candidates]
+
     async def candidates(self, exchange_client, settings: dict) -> list[dict]:
         preferred_strategy = str(settings.get("effective_strategy_mode") or settings.get("strategy_mode", "hybrid")).lower()
+        if preferred_strategy == "orderflow_impulse":
+            base_max = int(settings.get("orderflow_impulse_max_candidates", os.getenv("ORDERFLOW_IMPULSE_MAX_CANDIDATES", "3")) or 3)
+            return await self._orderflow_impulse_candidates(exchange_client, settings, base_max)
         if preferred_strategy in {"quick_bounce", "impulse_dump"}:
             prefix = "quick_bounce" if preferred_strategy == "quick_bounce" else "impulse_dump"
             env_prefix = "QUICK_BOUNCE" if preferred_strategy == "quick_bounce" else "IMPULSE_DUMP"
