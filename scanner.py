@@ -505,6 +505,11 @@ class Scanner:
         top_n = int(float(settings.get("orderflow_impulse_top_coins", 50) or 50))
         min_quote = float(settings.get("orderflow_impulse_min_24h_volume_usdt", 50000000.0) or 0)
         min_vol_ratio = float(settings.get("orderflow_impulse_min_volume_ratio", 1.5) or 1.5)
+        # v0256: previous builds wrote 2.0 into persistent settings when the
+        # button was toggled. For the agreed orderflow mode, cap the live
+        # volume threshold at 1.5 so old DB values do not keep blocking scans.
+        if min_vol_ratio > 1.5:
+            min_vol_ratio = 1.5
         min_trend = abs(float(settings.get("orderflow_impulse_min_trend_pct", 0.25) or 0.25))
         min_imb = abs(float(settings.get("orderflow_impulse_min_imbalance_abs", 0.08) or 0.08))
         max_spread = abs(float(settings.get("orderflow_impulse_max_spread_pct", 0.20) or 0.20))

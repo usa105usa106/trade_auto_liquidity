@@ -3748,7 +3748,7 @@ async def orderflow_impulse_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         "orderflow_impulse_time_stop_sec": 14400,
         "orderflow_impulse_top_coins": 50,
         "orderflow_impulse_max_open_positions": 3,
-        "orderflow_impulse_min_volume_ratio": 2.0,
+        "orderflow_impulse_min_volume_ratio": 1.5,
         "orderflow_impulse_min_trend_pct": 0.25,
         "orderflow_impulse_min_imbalance_abs": 0.08,
         "orderflow_impulse_max_spread_pct": 0.20,
