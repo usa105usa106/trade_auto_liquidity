@@ -312,6 +312,54 @@ class ProtectionEngine:
                         "checked_at": time.time(),
                     }
 
+            # v0286: Strongest Coin / Cascade Hunter use split MEXC planorders
+            # (TP1, TP2, SL). These orders do NOT appear in stoporder/open_orders.
+            # Verify the exact planorder ids directly and do not downgrade a
+            # protected position just because stoporder/open_orders returns [].
+            is_split_plan_strategy = strategy_l in {"strongest_coin", "cascade_hunter"}
+            if is_split_plan_strategy and hasattr(self.exchange_client, "mexc_find_active_plan_order"):
+                tp1_id = str(pos.get("tp1_order_id") or "").strip()
+                tp2_id = str(pos.get("tp2_order_id") or "").strip()
+                sl_id_split = str(pos.get("sl_order_id") or "").strip()
+                if tp1_id and tp2_id and sl_id_split:
+                    tp1_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=tp1_id)
+                    tp2_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=tp2_id)
+                    sl_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=sl_id_split)
+                    if tp1_row and tp2_row and sl_row:
+                        return {
+                            "tp_exists": True,
+                            "sl_exists": True,
+                            "take_profit_ok": True,
+                            "stop_loss_ok": True,
+                            "tp_order_id": pos.get("tp_order_id") or f"{tp1_id},{tp2_id}",
+                            "tp1_order_id": tp1_id,
+                            "tp2_order_id": tp2_id,
+                            "sl_order_id": sl_id_split,
+                            "protection_status": "EXCHANGE PROTECTED",
+                            "protection_mode": "exchange_split_planorder",
+                            "protection_note": "MEXC split TP1/TP2/SL planorders verified by id",
+                            "checked_at": time.time(),
+                        }
+                    try:
+                        opened_at = float(pos.get("opened_at") or pos.get("created_at") or 0)
+                    except Exception:
+                        opened_at = 0.0
+                    if opened_at and time.time() - opened_at < 120.0:
+                        return {
+                            "tp_exists": True,
+                            "sl_exists": True,
+                            "take_profit_ok": True,
+                            "stop_loss_ok": True,
+                            "tp_order_id": pos.get("tp_order_id") or f"{tp1_id},{tp2_id}",
+                            "tp1_order_id": tp1_id,
+                            "tp2_order_id": tp2_id,
+                            "sl_order_id": sl_id_split,
+                            "protection_status": "EXCHANGE PROTECTED",
+                            "protection_mode": "exchange_split_planorder_pending_verify",
+                            "protection_note": "MEXC split planorder ids accepted; list verification in grace period",
+                            "checked_at": time.time(),
+                        }
+
             # v0233 Quick Bounce uses MEXC /planorder/place for standalone
             # reduce-only TP/SL. Those orders do NOT appear in
             # /stoporder/open_orders, so checking generic open orders can produce

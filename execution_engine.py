@@ -1328,14 +1328,27 @@ class ExecutionEngine:
                     out["boost_unsafe_position"] = False
                     out["boost_defensive_mode"] = False
                 elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin"} and out.get("tp1_order_id") and out.get("tp2_order_id") and out.get("sl_order_id"):
+                    # v0286: split TP/SL are MEXC planorders, not stoporder rows.
+                    # Verify exact planorder ids when possible; during MEXC indexing
+                    # lag, keep returned ids as protected for watchdog grace.
+                    verified_split = {}
+                    if hasattr(self.exchange_client, "mexc_find_active_plan_order"):
+                        try:
+                            tp1_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=str(out.get("tp1_order_id") or ""))
+                            tp2_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=str(out.get("tp2_order_id") or ""))
+                            sl_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=str(out.get("sl_order_id") or ""))
+                            verified_split = {"tp1_plan_verified": bool(tp1_row), "tp2_plan_verified": bool(tp2_row), "sl_plan_verified": bool(sl_row)}
+                        except Exception as e:
+                            verified_split = {"split_plan_verify_warning": str(e)[:220]}
+                    out.update(verified_split)
                     out["tp_exists"] = True
                     out["sl_exists"] = True
                     out["take_profit_ok"] = True
                     out["stop_loss_ok"] = True
                     out["ok"] = True
                     out["protection_status"] = "EXCHANGE PROTECTED"
-                    out["protection_mode"] = "exchange_split_tp"
-                    out["protection_note"] = "Split TP verified by returned planorder ids: TP1 50% at 1R, TP2 rest at 2R"
+                    out["protection_mode"] = "exchange_split_planorder"
+                    out["protection_note"] = "Split TP/SL are MEXC planorders: TP1 50% at 1R, TP2 rest at 2R, SL under pullback"
                 else:
                     verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), str(out.get("sl_order_id") or ""))
                     out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})

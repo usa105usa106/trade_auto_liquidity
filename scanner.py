@@ -1166,9 +1166,10 @@ class Scanner:
         min_pullback = float(settings.get("strongest_coin_min_pullback_pct", 0.35) or 0.35)
         max_pullback = float(settings.get("strongest_coin_max_pullback_pct", 1.80) or 1.80)
         max_depth = float(settings.get("strongest_coin_max_pullback_depth", 0.45) or 0.45)
-        stop_buffer = float(settings.get("strongest_coin_stop_buffer_pct", 0.25) or 0.25)
-        min_sl = float(settings.get("strongest_coin_min_sl_pct", 1.20) or 1.20)
-        max_sl = float(settings.get("strongest_coin_max_sl_pct", 2.20) or 2.20)
+        stop_buffer = float(settings.get("strongest_coin_stop_buffer_pct", 0.35) or 0.35)
+        min_sl = float(settings.get("strongest_coin_min_sl_pct", 1.60) or 1.60)
+        max_sl = float(settings.get("strongest_coin_max_sl_pct", 2.80) or 2.80)
+        min_hold_recovery = float(settings.get("strongest_coin_min_hold_recovery_pct", 0.30) or 0.30)
 
         reject_counts = Counter(); reject_examples = defaultdict(list)
         scanned = errors = 0; out = []; last_error = ""
@@ -1284,11 +1285,16 @@ class Scanner:
                             depth = pullback / max(impulse_move, 0.0001)
                             if impulse_move <= 0 or depth > max_depth:
                                 record(sid, f"pullback too deep {depth:.2f}"); return None
-                            # Hold = the pullback low held and current candle starts to recover.
-                            pullback_low = min(lows[-4:])
-                            hold = (closes[-1] >= opens[-1] or closes[-1] > closes[-2]) and lows[-1] >= pullback_low * 0.999
+                            # Hold = previous pullback low held and current price recovered.
+                            # v0286: do not accept a candle that is still making a new low;
+                            # that was causing immediate stop-outs.
+                            prev_pullback_low = min(lows[-5:-1]) if len(lows) >= 6 else min(lows[:-1])
+                            held_low = min(prev_pullback_low, lows[-1])
+                            recovery_pct = (last - prev_pullback_low) / prev_pullback_low * 100.0 if prev_pullback_low > 0 else 0.0
+                            hold = (closes[-1] >= opens[-1] or closes[-1] > closes[-2]) and lows[-1] >= prev_pullback_low * 0.999 and recovery_pct >= min_hold_recovery
                             if not hold:
-                                record(sid, "hold weak"); return None
+                                record(sid, f"hold weak recovery {recovery_pct:.2f}% < {min_hold_recovery:.2f}%"); return None
+                            pullback_low = held_low
                             stop_price = pullback_low * (1 - stop_buffer / 100.0)
                             sl_pct = (last - stop_price) / last * 100.0 if last > 0 and stop_price > 0 else 0.0
                             if sl_pct < min_sl:
@@ -1305,7 +1311,7 @@ class Scanner:
                                 "move_1m_pct":round(m1,4), "move_5m_pct":round(m5,4), "move_15m_pct":round(m15,4),
                                 "btc_move_5m_pct":round(btc_5m,4), "btc_move_15m_pct":round(btc_15m,4), "rs_btc_15m_pct":round(rs_btc,4),
                                 "strength_score":round(strength,4), "pullback_pct":round(pullback,4), "pullback_depth":round(depth,4),
-                                "pullback_low":round(pullback_low,8), "custom_stop_price":round(stop_price,8), "sl_pct":round(sl_pct,4),
+                                "pullback_low":round(pullback_low,8), "hold_recovery_pct":round(recovery_pct,4), "custom_stop_price":round(stop_price,8), "sl_pct":round(sl_pct,4),
                                 "tp1_r":1.0, "tp2_r":2.0, "tp1_fraction":0.50,
                                 "spot_spread_pct":round(spread,4), "spot_volume_ratio":round(vol_ratio,4), "volume_5m_usdt":round(volume_5m_usdt,2),
                                 "spot_bid_depth_usdt":round(bid_depth,2), "spot_ask_depth_usdt":round(ask_depth,2),

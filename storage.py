@@ -202,6 +202,7 @@ DEFAULT_SETTINGS = {
     "strongest_coin_min_pullback_pct": DEFAULTS.strongest_coin_min_pullback_pct,
     "strongest_coin_max_pullback_pct": DEFAULTS.strongest_coin_max_pullback_pct,
     "strongest_coin_max_pullback_depth": DEFAULTS.strongest_coin_max_pullback_depth,
+    "strongest_coin_min_hold_recovery_pct": DEFAULTS.strongest_coin_min_hold_recovery_pct,
     "strongest_coin_stop_buffer_pct": DEFAULTS.strongest_coin_stop_buffer_pct,
     "strongest_coin_min_sl_pct": DEFAULTS.strongest_coin_min_sl_pct,
     "strongest_coin_max_sl_pct": DEFAULTS.strongest_coin_max_sl_pct,
@@ -491,6 +492,20 @@ class Storage:
                 await self.set("strongest_coin_min_sl_pct", 1.20, bump_revision=False)
                 await self.set("strongest_coin_max_sl_pct", 2.20, bump_revision=False)
                 await self.set("v0283_strongest_coin_stop_pnl_migrated", True, bump_revision=False)
+        except Exception:
+            pass
+
+        # v0286: Strongest Coin real stop/hold fix. The earlier 1.2% minimum
+        # stop was still too close for MEXC 10x momentum entries, and hold
+        # detection could accept the same candle making the pullback low.
+        # Force safer settings once for existing Railway DBs.
+        try:
+            if await self.get("v0286_strongest_coin_stop_hold_migrated") is None:
+                await self.set("strongest_coin_stop_buffer_pct", 0.35, bump_revision=False)
+                await self.set("strongest_coin_min_sl_pct", 1.60, bump_revision=False)
+                await self.set("strongest_coin_max_sl_pct", 2.80, bump_revision=False)
+                await self.set("strongest_coin_min_hold_recovery_pct", 0.30, bump_revision=False)
+                await self.set("v0286_strongest_coin_stop_hold_migrated", True, bump_revision=False)
         except Exception:
             pass
 
