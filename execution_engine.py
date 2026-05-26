@@ -602,6 +602,7 @@ class ExecutionEngine:
                             and not bool(pos.get("liquidation_stop_mode"))
                             and float(pos.get("take_price") or 0) > 0
                             and float(pos.get("stop_price") or 0) > 0
+                            and str(pos.get("strategy") or "").lower() not in {"cascade_hunter", "strongest_coin"}
                             and not (str(pos.get("strategy") or "").lower() == "boost_scalping" and self._truthy(await self._setting("boost_emergency_sl_only", os.getenv("BOOST_EMERGENCY_SL_ONLY", "true")), True))
                         ):
                             try:
@@ -697,7 +698,7 @@ class ExecutionEngine:
                         await self.storage.upsert_position(pos)
                     # legacy regression marker: elif strategy_name == "quick_bounce"
                     # legacy regression marker: exchange SL/TP failed; quick_bounce remains open under virtual TP/SL monitor
-                    elif strategy_name in {"quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal"}:
+                    elif strategy_name in {"quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter", "strongest_coin"}:
                         # v0231: Quick Bounce must try real exchange SL/TP first, but if
                         # MEXC rejects/does not confirm them, DO NOT panic-close the entry.
                         # Keep the position open and let PositionManager enforce virtual

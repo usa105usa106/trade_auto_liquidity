@@ -4044,10 +4044,10 @@ def _button_mapping():
         ("▶️ Run", run_cmd), ("▶ Run", run_cmd), ("Run", run_cmd),
         ("⏹ Stop", stop_cmd), ("Stop", stop_cmd),
         ("📊 Status", status_cmd), ("Status", status_cmd),
-        ("🚨 Panic", panic_cmd), ("Panic", panic_cmd),
+        ("🚨 Panic", panic_cmd), ("Panic", panic_cmd), ("/panic", panic_cmd), ("/Panic", panic_cmd),
         ("📈 Positions", positions_cmd), ("Positions", positions_cmd),
-        ("🧯 Close All", close_all_cmd), ("Close All", close_all_cmd), ("close all", close_all_cmd),
-        ("🧹 Cancel All", cancel_all_cmd), ("Cancel All", cancel_all_cmd), ("cancel all", cancel_all_cmd),
+        ("🧯 Close All", close_all_cmd), ("Close All", close_all_cmd), ("close all", close_all_cmd), ("/close all", close_all_cmd), ("/Close all", close_all_cmd), ("/close_all", close_all_cmd),
+        ("🧹 Cancel All", cancel_all_cmd), ("Cancel All", cancel_all_cmd), ("cancel all", cancel_all_cmd), ("cansel all", cancel_all_cmd), ("/cancel all", cancel_all_cmd), ("/cansel all", cancel_all_cmd), ("/cancel_all", cancel_all_cmd),
         ("📉 Stats", stats_cmd), ("Stats", stats_cmd),
         ("💰 Balance", balance_cmd), ("Balance", balance_cmd), ("баланс", balance_cmd), ("Баланс", balance_cmd),
         ("🏓 Ping", ping_cmd), ("Ping", ping_cmd),
@@ -5885,15 +5885,19 @@ def build_app():
     app.add_handler(CommandHandler("boost_list", _wrap_command(boost_list_cmd, "/boost_list")))
     app.add_handler(CommandHandler("boost_list_del", _wrap_command(boost_list_del_cmd, "/boost_list_del")))
     app.add_handler(CommandHandler("stop", _wrap_command(stop_cmd, "/stop")))
-    app.add_handler(CommandHandler("panic", _wrap_command(panic_cmd, "/panic")))
+    # Emergency command aliases. Telegram treats "/Close all" as command
+    # "Close" with arg "all", and unmatched slash commands never reach the
+    # reply-keyboard text_router because it excludes filters.COMMAND.  Operators
+    # often type/click these variants, so wire them directly to the real actions.
+    app.add_handler(CommandHandler(["panic", "Panic", "PANIC"], _wrap_command(panic_cmd, "/panic")))
     app.add_handler(CommandHandler("status", _wrap_command(status_cmd, "/status")))
     app.add_handler(CommandHandler("ping", _wrap_command(ping_cmd, "/ping")))
     app.add_handler(CommandHandler("balance", _wrap_command(balance_cmd, "/balance")))
     app.add_handler(CommandHandler("positions", _wrap_command(positions_cmd, "/positions")))
     app.add_handler(CommandHandler("mexc_debug_state", _wrap_command(mexc_debug_state_cmd, "/mexc_debug_state")))
     app.add_handler(CommandHandler("open_orders", _wrap_command(open_orders_cmd, "/open_orders")))
-    app.add_handler(CommandHandler("cancel_all", _wrap_command(cancel_all_cmd, "/cancel_all")))
-    app.add_handler(CommandHandler("close_all", _wrap_command(close_all_cmd, "/close_all")))
+    app.add_handler(CommandHandler(["cancel_all", "cancel", "Cancel", "CANCEL", "cansel", "Cansel", "CANSEL", "cancelall", "CancelAll", "canselall", "CanselAll"], _wrap_command(cancel_all_cmd, "/cancel_all")))
+    app.add_handler(CommandHandler(["close_all", "close", "Close", "CLOSE", "closeall", "CloseAll"], _wrap_command(close_all_cmd, "/close_all")))
     app.add_handler(CommandHandler("stats", _wrap_command(stats_cmd, "/stats")))
     app.add_handler(CommandHandler("ai_stats", _wrap_command(ai_stats_cmd, "/ai_stats")))
     app.add_handler(CommandHandler("ai_stats_current", _wrap_command(ai_stats_current_cmd, "/ai_stats_current")))

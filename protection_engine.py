@@ -287,7 +287,7 @@ class ProtectionEngine:
             # showing a false LOCAL PROTECTION/MISSING warning or trying to
             # restore/cancel orders.
             strategy_l = str(pos.get("strategy") or "").lower()
-            is_native_tpsl_strategy = strategy_l in {"impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter"}
+            is_native_tpsl_strategy = strategy_l in {"impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter", "strongest_coin"}
             if is_native_tpsl_strategy and (pos.get("tpsl_native_direct_posted") or pos.get("tpsl_native_direct_raw")):
                 try:
                     opened_at = float(pos.get("opened_at") or pos.get("created_at") or 0)
@@ -377,7 +377,7 @@ class ProtectionEngine:
         # if placement failed or cannot be verified, local virtual TP/SL handles
         # the exit without auto-closing the trade.
         strategy_l = str(pos.get("strategy") or "").lower()
-        if strategy_l in {"quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter"}:
+        if strategy_l in {"quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter", "strongest_coin"}:
             out["protection_status"] = "VIRTUAL_PROTECTED"
             out["protection_mode"] = "virtual"
             out["virtual_tp_sl_active"] = True
