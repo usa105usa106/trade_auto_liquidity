@@ -12,6 +12,7 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["🔻 импульсный слив"],
     ["📊 orderflow impulse"],
     ["🌊 cascade hunter"],
+    ["💪 strongest coin"],
     ["🗡 knife reversal"],
     ["🧠 multi strategy"],
     ["🚀 BOOST MODE", "🛑 STOP BOOST"],

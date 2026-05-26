@@ -708,13 +708,13 @@ class ExecutionEngine:
                             "protection_mode": "virtual",
                             "real_tpsl_failed": True,
                             "virtual_tp_sl_active": True,
-                            "protection_note": "exchange SL/TP failed; quick_bounce/impulse_dump/orderflow_impulse/knife_reversal/cascade_hunter remains open under virtual TP/SL monitor",
+                            "protection_note": "exchange SL/TP failed; quick_bounce/impulse_dump/orderflow_impulse/knife_reversal/cascade_hunter/strongest_coin remains open under virtual TP/SL monitor",
                             "quick_bounce_virtual_since": time.time(),
                             "impulse_dump_virtual_since": time.time() if strategy_name == "impulse_dump" else 0,
-                            "orderflow_impulse_virtual_since": time.time() if strategy_name in {"orderflow_impulse", "knife_reversal", "cascade_hunter"} else 0,
+                            "orderflow_impulse_virtual_since": time.time() if strategy_name in {"orderflow_impulse", "knife_reversal", "cascade_hunter", "strongest_coin"} else 0,
                             "quick_bounce_real_tpsl_error": str(protection.get("tpsl_error") or protection.get("tp_error") or protection.get("sl_error") or protection.get("verify_error") or protection.get("protection_warning") or "")[:700],
                             "impulse_dump_real_tpsl_error": str(protection.get("tpsl_error") or protection.get("tp_error") or protection.get("sl_error") or protection.get("verify_error") or protection.get("protection_warning") or "")[:700] if strategy_name == "impulse_dump" else "",
-                            "orderflow_impulse_real_tpsl_error": str(protection.get("tpsl_error") or protection.get("tp_error") or protection.get("sl_error") or protection.get("verify_error") or protection.get("protection_warning") or "")[:700] if strategy_name in {"orderflow_impulse", "knife_reversal", "cascade_hunter"} else "",
+                            "orderflow_impulse_real_tpsl_error": str(protection.get("tpsl_error") or protection.get("tp_error") or protection.get("sl_error") or protection.get("verify_error") or protection.get("protection_warning") or "")[:700] if strategy_name in {"orderflow_impulse", "knife_reversal", "cascade_hunter", "strongest_coin"} else "",
                         })
                         pos.update(protection)
                         pos["updated_at"] = time.time()
@@ -1110,7 +1110,7 @@ class ExecutionEngine:
             # visible in every endpoint. Only do destructive cleanup after several
             # failed attempts, and only when explicitly enabled.
             if (
-                strategy_name_for_protection not in {"boost_scalping", "quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter"}
+                strategy_name_for_protection not in {"boost_scalping", "quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter", "strongest_coin"}
                 and i >= 2
                 and os.getenv("PROTECTION_CANCEL_STALE_ON_RETRY", "false").lower() in {"1", "true", "yes", "on"}
                 and hasattr(self.exchange_client, "cancel_all_orders")
@@ -1120,7 +1120,7 @@ class ExecutionEngine:
                 except Exception as e:
                     out["retry_cancel_error"] = str(e)[:240]
                 await asyncio.sleep(delay)
-            elif strategy_name_for_protection in {"boost_scalping", "quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter"} and i >= 2:
+            elif strategy_name_for_protection in {"boost_scalping", "quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter", "strongest_coin"} and i >= 2:
                 out["retry_cancel_skipped"] = "fast strategy protection: never cancel possible existing planorder backstop"
             if liquidation_stop_mode:
                 try:
@@ -1159,7 +1159,7 @@ class ExecutionEngine:
                 except Exception as e:
                     out["sl_error"] = str(e)[:800]
                     log_event("error_boost_emergency_sl", symbol=symbol, side=side, qty=qty, stop_price=sl, attempt=i + 1, error=str(e), ok=False)
-            elif strategy_name_for_protection == "cascade_hunter":
+            elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin"}:
                 # Split TP mode: TP1 closes 50% at 1R, TP2 closes the remaining 50% at 2R.
                 # Do not use MEXC native by-position TP/SL here because it supports one TP only.
                 try:
@@ -1169,10 +1169,10 @@ class ExecutionEngine:
                         out["tp_error"] = split.get("tp_error")
                 except Exception as e:
                     out["tp_error"] = str(e)[:800]
-                    log_event("error_cascade_split_tp", symbol=symbol, side=side, qty=qty, tp1=pos.get("partial_take_price"), tp2=pos.get("take_price"), attempt=i + 1, error=str(e), ok=False)
+                    log_event("error_split_tp", symbol=symbol, side=side, qty=qty, tp1=pos.get("partial_take_price"), tp2=pos.get("take_price"), attempt=i + 1, error=str(e), ok=False)
                 try:
                     if sl > 0:
-                        log_event("cascade_split_sl_request", symbol=symbol, side=side, qty=qty, stop_price=sl, attempt=i + 1)
+                        log_event("split_tp_sl_request", symbol=symbol, side=side, qty=qty, stop_price=sl, attempt=i + 1)
                         order = await self._create_stop_market_order(symbol, side, qty, sl)
                         out["sl_order_id"] = order.get("id")
                         out["sl_raw"] = order
@@ -1289,7 +1289,7 @@ class ExecutionEngine:
                     out["protection_mode"] = "exchange_emergency_sl_only"
                     out["boost_unsafe_position"] = False
                     out["boost_defensive_mode"] = False
-                elif strategy_name_for_protection == "cascade_hunter" and out.get("tp1_order_id") and out.get("tp2_order_id") and out.get("sl_order_id"):
+                elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin"} and out.get("tp1_order_id") and out.get("tp2_order_id") and out.get("sl_order_id"):
                     out["tp_exists"] = True
                     out["sl_exists"] = True
                     out["take_profit_ok"] = True
@@ -1297,7 +1297,7 @@ class ExecutionEngine:
                     out["ok"] = True
                     out["protection_status"] = "EXCHANGE PROTECTED"
                     out["protection_mode"] = "exchange_split_tp"
-                    out["protection_note"] = "Cascade split TP verified by returned planorder ids: TP1 50% at 1R, TP2 rest at 2R"
+                    out["protection_note"] = "Split TP verified by returned planorder ids: TP1 50% at 1R, TP2 rest at 2R"
                 else:
                     verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), str(out.get("sl_order_id") or ""))
                     out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})

@@ -1146,6 +1146,201 @@ class Scanner:
         out.sort(key=lambda c: float(c.get("confidence",0)), reverse=True)
         return out[:max_candidates]
 
+
+    async def _strongest_coin_candidates(self, exchange_client, settings: dict, max_candidates: int) -> list[dict]:
+        """Strongest Coin + Pullback + RS/BTC.
+
+        Binance SPOT is used only for scanning top-200 USDT spot markets.
+        MEXC futures is used only for execution after the strongest pullback-hold setup is found.
+        LONG only, top-1 candidate, simple momentum continuation.
+        """
+        import aiohttp, socket
+        from urllib.parse import urlencode
+
+        top_n = int(float(settings.get("strongest_coin_top_coins", 200) or 200))
+        min_quote = float(settings.get("strongest_coin_min_24h_volume_usdt", 5000000.0) or 0)
+        max_spread = float(settings.get("strongest_coin_max_spread_pct", 0.15) or 0.15)
+        min_strength = float(settings.get("strongest_coin_min_strength_score", 0.60) or 0.60)
+        min_rs = float(settings.get("strongest_coin_min_rs_btc_15m_pct", 0.50) or 0.50)
+        btc_panic_5m = float(settings.get("strongest_coin_btc_panic_5m_pct", -1.50) or -1.50)
+        min_pullback = float(settings.get("strongest_coin_min_pullback_pct", 0.35) or 0.35)
+        max_pullback = float(settings.get("strongest_coin_max_pullback_pct", 1.80) or 1.80)
+        max_depth = float(settings.get("strongest_coin_max_pullback_depth", 0.45) or 0.45)
+        stop_buffer = float(settings.get("strongest_coin_stop_buffer_pct", 0.15) or 0.15)
+        min_sl = float(settings.get("strongest_coin_min_sl_pct", 0.60) or 0.60)
+        max_sl = float(settings.get("strongest_coin_max_sl_pct", 2.50) or 2.50)
+
+        reject_counts = Counter(); reject_examples = defaultdict(list)
+        scanned = errors = 0; out = []; last_error = ""
+
+        def record(sym, reason):
+            reason = str(reason or "unknown")[:120]
+            bucket = reason.split(":", 1)[0]
+            for pref in ("volume low", "no mexc futures", "btc panic", "strength weak", "rs/btc weak", "no pullback", "pullback too deep", "hold weak", "spread high", "sl bad", "binance spot unavailable"):
+                if reason.startswith(pref): bucket = pref; break
+            reject_counts[bucket] += 1
+            if len(reject_examples[bucket]) < 3:
+                reject_examples[bucket].append(f"{sym}->{reason}")
+
+        def to_spot_symbol(symbol_id: str) -> str | None:
+            sid = str(symbol_id or "").upper()
+            if not sid.endswith("USDT") or len(sid) <= 4:
+                return None
+            base = sid[:-4]
+            if base.endswith(("UP", "DOWN", "BULL", "BEAR")) or base in {"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP"}:
+                return None
+            return f"{base}/USDT"
+
+        def move(closes, minutes: int) -> float:
+            if len(closes) <= minutes or closes[-minutes-1] <= 0:
+                return 0.0
+            return (closes[-1] - closes[-minutes-1]) / closes[-minutes-1] * 100.0
+
+        bases = [b.strip().rstrip("/") for b in str(settings.get("binance_spot_base_urls") or os.getenv("BINANCE_SPOT_BASE_URLS", "https://api.binance.com,https://api1.binance.com,https://api2.binance.com,https://api3.binance.com,https://api4.binance.com,https://data-api.binance.vision")).split(",") if b.strip()]
+        timeout = aiohttp.ClientTimeout(total=float(settings.get("binance_spot_timeout_sec", os.getenv("BINANCE_SPOT_TIMEOUT_SEC", "7")) or 7))
+        proxy_enabled = bool(settings.get("proxy_enabled", False)); proxy_url = str(settings.get("proxy_url", "") or ""); proxy = proxy_url if proxy_enabled and proxy_url else None
+
+        async def get_json(session, path, params=None):
+            nonlocal last_error
+            params = params or {}
+            qs = ("?" + urlencode(params)) if params else ""
+            errs = []
+            for base in bases:
+                try:
+                    async with session.get(f"{base}{path}{qs}", proxy=proxy) as r:
+                        txt = await r.text(); last_error = txt[:220]
+                        if r.status != 200:
+                            errs.append(f"{base} {r.status}: {txt[:120]}"); continue
+                        return await r.json(content_type=None)
+                except Exception as e:
+                    errs.append(f"{base} {type(e).__name__}: {e}")
+            last_error = "; ".join(errs)[-500:]
+            raise RuntimeError(last_error or f"Binance spot REST failed {path}")
+
+        try:
+            if hasattr(exchange_client, "load_markets"):
+                try: await exchange_client.load_markets()
+                except Exception: pass
+            headers={"User-Agent":"Mozilla/5.0 liquidity-bot strongest-coin"}
+            connector=aiohttp.TCPConnector(family=socket.AF_INET, ttl_dns_cache=300)
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector, trust_env=True) as session:
+                btc_candles = await get_json(session, "/api/v3/klines", {"symbol":"BTCUSDT", "interval":"1m", "limit":20})
+                btc_closes = [float(c[4]) for c in btc_candles or []]
+                btc_5m = move(btc_closes, 5); btc_15m = move(btc_closes, 15)
+                if btc_5m < btc_panic_5m:
+                    self.last_strongest_coin_stats = {"btc_5m_move_pct": btc_5m, "btc_15m_move_pct": btc_15m, "blocked": "btc panic", "top_coins": top_n}
+                    self.last_reject_top_reasons = [("btc panic", 1)]
+                    self.last_reject_reason = f"btc panic {btc_5m:+.2f}% < {btc_panic_5m:+.2f}%"
+                    return []
+
+                tickers = await get_json(session, "/api/v3/ticker/24hr")
+                ranked=[]; prefilter_volume_low=0; prefilter_no_futures=0
+                for t in tickers or []:
+                    sid = str(t.get("symbol") or "").upper()
+                    spot_sym = to_spot_symbol(sid)
+                    if not spot_sym: continue
+                    qv = self._safe_float(t.get("quoteVolume"), 0.0)
+                    if qv < min_quote:
+                        prefilter_volume_low += 1; continue
+                    fut = self._binance_spot_to_futures_symbol(spot_sym, exchange_client)
+                    if not fut:
+                        prefilter_no_futures += 1; continue
+                    pct = self._safe_float(t.get("priceChangePercent"), 0.0)
+                    ranked.append((qv * (1 + max(0.0, min(pct, 50.0)) / 100.0), spot_sym, sid, fut, qv))
+                ranked.sort(reverse=True)
+                selected = ranked[:top_n]
+                self.hot_symbols = [fut for *_x, fut, _qv in selected]
+                sem=asyncio.Semaphore(self._concurrency_limit(settings))
+
+                async def scan_one(spot_sym, sid, fut, qv):
+                    nonlocal scanned, errors
+                    async with sem:
+                        scanned += 1
+                        try:
+                            candles = await get_json(session, "/api/v3/klines", {"symbol":sid, "interval":"1m", "limit":20})
+                            if not candles or len(candles) < 17:
+                                record(sid, "spot data unavailable: candles"); return None
+                            ob = await get_json(session, "/api/v3/depth", {"symbol":sid, "limit":20})
+                            opens=[float(c[1]) for c in candles]; highs=[float(c[2]) for c in candles]; lows=[float(c[3]) for c in candles]; closes=[float(c[4]) for c in candles]; vols=[float(c[5]) for c in candles]
+                            last=closes[-1]
+                            m1=move(closes,1); m5=move(closes,5); m15=move(closes,15)
+                            strength = m1*0.2 + m5*0.4 + m15*0.4
+                            rs_btc = m15 - btc_15m
+                            bids=(ob.get("bids") or [])[:20] if isinstance(ob,dict) else []
+                            asks=(ob.get("asks") or [])[:20] if isinstance(ob,dict) else []
+                            bb=float(bids[0][0]) if bids else 0.0; ba=float(asks[0][0]) if asks else 0.0
+                            mid=(bb+ba)/2 if bb and ba else last
+                            spread=((ba-bb)/mid*100.0) if mid else 999.0
+                            if spread > max_spread: record(sid, f"spread high {spread:.3f} > {max_spread:.3f}"); return None
+                            if strength < min_strength: record(sid, f"strength weak {strength:+.2f} < {min_strength:+.2f}"); return None
+                            if rs_btc < min_rs: record(sid, f"rs/btc weak {rs_btc:+.2f} < {min_rs:+.2f}"); return None
+
+                            recent_high = max(highs[-8:-1]) if len(highs) >= 9 else max(highs[:-1])
+                            impulse_anchor = closes[-16]
+                            impulse_move = (recent_high - impulse_anchor) / impulse_anchor * 100.0 if impulse_anchor > 0 else 0.0
+                            pullback = (recent_high - last) / recent_high * 100.0 if recent_high > 0 else 0.0
+                            if pullback < min_pullback or pullback > max_pullback:
+                                record(sid, f"no pullback {pullback:.2f}%"); return None
+                            depth = pullback / max(impulse_move, 0.0001)
+                            if impulse_move <= 0 or depth > max_depth:
+                                record(sid, f"pullback too deep {depth:.2f}"); return None
+                            # Hold = the pullback low held and current candle starts to recover.
+                            pullback_low = min(lows[-4:])
+                            hold = (closes[-1] >= opens[-1] or closes[-1] > closes[-2]) and lows[-1] >= pullback_low * 0.999
+                            if not hold:
+                                record(sid, "hold weak"); return None
+                            stop_price = pullback_low * (1 - stop_buffer / 100.0)
+                            sl_pct = (last - stop_price) / last * 100.0 if last > 0 and stop_price > 0 else 0.0
+                            if sl_pct < min_sl:
+                                stop_price = last * (1 - min_sl / 100.0); sl_pct = min_sl
+                            if sl_pct > max_sl:
+                                record(sid, f"sl bad {sl_pct:.2f}% > {max_sl:.2f}%"); return None
+                            volume_5m_usdt = sum(float(c[7]) for c in candles[-5:])
+                            base_vol = sum(vols[:-5]) / max(1, len(vols[:-5]))
+                            vol_ratio = (sum(vols[-5:]) / 5) / base_vol if base_vol else 0.0
+                            bid_depth=sum(float(p)*float(q) for p,q in bids); ask_depth=sum(float(p)*float(q) for p,q in asks)
+                            score = 70 + min(12, strength*2.0) + min(10, rs_btc*1.5) + min(5, max(0.0, vol_ratio-1.0)*2.0) - min(5, pullback*0.5)
+                            details={
+                                "setup":"strongest_coin_pullback_hold", "spot_source":"binance_spot_public_rest", "spot_symbol":sid,
+                                "move_1m_pct":round(m1,4), "move_5m_pct":round(m5,4), "move_15m_pct":round(m15,4),
+                                "btc_move_5m_pct":round(btc_5m,4), "btc_move_15m_pct":round(btc_15m,4), "rs_btc_15m_pct":round(rs_btc,4),
+                                "strength_score":round(strength,4), "pullback_pct":round(pullback,4), "pullback_depth":round(depth,4),
+                                "pullback_low":round(pullback_low,8), "custom_stop_price":round(stop_price,8), "sl_pct":round(sl_pct,4),
+                                "tp1_r":1.0, "tp2_r":2.0, "tp1_fraction":0.50,
+                                "spot_spread_pct":round(spread,4), "spot_volume_ratio":round(vol_ratio,4), "volume_5m_usdt":round(volume_5m_usdt,2),
+                                "spot_bid_depth_usdt":round(bid_depth,2), "spot_ask_depth_usdt":round(ask_depth,2),
+                                "source":"Strongest Coin + Pullback + RS/BTC; Binance spot scan; MEXC futures execution only",
+                            }
+                            return self.engine._base(fut, "LONG", "strongest_coin", last, score, spread, bid_depth+ask_depth, 0.0, details)
+                        except Exception as e:
+                            errors += 1; record(sid, f"spot data unavailable: {type(e).__name__}"); return None
+
+                batch=max(self._concurrency_limit(settings)*2,1)
+                for i in range(0, len(selected), batch):
+                    res=await asyncio.gather(*(scan_one(spot,sid,fut,qv) for _rank,spot,sid,fut,qv in selected[i:i+batch]), return_exceptions=False)
+                    out.extend([r for r in res if r])
+        except Exception as e:
+            errors += 1; self.last_refresh_error=f"strongest_coin Binance spot failed: {type(e).__name__}: {e}; last={last_error}"[:700]
+            record("BINANCE", f"binance spot unavailable: {type(e).__name__}: {last_error or str(e)}")
+
+        self._record_cycle_health(scanned, errors, settings)
+        out.sort(key=lambda c: float(c.get("confidence",0)), reverse=True)
+        out = out[:1]
+        self.last_ai_candidates_count=len(out)
+        self.last_strongest_coin_stats={
+            "checked_symbols":scanned, "errors":errors, "candidates":len(out), "top_coins":top_n,
+            "min_24h_volume_usdt":min_quote, "min_strength_score":min_strength, "min_rs_btc_15m_pct":min_rs,
+            "min_pullback_pct":min_pullback, "max_pullback_pct":max_pullback, "max_spread_pct":max_spread,
+            "source":"binance_spot_public_rest",
+        }
+        self.last_reject_top_reasons=reject_counts.most_common(8)
+        ex=[]
+        for reason,_ in self.last_reject_top_reasons[:4]: ex.extend(reject_examples.get(reason,[])[:2])
+        self.last_reject_examples=ex[:8]
+        self.last_reject_reason="; ".join([f"{r}:{c}" for r,c in self.last_reject_top_reasons[:3]]) or "no strongest coin pullback setup"
+        self.last_signal_summary=f"Binance spot strongest_coin candidates={len(out)} scanned={scanned}"
+        return out[:max_candidates]
+
     async def _multi_strategy_candidates(self, exchange_client, settings: dict, max_candidates: int) -> list[dict]:
         st = dict(settings)
         st["orderflow_impulse_top_coins"] = int(float(settings.get("multi_strategy_top_coins", settings.get("orderflow_impulse_top_coins", 100)) or 100))
@@ -1178,6 +1373,9 @@ class Scanner:
         if preferred_strategy == "knife_reversal":
             base_max = int(settings.get("knife_reversal_max_candidates", os.getenv("KNIFE_REVERSAL_MAX_CANDIDATES", "3")) or 3)
             return await self._knife_reversal_candidates(exchange_client, settings, base_max)
+        if preferred_strategy == "strongest_coin":
+            base_max = int(settings.get("strongest_coin_max_candidates", os.getenv("STRONGEST_COIN_MAX_CANDIDATES", "1")) or 1)
+            return await self._strongest_coin_candidates(exchange_client, settings, base_max)
         if preferred_strategy == "multi_strategy":
             base_max = int(settings.get("multi_strategy_max_candidates", os.getenv("MULTI_STRATEGY_MAX_CANDIDATES", "3")) or 3)
             return await self._multi_strategy_candidates(exchange_client, settings, base_max)

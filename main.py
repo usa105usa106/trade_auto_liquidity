@@ -3793,7 +3793,7 @@ async def multi_strategy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("🧠 multi_strategy OFF. Existing positions are still managed.", reply_markup=MAIN_MENU)
         return
     updates = {
-        "multi_strategy_enabled": True, "orderflow_impulse_enabled": True, "knife_reversal_enabled": True,
+        "multi_strategy_enabled": True, "orderflow_impulse_enabled": True, "knife_reversal_enabled": True, "strongest_coin_enabled": False,
         "strategy_mode": "multi_strategy", "auto_strategy_adaptation": False, "regime_adaptation": False,
         "max_open_positions": 3, "scan_interval_sec": 60, "multi_strategy_top_coins": 100, "multi_strategy_scan_interval_sec": 60, "multi_strategy_max_open_positions": 3,
         "orderflow_impulse_top_coins": 100, "orderflow_impulse_scan_interval_sec": 60, "orderflow_impulse_max_open_positions": 3,
@@ -3812,6 +3812,85 @@ async def multi_strategy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+
+async def strongest_coin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return
+    global running, entries_enabled, trading_task, position_task
+    s = await storage.all_settings()
+    enabled = str(s.get("strategy_mode", "hybrid")).lower() == "strongest_coin" and _bool_setting(s, "strongest_coin_enabled", False)
+    if enabled:
+        await storage.set("strongest_coin_enabled", False, bump_revision=False)
+        await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+        trigger_scan_now(context.application, reason="strongest_coin:off")
+        await reply(update, "○ Strongest coin OFF\nСканер остановлен, новые сделки не открываются. Открытые позиции продолжают сопровождаться до TP/SL/time-stop.", reply_markup=MAIN_MENU)
+        return
+
+    updates = {
+        "strongest_coin_enabled": True,
+        "cascade_hunter_enabled": False,
+        "orderflow_impulse_enabled": False,
+        "knife_reversal_enabled": False,
+        "multi_strategy_enabled": False,
+        "quick_bounce_enabled": False,
+        "impulse_dump_enabled": False,
+        "strategy_mode": "strongest_coin",
+        "universe_mode": "top-200",
+        "max_symbols": 200,
+        "scan_interval_sec": 60,
+        "symbol_refresh_sec": 300,
+        "max_open_positions": 1,
+        "trade_margin_pct": 0.10,
+        "cooldown_after_close_sec": 3600,
+        "strongest_coin_top_coins": 200,
+        "strongest_coin_scan_interval_sec": 60,
+        "strongest_coin_trade_margin_pct": 0.10,
+        "strongest_coin_max_open_positions": 1,
+        "strongest_coin_leverage": 10,
+        "strongest_coin_min_24h_volume_usdt": 5000000.0,
+        "strongest_coin_max_spread_pct": 0.15,
+        "strongest_coin_min_strength_score": 0.60,
+        "strongest_coin_min_rs_btc_15m_pct": 0.50,
+        "strongest_coin_btc_panic_5m_pct": -1.50,
+        "strongest_coin_min_pullback_pct": 0.35,
+        "strongest_coin_max_pullback_pct": 1.80,
+        "strongest_coin_max_pullback_depth": 0.45,
+        "strongest_coin_stop_buffer_pct": 0.15,
+        "strongest_coin_min_sl_pct": 0.60,
+        "strongest_coin_max_sl_pct": 2.50,
+        "strongest_coin_tp1_r": 1.0,
+        "strongest_coin_tp2_r": 2.0,
+        "strongest_coin_tp1_fraction": 0.50,
+        "strongest_coin_time_stop_sec": 600,
+        "strongest_coin_cooldown_after_close_sec": 3600,
+        "mexc_order_leverage": 10,
+        "scan_market_source": "mexc_binance",
+        "spot_confirmation_enabled": False,
+        "auto_strategy_adaptation": False,
+        "regime_adaptation": False,
+        "liquidity_runner_enabled": False,
+        "mirror_mode": "off",
+        "session_filter_enabled": False,
+        "america_short_bias_enabled": False,
+        "openai_analysis_enabled": False,
+    }
+    for k, v in updates.items():
+        await storage.set(k, v, bump_revision=False)
+    await storage.set("settings_revision", int(s.get("settings_revision", 1) or 1) + 1, bump_revision=False)
+    scanner.last_refresh = 0
+    entries_enabled = True
+    running = True
+    if trading_task is None or trading_task.done():
+        trading_task = context.application.create_task(trading_loop(context.application))
+    if position_task is None or position_task.done():
+        position_task = context.application.create_task(position_management_loop(context.application))
+    trigger_scan_now(context.application, reason="strongest_coin:on")
+    await reply(update,
+        "✅ Strongest coin ON\n"
+        "Binance SPOT top-200 каждые 60s: weighted momentum + RS/BTC + pullback hold. Только LONG.\n"
+        "Исполнение: MEXC futures. 1 сделка максимум, 10% баланса, x10 isolated, cooldown монеты 1h. TP1 1R 50%, TP2 2R остаток.",
+        reply_markup=MAIN_MENU,
+    )
+
 async def cascade_hunter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     global running, entries_enabled, trading_task, position_task
@@ -3829,6 +3908,7 @@ async def cascade_hunter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "orderflow_impulse_enabled": False,
         "knife_reversal_enabled": False,
         "multi_strategy_enabled": False,
+        "strongest_coin_enabled": False,
         "quick_bounce_enabled": False,
         "impulse_dump_enabled": False,
         "strategy_mode": "cascade_hunter",
@@ -3979,6 +4059,7 @@ def _button_mapping():
         ("🔻 импульсный слив", impulse_dump_cmd), ("импульсный слив", impulse_dump_cmd), ("Импульсный слив", impulse_dump_cmd),
         ("📊 orderflow impulse", orderflow_impulse_cmd), ("orderflow impulse", orderflow_impulse_cmd), ("Orderflow impulse", orderflow_impulse_cmd),
         ("🌊 cascade hunter", cascade_hunter_cmd), ("cascade hunter", cascade_hunter_cmd), ("Cascade hunter", cascade_hunter_cmd),
+        ("💪 strongest coin", strongest_coin_cmd), ("strongest coin", strongest_coin_cmd), ("Strongest coin", strongest_coin_cmd),
         ("🗡 knife reversal", knife_reversal_cmd), ("knife reversal", knife_reversal_cmd), ("Knife reversal", knife_reversal_cmd),
         ("🧠 multi strategy", multi_strategy_cmd), ("multi strategy", multi_strategy_cmd), ("Multi strategy", multi_strategy_cmd),
         ("🚀 BOOST MODE", boost_start_cmd), ("BOOST MODE", boost_start_cmd),
@@ -5221,7 +5302,8 @@ async def trading_loop(app):
                 cascade_hunter_cycle = base_strategy_mode == "cascade_hunter"
                 knife_reversal_cycle = base_strategy_mode == "knife_reversal"
                 multi_strategy_cycle = base_strategy_mode == "multi_strategy"
-                special_native_cycle = orderflow_impulse_cycle or cascade_hunter_cycle or knife_reversal_cycle or multi_strategy_cycle
+                strongest_coin_cycle = base_strategy_mode == "strongest_coin"
+                special_native_cycle = orderflow_impulse_cycle or cascade_hunter_cycle or knife_reversal_cycle or multi_strategy_cycle or strongest_coin_cycle
                 if quick_bounce_cycle and not _bool_setting(settings, "quick_bounce_enabled", False):
                     scanner.last_signal_summary = "quick_bounce OFF: scanner stopped"
                     scanner.last_reject_reason = "Press ⚡ быстрый отскок again to resume scanning. Existing positions are still managed."
@@ -5250,6 +5332,12 @@ async def trading_loop(app):
                     scanner.last_signal_summary = "knife_reversal OFF: scanner stopped"
                     scanner.last_reject_reason = "Press 🗡 knife reversal again to resume scanning. Existing positions are still managed."
                     await update_scanner_status(app, settings, status="knife reversal off")
+                    await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 60)))
+                    continue
+                if strongest_coin_cycle and not _bool_setting(settings, "strongest_coin_enabled", False):
+                    scanner.last_signal_summary = "strongest_coin OFF: scanner stopped"
+                    scanner.last_reject_reason = "Press 💪 strongest coin again to resume scanning. Existing positions are still managed."
+                    await update_scanner_status(app, settings, status="strongest coin off")
                     await sleep_until_next_scan(app, int(settings.get("scan_interval_sec", 60)))
                     continue
                 if multi_strategy_cycle and not _bool_setting(settings, "multi_strategy_enabled", False):
@@ -5294,6 +5382,8 @@ async def trading_loop(app):
                     log_event("cascade_hunter_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("cascade_hunter_top_coins", settings.get("max_symbols", 100)) or 100)), source="binance_spot_cascade_pressure")
                 if knife_reversal_cycle:
                     log_event("knife_reversal_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("knife_reversal_top_coins", 100) or 100)), source="binance_spot_wick_reclaim")
+                if strongest_coin_cycle:
+                    log_event("strongest_coin_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("strongest_coin_top_coins", settings.get("max_symbols", 200)) or 200)), source="binance_spot_strongest_coin")
                 if multi_strategy_cycle:
                     log_event("multi_strategy_scan_start", stage="scan", ok=True, top_coins=int(float(settings.get("multi_strategy_top_coins", 100) or 100)), source="binance_spot_orderflow+binance_spot_knife_reversal")
                 if base_strategy_mode == "all":
@@ -5358,6 +5448,8 @@ async def trading_loop(app):
                     await orderflow_impulse_progress_message(app, 100, clear=True)
                 if knife_reversal_cycle:
                     log_event("knife_reversal_scan_done", stage="scan", ok=True, candidates=len(candidates or []), symbols=[str(c.get("symbol", "")) for c in (candidates or [])[:10]], reject_reasons=getattr(scanner, "last_reject_top_reasons", []), stats=getattr(scanner, "last_knife_scan_stats", {}), errors=getattr(scanner, "last_cycle_errors", 0))
+                if strongest_coin_cycle:
+                    log_event("strongest_coin_scan_done", stage="scan", ok=True, candidates=len(candidates or []), symbols=[str(c.get("symbol", "")) for c in (candidates or [])[:10]], reject_reasons=getattr(scanner, "last_reject_top_reasons", []), stats=getattr(scanner, "last_strongest_coin_stats", {}), errors=getattr(scanner, "last_cycle_errors", 0))
                 if multi_strategy_cycle:
                     log_event("multi_strategy_scan_done", stage="scan", ok=True, candidates=len(candidates or []), symbols=[str(c.get("symbol", "")) for c in (candidates or [])[:10]], stats=getattr(scanner, "last_multi_strategy_stats", {}), errors=getattr(scanner, "last_cycle_errors", 0))
                 if scanner.last_slowdown_sec:
@@ -5444,8 +5536,11 @@ async def trading_loop(app):
                     cand["strategy_mode"] = base_strategy_mode
                     cand["effective_strategy_mode"] = effective_strategy
                     if special_native_cycle:
-                        common_slots = int(float(settings.get("multi_strategy_max_open_positions", settings.get("cascade_hunter_max_open_positions", settings.get("orderflow_impulse_max_open_positions", 3))) or 3))
                         st_name = str(cand.get("strategy", "orderflow_impulse")).lower()
+                        if st_name == "strongest_coin" or strongest_coin_cycle:
+                            common_slots = int(float(settings.get("strongest_coin_max_open_positions", 1) or 1))
+                        else:
+                            common_slots = int(float(settings.get("multi_strategy_max_open_positions", settings.get("cascade_hunter_max_open_positions", settings.get("orderflow_impulse_max_open_positions", 3))) or 3))
                         cand["max_open_positions"] = common_slots
                         if st_name == "knife_reversal":
                             cand["trade_margin_pct"] = float(settings.get("knife_reversal_trade_margin_pct", 0.10) or 0.10)
@@ -5453,6 +5548,9 @@ async def trading_loop(app):
                         elif st_name == "cascade_hunter":
                             cand["trade_margin_pct"] = float(settings.get("cascade_hunter_trade_margin_pct", 0.10) or 0.10)
                             cand["leverage"] = int(float(settings.get("cascade_hunter_leverage", 10) or 10))
+                        elif st_name == "strongest_coin":
+                            cand["trade_margin_pct"] = float(settings.get("strongest_coin_trade_margin_pct", 0.10) or 0.10)
+                            cand["leverage"] = int(float(settings.get("strongest_coin_leverage", 10) or 10))
                         else:
                             cand["trade_margin_pct"] = float(settings.get("orderflow_impulse_trade_margin_pct", 0.10) or 0.10)
                             cand["leverage"] = int(float(settings.get("orderflow_impulse_leverage", 10) or 10))
@@ -5482,7 +5580,10 @@ async def trading_loop(app):
 
                     plan = TradePlanner().make_plan(cand, settings, equity_usdt=equity)
                     if special_native_cycle and plan:
-                        common_slots = int(float(settings.get("multi_strategy_max_open_positions", settings.get("cascade_hunter_max_open_positions", settings.get("orderflow_impulse_max_open_positions", 3))) or 3))
+                        if str(plan.strategy).lower() == "strongest_coin" or strongest_coin_cycle:
+                            common_slots = int(float(settings.get("strongest_coin_max_open_positions", 1) or 1))
+                        else:
+                            common_slots = int(float(settings.get("multi_strategy_max_open_positions", settings.get("cascade_hunter_max_open_positions", settings.get("orderflow_impulse_max_open_positions", 3))) or 3))
                         try:
                             plan.max_open_positions = common_slots
                         except Exception:

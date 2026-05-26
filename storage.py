@@ -187,6 +187,29 @@ DEFAULT_SETTINGS = {
     "cascade_hunter_min_price_move_pct": DEFAULTS.cascade_hunter_min_price_move_pct,
     "cascade_hunter_max_spread_pct": DEFAULTS.cascade_hunter_max_spread_pct,
     "cascade_hunter_min_24h_volume_usdt": DEFAULTS.cascade_hunter_min_24h_volume_usdt,
+
+    "strongest_coin_enabled": DEFAULTS.strongest_coin_enabled,
+    "strongest_coin_top_coins": DEFAULTS.strongest_coin_top_coins,
+    "strongest_coin_scan_interval_sec": DEFAULTS.strongest_coin_scan_interval_sec,
+    "strongest_coin_trade_margin_pct": DEFAULTS.strongest_coin_trade_margin_pct,
+    "strongest_coin_max_open_positions": DEFAULTS.strongest_coin_max_open_positions,
+    "strongest_coin_leverage": DEFAULTS.strongest_coin_leverage,
+    "strongest_coin_min_24h_volume_usdt": DEFAULTS.strongest_coin_min_24h_volume_usdt,
+    "strongest_coin_max_spread_pct": DEFAULTS.strongest_coin_max_spread_pct,
+    "strongest_coin_min_strength_score": DEFAULTS.strongest_coin_min_strength_score,
+    "strongest_coin_min_rs_btc_15m_pct": DEFAULTS.strongest_coin_min_rs_btc_15m_pct,
+    "strongest_coin_btc_panic_5m_pct": DEFAULTS.strongest_coin_btc_panic_5m_pct,
+    "strongest_coin_min_pullback_pct": DEFAULTS.strongest_coin_min_pullback_pct,
+    "strongest_coin_max_pullback_pct": DEFAULTS.strongest_coin_max_pullback_pct,
+    "strongest_coin_max_pullback_depth": DEFAULTS.strongest_coin_max_pullback_depth,
+    "strongest_coin_stop_buffer_pct": DEFAULTS.strongest_coin_stop_buffer_pct,
+    "strongest_coin_min_sl_pct": DEFAULTS.strongest_coin_min_sl_pct,
+    "strongest_coin_max_sl_pct": DEFAULTS.strongest_coin_max_sl_pct,
+    "strongest_coin_tp1_r": DEFAULTS.strongest_coin_tp1_r,
+    "strongest_coin_tp2_r": DEFAULTS.strongest_coin_tp2_r,
+    "strongest_coin_tp1_fraction": DEFAULTS.strongest_coin_tp1_fraction,
+    "strongest_coin_time_stop_sec": DEFAULTS.strongest_coin_time_stop_sec,
+    "strongest_coin_cooldown_after_close_sec": DEFAULTS.strongest_coin_cooldown_after_close_sec,
     "knife_reversal_enabled": DEFAULTS.knife_reversal_enabled,
     "knife_reversal_top_coins": DEFAULTS.knife_reversal_top_coins,
     "knife_reversal_scan_interval_sec": DEFAULTS.knife_reversal_scan_interval_sec,
@@ -444,6 +467,18 @@ class Storage:
                 if current_lev == 1 and os.getenv("MEXC_ORDER_LEVERAGE") is None:
                     await self.set("mexc_order_leverage", 5, bump_revision=False)
                 await self.set("v0060_leverage_default_migrated", True, bump_revision=False)
+        except Exception:
+            pass
+
+        # v0280: add Strongest Coin simple mode defaults.
+        try:
+            if await self.get("v0280_strongest_coin_settings_migrated") is None:
+                await self.set("strongest_coin_top_coins", 200, bump_revision=False)
+                await self.set("strongest_coin_trade_margin_pct", 0.10, bump_revision=False)
+                await self.set("strongest_coin_max_open_positions", 1, bump_revision=False)
+                await self.set("strongest_coin_leverage", 10, bump_revision=False)
+                await self.set("strongest_coin_cooldown_after_close_sec", 3600, bump_revision=False)
+                await self.set("v0280_strongest_coin_settings_migrated", True, bump_revision=False)
         except Exception:
             pass
 

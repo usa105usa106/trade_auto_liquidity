@@ -89,6 +89,14 @@ class TradePlanner:
                 "tp_mult": 1.0,
                 "sl_mult": 1.0,
             },
+            "strongest_coin": {
+                "min_tp": 0.1,
+                "max_tp": 10.0,
+                "min_sl": float(os.getenv("STRONGEST_COIN_MIN_SL_PCT", "0.60")),
+                "max_sl": float(os.getenv("STRONGEST_COIN_MAX_SL_PCT", "2.50")),
+                "tp_mult": 1.0,
+                "sl_mult": 1.0,
+            },
             "cascade_hunter": {
                 "min_tp": float(os.getenv("CASCADE_HUNTER_TP_PCT", "4.0")),
                 "max_tp": float(os.getenv("CASCADE_HUNTER_TP_PCT", "4.0")),
@@ -188,6 +196,26 @@ class TradePlanner:
             candidate["trade_margin_pct"] = float(settings.get("quick_bounce_trade_margin_pct", os.getenv("QUICK_BOUNCE_TRADE_MARGIN_PCT", "0.10")) or 0.10)
             candidate["max_open_positions"] = int(float(settings.get("quick_bounce_max_open_positions", os.getenv("QUICK_BOUNCE_MAX_OPEN_POSITIONS", "5")) or 5))
             candidate["leverage"] = int(float(settings.get("quick_bounce_leverage", os.getenv("QUICK_BOUNCE_LEVERAGE", "10")) or 10))
+        elif strategy in {"strongest_coin"}:
+            details = candidate.get("score_details") or {}
+            custom_stop = float(details.get("custom_stop_price") or 0) if isinstance(details, dict) else 0.0
+            if side == "LONG" and custom_stop > 0 and custom_stop < price:
+                sl_pct = max(0.01, (price - custom_stop) / price * 100.0)
+            else:
+                sl_pct = max(0.01, float(settings.get("strongest_coin_min_sl_pct", os.getenv("STRONGEST_COIN_MIN_SL_PCT", "0.60")) or 0.60))
+            max_sl = float(settings.get("strongest_coin_max_sl_pct", os.getenv("STRONGEST_COIN_MAX_SL_PCT", "2.50")) or 2.50)
+            if sl_pct > max_sl:
+                return None
+            tp1_r = max(0.1, float(settings.get("strongest_coin_tp1_r", os.getenv("STRONGEST_COIN_TP1_R", "1.0")) or 1.0))
+            tp2_r = max(tp1_r, float(settings.get("strongest_coin_tp2_r", os.getenv("STRONGEST_COIN_TP2_R", "2.0")) or 2.0))
+            tp1_fraction = max(0.01, min(0.99, float(settings.get("strongest_coin_tp1_fraction", os.getenv("STRONGEST_COIN_TP1_FRACTION", "0.50")) or 0.50)))
+            tp_pct = sl_pct * tp2_r
+            rr = round(tp2_r, 6)
+            candidate["score_details"] = dict(details)
+            candidate["score_details"].update({"sl_pct": sl_pct, "tp_pct": tp_pct, "tp1_r": tp1_r, "tp2_r": tp2_r, "tp1_fraction": tp1_fraction, "rr": rr})
+            candidate["trade_margin_pct"] = float(settings.get("strongest_coin_trade_margin_pct", os.getenv("STRONGEST_COIN_TRADE_MARGIN_PCT", "0.10")) or 0.10)
+            candidate["max_open_positions"] = int(float(settings.get("strongest_coin_max_open_positions", os.getenv("STRONGEST_COIN_MAX_OPEN_POSITIONS", "1")) or 1))
+            candidate["leverage"] = int(float(settings.get("strongest_coin_leverage", os.getenv("STRONGEST_COIN_LEVERAGE", "10")) or 10))
         elif strategy in {"cascade_hunter"}:
             details = candidate.get("score_details") or {}
             # CASCADE HUNTER: fixed SL distance, two RR targets.
@@ -329,7 +357,7 @@ class TradePlanner:
         else:
             max_notional_by_margin = max_margin_per_position * leverage
             notional_ceiling = self.max_order_usdt
-            if strategy in {"orderflow_impulse", "knife_reversal", "cascade_hunter"}:
+            if strategy in {"orderflow_impulse", "knife_reversal", "cascade_hunter", "strongest_coin"}:
                 # ORDERFLOW/KNIFE: user expects fixed isolated margin allocation: 10% of balance per trade.
                 # Do not let risk_pct sizing or MAX_ORDER_USDT shrink it to a tiny notional.
                 # Example: equity 100 USDT, margin 10%, lev 10x => notional 100 USDT, margin 10 USDT.
@@ -341,7 +369,7 @@ class TradePlanner:
                 # Account is too small for the configured leverage/min order.
                 return None
 
-            if strategy in {"orderflow_impulse", "knife_reversal", "cascade_hunter"}:
+            if strategy in {"orderflow_impulse", "knife_reversal", "cascade_hunter", "strongest_coin"}:
                 notional = max(self.min_order_usdt, max_notional_by_margin)
             else:
                 notional = clamp(risk_notional, self.min_order_usdt, notional_ceiling)
@@ -357,7 +385,7 @@ class TradePlanner:
         else:
             stop = price * (1 + sl_pct / 100.0)
             take = price * (1 - tp_pct / 100.0)
-        if strategy == "cascade_hunter":
+        if strategy in {"cascade_hunter", "strongest_coin"}:
             risk_abs = abs(price - stop)
             tp1_r = float(candidate.get("score_details", {}).get("tp1_r", 1.0) or 1.0)
             partial_fraction = float(candidate.get("score_details", {}).get("tp1_fraction", 0.50) or 0.50)
@@ -369,7 +397,7 @@ class TradePlanner:
                 partial_take = price - risk_abs * tp1_r
                 final_take = take
 
-        order_type = "market" if strategy in {"momentum", "ai_scalping", "boost_scalping", "quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter"} else "limit"
+        order_type = "market" if strategy in {"momentum", "ai_scalping", "boost_scalping", "quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter", "strongest_coin"} else "limit"
         lr_rr = float(candidate.get("liquidity_retest_rr") or (details.get("adaptive_rr") if isinstance(details, dict) else 0) or 0)
         lr_zone_low = float(details.get("zone_low") or 0) if isinstance(details, dict) else 0.0
         lr_zone_high = float(details.get("zone_high") or 0) if isinstance(details, dict) else 0.0
