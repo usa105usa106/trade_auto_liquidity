@@ -92,8 +92,8 @@ class TradePlanner:
             "strongest_coin": {
                 "min_tp": 0.1,
                 "max_tp": 10.0,
-                "min_sl": float(os.getenv("STRONGEST_COIN_MIN_SL_PCT", "0.60")),
-                "max_sl": float(os.getenv("STRONGEST_COIN_MAX_SL_PCT", "2.50")),
+                "min_sl": float(os.getenv("STRONGEST_COIN_MIN_SL_PCT", "1.20")),
+                "max_sl": float(os.getenv("STRONGEST_COIN_MAX_SL_PCT", "2.20")),
                 "tp_mult": 1.0,
                 "sl_mult": 1.0,
             },
@@ -202,8 +202,8 @@ class TradePlanner:
             if side == "LONG" and custom_stop > 0 and custom_stop < price:
                 sl_pct = max(0.01, (price - custom_stop) / price * 100.0)
             else:
-                sl_pct = max(0.01, float(settings.get("strongest_coin_min_sl_pct", os.getenv("STRONGEST_COIN_MIN_SL_PCT", "0.60")) or 0.60))
-            max_sl = float(settings.get("strongest_coin_max_sl_pct", os.getenv("STRONGEST_COIN_MAX_SL_PCT", "2.50")) or 2.50)
+                sl_pct = max(0.01, float(settings.get("strongest_coin_min_sl_pct", os.getenv("STRONGEST_COIN_MIN_SL_PCT", "1.20")) or 1.20))
+            max_sl = float(settings.get("strongest_coin_max_sl_pct", os.getenv("STRONGEST_COIN_MAX_SL_PCT", "2.20")) or 2.20)
             if sl_pct > max_sl:
                 return None
             tp1_r = max(0.1, float(settings.get("strongest_coin_tp1_r", os.getenv("STRONGEST_COIN_TP1_R", "1.0")) or 1.0))

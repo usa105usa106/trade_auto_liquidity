@@ -1166,9 +1166,9 @@ class Scanner:
         min_pullback = float(settings.get("strongest_coin_min_pullback_pct", 0.35) or 0.35)
         max_pullback = float(settings.get("strongest_coin_max_pullback_pct", 1.80) or 1.80)
         max_depth = float(settings.get("strongest_coin_max_pullback_depth", 0.45) or 0.45)
-        stop_buffer = float(settings.get("strongest_coin_stop_buffer_pct", 0.15) or 0.15)
-        min_sl = float(settings.get("strongest_coin_min_sl_pct", 0.60) or 0.60)
-        max_sl = float(settings.get("strongest_coin_max_sl_pct", 2.50) or 2.50)
+        stop_buffer = float(settings.get("strongest_coin_stop_buffer_pct", 0.25) or 0.25)
+        min_sl = float(settings.get("strongest_coin_min_sl_pct", 1.20) or 1.20)
+        max_sl = float(settings.get("strongest_coin_max_sl_pct", 2.20) or 2.20)
 
         reject_counts = Counter(); reject_examples = defaultdict(list)
         scanned = errors = 0; out = []; last_error = ""

@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0282 STRONGEST SPLIT TP WATCHDOG FIX")
+VERSION = os.getenv("BOT_VERSION", "0285 STRONGEST COIN TPSL SIDE FIX")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -240,9 +240,9 @@ class Defaults:
     strongest_coin_min_pullback_pct: float = env_float("STRONGEST_COIN_MIN_PULLBACK_PCT", 0.35)
     strongest_coin_max_pullback_pct: float = env_float("STRONGEST_COIN_MAX_PULLBACK_PCT", 1.80)
     strongest_coin_max_pullback_depth: float = env_float("STRONGEST_COIN_MAX_PULLBACK_DEPTH", 0.45)
-    strongest_coin_stop_buffer_pct: float = env_float("STRONGEST_COIN_STOP_BUFFER_PCT", 0.15)
-    strongest_coin_min_sl_pct: float = env_float("STRONGEST_COIN_MIN_SL_PCT", 0.60)
-    strongest_coin_max_sl_pct: float = env_float("STRONGEST_COIN_MAX_SL_PCT", 2.50)
+    strongest_coin_stop_buffer_pct: float = env_float("STRONGEST_COIN_STOP_BUFFER_PCT", 0.25)
+    strongest_coin_min_sl_pct: float = env_float("STRONGEST_COIN_MIN_SL_PCT", 1.20)
+    strongest_coin_max_sl_pct: float = env_float("STRONGEST_COIN_MAX_SL_PCT", 2.20)
     strongest_coin_tp1_r: float = env_float("STRONGEST_COIN_TP1_R", 1.0)
     strongest_coin_tp2_r: float = env_float("STRONGEST_COIN_TP2_R", 2.0)
     strongest_coin_tp1_fraction: float = env_float("STRONGEST_COIN_TP1_FRACTION", 0.50)

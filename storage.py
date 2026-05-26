@@ -482,6 +482,18 @@ class Storage:
         except Exception:
             pass
 
+        # v0283: Strongest Coin stop/PnL fix. Existing Railway DBs may still
+        # contain the old too-tight 0.60% stop values from v0280-v0282. Force the
+        # safer defaults once so pressing the button is not required after deploy.
+        try:
+            if await self.get("v0283_strongest_coin_stop_pnl_migrated") is None:
+                await self.set("strongest_coin_stop_buffer_pct", 0.25, bump_revision=False)
+                await self.set("strongest_coin_min_sl_pct", 1.20, bump_revision=False)
+                await self.set("strongest_coin_max_sl_pct", 2.20, bump_revision=False)
+                await self.set("v0283_strongest_coin_stop_pnl_migrated", True, bump_revision=False)
+        except Exception:
+            pass
+
     async def get(self, key: str, default: Any = None) -> Any:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))

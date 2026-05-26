@@ -187,7 +187,15 @@ class ExecutionEngine:
         return float(fallback or 0)
 
     def _rebase_protection_to_fill(self, pos: dict, fill_price: float) -> dict:
-        """Keep the original SL/TP percentages but anchor them to the real fill price."""
+        """Keep the original SL/TP percentages but anchor them to the real fill price.
+
+        v0285: split-TP strategies (cascade_hunter/strongest_coin) also need
+        partial_take_price/final_take_price rebased.  Older builds only rebased
+        stop_price and take_price, so TP1 could stay anchored to the scanner
+        signal price while the real MEXC fill moved.  That made the displayed
+        final take look roughly correct while the actual split TP plan could be
+        inconsistent.  Recompute TP1/TP2 from the live entry and live SL by R.
+        """
         original_entry = float(pos.get("entry_price") or 0)
         fill_price = float(fill_price or 0)
         if original_entry <= 0 or fill_price <= 0:
@@ -209,6 +217,31 @@ class ExecutionEngine:
             if old_take > 0:
                 take_pct = abs(old_take - original_entry) / original_entry
                 pos["take_price"] = fill_price * (1 + take_pct)
+
+        strategy = str(pos.get("strategy") or "").lower()
+        if strategy in {"cascade_hunter", "strongest_coin"}:
+            stop = float(pos.get("stop_price") or 0)
+            risk_abs = abs(fill_price - stop) if stop > 0 else 0.0
+            details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
+            tp1_r = float(pos.get("tp1_r") or details.get("tp1_r") or 1.0)
+            tp2_r = float(pos.get("tp2_r") or details.get("tp2_r") or 2.0)
+            frac = float(pos.get("partial_take_fraction") or details.get("tp1_fraction") or 0.50)
+            frac = max(0.01, min(0.99, frac))
+            tp1_r = max(0.1, tp1_r)
+            tp2_r = max(tp1_r, tp2_r)
+            if risk_abs > 0:
+                if side == "SHORT":
+                    pos["partial_take_price"] = fill_price - risk_abs * tp1_r
+                    pos["final_take_price"] = fill_price - risk_abs * tp2_r
+                    pos["take_price"] = pos["final_take_price"]
+                else:
+                    pos["partial_take_price"] = fill_price + risk_abs * tp1_r
+                    pos["final_take_price"] = fill_price + risk_abs * tp2_r
+                    pos["take_price"] = pos["final_take_price"]
+                pos["partial_take_fraction"] = frac
+                pos["tp1_r"] = tp1_r
+                pos["tp2_r"] = tp2_r
+
         pos["entry_price"] = fill_price
         pos["fill_price_source"] = "exchange_order"
         return pos
@@ -899,18 +932,22 @@ class ExecutionEngine:
             return {"ok": False, "reason": str(e), "native_mexc_error": native_reason}
 
     def _close_order_side_for_position(self, side: str) -> str:
-        """Return order side needed to close a position side.
+        """Return the close-order side for TP/SL trigger orders.
 
-        Internal positions store side as LONG/SHORT, while MEXC native plan
-        orders expect close order side as buy/sell. Passing LONG/SHORT into the
-        native TP/SL layer made triggerType fallback to a wrong default and could
-        make SL/TP never place correctly.
+        Callers in this engine sometimes pass a position side (LONG/SHORT) and
+        sometimes already pass a close order side (sell/buy).  Older code
+        inverted both LONG/SHORT and buy/sell, so a LONG position whose close
+        side was already ``sell`` was converted back to ``buy``.  That could make
+        MEXC TP/SL plan orders wrong or invisible.  Only LONG/SHORT should be
+        converted; buy/sell must be treated as already-normalized order sides.
         """
         s = str(side or "").strip().lower()
-        if s in {"long", "buy"}:
+        if s == "long":
             return "sell"
-        if s in {"short", "sell"}:
+        if s == "short":
             return "buy"
+        if s in {"buy", "sell"}:
+            return s
         return s
 
     async def _stored_position_leverage(self, symbol: str) -> int | None:
@@ -1402,30 +1439,44 @@ class ExecutionEngine:
             return False, {"error": str(e)[:180]}
 
     async def _balance_cash_usdt(self) -> float | None:
-        """Best-effort futures cash balance for realized live PnL deltas.
+        """Best-effort futures equity balance for realized live PnL deltas.
 
-        For live BOOST scalping, local mark-price PnL can differ materially from
-        MEXC execution because TP is only 0.03-0.05%.  cashBalance is the most
-        useful value for realized close delta; fall back to total only if cash is
-        unavailable.
+        IMPORTANT: do not use free/cash balance first on MEXC futures. While a
+        position is open, free balance excludes isolated margin; after close the
+        margin is released, so free-balance delta can look like a huge fake win
+        even when the trade stopped out. Prefer equity/total and only then fall
+        back to free-like values.
         """
         try:
             bal = await self.exchange_client.fetch_balance()
             usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
-            for key in ("cashBalance", "availableCash", "total", "free"):
+            for key in ("total", "equity", "balance", "accountEquity", "marginBalance"):
                 try:
                     v = usdt.get(key) if isinstance(usdt, dict) else None
                     if v not in (None, ""):
                         return float(v)
                 except Exception:
                     pass
-            for section in ("total", "free"):
+            for section in ("total",):
                 try:
                     v = ((bal or {}).get(section, {}) or {}).get("USDT")
                     if v not in (None, ""):
                         return float(v)
                 except Exception:
                     pass
+            for key in ("cashBalance", "availableCash", "free"):
+                try:
+                    v = usdt.get(key) if isinstance(usdt, dict) else None
+                    if v not in (None, ""):
+                        return float(v)
+                except Exception:
+                    pass
+            try:
+                v = ((bal or {}).get("free", {}) or {}).get("USDT")
+                if v not in (None, ""):
+                    return float(v)
+            except Exception:
+                pass
         except Exception:
             return None
         return None
@@ -1507,10 +1558,18 @@ class ExecutionEngine:
                 # Ignore impossible huge deltas caused by a stale/wrong balance read,
                 # but accept small negative/positive real execution differences.
                 if abs(delta) <= max(10.0, abs(notional) * 0.25 + 2.0):
-                    pnl_usdt = delta
-                    pnl_source = "exchange_cash_delta_after_fees"
-                    if notional > 0:
-                        pnl_pct = (pnl_usdt / notional) * 100.0
+                    # Extra safety for MEXC/free-balance anomalies: never turn a
+                    # local stop-loss into a reported win just because margin was
+                    # released into free balance.
+                    local_pnl_usdt = pnl_usdt
+                    reason_l = str(reason or "").lower()
+                    if ("stop" in reason_l or reason_l in {"sl", "stop_loss"}) and local_pnl_usdt < 0 and delta > 0:
+                        pnl_source = "local_price_stop_loss_cash_delta_ignored"
+                    else:
+                        pnl_usdt = delta
+                        pnl_source = "exchange_equity_delta_after_fees"
+                        if notional > 0:
+                            pnl_pct = (pnl_usdt / notional) * 100.0
 
         await self.storage.add_trade({
             "ts_open": pos.get("opened_at"),
