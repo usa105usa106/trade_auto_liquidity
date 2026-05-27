@@ -1342,7 +1342,6 @@ class ExchangeClient:
             ("/api/v1/private/order/cancel_all", "POST"),
             ("/api/v1/private/planorder/cancel_all", "POST"),
             ("/api/v1/private/stoporder/cancel_all", "POST"),
-            ("/api/v1/private/tpsl/cancel_all", "POST"),
         ]
         for sym in seen:
             msym = self._mexc_symbol(sym)
@@ -1366,7 +1365,6 @@ class ExchangeClient:
                     ("/api/v1/private/order/cancel", {"symbol": msym, "orderId": oid}),
                     ("/api/v1/private/planorder/cancel", {"symbol": msym, "orderId": oid}),
                     ("/api/v1/private/stoporder/cancel", {"symbol": msym, "orderId": oid}),
-                    ("/api/v1/private/tpsl/cancel", {"symbol": msym, "orderId": oid}),
                 ]
                 for path, body in candidates:
                     try:
@@ -1584,10 +1582,88 @@ class ExchangeClient:
         }
 
     async def mexc_close_all_positions_native(self):
-        """Emergency exchange-side close all positions endpoint."""
+        """Emergency exchange-side close all positions endpoint.
+
+        MEXC close_all is not always enough by itself, so keep this method as
+        a thin native endpoint call and use mexc_hard_close_all_positions() for
+        operator panic commands.
+        """
         if self.exchange_id != "mexc":
             raise NotImplementedError("native close_all is MEXC only")
         return await self._mexc_private("POST", "/api/v1/private/position/close_all", body={})
+
+    async def mexc_hard_close_all_positions(self, symbols: list[str] | None = None, retries: int = 3) -> dict:
+        """Panic-close real MEXC futures positions and cancel TP/SL planorders.
+
+        This is intentionally native and contract-volume based.  It does not
+        rely on the local SQLite cache.  For each raw open_positions row it sends
+        MEXC order/create type=5 with side=4 for LONG close and side=2 for SHORT
+        close using holdVol.  Then it cancels all normal/plan/stop orders again
+        and verifies open_positions is empty.
+        """
+        if self.exchange_id != "mexc":
+            raise NotImplementedError("hard close is MEXC only")
+        import asyncio
+        wanted = symbols or ["BTC_USDT"]
+        results: list[dict] = []
+        errors: list[str] = []
+        snapshots: list[dict] = []
+
+        async def _positions_for(sym_list: list[str] | None = None) -> list[dict]:
+            try:
+                rows = await self._mexc_fetch_positions(sym_list)
+                return [p for p in rows or [] if float(p.get("contracts") or 0) > 0 or float((p.get("info") or {}).get("holdVol") or 0) > 0]
+            except Exception as e:
+                errors.append(f"fetch_positions: {e}")
+                return []
+
+        # Always try broad cancel first and per-symbol cancel for BTC.
+        for sym in [None] + list(wanted):
+            try:
+                res = await self._mexc_cancel_all_orders(sym)
+                results.append({"stage": "cancel_before", "symbol": sym or "*", "result": res})
+            except Exception as e:
+                errors.append(f"cancel_before {sym or '*'}: {e}")
+
+        for attempt in range(1, max(1, int(retries)) + 1):
+            positions = await _positions_for(wanted if wanted else None)
+            # If symbol-filtered fetch missed hidden positions, try broad fetch.
+            if not positions:
+                positions = await _positions_for(None)
+            snapshots.append({"attempt": attempt, "positions": positions})
+            if not positions:
+                break
+            for pos in positions:
+                try:
+                    close_res = await self.mexc_close_position_market_native(pos)
+                    results.append({"stage": "close", "attempt": attempt, "position": {"symbol": pos.get("mexc_symbol") or pos.get("symbol"), "side": pos.get("side"), "contracts": pos.get("contracts"), "info": {"holdVol": (pos.get("info") or {}).get("holdVol"), "positionType": (pos.get("info") or {}).get("positionType")}}, "result": close_res})
+                except Exception as e:
+                    errors.append(f"close {pos.get('mexc_symbol') or pos.get('symbol')}: {e}")
+            await asyncio.sleep(0.8 * attempt)
+
+        # Native close_all as final fallback.
+        try:
+            native = await self.mexc_close_all_positions_native()
+            results.append({"stage": "native_close_all_fallback", "result": native})
+        except Exception as e:
+            msg = str(e)
+            if "2009" not in msg and "nonexistent" not in msg.lower() and "closed" not in msg.lower():
+                errors.append(f"native_close_all_fallback: {e}")
+
+        # Cancel TP/SL and limits after closing.
+        for sym in [None] + list(wanted):
+            try:
+                res = await self._mexc_cancel_all_orders(sym)
+                results.append({"stage": "cancel_after", "symbol": sym or "*", "result": res})
+            except Exception as e:
+                errors.append(f"cancel_after {sym or '*'}: {e}")
+
+        await asyncio.sleep(1.0)
+        remaining = await _positions_for(wanted if wanted else None)
+        if not remaining:
+            remaining = await _positions_for(None)
+        ok = len(remaining) == 0
+        return {"ok": ok, "results": results, "errors": errors, "remaining_positions": remaining, "snapshots": snapshots[-2:]}
 
     def _mexc_plan_trigger_type(self, close_side: str, kind: str) -> int:
         """Return MEXC plan triggerType for a close TP/SL order.
