@@ -1784,8 +1784,12 @@ class ExchangeClient:
             except Exception as e:
                 errors.append(f"synthetic_btc_sweep: {e}")
 
-        # Build cancel sweep list: all discovered symbols + requested symbols + BTC fallback.
-        cancel_syms: list[str | None] = [None]
+        # Build an EARLY cancel list from requested/open-position symbols only.
+        # Do NOT run global cancel discovery before closing positions: on accounts
+        # with many old plan/trigger rows that sweep can spend the whole Telegram
+        # timeout cancelling unrelated symbols (NIL/EIGEN/etc.) before any close
+        # order is sent.  Close the live position first, then do cleanup.
+        cancel_syms: list[str | None] = []
         cancel_syms.extend(wanted)
         try:
             cancel_syms.extend([p.get("mexc_symbol") or p.get("symbol") for p in await _positions_for(None)])

@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = os.getenv("BOT_VERSION", "0288 BTC AI 4H AUTOPILOT V32 MEXC FLASH CLOSE FIX")
+VERSION = os.getenv("BOT_VERSION", "0289 BTC AI 4H AUTOPILOT V33 CLOSE FIRST NO GLOBAL CANCEL")
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
