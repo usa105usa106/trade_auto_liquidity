@@ -462,7 +462,11 @@ class BTCVisionAutopilot:
         tp2_label = 0.0 if reduced_mode else 4.0
         common = {"btc_ai": True, "probability": d.probability, "entry_zone": [entry_low, entry_high], "cancel_after_sec": 14400, "reason": d.reason, "risk_mode": ("reduced_65_74" if reduced_mode else "normal_75_plus"), "balance_share": balance_share, "tp1_percent": 2.0, "tp2_percent": tp2_label, "tp1_fraction": tp1_fraction, "move_sl_to_be_after_tp1": (not reduced_mode)}
         if force_market or d.probability >= 85:
-            plan_m = TradePlan(symbol=symbol, side=d.signal, order_type="market", qty=qty_total, entry_price=price, stop_price=stop, take_price=tp2, partial_take_price=tp1, partial_take_fraction=0.50, final_take_price=tp2, risk_pct=0.0, confidence=d.probability/100, strategy="btc_ai_4h", max_open_positions=maxpos, planned_notional_usdt=notional, expected_margin_usdt=margin, leverage=leverage, signal_details=common)
+            # Normal live 85%+ market keeps split TP1/TP2.
+            # /test_btc may force market below threshold, but it is a mechanical test only.
+            market_tp_fraction = 0.50 if not reduced_mode else 1.0
+            market_final_tp = tp2 if not reduced_mode else tp1
+            plan_m = TradePlan(symbol=symbol, side=d.signal, order_type="market", qty=qty_total, entry_price=price, stop_price=stop, take_price=market_final_tp, partial_take_price=tp1, partial_take_fraction=market_tp_fraction, final_take_price=market_final_tp, risk_pct=0.0, confidence=d.probability/100, strategy="btc_ai_4h", max_open_positions=maxpos, planned_notional_usdt=notional, expected_margin_usdt=margin, leverage=leverage, signal_details=common)
             log_event("btc_ai_order_request", symbol=symbol, side=d.signal, order_type="market", force_live_test=force_market, qty=qty_total, entry=price, stop=stop, tp1=tp1, tp2=tp2, probability=d.probability, margin=margin, leverage=leverage, venue="MEXC")
             res_m = await self.execution_engine.place_entry(plan_m, live=live)
             log_event("btc_ai_order_response", symbol=symbol, side=d.signal, order_type="market", response=res_m, ok=bool(isinstance(res_m, dict) and res_m.get("ok", True)))
@@ -479,16 +483,27 @@ class BTCVisionAutopilot:
                                         f"Позиция/ордера не изменены. Подробности: /log")
                 return
             protection = "EXCHANGE PROTECTED"
-            await self._notify(app, f"✅ BTC AI {'LIVE TEST' if force_market else 'A+'} MARKET 100%\n"
-                                    f"Вход: ~{price:.2f}\n"
-                                    f"SL: {stop:.2f}\n"
-                                    f"TP1: {tp1:.2f} (50%)\n"
-                                    f"TP2: {tp2:.2f} (остаток)\n"
-                                    f"Проходимость: {d.probability:.1f}%\n"
-                                    f"Защита: {protection}\n"
-                                    f"Виртуальное сопровождение: ВКЛ")
+            if reduced_mode:
+                await self._notify(app, f"✅ BTC AI {'LIVE TEST' if force_market else 'MARKET'} REDUCED 65–74%\n"
+                                        f"Вход: ~{price:.2f}\n"
+                                        f"SL: {stop:.2f} (1%)\n"
+                                        f"TP: {tp1:.2f} (+2%, закрыть 100%)\n"
+                                        f"Проходимость: {d.probability:.1f}%\n"
+                                        f"Размер: 5% от total balance · x{leverage}\n"
+                                        f"Защита: {protection}\n"
+                                        f"Виртуальное сопровождение: ВКЛ")
+            else:
+                await self._notify(app, f"✅ BTC AI {'LIVE TEST' if force_market else 'A+'} MARKET 100%\n"
+                                        f"Вход: ~{price:.2f}\n"
+                                        f"SL: {stop:.2f}\n"
+                                        f"TP1: {tp1:.2f} (50%)\n"
+                                        f"TP2: {tp2:.2f} (остаток)\n"
+                                        f"Проходимость: {d.probability:.1f}%\n"
+                                        f"Защита: {protection}\n"
+                                        f"Виртуальное сопровождение: ВКЛ")
             return
-        plan = TradePlan(symbol=symbol, side=d.signal, order_type="limit", qty=qty_total, entry_price=entry_mid, stop_price=stop, take_price=tp2, partial_take_price=tp1, partial_take_fraction=tp1_fraction, final_take_price=tp2, risk_pct=0.0, confidence=d.probability/100, strategy="btc_ai_4h", max_open_positions=maxpos, planned_notional_usdt=notional, expected_margin_usdt=margin, leverage=leverage, signal_details=common)
+        final_take = tp1 if reduced_mode else tp2
+        plan = TradePlan(symbol=symbol, side=d.signal, order_type="limit", qty=qty_total, entry_price=entry_mid, stop_price=stop, take_price=final_take, partial_take_price=tp1, partial_take_fraction=tp1_fraction, final_take_price=final_take, risk_pct=0.0, confidence=d.probability/100, strategy="btc_ai_4h", max_open_positions=maxpos, planned_notional_usdt=notional, expected_margin_usdt=margin, leverage=leverage, signal_details=common)
         log_event("btc_ai_order_request", symbol=symbol, side=d.signal, order_type="limit", qty=qty_total, entry=entry_mid, entry_zone=[entry_low, entry_high], stop=stop, tp1=tp1, tp2=tp2, probability=d.probability, margin=margin, leverage=leverage, venue="MEXC")
         res = await self.execution_engine.place_entry(plan, live=live)
         log_event("btc_ai_order_response", symbol=symbol, side=d.signal, order_type="limit", response=res, ok=bool(isinstance(res, dict) and res.get("ok", True)))
@@ -618,6 +633,12 @@ class BTCVisionAutopilot:
 
         last = float(market_data.get("last_price") or df.close.iloc[-1])
         all_price_levels = [float(df.low.min()), float(df.high.max()), last]
+        high24_for_scale = float(market_data.get("high_24h") or 0)
+        low24_for_scale = float(market_data.get("low_24h") or 0)
+        if high24_for_scale > 0:
+            all_price_levels.append(high24_for_scale)
+        if low24_for_scale > 0:
+            all_price_levels.append(low24_for_scale)
         if levels:
             all_price_levels += [float(levels.get(k) or 0) for k in ["entry_mid", "stop_loss", "take_profit_1", "take_profit_2"]]
         all_price_levels = [v for v in all_price_levels if v > 0]
@@ -626,26 +647,42 @@ class BTCVisionAutopilot:
         ax.set_ylim(ymin - pad, ymax + pad)
         ax.set_xlim(-1, len(df) + 12)
 
-        # Current price line
+        # Current price and 24H range labels. These are visible on the AI clean chart too.
         ax.axhline(last, color=txt, linestyle=":", linewidth=1.1, alpha=0.75)
         ax.text(len(df) + 0.4, last, f"LAST {last:.1f}", color=txt, va="center", fontsize=9,
                 bbox=dict(boxstyle="round,pad=0.25", facecolor="#111827", edgecolor=txt, alpha=0.75))
+
+        high24 = float(market_data.get("high_24h") or 0)
+        low24 = float(market_data.get("low_24h") or 0)
+        if high24 > 0:
+            ax.axhline(high24, color="#94a3b8", linestyle=":", linewidth=0.8, alpha=0.42)
+            ax.text(max(0, len(df) - 18), high24, f"24H HIGH {high24:.1f}", color="#cbd5e1", va="bottom", ha="left", fontsize=8,
+                    bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#334155", alpha=0.62))
+        if low24 > 0:
+            ax.axhline(low24, color="#94a3b8", linestyle=":", linewidth=0.8, alpha=0.42)
+            ax.text(max(0, len(df) - 18), low24, f"24H LOW {low24:.1f}", color="#cbd5e1", va="top", ha="left", fontsize=8,
+                    bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#334155", alpha=0.62))
 
         if levels:
             entry = float(levels.get("entry_mid") or 0)
             sl = float(levels.get("stop_loss") or 0)
             tp1 = float(levels.get("take_profit_1") or 0)
             tp2 = float(levels.get("take_profit_2") or 0)
+            reduced_chart = bool(levels.get("reduced_mode")) or (abs(tp2 - tp1) <= max(1e-9, abs(tp1) * 1e-8) if tp1 > 0 and tp2 > 0 else False)
             e_low = float(levels.get("entry_low") or entry)
             e_high = float(levels.get("entry_high") or entry)
             span_left = 0.58
             if entry > 0 and sl > 0:
                 ax.axhspan(min(entry, sl), max(entry, sl), xmin=span_left, xmax=1.0, color=red, alpha=0.12)
-            if entry > 0 and tp2 > 0:
-                ax.axhspan(min(entry, tp2), max(entry, tp2), xmin=span_left, xmax=1.0, color=green, alpha=0.10)
+            if entry > 0 and tp1 > 0:
+                shade_top = tp1 if reduced_chart else (tp2 if tp2 > 0 else tp1)
+                ax.axhspan(min(entry, shade_top), max(entry, shade_top), xmin=span_left, xmax=1.0, color=green, alpha=0.10)
             if e_low > 0 and e_high > 0:
                 ax.axhspan(min(e_low, e_high), max(e_low, e_high), xmin=span_left, xmax=1.0, color=orange, alpha=0.18)
-            level_rows = [(entry, "ENTRY", orange), (sl, "SL", red), (tp1, "TP1 +2%", green), (tp2, "TP2 +4%", green)]
+            if reduced_chart:
+                level_rows = [(entry, "ENTRY", orange), (sl, "SL", red), (tp1, "TP +2% 100%", green)]
+            else:
+                level_rows = [(entry, "ENTRY", orange), (sl, "SL", red), (tp1, "TP1 +2%", green), (tp2, "TP2 +4%", green)]
             for val, label, col in level_rows:
                 if val <= 0:
                     continue
@@ -825,6 +862,9 @@ class BTCVisionAutopilot:
 
     async def collect_market_data(self, symbol: str, candles: list) -> dict:
         ticker = await self.exchange_client.fetch_ticker(symbol)
+        ticker_info = ticker.get("info") if isinstance(ticker, dict) else {}
+        if not isinstance(ticker_info, dict):
+            ticker_info = {}
         depth = await self.exchange_client.fetch_order_book(symbol, limit=50)
         funding = await self._mexc_funding(symbol)
         spot = await self._binance_spot_pressure("BTCUSDT")
@@ -845,6 +885,8 @@ class BTCVisionAutopilot:
             "spot_confirmation_source": "Binance spot",
             "normalization_note": "Do NOT compare raw MEXC futures volume USDT to raw Binance spot volume USDT. MEXC futures liquidity is lower. Use each venue only in its own context: MEXC for executable futures structure/volume/funding/orderbook, Binance spot only as directional confirmation using buy_ratio/delta_score, not absolute size.",
             "last_price": float(ticker.get("last") or last),
+            "high_24h": float(ticker_info.get("high24Price") or ticker_info.get("high24") or ticker_info.get("high") or df.high.tail(6).max()),
+            "low_24h": float(ticker_info.get("lower24Price") or ticker_info.get("low24Price") or ticker_info.get("low24") or ticker_info.get("low") or df.low.tail(6).min()),
             "mexc_volume_last": float(df.volume.iloc[-1]),
             "mexc_volume_ratio_30": vol_ratio,
             "funding": funding,
