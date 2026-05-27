@@ -38,6 +38,8 @@ def _write(path: Path, record: dict) -> None:
 def log_event(kind: str, **fields: Any) -> None:
     record = {"kind": kind, **fields}
     _write(LOG_DIR / "trade.log", record)
+    if str(kind).lower().startswith("btc_ai"):
+        _write(LOG_DIR / "btc_ai.log", record)
     if kind.lower().startswith("error") or "error" in kind.lower() or fields.get("ok") is False:
         _write(LOG_DIR / "errors.log", record)
 
@@ -92,7 +94,7 @@ def tail_important(lines: int = 160, max_chars: int = 12000) -> str:
     )
     important_kinds = (
         "error", "protection", "tpsl", "trigger", "opened", "closed",
-        "boost", "quick_bounce", "scan", "scanner", "decision", "rejected", "wait", "stage",
+        "boost", "quick_bounce", "btc_ai", "prompt", "order", "scan", "scanner", "decision", "rejected", "wait", "stage",
         "entry", "open", "opened", "tp", "sl", "take", "stop", "virtual", "real_tpsl",
         "mexc_native", "mexc_trigger", "mexc_stoporder_place_body",
     )

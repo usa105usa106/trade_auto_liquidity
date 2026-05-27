@@ -32,6 +32,7 @@ from boost_scalping_engine import BoostScalpingEngine
 from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
+from ai_btc_autopilot import BTCVisionAutopilot
 from debug_log import tail_text, tail_important, log_event
 
 logging.basicConfig(level=logging.INFO)
@@ -53,6 +54,7 @@ balance_locks = {}
 ws_supervisor = None
 trading_task = None
 position_task = None
+btc_ai_task = None
 
 def admin_id_list() -> list[str]:
     return [x.strip() for x in str(ADMIN_IDS or os.getenv("ADMIN_IDS", "")).split(",") if x.strip()]
@@ -1342,16 +1344,122 @@ async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 n = max(20, min(300, int(context.args[0])))
             except Exception:
                 n = 80
-        text = tail_important(lines=n, max_chars=3300)
-        # /log is read-only: never calls OpenAI, only shows cached last AI verdict.
-        ai_line = str(getattr(scanner, "last_openai_analysis_status", "") or "")
-        if not ai_line:
-            ai_line = "AI analysis: no cached check yet"
+        text = tail_text(files=["btc_ai.log", "errors.log", "mexc_raw.log", "trade.log"], lines=n, max_chars=3200)
+        # /log is read-only: never calls OpenAI. It shows cached AI/MEXC/order logs and current local positions.
+        ai_line = str(getattr(scanner, "last_openai_analysis_status", "") or "AI analysis: no cached scanner check yet")
+        try:
+            settings = await storage.all_settings()
+            settings_view = {
+                "version": VERSION,
+                "btc_ai_autopilot_enabled": settings.get("btc_ai_autopilot_enabled"),
+                "btc_ai_live_test_enabled": settings.get("btc_ai_live_test_enabled"),
+                "btc_ai_symbol": settings.get("btc_ai_symbol"),
+                "btc_ai_min_trade_probability": settings.get("btc_ai_min_trade_probability"),
+                "btc_ai_a_plus_probability": settings.get("btc_ai_a_plus_probability"),
+                "btc_ai_balance_share": settings.get("btc_ai_balance_share"),
+                "btc_ai_leverage": settings.get("btc_ai_leverage"),
+                "scan_market_source": settings.get("scan_market_source"),
+                "live_trading": settings.get("live_trading"),
+            }
+            positions = await storage.positions()
+            btc_positions = [p for p in positions if str(p.get("strategy") or "") == "btc_ai_4h" or str(p.get("symbol") or "").upper() in {"BTC_USDT", "BTCUSDT", "BTC/USDT"}]
+            pos_text = json.dumps(btc_positions[-8:], ensure_ascii=False, default=str)[:1200]
+            set_text = json.dumps(settings_view, ensure_ascii=False, default=str)
+        except Exception as e:
+            pos_text = f"positions/settings read error: {e}"
+            set_text = "{}"
         # Telegram message limit is 4096. Keep it copyable and readable.
-        msg = "🧾 Last bot logs:\n```\n" + ai_line[:500] + "\n" + text[-3200:] + "\n```"
+        header = "🧾 BTC AI / MEXC / OpenAI logs\n" + ai_line[:220] + "\nSETTINGS=" + set_text + "\nACTIVE_POSITIONS=" + pos_text + "\n"
+        msg = header + "```\n" + text[-3100:] + "\n```"
+        if len(msg) > 4050:
+            msg = msg[:900] + "\n...TRUNCATED...\n```\n" + text[-2700:] + "\n```"
         await reply(update, msg, reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"/log error: {e}", reply_markup=MAIN_MENU)
+
+
+async def test_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle immediate BTC AI live test.
+
+    ON: hard-isolates BTC AI mode, draws MEXC 4H chart, sends chart+compact data to OpenAI,
+    then opens a live MEXC BTC MARKET test trade regardless of AI probability to verify exchange mechanics.
+    OFF: disables only the test/new-entry trigger. Existing positions are not closed.
+    """
+    global btc_ai_task, position_task
+    if not allowed(update):
+        return
+    settings = await storage.all_settings()
+    currently_on = bool(settings.get("btc_ai_live_test_enabled", False))
+    if currently_on:
+        await storage.set("btc_ai_live_test_enabled", False, bump_revision=False)
+        await storage.set("btc_ai_autopilot_enabled", False, bump_revision=False)
+        obj = context.application.bot_data.get("btc_ai_autopilot")
+        if obj:
+            obj.stop()
+        log_event("btc_ai_live_test_toggle", enabled=False, ok=True)
+        await reply(update, "⏹ BTC AI LIVE TEST ВЫКЛ. Новые тестовые входы отключены. Открытые сделки НЕ закрываются; сопровождение остается.", reply_markup=MAIN_MENU)
+        return
+
+    hard_settings = {
+        "btc_ai_live_test_enabled": True,
+        "btc_ai_autopilot_enabled": True,
+        "btc_ai_symbol": "BTC_USDT",
+        "btc_ai_balance_share": 0.10,
+        "btc_ai_leverage": 10,
+        "btc_ai_min_trade_probability": 75,
+        "btc_ai_a_plus_probability": 85,
+        "btc_ai_limit_timeout_sec": 14400,
+        "btc_ai_pause_until": 0,
+        "limit_timeout_sec": 14400,
+        "live_trading": True,
+        "strategy_mode": "hybrid",
+        "max_open_positions": 1,
+        "openai_analysis_enabled": True,
+        "openai_show_decisions": True,
+        "boost_autopilot_active": False,
+        "boost_parallel_scan_enabled": False,
+        "quick_bounce_enabled": False,
+        "impulse_dump_enabled": False,
+        "orderflow_impulse_enabled": False,
+        "cascade_hunter_enabled": False,
+        "strongest_coin_enabled": False,
+        "liquidity_runner_enabled": False,
+        "auto_strategy_adaptation": False,
+        "regime_adaptation": False,
+        "spot_confirmation_enabled": False,
+        "session_filter_enabled": False,
+        "america_short_bias_enabled": False,
+        "mirror_mode": "off",
+        "trade_margin_pct": 0.10,
+        "margin_allocation_enabled": True,
+        "mexc_order_leverage": 10,
+        "scan_market_source": "mexc_binance",
+    }
+    for k, v in hard_settings.items():
+        await storage.set(k, v, bump_revision=False)
+    settings = await storage.all_settings()
+    ex = await get_exchange(settings)
+    executor = ExecutionEngine(storage, ex)
+    autopilot = BTCVisionAutopilot(storage, ex, executor)
+    context.application.bot_data["btc_ai_autopilot"] = autopilot
+    if position_task is None or position_task.done():
+        globals()["position_task"] = context.application.create_task(position_management_loop(context.application))
+    # Keep the lightweight monitor loop alive after the one-shot test so TP1->BE and 24h exit keep working.
+    if btc_ai_task is None or btc_ai_task.done():
+        btc_ai_task = context.application.create_task(autopilot.run_loop(context.application))
+
+    log_event("btc_ai_live_test_toggle", enabled=True, ok=True, mode="immediate_cycle", version=VERSION)
+    await reply(update, "🧪 BTC AI LIVE TEST ВКЛ\nСейчас рисую MEXC 4H график, отправляю в OpenAI и открою MEXC BTC сделку только если probability >=75%. Все детали будут в /log.", reply_markup=MAIN_MENU)
+
+    async def _run_once():
+        try:
+            log_event("btc_ai_live_test_start", ok=True, version=VERSION)
+            await autopilot.cycle(context.application, force_live_test=True)
+            log_event("btc_ai_live_test_finish", ok=True)
+        except Exception as e:
+            log_event("btc_ai_live_test_error", ok=False, error=str(e)[:1200])
+            await reply(update, f"❌ BTC AI LIVE TEST error: {str(e)[:700]}. Сделка не открывается, если ошибка была до execution.", reply_markup=MAIN_MENU)
+    context.application.create_task(_run_once())
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1362,7 +1470,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Команды:
 /start - меню
 /help - помощь
-/log [lines] - последние MEXC/TP-SL ошибки
+/log [lines] - полный BTC AI/MEXC/OpenAI лог, токены, prompt, ордера, позиции
 /run - запустить торговлю
 /boost_start или кнопка 🚀 BOOST MODE - запустить BOOST autopilot: 10% депозита → x20 цель
 /boost_stop или кнопка 🛑 STOP BOOST - остановить BOOST и новые входы
@@ -1378,8 +1486,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /balance - futures balance + IP/proxy; если MEXC margin=0 при открытых позициях, показывает estimated margin
 /positions - локальные + реальные позиции MEXC + protection mode
 /open_orders - обычные + plan/stop/TP-SL ордера MEXC
-/cancel_all - отменить normal/plan/stop/TP-SL ордера MEXC, включая ghost/frozen orders
-/close_all - закрыть реальные позиции, отменить все ордера, затем сверить balance/cache
+/cancel_all или /cancel all - жестко отменить normal/plan/stop/TP-SL ордера MEXC, включая ghost/frozen orders
+/close_all или /close all - жестко закрыть реальные позиции, отменить все ордера, затем сверить balance/cache
 /stats - статистика сделок
 /ai_stats - меню статистики AI BTC/ETH scalping
 /ai_stats_current - текущая AI session статистика
@@ -1389,6 +1497,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /sync_positions - подтянуть реальные позиции MEXC в бота
 /recovery - восстановить позиции MEXC после рестарта и проверить TP/SL
 /mexc_debug_state [SYMBOL] - raw debug MEXC positions/orders/symbol variants
+/test_btc - toggle LIVE BTC AI test: рисует график, отправляет ИИ, открывает TEST market сделку при любом ответе ИИ, пишет полный лог
 
 Note: /positions checks MEXC exchange-first; /open_orders scans normal + plan + stop + TP/SL endpoints. If exchange TP/SL is missing after retries, new AI scalping entries are closed immediately.
 /proxy on|off|test|set URL
@@ -1416,6 +1525,87 @@ scan_market_source = binance_binance | mexc_mexc | mexc_binance.
 
 По умолчанию: mexc_binance = MEXC фьючи скан + Binance spot подтверждение.
 """.strip(), reply_markup=MAIN_MENU)
+
+async def btc_ai_autopilot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global btc_ai_task, position_task
+    if not allowed(update): return
+    settings = await storage.all_settings()
+    enabled = not bool(settings.get("btc_ai_autopilot_enabled", False))
+    if enabled:
+        # Hard OFF everything else; BTC 4H mode owns the bot while enabled.
+        hard_settings = {
+            "btc_ai_autopilot_enabled": True,
+            "btc_ai_symbol": "BTC_USDT",
+            "btc_ai_balance_share": 0.10,
+            "btc_ai_leverage": 10,
+            "btc_ai_min_trade_probability": 75,
+            "btc_ai_a_plus_probability": 85,
+            "btc_ai_limit_timeout_sec": 14400,
+            "btc_ai_pause_until": 0,
+            "limit_timeout_sec": 14400,
+            "live_trading": True,
+            "strategy_mode": "hybrid",
+            "max_open_positions": 1,
+            "openai_analysis_enabled": True,
+            "openai_show_decisions": True,
+            "boost_autopilot_active": False,
+            "boost_parallel_scan_enabled": False,
+            "quick_bounce_enabled": False,
+            "impulse_dump_enabled": False,
+            "orderflow_impulse_enabled": False,
+            "cascade_hunter_enabled": False,
+            "strongest_coin_enabled": False,
+            "liquidity_runner_enabled": False,
+            "auto_strategy_adaptation": False,
+            "regime_adaptation": False,
+            "spot_confirmation_enabled": False,
+            "session_filter_enabled": False,
+            "america_short_bias_enabled": False,
+            "mirror_mode": "off",
+            "trade_margin_pct": 0.10,
+            "margin_allocation_enabled": True,
+            "mexc_order_leverage": 10,
+            "scan_market_source": "mexc_binance",
+        }
+        for k, v in hard_settings.items():
+            await storage.set(k, v, bump_revision=False)
+        ex = await get_exchange(await storage.all_settings())
+        executor = ExecutionEngine(storage, ex)
+        autopilot = BTCVisionAutopilot(storage, ex, executor)
+        context.application.bot_data["btc_ai_autopilot"] = autopilot
+        if btc_ai_task is None or btc_ai_task.done():
+            btc_ai_task = context.application.create_task(autopilot.run_loop(context.application))
+        if position_task is None or position_task.done():
+            globals()["position_task"] = context.application.create_task(position_management_loop(context.application))
+        next_ts = autopilot.next_msk_close_ts()
+        msg = ("✅ BTC AI 4H автопилот ВКЛ\n"
+               "Жестко отключено всё остальное.\n"
+               "Торговля: MEXC BTC_USDT futures.\n"
+               "Данные: MEXC chart/volume/funding/liquidation proxy + Binance spot pressure.\n"
+               "Баланс: 10%, плечо x10.\n"
+               "Порог: 75%, A+ от 85%.\n"
+               "Следующий анализ: " + autopilot._fmt_msk(next_ts))
+        await reply(update, msg, reply_markup=MAIN_MENU)
+    else:
+        # OFF disables only new BTC AI entries/new 4H analyses.
+        # Existing positions are NOT closed, and virtual accompaniment remains active
+        # via the background loop/position manager: TP1 -> breakeven, TP2/SL handling.
+        await storage.set("btc_ai_autopilot_enabled", False, bump_revision=False)
+        obj = context.application.bot_data.get("btc_ai_autopilot")
+        if obj:
+            try:
+                await obj.cancel_pending_btc_entries(context.application, reason="btc_ai_4h_off_cancel_pending")
+            except Exception:
+                pass
+        if btc_ai_task is None or btc_ai_task.done():
+            ex = await get_exchange(await storage.all_settings())
+            executor = ExecutionEngine(storage, ex)
+            autopilot = BTCVisionAutopilot(storage, ex, executor)
+            context.application.bot_data["btc_ai_autopilot"] = autopilot
+            btc_ai_task = context.application.create_task(autopilot.run_loop(context.application))
+        if position_task is None or position_task.done():
+            globals()["position_task"] = context.application.create_task(position_management_loop(context.application))
+        await reply(update, "⏹ BTC AI 4H автопилот ВЫКЛ\nНовые входы отключены. Открытые сделки не закрываются, виртуальное сопровождение остается включено.", reply_markup=MAIN_MENU)
 
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Regression marker: global running, trading_task
@@ -1464,6 +1654,9 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entries_enabled = False
     _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
+    await storage.set("btc_ai_autopilot_enabled", False, bump_revision=False)
+    obj = context.application.bot_data.get("btc_ai_autopilot")
+    if obj: obj.stop()
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
     # Keep the loop alive when it is already running so open positions continue
     # through TP/SL/trailing/local exits. If the bot was fully stopped, do not
@@ -1483,6 +1676,9 @@ async def panic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     running = False
     _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
+    await storage.set("btc_ai_autopilot_enabled", False, bump_revision=False)
+    obj = context.application.bot_data.get("btc_ai_autopilot")
+    if obj: obj.stop()
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
     for task in (trading_task, position_task):
         if task and not task.done():
@@ -4055,6 +4251,7 @@ def _button_mapping():
         ("🔐 API", api_cmd), ("API", api_cmd),
         ("📊 AI Stats", ai_stats_cmd), ("AI Stats", ai_stats_cmd),
         ("🤖 AI BTC/ETH scalping", ai_scalping_toggle_cmd), ("AI BTC/ETH scalping", ai_scalping_toggle_cmd),
+        ("₿ BTC AI 4H автопилот", btc_ai_autopilot_cmd), ("BTC AI 4H автопилот", btc_ai_autopilot_cmd),
         ("⚡ быстрый отскок", quick_bounce_cmd), ("быстрый отскок", quick_bounce_cmd), ("Быстрый отскок", quick_bounce_cmd),
         ("🔻 импульсный слив", impulse_dump_cmd), ("импульсный слив", impulse_dump_cmd), ("Импульсный слив", impulse_dump_cmd),
         ("📊 orderflow impulse", orderflow_impulse_cmd), ("orderflow impulse", orderflow_impulse_cmd), ("Orderflow impulse", orderflow_impulse_cmd),
@@ -4541,6 +4738,7 @@ async def position_management_loop(app):
                 await asyncio.sleep(1)
     finally:
         position_task = None
+btc_ai_task = None
 
 
 
@@ -5876,6 +6074,7 @@ def build_app():
     app.add_handler(CommandHandler("start", _wrap_command(start, "/start")))
     app.add_handler(CommandHandler("help", _wrap_command(help_cmd, "/help")))
     app.add_handler(CommandHandler("log", _wrap_command(log_cmd, "/log")))
+    app.add_handler(CommandHandler("test_btc", _wrap_command(test_btc_cmd, "/test_btc")))
     app.add_handler(CommandHandler("run", _wrap_command(run_cmd, "/run")))
     app.add_handler(CommandHandler("boost_start", _wrap_command(boost_start_cmd, "/boost_start")))
     app.add_handler(CommandHandler("boost_stop", _wrap_command(boost_stop_cmd, "/boost_stop")))

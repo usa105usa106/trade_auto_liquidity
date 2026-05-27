@@ -316,7 +316,7 @@ class ProtectionEngine:
             # (TP1, TP2, SL). These orders do NOT appear in stoporder/open_orders.
             # Verify the exact planorder ids directly and do not downgrade a
             # protected position just because stoporder/open_orders returns [].
-            is_split_plan_strategy = strategy_l in {"strongest_coin", "cascade_hunter"}
+            is_split_plan_strategy = strategy_l in {"strongest_coin", "cascade_hunter", "btc_ai_4h"}
             if is_split_plan_strategy and hasattr(self.exchange_client, "mexc_find_active_plan_order"):
                 tp1_id = str(pos.get("tp1_order_id") or "").strip()
                 tp2_id = str(pos.get("tp2_order_id") or "").strip()

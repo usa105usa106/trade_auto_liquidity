@@ -219,7 +219,27 @@ class ExecutionEngine:
                 pos["take_price"] = fill_price * (1 + take_pct)
 
         strategy = str(pos.get("strategy") or "").lower()
-        if strategy in {"cascade_hunter", "strongest_coin"}:
+        if strategy == "btc_ai_4h":
+            # BTC AI autopilot uses fixed percentage exits by design:
+            # TP1 = 2% close 50%, TP2 = 4% close the rest. Do not convert these
+            # into R-multiples from the stop distance, because the stop is allowed
+            # to be 1-2% while the take-profits must remain exactly 2%/4%.
+            details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
+            tp1_pct = float(pos.get("tp1_percent") or details.get("tp1_percent") or 2.0) / 100.0
+            tp2_pct = float(pos.get("tp2_percent") or details.get("tp2_percent") or 4.0) / 100.0
+            frac = float(pos.get("partial_take_fraction") or details.get("tp1_fraction") or 0.50)
+            frac = max(0.01, min(0.99, frac))
+            if side == "SHORT":
+                pos["partial_take_price"] = fill_price * (1 - tp1_pct)
+                pos["final_take_price"] = fill_price * (1 - tp2_pct)
+            else:
+                pos["partial_take_price"] = fill_price * (1 + tp1_pct)
+                pos["final_take_price"] = fill_price * (1 + tp2_pct)
+            pos["take_price"] = pos["final_take_price"]
+            pos["partial_take_fraction"] = frac
+            pos["tp1_percent"] = tp1_pct * 100.0
+            pos["tp2_percent"] = tp2_pct * 100.0
+        elif strategy in {"cascade_hunter", "strongest_coin"}:
             stop = float(pos.get("stop_price") or 0)
             risk_abs = abs(fill_price - stop) if stop > 0 else 0.0
             details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
@@ -635,7 +655,7 @@ class ExecutionEngine:
                             and not bool(pos.get("liquidation_stop_mode"))
                             and float(pos.get("take_price") or 0) > 0
                             and float(pos.get("stop_price") or 0) > 0
-                            and str(pos.get("strategy") or "").lower() not in {"cascade_hunter", "strongest_coin"}
+                            and str(pos.get("strategy") or "").lower() not in {"cascade_hunter", "strongest_coin", "btc_ai_4h"}
                             and not (str(pos.get("strategy") or "").lower() == "boost_scalping" and self._truthy(await self._setting("boost_emergency_sl_only", os.getenv("BOOST_EMERGENCY_SL_ONLY", "true")), True))
                         ):
                             try:
@@ -1197,7 +1217,7 @@ class ExecutionEngine:
                 except Exception as e:
                     out["sl_error"] = str(e)[:800]
                     log_event("error_boost_emergency_sl", symbol=symbol, side=side, qty=qty, stop_price=sl, attempt=i + 1, error=str(e), ok=False)
-            elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin"}:
+            elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin", "btc_ai_4h"}:
                 # Split TP mode: TP1 closes 50% at 1R, TP2 closes the remaining 50% at 2R.
                 # Do not use MEXC native by-position TP/SL here because it supports one TP only.
                 try:
@@ -1327,7 +1347,7 @@ class ExecutionEngine:
                     out["protection_mode"] = "exchange_emergency_sl_only"
                     out["boost_unsafe_position"] = False
                     out["boost_defensive_mode"] = False
-                elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin"} and out.get("tp1_order_id") and out.get("tp2_order_id") and out.get("sl_order_id"):
+                elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin", "btc_ai_4h"} and out.get("tp1_order_id") and out.get("tp2_order_id") and out.get("sl_order_id"):
                     # v0286: split TP/SL are MEXC planorders, not stoporder rows.
                     # Verify exact planorder ids when possible; during MEXC indexing
                     # lag, keep returned ids as protected for watchdog grace.
