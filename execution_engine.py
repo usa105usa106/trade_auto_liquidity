@@ -425,6 +425,10 @@ class ExecutionEngine:
         try:
             entry = float(pos.get("entry_price") or 0)
             qty = float(pos.get("qty") or 0)
+            if qty <= 0 and isinstance(pos.get("raw_exchange_position"), dict):
+                qty = self.exchange_position_qty(pos.get("raw_exchange_position") or {})
+                if qty > 0:
+                    pos["qty"] = qty
             leverage = int(float(pos.get("leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or 5))
             open_type = int(float(os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or 1))
             notional = float(pos.get("planned_notional_usdt") or 0) or (abs(entry * qty) if entry > 0 and qty > 0 else 0.0)
@@ -815,6 +819,14 @@ class ExecutionEngine:
                 )
                 for k, v in vals.items():
                     if v not in (None, ""):
+                        # Never let generic precision rounding turn a live MEXC BTC
+                        # micro-position qty into 0; protection would be skipped.
+                        if k == "qty":
+                            try:
+                                if float(v or 0) <= 0 < float(pos.get("qty") or 0):
+                                    continue
+                            except Exception:
+                                pass
                         pos[k] = v
         except Exception as e:
             pos["precision_warning"] = str(e)[:160]
@@ -1019,7 +1031,33 @@ class ExecutionEngine:
         frac = max(0.01, min(0.99, float(pos.get("partial_take_fraction") or 0.50)))
         qty1 = max(0.0, qty * frac)
         qty2 = max(0.0, qty - qty1)
-        out = {"tp1_price": tp1, "tp2_price": tp2, "tp1_fraction": frac, "tp1_qty": qty1, "tp2_qty": qty2}
+
+        # v14 BTC AI MEXC exact split:
+        # For MEXC BTC tests, split by exchange contract volume so TP1/TP2 become
+        # exact integer planorder vols (e.g. holdVol=2 => TP1=1 contract, TP2=1 contract).
+        out_extra = {}
+        if (
+            str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc"
+            and str(pos.get("strategy") or "").lower() == "btc_ai_4h"
+            and isinstance(pos.get("raw_exchange_position"), dict)
+        ):
+            try:
+                rawp = pos.get("raw_exchange_position") or {}
+                info2 = rawp.get("info") if isinstance(rawp.get("info"), dict) else {}
+                hold_vol = int(round(abs(float(info2.get("holdVol") or rawp.get("contracts") or pos.get("mexc_protection_hold_vol") or 0))))
+                csize = float(rawp.get("contractSize") or info2.get("contractSize") or pos.get("mexc_protection_contract_size") or 0)
+                if csize <= 0 and str(pos.get("symbol") or "").upper().replace("/", "_").startswith("BTC"):
+                    csize = 0.0001
+                if hold_vol >= 2 and csize > 0:
+                    tp1_vol = max(1, min(hold_vol - 1, int(round(hold_vol * frac))))
+                    tp2_vol = max(1, hold_vol - tp1_vol)
+                    qty1 = tp1_vol * csize
+                    qty2 = tp2_vol * csize
+                    out_extra = {"tp1_vol": tp1_vol, "tp2_vol": tp2_vol, "hold_vol": hold_vol, "contract_size": csize}
+            except Exception as e:
+                out_extra = {"mexc_split_qty_warning": str(e)[:180]}
+
+        out = {"tp1_price": tp1, "tp2_price": tp2, "tp1_fraction": frac, "tp1_qty": qty1, "tp2_qty": qty2, **out_extra}
         if tp1 <= 0 or tp2 <= 0 or qty1 <= 0 or qty2 <= 0:
             out["tp_error"] = "missing cascade split TP price/qty"
             return out
@@ -1099,13 +1137,29 @@ class ExecutionEngine:
     async def place_protection_orders(self, pos: dict, live: bool) -> dict:
         if not live:
             return {}
+        raw_qty_before_sanitize = float((pos or {}).get("qty") or 0)
         pos = await self._normalize_protection_distance(self._sanitize_position_for_exchange(dict(pos)))
+        if (not float(pos.get("qty") or 0)) and raw_qty_before_sanitize > 0:
+            pos["qty"] = raw_qty_before_sanitize
         symbol = pos["symbol"]
         # Do not place protection until the exchange exposes positionId/holdVol.
         live_row = await self._wait_for_live_position(symbol, pos.get("side"))
         if live_row:
             try:
-                pos["qty"] = self.exchange_position_qty(live_row) or pos.get("qty")
+                live_qty = self.exchange_position_qty(live_row)
+                # MEXC tiny BTC positions can be rounded to 0 by generic precision helpers.
+                # Always keep the confirmed live position amount for protection; planorder
+                # methods convert base amount back to integer contract vol.
+                if not live_qty or live_qty <= 0:
+                    try:
+                        info2 = live_row.get("info", {}) if isinstance(live_row.get("info"), dict) else {}
+                        contracts2 = float(live_row.get("contracts") or info2.get("holdVol") or 0)
+                        csize2 = float(live_row.get("contractSize") or 0.0001)
+                        live_qty = contracts2 * csize2
+                    except Exception:
+                        live_qty = 0
+                if live_qty and live_qty > 0:
+                    pos["qty"] = live_qty
                 pos["exchange_contracts"] = live_row.get("contracts")
                 pos["raw_exchange_position"] = live_row
                 info = live_row.get("info", {}) if isinstance(live_row.get("info"), dict) else {}
@@ -1123,6 +1177,41 @@ class ExecutionEngine:
                 pos["protection_position_sync_warning"] = str(e)[:180]
         symbol = pos["symbol"]
         qty = float(pos.get("qty") or 0)
+
+        # v14 BTC AI MEXC protection fix:
+        # MEXC futures protects positions by integer contract volume (holdVol), while
+        # our generic close helpers receive base-coin amount and convert it back to vol.
+        # For tiny BTC tests the local qty may be 0 after precision sanitizing, even
+        # though the exchange position is live. Always reconstruct qty from the
+        # confirmed MEXC live position row: amount = holdVol * contractSize.
+        if (
+            str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc"
+            and str(pos.get("strategy") or "").lower() == "btc_ai_4h"
+        ):
+            try:
+                rawp = pos.get("raw_exchange_position") if isinstance(pos.get("raw_exchange_position"), dict) else None
+                if not rawp and isinstance(locals().get("live_row"), dict):
+                    rawp = locals().get("live_row")
+                if isinstance(rawp, dict):
+                    info2 = rawp.get("info") if isinstance(rawp.get("info"), dict) else {}
+                    hold_vol = float(info2.get("holdVol") or info2.get("vol") or rawp.get("contracts") or rawp.get("contractVolume") or 0)
+                    csize = float(rawp.get("contractSize") or info2.get("contractSize") or info2.get("contract_size") or 0)
+                    if csize <= 0 and str(symbol).upper().replace("/", "_").startswith("BTC"):
+                        csize = 0.0001
+                    base_qty = abs(hold_vol) * csize if hold_vol > 0 and csize > 0 else 0.0
+                    if base_qty > 0:
+                        qty = base_qty
+                        pos["qty"] = base_qty
+                        pos["raw_exchange_position"] = rawp
+                        pos["mexc_protection_hold_vol"] = int(round(abs(hold_vol)))
+                        pos["mexc_protection_contract_size"] = csize
+            except Exception as e:
+                pos["btc_ai_mexc_qty_fix_warning"] = str(e)[:180]
+
+        if qty <= 0 and isinstance(pos.get("raw_exchange_position"), dict):
+            qty = self.exchange_position_qty(pos.get("raw_exchange_position") or {})
+            if qty > 0:
+                pos["qty"] = qty
         liquidation_stop_mode = bool(pos.get("liquidation_stop_mode")) and str(pos.get("strategy") or "").lower() == "ai_scalping"
         if qty <= 0:
             return {"ok": False, "protection_status": "LOCAL BOT PROTECTED", "protection_mode": "local_monitoring", "protection_warning": "missing qty for exchange protection"}
@@ -1518,6 +1607,10 @@ class ExecutionEngine:
         symbol = pos["symbol"]
         side = "sell" if str(pos.get("side")).upper() == "LONG" else "buy"
         qty = float(pos.get("qty") or 0)
+        if qty <= 0 and isinstance(pos.get("raw_exchange_position"), dict):
+            qty = self.exchange_position_qty(pos.get("raw_exchange_position") or {})
+            if qty > 0:
+                pos["qty"] = qty
         pos["status"] = "closing"
         await self.storage.upsert_position(pos)
         already_closed = False

@@ -260,7 +260,13 @@ class ExchangeClient:
         This removes Python float tails like 0.38182571428571427 and prevents
         MEXC 2015 precision errors when placing protection orders.
         """
-        out = {"qty": self._mexc_amount_to_precision(symbol, qty)}
+        q_prec = self._mexc_amount_to_precision(symbol, qty)
+        try:
+            if float(q_prec or 0) <= 0 < float(qty or 0):
+                q_prec = float(qty)
+        except Exception:
+            pass
+        out = {"qty": q_prec}
         if stop_price not in (None, ""):
             out["stop_price"] = self._mexc_price_to_precision(symbol, float(stop_price or 0))
         if take_price not in (None, ""):
@@ -1539,10 +1545,8 @@ class ExchangeClient:
         # not LONG/SHORT direction.
         safe_sl = self._mexc_price_to_precision(symbol, safe_sl)
         safe_tp = self._mexc_price_to_precision(symbol, safe_tp)
-        try:
-            vol = self._amount_to_mexc_vol(symbol, vol)
-        except Exception:
-            pass
+        # vol from live position is already MEXC contract volume (holdVol).
+        # Do not convert contracts to contracts again.
         body = {
             "symbol": self._mexc_symbol(symbol),
             "positionId": int(float(pid)),
