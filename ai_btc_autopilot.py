@@ -118,6 +118,147 @@ class BTCVisionAutopilot:
             out.append(p)
         return out
 
+    def _btc_symbol_match(self, value: Any) -> bool:
+        v = str(value or "").upper().replace("/", "_").replace(":USDT", "")
+        return v in {"BTC_USDT", "BTCUSDT"}
+
+    def _exchange_position_contracts(self, ex_pos: dict) -> float:
+        info = ex_pos.get("info") if isinstance(ex_pos.get("info"), dict) else {}
+        for key in ("holdVol", "vol", "contracts"):
+            try:
+                val = info.get(key) if key in info else ex_pos.get(key)
+                if val not in (None, ""):
+                    return abs(float(val or 0))
+            except Exception:
+                pass
+        return 0.0
+
+    def _exchange_position_amount(self, ex_pos: dict) -> float:
+        info = ex_pos.get("info") if isinstance(ex_pos.get("info"), dict) else {}
+        for key in ("amount", "qty", "size"):
+            try:
+                val = ex_pos.get(key)
+                if val not in (None, ""):
+                    amount = abs(float(val or 0))
+                    if amount > 0:
+                        return amount
+            except Exception:
+                pass
+        contracts = self._exchange_position_contracts(ex_pos)
+        csize = 0.0
+        for key in ("contractSize", "contract_size"):
+            try:
+                val = ex_pos.get(key) if key in ex_pos else info.get(key)
+                if val not in (None, ""):
+                    csize = abs(float(val or 0)); break
+            except Exception:
+                pass
+        if csize <= 0 and self._btc_symbol_match(ex_pos.get("symbol") or info.get("symbol")):
+            csize = 0.0001
+        return contracts * csize if contracts > 0 and csize > 0 else contracts
+
+    def _exchange_position_entry(self, ex_pos: dict) -> float:
+        info = ex_pos.get("info") if isinstance(ex_pos.get("info"), dict) else {}
+        for key in ("entryPrice", "holdAvgPrice", "openAvgPrice", "average", "avgPrice"):
+            try:
+                val = ex_pos.get(key) if key in ex_pos else info.get(key)
+                if val not in (None, ""):
+                    f = float(val or 0)
+                    if f > 0:
+                        return f
+            except Exception:
+                pass
+        return 0.0
+
+    def _exchange_position_side(self, ex_pos: dict) -> str:
+        info = ex_pos.get("info") if isinstance(ex_pos.get("info"), dict) else {}
+        raw = str(ex_pos.get("side") or info.get("positionType") or info.get("holdSide") or info.get("side") or "").strip().lower()
+        if raw in {"long", "buy", "1"}:
+            return "LONG"
+        if raw in {"short", "sell", "2"}:
+            return "SHORT"
+        return raw.upper()
+
+    def _exchange_position_opened_at(self, ex_pos: dict, local_pos: dict | None = None) -> float:
+        if isinstance(local_pos, dict):
+            for key in ("opened_at", "created_at", "entry_filled_at"):
+                try:
+                    val = float(local_pos.get(key) or 0)
+                    if val > 0:
+                        return val
+                except Exception:
+                    pass
+        info = ex_pos.get("info") if isinstance(ex_pos.get("info"), dict) else {}
+        for key in ("createTime", "createdTime", "created_at", "openTime"):
+            try:
+                val = info.get(key) if key in info else ex_pos.get(key)
+                if val in (None, ""):
+                    continue
+                ts = float(val)
+                if ts > 10_000_000_000:
+                    ts /= 1000.0
+                if ts > 0:
+                    return ts
+            except Exception:
+                pass
+        return 0.0
+
+    async def _exchange_btc_positions(self) -> list[dict]:
+        try:
+            rows = await self.exchange_client.fetch_positions([self.symbol])
+        except TypeError:
+            rows = await self.exchange_client.fetch_positions()
+        except Exception as e:
+            log_event("btc_ai_exchange_positions_error", ok=False, error=str(e)[:600])
+            return []
+        out = []
+        for row in rows or []:
+            info = row.get("info") if isinstance(row.get("info"), dict) else {}
+            if not (self._btc_symbol_match(row.get("symbol")) or self._btc_symbol_match(row.get("mexc_symbol")) or self._btc_symbol_match(info.get("symbol"))):
+                continue
+            if self._exchange_position_contracts(row) > 0 or self._exchange_position_amount(row) > 0:
+                out.append(row)
+        return out
+
+    def _match_local_btc_position(self, local_positions: list[dict], ex_pos: dict) -> dict | None:
+        ex_side = self._exchange_position_side(ex_pos)
+        for pos in local_positions or []:
+            if str(pos.get("strategy") or "") != "btc_ai_4h":
+                continue
+            if str(pos.get("status") or "").lower() not in {"open", "closing", "pending"}:
+                continue
+            if not self._btc_symbol_match(pos.get("symbol") or self.symbol):
+                continue
+            side = str(pos.get("side") or "").upper()
+            if side and ex_side and side != ex_side:
+                continue
+            return pos
+        return None
+
+    def _exchange_stub_position(self, ex_pos: dict, local_pos: dict | None = None) -> dict:
+        info = ex_pos.get("info") if isinstance(ex_pos.get("info"), dict) else {}
+        entry = self._exchange_position_entry(ex_pos)
+        side = self._exchange_position_side(ex_pos)
+        amount = self._exchange_position_amount(ex_pos)
+        contracts = self._exchange_position_contracts(ex_pos)
+        base = dict(local_pos or {})
+        base.update({
+            "symbol": self.symbol,
+            "side": side,
+            "status": "open",
+            "strategy": "btc_ai_4h",
+            "entry_price": entry or float(base.get("entry_price") or 0),
+            "qty": amount or float(base.get("qty") or 0),
+            "exchange_contracts": contracts,
+            "raw_exchange_position": ex_pos,
+            "exchange_position_id": info.get("positionId") or base.get("exchange_position_id"),
+        })
+        opened_at = self._exchange_position_opened_at(ex_pos, base)
+        if opened_at > 0:
+            base.setdefault("opened_at", opened_at)
+            base.setdefault("created_at", opened_at)
+        return base
+
     async def active_btc_position(self) -> dict | None:
         for p in await self._btc_ai_positions():
             if str(p.get("status") or "").lower() == "open":
@@ -330,15 +471,18 @@ class BTCVisionAutopilot:
                 entry_zone_low=last_price * 0.999 if last_price else 0,
                 entry_zone_high=last_price * 1.001 if last_price else 0,
                 stop_loss=last_price * 0.99 if last_price else 0,
+                take_profit_1=last_price * 1.01 if last_price else 0,
+                take_profit_2=last_price * 1.02 if last_price else 0,
                 reason=f"LIVE TEST OVERRIDE after AI error: {decision.error}",
                 error="",
             )
-            plan_levels = self.prepare_levels(decision, market_data, forced_entry=last_price)
-            log_event("btc_ai_live_test_override", ok=True, reason="ai_error", decision=decision.__dict__, plan_levels=plan_levels)
-        else:
-            plan_levels = self.prepare_levels(decision, market_data) if decision.signal in {"LONG", "SHORT"} else {}
 
         prob = float(decision.probability or 0)
+        reduced_mode_for_levels = (65.0 <= prob < 75.0) and (not force_live_test)
+        forced_entry_for_levels = float(market_data.get("last_price") or 0) if (force_live_test or prob >= 85.0) else None
+        plan_levels = self.prepare_levels(decision, market_data, forced_entry=forced_entry_for_levels, reduced_mode=reduced_mode_for_levels) if decision.signal in {"LONG", "SHORT"} else {}
+        if decision.grade == "TEST":
+            log_event("btc_ai_live_test_override", ok=True, reason="ai_error", decision=decision.__dict__, plan_levels=plan_levels)
         if force_live_test:
             last_price = float(market_data.get("last_price") or 0)
             original_signal = str(decision.signal or "WAIT").upper()
@@ -351,8 +495,12 @@ class BTCVisionAutopilot:
                 decision.entry_zone_high = last_price * 1.001 if last_price else 0
             if float(decision.stop_loss or 0) <= 0 and last_price:
                 decision.stop_loss = last_price * (0.99 if decision.signal == "LONG" else 1.01)
+            if float(decision.take_profit_1 or 0) <= 0 and last_price:
+                decision.take_profit_1 = last_price * (1.01 if decision.signal == "LONG" else 0.99)
+            if float(decision.take_profit_2 or 0) <= 0 and last_price:
+                decision.take_profit_2 = last_price * (1.02 if decision.signal == "LONG" else 0.98)
             decision.grade = str(decision.grade or "TEST") + " LIVE_TEST"
-            plan_levels = self.prepare_levels(decision, market_data, forced_entry=last_price)
+            plan_levels = self.prepare_levels(decision, market_data, forced_entry=last_price, reduced_mode=False)
             log_event("btc_ai_live_test_force_trade", ok=True, original_signal=original_signal, original_probability=original_probability, forced_signal=decision.signal, decision=decision.__dict__, plan_levels=plan_levels)
 
             # Telegram receives the annotated chart AFTER levels are calculated. AI did not see this chart.
@@ -454,13 +602,27 @@ class BTCVisionAutopilot:
         stop = float(lv.get("stop_loss") or 0)
         tp1 = float(lv.get("take_profit_1") or 0)
         tp2 = float(lv.get("take_profit_2") or 0)
-        if tp2 <= 0 or tp1 <= 0 or stop <= 0 or entry_mid <= 0:
-            await self._notify(app, "❌ BTC AI: неполные уровни SL/TP/entry после risk-check")
+        if tp1 <= 0 or stop <= 0 or entry_mid <= 0 or ((not reduced_mode) and tp2 <= 0):
+            await self._notify(app, "❌ BTC AI: уровни ИИ не прошли risk-check: нужен entry, SL, TP1; для 75%+ нужен ещё TP2")
             return
         maxpos = 1
         tp1_fraction = 1.0 if reduced_mode else 0.50
-        tp2_label = 0.0 if reduced_mode else 4.0
-        common = {"btc_ai": True, "probability": d.probability, "entry_zone": [entry_low, entry_high], "cancel_after_sec": 14400, "reason": d.reason, "risk_mode": ("reduced_65_74" if reduced_mode else "normal_75_plus"), "balance_share": balance_share, "tp1_percent": 2.0, "tp2_percent": tp2_label, "tp1_fraction": tp1_fraction, "move_sl_to_be_after_tp1": (not reduced_mode)}
+        common = {
+            "btc_ai": True,
+            "probability": d.probability,
+            "entry_zone": [entry_low, entry_high],
+            "cancel_after_sec": 14400,
+            "reason": d.reason,
+            "risk_mode": ("reduced_65_74" if reduced_mode else "normal_75_plus"),
+            "balance_share": balance_share,
+            "tp1_fraction": tp1_fraction,
+            "move_sl_to_be_after_tp1": (not reduced_mode),
+            "tp_source": "ai",
+            "bot_does_not_modify_tp": True,
+            "stop_adjusted_by_bot": bool(lv.get("stop_adjusted_by_bot")),
+            "ai_stop_pct": float(lv.get("ai_stop_pct") or 0),
+            "final_stop_pct": float(lv.get("stop_pct") or 0),
+        }
         if force_market or d.probability >= 85:
             # Normal live 85%+ market keeps split TP1/TP2.
             # /test_btc may force market below threshold, but it is a mechanical test only.
@@ -486,8 +648,8 @@ class BTCVisionAutopilot:
             if reduced_mode:
                 await self._notify(app, f"✅ BTC AI {'LIVE TEST' if force_market else 'MARKET'} REDUCED 65–74%\n"
                                         f"Вход: ~{price:.2f}\n"
-                                        f"SL: {stop:.2f} (1%)\n"
-                                        f"TP: {tp1:.2f} (+2%, закрыть 100%)\n"
+                                        f"SL: {stop:.2f} ({float(lv.get('stop_pct') or 0):.2f}%)\n"
+                                        f"TP: {tp1:.2f} (ИИ, закрыть 100%)\n"
                                         f"Проходимость: {d.probability:.1f}%\n"
                                         f"Размер: 5% от total balance · x{leverage}\n"
                                         f"Защита: {protection}\n"
@@ -496,8 +658,8 @@ class BTCVisionAutopilot:
                 await self._notify(app, f"✅ BTC AI {'LIVE TEST' if force_market else 'A+'} MARKET 100%\n"
                                         f"Вход: ~{price:.2f}\n"
                                         f"SL: {stop:.2f}\n"
-                                        f"TP1: {tp1:.2f} (50%)\n"
-                                        f"TP2: {tp2:.2f} (остаток)\n"
+                                        f"TP1: {tp1:.2f} (ИИ, 50%)\n"
+                                        f"TP2: {tp2:.2f} (ИИ, остаток)\n"
                                         f"Проходимость: {d.probability:.1f}%\n"
                                         f"Защита: {protection}\n"
                                         f"Виртуальное сопровождение: ВКЛ")
@@ -522,8 +684,8 @@ class BTCVisionAutopilot:
         if reduced_mode:
             await self._notify(app, f"✅ BTC AI LIMIT выставлен · REDUCED 65–74%\n"
                                     f"Вход: {entry_mid:.2f}\n"
-                                    f"SL: {stop:.2f} (1%)\n"
-                                    f"TP: {tp1:.2f} (+2%, закрыть 100%)\n"
+                                    f"SL: {stop:.2f} ({float(lv.get('stop_pct') or 0):.2f}%)\n"
+                                    f"TP: {tp1:.2f} (ИИ, закрыть 100%)\n"
                                     f"Проходимость: {d.probability:.1f}%\n"
                                     f"Размер: 5% от total balance · x{leverage}\n"
                                     f"Лимитка живет: 4 часа\n"
@@ -532,14 +694,22 @@ class BTCVisionAutopilot:
             await self._notify(app, f"✅ BTC AI LIMIT выставлен\n"
                                     f"Вход: {entry_mid:.2f}\n"
                                     f"SL: {stop:.2f}\n"
-                                    f"TP1: {tp1:.2f} (50%)\n"
-                                    f"TP2: {tp2:.2f} (остаток)\n"
+                                    f"TP1: {tp1:.2f} (ИИ, 50%)\n"
+                                    f"TP2: {tp2:.2f} (ИИ, остаток)\n"
                                     f"Проходимость: {d.probability:.1f}%\n"
                                     f"Размер: 10% от total balance · x{leverage}\n"
                                     f"Лимитка живет: 4 часа\n"
                                     f"Виртуальное сопровождение: ВКЛ")
 
     def prepare_levels(self, d: BTCAutopilotDecision, market_data: dict, forced_entry: float | None = None, reduced_mode: bool = False) -> dict:
+        """Build final executable levels from the AI plan.
+
+        Design rule for BTC AI:
+        - AI owns ENTRY zone and TP1/TP2. The bot must not rewrite take-profits.
+        - Bot validates direction and risk.
+        - Bot may only widen a too-close stop to 1% from executable entry.
+        - If the AI stop needs more than 2% room, reject the setup instead of distorting it.
+        """
         if d.signal not in {"LONG", "SHORT"}:
             return {}
         try:
@@ -549,29 +719,79 @@ class BTCVisionAutopilot:
                 entry_mid = float(market_data.get("last_price") or 0)
             if entry_mid <= 0:
                 return {}
+
             side = d.signal.upper()
-            # Stop may be proposed by AI, but bot always corrects it into the allowed range.
-            # Reduced 65-74% mode is fixed: SL 1%, TP +2% close 100%.
             ai_stop = float(d.stop_loss or 0)
-            stop_pct = 1.0 if reduced_mode else 1.5
-            if (not reduced_mode) and ai_stop > 0:
-                pct = abs(entry_mid - ai_stop) / entry_mid * 100.0
-                if pct < 1.0:
-                    stop_pct = 1.0
-                elif pct > 2.0:
-                    stop_pct = 2.0
-                else:
-                    stop_pct = pct
+            ai_tp1 = float(d.take_profit_1 or 0)
+            ai_tp2 = float(d.take_profit_2 or 0)
+            if ai_stop <= 0 or ai_tp1 <= 0:
+                log_event("btc_ai_levels_rejected", reason="missing_ai_sl_or_tp1", decision=d.__dict__, reduced_mode=reduced_mode)
+                return {}
+            if (not reduced_mode) and ai_tp2 <= 0:
+                log_event("btc_ai_levels_rejected", reason="missing_ai_tp2_for_75_plus", decision=d.__dict__, reduced_mode=reduced_mode)
+                return {}
+
+            # Validate geometry. Reduced 65-74% uses one AI TP only. 75%+ requires two AI TPs.
             if side == "LONG":
-                stop = entry_mid * (1 - stop_pct / 100.0)
-                tp1 = entry_mid * 1.02
-                tp2 = tp1 if reduced_mode else entry_mid * 1.04
+                if reduced_mode:
+                    ok = ai_stop < entry_mid < ai_tp1
+                else:
+                    ok = ai_stop < entry_mid < ai_tp1 <= ai_tp2
             else:
-                stop = entry_mid * (1 + stop_pct / 100.0)
-                tp1 = entry_mid * 0.98
-                tp2 = tp1 if reduced_mode else entry_mid * 0.96
-            return {"entry_low": entry_low, "entry_high": entry_high, "entry_mid": entry_mid, "stop_loss": stop, "take_profit_1": tp1, "take_profit_2": tp2, "stop_pct": stop_pct, "tp1_pct": 2.0, "tp2_pct": (0.0 if reduced_mode else 4.0), "reduced_mode": reduced_mode}
-        except Exception:
+                if reduced_mode:
+                    ok = ai_tp1 < entry_mid < ai_stop
+                else:
+                    ok = ai_tp2 <= ai_tp1 < entry_mid < ai_stop
+            if not ok:
+                log_event(
+                    "btc_ai_levels_rejected",
+                    reason="invalid_ai_level_geometry",
+                    side=side, entry_mid=entry_mid, stop_loss=ai_stop, tp1=ai_tp1, tp2=ai_tp2,
+                    reduced_mode=reduced_mode, decision=d.__dict__,
+                )
+                return {}
+
+            stop_pct_ai = abs(entry_mid - ai_stop) / entry_mid * 100.0
+            if stop_pct_ai < 1.0:
+                # Only allowed correction: widen SL to a minimum 1% from executable entry.
+                stop = entry_mid * (0.99 if side == "LONG" else 1.01)
+                stop_pct = 1.0
+                stop_adjusted = True
+            elif stop_pct_ai <= 2.0:
+                stop = ai_stop
+                stop_pct = stop_pct_ai
+                stop_adjusted = False
+            else:
+                # Do not compress a wide AI stop into a different trade idea. Skip the signal.
+                log_event(
+                    "btc_ai_levels_rejected",
+                    reason="ai_stop_wider_than_2pct",
+                    side=side, entry_mid=entry_mid, stop_loss=ai_stop, stop_pct=stop_pct_ai,
+                    reduced_mode=reduced_mode, decision=d.__dict__,
+                )
+                return {}
+
+            tp1 = ai_tp1
+            tp2 = 0.0 if reduced_mode else ai_tp2
+            tp1_pct = abs(tp1 - entry_mid) / entry_mid * 100.0 if entry_mid > 0 else 0.0
+            tp2_pct = abs(tp2 - entry_mid) / entry_mid * 100.0 if (entry_mid > 0 and tp2 > 0) else 0.0
+            return {
+                "entry_low": entry_low,
+                "entry_high": entry_high,
+                "entry_mid": entry_mid,
+                "stop_loss": stop,
+                "take_profit_1": tp1,
+                "take_profit_2": tp2,
+                "stop_pct": stop_pct,
+                "ai_stop_pct": stop_pct_ai,
+                "stop_adjusted_by_bot": stop_adjusted,
+                "tp1_pct": tp1_pct,
+                "tp2_pct": tp2_pct,
+                "reduced_mode": reduced_mode,
+                "tp_source": "ai",
+            }
+        except Exception as e:
+            log_event("btc_ai_levels_error", ok=False, error=str(e)[:500], decision=getattr(d, "__dict__", {}))
             return {}
 
     def _prepare_chart_df(self, candles: list, tail: int = 90) -> pd.DataFrame:
@@ -593,6 +813,7 @@ class BTCVisionAutopilot:
     def _draw_clean_btc_chart(self, df: pd.DataFrame, market_data: dict, levels: dict | None = None, decision: BTCAutopilotDecision | None = None, filename_prefix: str = "btc_ai_clean") -> str:
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
+        from matplotlib.ticker import FuncFormatter
 
         bg = "#0f1722"
         grid = "#263241"
@@ -652,16 +873,34 @@ class BTCVisionAutopilot:
         ax.text(len(df) + 0.4, last, f"LAST {last:.1f}", color=txt, va="center", fontsize=9,
                 bbox=dict(boxstyle="round,pad=0.25", facecolor="#111827", edgecolor=txt, alpha=0.75))
 
-        high24 = float(market_data.get("high_24h") or 0)
-        low24 = float(market_data.get("low_24h") or 0)
-        if high24 > 0:
+        # Clean AI chart: mark the real 24H extremes on the candles that made them.
+        # On 4H BTC chart, 24 hours = last 6 candles. Do not place labels at a fixed X offset,
+        # because that makes HIGH/LOW look random and can confuse visual AI analysis.
+        lookback_24h = min(len(df), 6)
+        high24 = 0.0
+        low24 = 0.0
+        high24_idx = None
+        low24_idx = None
+        if lookback_24h > 0:
+            df24 = df.tail(lookback_24h)
+            high24_idx = int(df24["high"].idxmax())
+            low24_idx = int(df24["low"].idxmin())
+            high24 = float(df.loc[high24_idx, "high"])
+            low24 = float(df.loc[low24_idx, "low"])
+        if high24 > 0 and high24_idx is not None:
             ax.axhline(high24, color="#94a3b8", linestyle=":", linewidth=0.8, alpha=0.42)
-            ax.text(max(0, len(df) - 18), high24, f"24H HIGH {high24:.1f}", color="#cbd5e1", va="bottom", ha="left", fontsize=8,
-                    bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#334155", alpha=0.62))
-        if low24 > 0:
+            ax.scatter([high24_idx], [high24], marker="^", s=42, color="#cbd5e1", edgecolor="#0b111c", linewidth=0.7, zorder=6)
+            ax.annotate(f"24H HIGH {high24:.1f}", xy=(high24_idx, high24), xytext=(0, 12), textcoords="offset points",
+                        color="#cbd5e1", va="bottom", ha="center", fontsize=8,
+                        bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#334155", alpha=0.70),
+                        arrowprops=dict(arrowstyle="-", color="#64748b", alpha=0.65, linewidth=0.8))
+        if low24 > 0 and low24_idx is not None:
             ax.axhline(low24, color="#94a3b8", linestyle=":", linewidth=0.8, alpha=0.42)
-            ax.text(max(0, len(df) - 18), low24, f"24H LOW {low24:.1f}", color="#cbd5e1", va="top", ha="left", fontsize=8,
-                    bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#334155", alpha=0.62))
+            ax.scatter([low24_idx], [low24], marker="v", s=42, color="#cbd5e1", edgecolor="#0b111c", linewidth=0.7, zorder=6)
+            ax.annotate(f"24H LOW {low24:.1f}", xy=(low24_idx, low24), xytext=(0, -14), textcoords="offset points",
+                        color="#cbd5e1", va="top", ha="center", fontsize=8,
+                        bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#334155", alpha=0.70),
+                        arrowprops=dict(arrowstyle="-", color="#64748b", alpha=0.65, linewidth=0.8))
 
         if levels:
             entry = float(levels.get("entry_mid") or 0)
@@ -680,9 +919,9 @@ class BTCVisionAutopilot:
             if e_low > 0 and e_high > 0:
                 ax.axhspan(min(e_low, e_high), max(e_low, e_high), xmin=span_left, xmax=1.0, color=orange, alpha=0.18)
             if reduced_chart:
-                level_rows = [(entry, "ENTRY", orange), (sl, "SL", red), (tp1, "TP +2% 100%", green)]
+                level_rows = [(entry, "ENTRY", orange), (sl, "SL", red), (tp1, "TP AI 100%", green)]
             else:
-                level_rows = [(entry, "ENTRY", orange), (sl, "SL", red), (tp1, "TP1 +2%", green), (tp2, "TP2 +4%", green)]
+                level_rows = [(entry, "ENTRY", orange), (sl, "SL", red), (tp1, "TP1 AI", green), (tp2, "TP2 AI", green)]
             for val, label, col in level_rows:
                 if val <= 0:
                     continue
@@ -699,6 +938,19 @@ class BTCVisionAutopilot:
 
         cols = [green if c >= o else red for o, c in zip(df.open, df.close)]
         av.bar(x, df.volume, color=cols, alpha=0.62, width=w)
+        def _compact_volume_formatter(value, _pos):
+            value = float(value or 0)
+            sign = "-" if value < 0 else ""
+            value = abs(value)
+            if value >= 1_000_000_000:
+                return f"{sign}{value / 1_000_000_000:.1f}B"
+            if value >= 1_000_000:
+                return f"{sign}{value / 1_000_000:.0f}M"
+            if value >= 1_000:
+                return f"{sign}{value / 1_000:.0f}K"
+            return f"{sign}{value:.0f}"
+        av.yaxis.set_major_formatter(FuncFormatter(_compact_volume_formatter))
+        av.yaxis.get_offset_text().set_visible(False)
         av.text(0, max(df.volume.max() * 0.78, 1), f"MEXC Volume ratio {float(market_data.get('mexc_volume_ratio_30') or 0):.2f}x", color=txt, fontsize=8)
 
         hcols = [green if h >= 0 else red for h in df.Hist]
@@ -725,54 +977,101 @@ class BTCVisionAutopilot:
         return self._draw_clean_btc_chart(df, market_data, levels=lv, decision=d, filename_prefix="btc_ai_signal_clean")
 
     async def monitor_tp1_breakeven(self, app):
-        """After TP1 is no longer active and price has touched TP1, move SL to breakeven for the remaining BTC position."""
+        """Exchange-first TP1 monitor.
+
+        Source of truth is MEXC /position/open_positions. Local storage is used
+        only as metadata for AI TP1/TP2/entry values. The remaining size comes
+        from the live exchange position, so a stale local qty cannot break BE
+        protection after TP1.
+        """
         try:
-            positions = await self.storage.positions()
-            for pos in positions:
-                if pos.get("status") != "open" or str(pos.get("strategy")) != "btc_ai_4h":
+            exchange_positions = await self._exchange_btc_positions()
+            if not exchange_positions:
+                return
+            try:
+                local_positions = await self.storage.positions()
+            except Exception:
+                local_positions = []
+
+            for ex_pos in exchange_positions:
+                local = self._match_local_btc_position(local_positions, ex_pos)
+                if not local:
+                    log_event("btc_ai_be_exchange_position_no_local_metadata", ok=False, symbol=self.symbol, exchange_position=ex_pos)
                     continue
-                if pos.get("btc_ai_tp1_be_done"):
+                if local.get("btc_ai_tp1_be_done") or local.get("breakeven_moved"):
                     continue
-                tp1 = float(pos.get("partial_take_price") or 0); entry = float(pos.get("entry_price") or 0)
-                if tp1 <= 0 or entry <= 0:
+
+                sig = local.get("signal_details") if isinstance(local.get("signal_details"), dict) else {}
+                if str(sig.get("risk_mode") or "") == "reduced_65_74" or float(local.get("partial_take_fraction") or 0) >= 0.999:
+                    # One-TP reduced setup closes 100%; there is no runner to move to BE.
                     continue
-                side = str(pos.get("side") or "").upper()
-                ticker = await self.exchange_client.fetch_ticker(pos.get("symbol") or self.symbol)
+
+                tp1 = float(local.get("partial_take_price") or 0)
+                tp2 = float(local.get("final_take_price") or local.get("take_price") or 0)
+                entry = self._exchange_position_entry(ex_pos) or float(local.get("entry_price") or 0)
+                if tp1 <= 0 or tp2 <= 0 or entry <= 0:
+                    log_event("btc_ai_be_missing_ai_levels", ok=False, tp1=tp1, tp2=tp2, entry=entry, local_id=local.get("id"))
+                    continue
+
+                side = self._exchange_position_side(ex_pos) or str(local.get("side") or "").upper()
+                ticker = await self.exchange_client.fetch_ticker(local.get("symbol") or self.symbol)
                 price = float(ticker.get("last") or 0)
                 touched = (side == "LONG" and price >= tp1) or (side == "SHORT" and price <= tp1)
                 if not touched:
                     continue
-                # If TP1 trigger is still active, wait; if endpoint unavailable, price touch is used as virtual confirmation.
-                tp1_id = str(pos.get("tp1_order_id") or "")
+
+                # If the original TP1 trigger is still visible, do not move the stop yet.
+                tp1_id = str(local.get("tp1_order_id") or "")
                 if tp1_id and hasattr(self.exchange_client, "mexc_find_active_plan_order"):
-                    row = await self.exchange_client.mexc_find_active_plan_order(pos.get("symbol") or self.symbol, order_id=tp1_id)
-                    if row:
-                        continue
-                # Cancel all old protective orders and attach fresh TP2 + SL at entry for the remainder.
-                try:
-                    await self.exchange_client.cancel_all_orders(pos.get("symbol") or self.symbol)
-                except Exception:
-                    pass
-                remaining_qty = max(0.0, float(pos.get("qty") or 0) * 0.50)
+                    try:
+                        row = await self.exchange_client.mexc_find_active_plan_order(local.get("symbol") or self.symbol, order_id=tp1_id)
+                        if row:
+                            continue
+                    except Exception:
+                        # Endpoint/rate issues should not block BE forever once price touched TP1.
+                        pass
+
+                remaining_qty = self._exchange_position_amount(ex_pos)
+                remaining_contracts = self._exchange_position_contracts(ex_pos)
+                if remaining_qty <= 0 and remaining_contracts <= 0:
+                    continue
+
                 close_side = "sell" if side == "LONG" else "buy"
-                tp2 = float(pos.get("take_price") or pos.get("final_take_price") or 0)
-                if remaining_qty > 0 and tp2 > 0:
-                    try: await self.execution_engine._create_take_profit_market_order(pos["symbol"], close_side, remaining_qty, tp2)
-                    except Exception: pass
-                    try: await self.execution_engine._create_stop_market_order(pos["symbol"], close_side, remaining_qty, entry)
-                    except Exception: pass
-                pos["qty"] = remaining_qty or pos.get("qty")
-                pos["stop_price"] = entry
-                pos["breakeven_moved"] = True
-                pos["btc_ai_tp1_be_done"] = True
-                pos["updated_at"] = time.time()
-                await self.storage.upsert_position(pos)
-                await self._notify(app, f"🟢 BTC AI TP1 взят. Стоп перенесен в Б/У: {entry:.2f}. TP2 остается: {tp2:.2f}")
+                try:
+                    await self.exchange_client.cancel_all_orders(local.get("symbol") or self.symbol)
+                except Exception as e:
+                    log_event("btc_ai_be_cancel_old_protection_warning", ok=False, error=str(e)[:300])
+
+                # Use live exchange amount for the runner.  Never use stale local qty.
+                if remaining_qty <= 0:
+                    remaining_qty = float(local.get("qty") or 0)
+                if remaining_qty <= 0:
+                    log_event("btc_ai_be_no_remaining_qty", ok=False, contracts=remaining_contracts, local_qty=local.get("qty"))
+                    continue
+
+                tp_order = sl_order = None
+                try:
+                    tp_order = await self.execution_engine._create_take_profit_market_order(local.get("symbol") or self.symbol, close_side, remaining_qty, tp2)
+                    sl_order = await self.execution_engine._create_stop_market_order(local.get("symbol") or self.symbol, close_side, remaining_qty, entry)
+                except Exception as e:
+                    log_event("btc_ai_be_reprotect_failed", ok=False, error=str(e)[:800], remaining_qty=remaining_qty, entry=entry, tp2=tp2)
+                    await self._notify(app, f"⚠️ BTC AI TP1: не смог переставить SL в Б/У по бирже. Проверь MEXC. Ошибка: {str(e)[:250]}")
+                    continue
+
+                local["qty"] = remaining_qty
+                local["exchange_contracts"] = remaining_contracts
+                local["raw_exchange_position"] = ex_pos
+                local["stop_price"] = entry
+                local["breakeven_moved"] = True
+                local["btc_ai_tp1_be_done"] = True
+                local["be_tp2_order_id"] = (tp_order or {}).get("id")
+                local["be_sl_order_id"] = (sl_order or {}).get("id")
+                local["updated_at"] = time.time()
+                await self.storage.upsert_position(local)
+                await self._notify(app, f"🟢 BTC AI TP1 взят по бирже. Остаток {remaining_contracts:g} контрактов защищён: SL в Б/У {entry:.2f}, TP2 ИИ {tp2:.2f}")
         except Exception as e:
             msg = str(e)
             low = msg.lower()
-            # MEXC 510/rate-limit during virtual monitoring is non-critical: do not spam Telegram.
-            # The next monitor tick will retry. Keep one throttled log entry for diagnostics.
             if "510" in msg or "too frequent" in low or "rate" in low:
                 now = time.time()
                 if now - self._last_be_rate_limit_log_ts > 300:
@@ -786,52 +1085,78 @@ class BTCVisionAutopilot:
                 await self._notify(app, f"⚠️ BTC AI BE monitor warning: {msg[:300]}")
 
     async def monitor_24h_time_exit(self, app):
-        """BTC AI time-stop: after 24h, do not force-close a loser.
+        """Exchange-first 24H time exit.
 
-        If the trade is older than 24h and still not fully completed, close it
-        only when current price is breakeven or better. If it is negative, keep
-        virtual management on and close as soon as it returns to breakeven.
+        After 24h the bot checks the real BTC position on MEXC, not local cache.
+        If the live position is breakeven or in profit, it closes the exchange
+        holdVol by market. If it is losing, it waits until breakeven.
         """
         try:
-            positions = await self.storage.positions()
-            for pos in positions:
-                if pos.get("status") != "open" or str(pos.get("strategy")) != "btc_ai_4h":
-                    continue
+            exchange_positions = await self._exchange_btc_positions()
+            if not exchange_positions:
+                return
+            try:
+                local_positions = await self.storage.positions()
+            except Exception:
+                local_positions = []
+            settings = await self.storage.all_settings()
+            live = self._bool(settings, "live_trading", False)
+
+            for ex_pos in exchange_positions:
+                local = self._match_local_btc_position(local_positions, ex_pos)
+                pos = self._exchange_stub_position(ex_pos, local)
                 if pos.get("btc_ai_24h_exit_done"):
                     continue
-                opened_at = float(pos.get("opened_at") or pos.get("created_at") or 0)
+                opened_at = self._exchange_position_opened_at(ex_pos, local)
                 if opened_at <= 0 or time.time() - opened_at < 86400:
                     continue
-                entry = float(pos.get("entry_price") or 0)
+
+                entry = self._exchange_position_entry(ex_pos) or float(pos.get("entry_price") or 0)
                 if entry <= 0:
                     continue
-                side = str(pos.get("side") or "").upper()
+                side = self._exchange_position_side(ex_pos) or str(pos.get("side") or "").upper()
                 ticker = await self.exchange_client.fetch_ticker(pos.get("symbol") or self.symbol)
                 price = float(ticker.get("last") or 0)
                 if price <= 0:
                     continue
                 pnl_ok = (side == "LONG" and price >= entry) or (side == "SHORT" and price <= entry)
                 if not pnl_ok:
-                    if not pos.get("btc_ai_24h_wait_be_notified"):
-                        pos["btc_ai_24h_wait_be_notified"] = True
-                        pos["btc_ai_24h_wait_be_started_at"] = time.time()
-                        await self.storage.upsert_position(pos)
-                        await self._notify(app, f"⏳ BTC AI 24H: сделка открыта больше суток, но сейчас в минусе. Не закрываю. Закрою автоматически, когда цена вернется в Б/У: {entry:.2f}")
+                    if local and not local.get("btc_ai_24h_wait_be_notified"):
+                        local["btc_ai_24h_wait_be_notified"] = True
+                        local["btc_ai_24h_wait_be_started_at"] = time.time()
+                        await self.storage.upsert_position(local)
+                    await self._notify(app, f"⏳ BTC AI 24H: реальная позиция MEXC открыта больше суток, но сейчас в минусе. Не закрываю. Закрою, когда цена вернется в Б/У: {entry:.2f}")
                     continue
-                live = self._bool(await self.storage.all_settings(), "live_trading", False)
-                # Cancel protective orders before market close to avoid stale reduce-only triggers.
+
+                if not live:
+                    log_event("btc_ai_24h_exchange_close_blocked_live_false", ok=False, symbol=self.symbol, entry=entry, price=price, side=side)
+                    await self._notify(app, "⚠️ BTC AI 24H: на MEXC есть позиция в Б/У/плюсе, но live_trading=false. Биржевое автозакрытие не выполнено.")
+                    continue
+
                 try:
                     await self.exchange_client.cancel_all_orders(pos.get("symbol") or self.symbol)
-                except Exception:
-                    pass
-                res = await self.execution_engine.close_position(pos, reason="btc_ai_24h_breakeven_time_exit", live=live, exit_price=price)
-                pos["btc_ai_24h_exit_done"] = True
-                pos["updated_at"] = time.time()
-                try:
-                    await self.storage.upsert_position(pos)
-                except Exception:
-                    pass
-                await self._notify(app, f"⏰ BTC AI 24H: сделка открыта больше суток и вышла в Б/У/плюс. Закрыл по рынку. Entry {entry:.2f}, current {price:.2f}. Детали в /log")
+                except Exception as e:
+                    log_event("btc_ai_24h_cancel_protection_warning", ok=False, error=str(e)[:300])
+
+                # Close the exact live exchange row/holdVol. Do not depend on local qty.
+                res = await self.execution_engine.close_exchange_position(ex_pos, reason="btc_ai_24h_exchange_breakeven_time_exit")
+                if not isinstance(res, dict) or not res.get("ok", False):
+                    log_event("btc_ai_24h_exchange_close_failed", ok=False, response=res, entry=entry, price=price, exchange_position=ex_pos)
+                    await self._notify(app, f"⚠️ BTC AI 24H: не смог закрыть реальную позицию MEXC. Ответ: {str(res)[:300]}")
+                    continue
+
+                if local:
+                    local["btc_ai_24h_exit_done"] = True
+                    local["status"] = "closed"
+                    local["closed_at"] = time.time()
+                    local["exit_price"] = price
+                    local["close_reason"] = "btc_ai_24h_exchange_breakeven_time_exit"
+                    local["updated_at"] = time.time()
+                    try:
+                        await self.storage.upsert_position(local)
+                    except Exception:
+                        pass
+                await self._notify(app, f"⏰ BTC AI 24H: реальная позиция MEXC открыта больше суток и вышла в Б/У/плюс. Закрыл по рынку. Entry {entry:.2f}, current {price:.2f}. Детали в /log")
         except Exception as e:
             msg = str(e)
             low = msg.lower()
@@ -846,137 +1171,6 @@ class BTCVisionAutopilot:
                 self._last_24h_warning_ts = now
                 log_event("btc_ai_24h_monitor_warning", ok=False, error=msg[:800])
                 await self._notify(app, f"⚠️ BTC AI 24H monitor warning: {msg[:300]}")
-
-    async def cancel_stale_pending(self):
-        try:
-            positions = await self.storage.positions()
-            for p in positions:
-                if p.get("status") != "pending":
-                    continue
-                if str(p.get("strategy")) != "btc_ai_4h":
-                    continue
-                if time.time() - float(p.get("opened_at") or 0) >= 14400:
-                    await self.execution_engine.cancel_entry(p, live=True, reason="btc_ai_4h_limit_timeout")
-        except Exception:
-            pass
-
-    async def collect_market_data(self, symbol: str, candles: list) -> dict:
-        ticker = await self.exchange_client.fetch_ticker(symbol)
-        ticker_info = ticker.get("info") if isinstance(ticker, dict) else {}
-        if not isinstance(ticker_info, dict):
-            ticker_info = {}
-        depth = await self.exchange_client.fetch_order_book(symbol, limit=50)
-        funding = await self._mexc_funding(symbol)
-        spot = await self._binance_spot_pressure("BTCUSDT")
-        liq = await self._mexc_liquidation_proxy(symbol)
-        df = pd.DataFrame(candles, columns=["ts","open","high","low","close","volume"])
-        for c in ["open","high","low","close","volume"]: df[c] = df[c].astype(float)
-        last = float(df.close.iloc[-1])
-        vol_ratio = float(df.volume.iloc[-1] / max(1e-9, df.volume.tail(30).mean()))
-        spot_norm = self._normalize_cross_exchange_pressure(spot, vol_ratio)
-        return {
-            "symbol": symbol,
-            "timeframe": "4h",
-            "execution_venue": "MEXC futures",
-            "chart_source": "MEXC futures",
-            "volume_source": "MEXC futures",
-            "funding_source": "MEXC futures",
-            "liquidation_source": "MEXC futures/proxy",
-            "spot_confirmation_source": "Binance spot",
-            "normalization_note": "Do NOT compare raw MEXC futures volume USDT to raw Binance spot volume USDT. MEXC futures liquidity is lower. Use each venue only in its own context: MEXC for executable futures structure/volume/funding/orderbook, Binance spot only as directional confirmation using buy_ratio/delta_score, not absolute size.",
-            "last_price": float(ticker.get("last") or last),
-            "high_24h": float(ticker_info.get("high24Price") or ticker_info.get("high24") or ticker_info.get("high") or df.high.tail(6).max()),
-            "low_24h": float(ticker_info.get("lower24Price") or ticker_info.get("low24Price") or ticker_info.get("low24") or ticker_info.get("low") or df.low.tail(6).min()),
-            "mexc_volume_last": float(df.volume.iloc[-1]),
-            "mexc_volume_ratio_30": vol_ratio,
-            "funding": funding,
-            "mexc_orderbook": self._book_summary(depth),
-            "binance_spot_pressure": spot,
-            "cross_exchange_pressure_normalized": spot_norm,
-            "mexc_liquidations_proxy": liq,
-            "closed_candle_msk": self._fmt_msk(df.ts.iloc[-1]/1000),
-            "candles_count": len(candles)
-        }
-
-    def _normalize_cross_exchange_pressure(self, spot: dict, mexc_volume_ratio_30: float) -> dict:
-        """Normalize Binance spot confirmation so AI does not compare raw venue volumes.
-
-        Binance spot BTC volume can be many times bigger than MEXC futures volume.
-        For the BTC AI mode the bot treats Binance spot only as a directional
-        confirmation layer. Raw Binance notional is deliberately converted into
-        ratio/score fields before it reaches the prompt.
-        """
-        try:
-            buy_ratio = float((spot or {}).get("buy_ratio") or 0.5)
-            delta = float((spot or {}).get("delta_usdt") or 0.0)
-            total = float((spot or {}).get("buy_usdt") or 0.0) + float((spot or {}).get("sell_usdt") or 0.0)
-            # Direction score from -1 to +1, based on spot aggression only.
-            delta_score = (delta / total) if total > 0 else 0.0
-            # Confidence of spot confirmation, not raw size.
-            # 0.50 buy_ratio = neutral, 0.60+ = solid buy pressure, 0.40- = solid sell pressure.
-            if buy_ratio >= 0.58:
-                direction = "BUY_CONFIRMATION"
-            elif buy_ratio <= 0.42:
-                direction = "SELL_CONFIRMATION"
-            else:
-                direction = "NEUTRAL"
-            return {
-                "binance_spot_direction": direction,
-                "binance_spot_buy_ratio": buy_ratio,
-                "binance_spot_delta_score": delta_score,
-                "mexc_futures_volume_ratio_30": float(mexc_volume_ratio_30 or 0.0),
-                "ai_rule": "Use Binance spot as directional confirmation only; never penalize/boost because raw Binance spot volume is larger than MEXC futures volume."
-            }
-        except Exception as e:
-            return {"error": str(e)[:120], "ai_rule": "ignore raw cross-exchange volume size"}
-
-
-    def _market_data_fatal_error(self, market_data: dict) -> str:
-        """Fail closed if MEXC/Binance inputs are missing.
-
-        BTC AI mode trades on MEXC futures. Binance is used only for spot
-        directional confirmation, but if that confirmation endpoint fails the
-        bot must not open a trade because probability would be based on partial data.
-        """
-        checks = [
-            ("MEXC funding", market_data.get("funding")),
-            ("MEXC liquidation proxy", market_data.get("mexc_liquidations_proxy")),
-            ("Binance spot pressure", market_data.get("binance_spot_pressure")),
-        ]
-        if not market_data.get("last_price"):
-            return "MEXC ticker/last_price missing"
-        if not market_data.get("mexc_orderbook"):
-            return "MEXC orderbook missing"
-        for name, obj in checks:
-            if isinstance(obj, dict) and obj.get("error"):
-                return f"{name}: {obj.get('error')}"
-        return ""
-
-    async def _recent_btc_ai_stop_losses(self, lookback_sec: int = 7 * 86400) -> int:
-        """Count consecutive BTC AI stop-loss closes in recent history."""
-        try:
-            rows = await self.storage.trade_rows(since=time.time() - lookback_sec)
-        except Exception:
-            return 0
-        btc_rows = []
-        for r in rows:
-            if str(r.get("strategy") or "") != "btc_ai_4h":
-                continue
-            sym = str(r.get("symbol") or "").upper()
-            if sym not in {"BTC_USDT", "BTCUSDT", "BTC/USDT"}:
-                continue
-            btc_rows.append(r)
-        btc_rows.sort(key=lambda x: float(x.get("ts_close") or 0), reverse=True)
-        count = 0
-        for r in btc_rows:
-            reason = str(r.get("reason") or "").lower()
-            result = str(r.get("result") or "").lower()
-            is_stop = ("stop" in reason or reason in {"sl", "stop_loss"}) and result == "loss"
-            if is_stop:
-                count += 1
-            else:
-                break
-        return count
 
     async def _apply_stop_loss_pause_if_needed(self, app) -> bool:
         """Pause BTC AI entries after 3 consecutive stop-losses.
@@ -1020,14 +1214,16 @@ Binance spot raw notional volume is normally much larger than MEXC futures volum
 Return STRICT JSON only with numeric prices. Be conservative. If setup quality is weak, return WAIT and probability below 65. Use 65-74 only for marginal but tradable reduced-risk setups.
 
 Trading rules:
-- BTC only.
-- probability <65: no trade.
-- 65-74.9: reduced-risk setup, limit entry at entry zone midpoint, bot uses 5% balance, fixed SL 1%, TP +2% close 100%.
-- 75-84.9: normal setup, limit entry at entry zone midpoint, bot uses 10% balance, TP1 +2% and TP2 +4%.
-- 85+: A+ setup, market order 100%, bot uses 10% balance, TP1 +2% and TP2 +4%.
-- Entry zone must be realistic for the current 4H structure.
-- AI may suggest stop, but bot will enforce stop distance between 1% and 2% from entry.
-- Bot uses fixed TP1=2% close 50%, TP2=4% close remaining.
+- BTC only. Return WAIT if probability <65.
+- You, the AI, must calculate entry_zone, stop_loss, take_profit_1 and take_profit_2 from 4H chart structure, liquidity, support/resistance, volatility, MEXC futures data and Binance spot confirmation.
+- Do not use fixed +2%/+4% take-profits unless the visible market structure genuinely supports those exact levels.
+- 65-74.9: reduced setup. Bot places LIMIT at the midpoint of your entry_zone, uses 5% balance, needs exactly one target: take_profit_1. Set take_profit_2=0. Bot closes 100% at your TP1.
+- 75-84.9: normal setup. Bot places LIMIT at the midpoint of your entry_zone, uses 10% balance. Provide TP1 and TP2. Bot closes 50% at your TP1 and 50% at your TP2.
+- 85+: A+ setup. Bot enters MARKET immediately with 10% balance. Provide TP1 and TP2 based on current market entry, not a distant pullback. Bot closes 50% at your TP1 and 50% at your TP2.
+- Bot will NOT modify your take-profit levels. Bad/missing TP levels make the signal invalid.
+- Bot may only widen stop_loss if it is closer than 1% from executable entry. If your required stop distance is above 2%, prefer WAIT instead of forcing the trade.
+- LONG geometry: stop_loss < entry < take_profit_1 <= take_profit_2. For reduced 65-74.9: stop_loss < entry < take_profit_1 and take_profit_2=0.
+- SHORT geometry: take_profit_2 <= take_profit_1 < entry < stop_loss. For reduced 65-74.9: take_profit_1 < entry < stop_loss and take_profit_2=0.
 - If a trade is open longer than 24h, bot will close it only when price is breakeven or better; if negative, bot waits until breakeven.
 
 Probability must include: MEXC 4H market structure, MEXC volume ratio, MEXC funding, MEXC orderbook, MEXC liquidation proxy, Binance spot directional confirmation, support/resistance, and risk/reward.
@@ -1165,8 +1361,8 @@ JSON schema: {"signal":"LONG|SHORT|WAIT","probability":0,"grade":"C|B|A|A+","ent
                 f"Тест принудительно откроет MARKET {d.signal}\n"
                 f"Вход: ~{entry_mid:.2f}\n"
                 f"SL: {stop:.2f}\n"
-                f"TP1: {tp1:.2f} (50%)\n"
-                f"TP2: {tp2:.2f} (остаток)\n"
+                f"TP1: {tp1:.2f} (ИИ, 50%)\n"
+                f"TP2: {tp2:.2f} (ИИ, остаток)\n"
                 f"График для ИИ: чистый. Этот график: с уровнями.")
 
     def format_decision(self,d,md,lv=None):
@@ -1176,13 +1372,15 @@ JSON schema: {"signal":"LONG|SHORT|WAIT","probability":0,"grade":"C|B|A|A+","ent
         stop = float(lv.get("stop_loss") or 0)
         tp1 = float(lv.get("take_profit_1") or 0)
         tp2 = float(lv.get("take_profit_2") or 0)
+        reduced = bool(lv.get("reduced_mode")) or (65.0 <= float(d.probability or 0) < 75.0)
+        tp_text = (f"TP: {tp1:.2f} (ИИ, закрыть 100%)") if reduced else (f"TP1: {tp1:.2f} (ИИ, 50%)\nTP2: {tp2:.2f} (ИИ, остаток)")
+        stop_note = " · SL расширен ботом до мин. 1%" if bool(lv.get("stop_adjusted_by_bot")) else ""
         return (f"✅ BTC AI 4H сигнал: {d.signal}\n"
                 f"Проходимость ИИ: {float(d.probability or 0):.1f}%\n"
                 f"Вход: {entry_mid:.2f}\n"
                 f"Enter zone: {float(lv.get('entry_low') or d.entry_zone_low):.2f}-{float(lv.get('entry_high') or d.entry_zone_high):.2f}\n"
-                f"SL: {stop:.2f} ({float(lv.get('stop_pct') or 0):.2f}%)\n"
-                f"TP1: {tp1:.2f} (+/-2%, закрыть 50%)\n"
-                f"TP2: {tp2:.2f} (+/-4%, закрыть остаток)\n"
+                f"SL: {stop:.2f} ({float(lv.get('stop_pct') or 0):.2f}%){stop_note}\n"
+                f"{tp_text}\n"
                 f"Свеча 4H закрыта: {md.get('closed_candle_msk')}\n"
                 f"Виртуальное сопровождение: ВКЛ")
 

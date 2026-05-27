@@ -1539,6 +1539,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /stop - остановить новые входы
 /panic - закрыть позиции и отменить ордера
 /status - статус
+/status_btc - реальный BTC AI статус по MEXC: позиция, TP/SL, TP1→BE, 24H exit
 /ping - отклик ms, RAM, uptime, открыто сейчас и общий счётчик открытий
 /balance - futures balance + IP/proxy; если MEXC margin=0 при открытых позициях, показывает estimated margin
 /positions - локальные + реальные позиции MEXC + protection mode
@@ -2588,6 +2589,219 @@ async def boost_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.application.bot_data.pop("boost_live_panel_last_event_key", None)
     log_event("boost_stop", stage="command", ok=True)
     await reply(update, "🛑 BOOST полностью остановлен: новые входы, hotlist/rotation/live-panel отключены. Открытые позиции не закрывал автоматически; /panic или /close_all — если надо закрыть сразу.", reply_markup=MAIN_MENU)
+
+
+
+def _btc_status_parse_ts(value) -> float:
+    """Return unix seconds from MEXC ms timestamps, unix timestamps or ISO strings."""
+    if value in (None, ""):
+        return 0.0
+    try:
+        if isinstance(value, (int, float)):
+            v = float(value)
+            return v / 1000.0 if v > 10_000_000_000 else v
+        txt = str(value).strip()
+        if not txt:
+            return 0.0
+        if txt.replace('.', '', 1).isdigit():
+            v = float(txt)
+            return v / 1000.0 if v > 10_000_000_000 else v
+        return datetime.fromisoformat(txt.replace('Z', '+00:00')).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _btc_status_age_text(opened_ts: float) -> str:
+    if not opened_ts:
+        return "unknown"
+    age = max(0, int(time.time() - float(opened_ts)))
+    h = age // 3600
+    m = (age % 3600) // 60
+    return f"{h}h {m}m"
+
+
+def _btc_status_order_kind(order: dict, side: str = "") -> str:
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    kind = str(info.get("_protection_kind") or "").lower()
+    typ = str(order.get("type") or info.get("orderType") or info.get("type") or "").lower()
+    txt = " ".join(str(x or "").lower() for x in [
+        kind, typ, order.get("clientOrderId"), info.get("externalOid"), info.get("clientOrderId"), info.get("_source_endpoint")
+    ])
+    if kind == "tp" or "tpsl_tp" in typ or "takeprofit" in txt or "take_profit" in txt or "bot_tp" in txt:
+        return "TP"
+    if kind == "sl" or "tpsl_sl" in typ or "stoploss" in txt or "stop_loss" in txt or "bot_sl" in txt:
+        return "SL"
+    # MEXC plan/stop orders often expose only triggerType. Treat unknown reduce-only orders as protection.
+    trigger_type = str(info.get("triggerType") or "")
+    price = float(order.get("price") or info.get("triggerPrice") or 0 or 0)
+    side_u = str(side or "").upper()
+    entry = 0.0
+    # Caller can still display UNKNOWN; do not over-classify without entry.
+    if trigger_type == "1":
+        return "TRIGGER"
+    if trigger_type == "2":
+        return "TRIGGER"
+    return "ORDER"
+
+
+def _btc_status_local_meta(local_rows: list[dict]) -> dict:
+    for p in local_rows or []:
+        sym = str(p.get("symbol") or p.get("mexc_symbol") or "").upper().replace('/', '_')
+        if str(p.get("strategy") or "") == "btc_ai_4h" or "BTC" in sym:
+            if str(p.get("status") or "open").lower() in {"open", "pending", "closing"}:
+                return p
+    return {}
+
+
+async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exchange-first BTC AI status: real MEXC position, orders, BE/24H state."""
+    if not allowed(update):
+        return
+    started = time.perf_counter()
+    s = await storage.all_settings()
+    api_key, api_secret = _api_creds(s)
+    if not (api_key and api_secret):
+        await reply(update, "📊 BTC Status\n❌ MEXC API key/secret не настроены. Используй /api set KEY SECRET", reply_markup=MAIN_MENU)
+        return
+    try:
+        ex = await get_exchange(s)
+        exec_engine = ExecutionEngine(storage, ex)
+        raw_positions = await asyncio.wait_for(ex.fetch_positions(), timeout=12)
+        exchange_positions = _dedupe_exchange_positions([p for p in (raw_positions or []) if exec_engine.exchange_position_qty(p) > 0], ex)
+        btc_positions = []
+        for p in exchange_positions:
+            info = p.get("info") if isinstance(p.get("info"), dict) else {}
+            sym = str(p.get("symbol") or p.get("mexc_symbol") or info.get("symbol") or "").upper()
+            if "BTC" in sym:
+                btc_positions.append(p)
+        local_rows = await storage.positions()
+        local = _btc_status_local_meta(local_rows)
+        lines = [f"📊 BTC Status v{VERSION}", "Source: MEXC exchange-first"]
+        lines.append(f"BTC AI: {'ON' if s.get('btc_ai_autopilot_enabled') else 'OFF'} | Live: {'ON' if s.get('live_trading') else 'OFF'}")
+        try:
+            autopilot = context.application.bot_data.get("btc_ai_autopilot")
+            if autopilot is None:
+                autopilot = BTCVisionAutopilot(storage, ex, exec_engine)
+            lines.append("Next 4H scan: " + autopilot._fmt_msk(autopilot.next_msk_close_ts()))
+        except Exception:
+            pass
+
+        try:
+            ticker = await asyncio.wait_for(ex.fetch_ticker("BTC_USDT"), timeout=8)
+            last = float((ticker or {}).get("last") or (ticker or {}).get("close") or 0)
+        except Exception:
+            last = 0.0
+        if last > 0:
+            lines.append(f"BTC last: {last:.2f}")
+
+        if not btc_positions:
+            lines.append("\nExchange BTC position: NONE")
+            try:
+                snap = await _hidden_margin_snapshot(ex)
+                if snap.get("hidden"):
+                    lines.append("⚠️ Но баланс показывает скрытую маржу/exposure:")
+                    lines.append(f"Used: {_fmt_money_value(snap.get('used'))} | Position margin: {_fmt_money_value(snap.get('positionMargin'))} | uPnL: {_fmt_money_value(snap.get('unrealized'))}")
+            except Exception as e:
+                lines.append(f"Hidden-margin check error: {str(e)[:160]}")
+        else:
+            for pos in btc_positions:
+                info = pos.get("info") if isinstance(pos.get("info"), dict) else {}
+                side = str(pos.get("side") or ("long" if str(info.get("positionType")) == "1" else "short" if str(info.get("positionType")) == "2" else "")).upper()
+                entry = 0.0
+                for key in ("entryPrice", "entry_price", "average"):
+                    try:
+                        v = pos.get(key)
+                        if v not in (None, "") and float(v) > 0:
+                            entry = float(v); break
+                    except Exception:
+                        pass
+                if entry <= 0:
+                    for key in ("holdAvgPrice", "openAvgPrice", "entryPrice"):
+                        try:
+                            v = info.get(key)
+                            if v not in (None, "") and float(v) > 0:
+                                entry = float(v); break
+                        except Exception:
+                            pass
+                contracts, contract_size = _position_contract_fields(pos)
+                qty = _position_base_qty(pos)
+                lev = info.get("leverage") or pos.get("leverage") or s.get("btc_ai_leverage") or s.get("mexc_order_leverage") or "?"
+                upnl = info.get("unrealized") or pos.get("unrealizedPnl") or pos.get("unrealized")
+                margin = info.get("im") or info.get("oim") or pos.get("initialMargin") or ""
+                opened_ts = 0.0
+                for key in ("createTime", "createdTime", "created_at", "openTime", "timestamp"):
+                    opened_ts = _btc_status_parse_ts(info.get(key) or pos.get(key))
+                    if opened_ts:
+                        break
+                if not opened_ts and local:
+                    for key in ("opened_at", "created_at", "entry_filled_at"):
+                        opened_ts = _btc_status_parse_ts(local.get(key))
+                        if opened_ts:
+                            break
+                be_or_profit = "n/a"
+                if last > 0 and entry > 0 and side in {"LONG", "SHORT"}:
+                    ok = (side == "LONG" and last >= entry) or (side == "SHORT" and last <= entry)
+                    pct = ((last - entry) / entry * 100.0) if side == "LONG" else ((entry - last) / entry * 100.0)
+                    be_or_profit = ("YES" if ok else "NO") + f" ({pct:+.3f}%)"
+                lines.append("\nExchange BTC position:")
+                lines.append(f"{side or '?'} | entry={entry:.2f} | qty={qty:.8f} BTC | contracts={contracts:.0f} | lev={lev}x")
+                if margin not in (None, "") or upnl not in (None, ""):
+                    lines.append(f"Margin={_fmt_money_value(margin)} | uPnL={_fmt_money_value(upnl)}")
+                lines.append(f"Age: {_btc_status_age_text(opened_ts)} | 24H BE/profit exit allowed now: {be_or_profit}")
+
+        # Local metadata is not source of truth, but useful for AI TP/BE plan display.
+        if local:
+            reduced = bool(local.get("btc_ai_reduced_mode") or local.get("reduced_mode"))
+            tp1 = float(local.get("partial_take_price") or local.get("take_profit_1") or 0)
+            tp2 = float(local.get("final_take_price") or local.get("take_profit_2") or local.get("take_price") or 0)
+            sl = float(local.get("stop_price") or local.get("stop_loss") or 0)
+            details = local.get("signal_details") if isinstance(local.get("signal_details"), dict) else {}
+            entry_l = local.get("entry_zone_low") or details.get("entry_zone_low")
+            entry_h = local.get("entry_zone_high") or details.get("entry_zone_high")
+            lines.append("\nBTC AI plan metadata:")
+            lines.append(f"Mode: {'65-74 one TP' if reduced else '75+ TP1/TP2'} | TP1→BE: {'DONE' if (local.get('btc_ai_tp1_be_done') or local.get('breakeven_moved')) else ('ARMED' if local.get('move_sl_to_be_after_tp1') else 'OFF')}")
+            if entry_l or entry_h:
+                lines.append(f"Entry zone: {entry_l} - {entry_h}")
+            lines.append(f"SL={sl:.2f} | TP1={tp1:.2f}" + (f" | TP2={tp2:.2f}" if not reduced and tp2 > 0 else ""))
+            if local.get("btc_ai_24h_exit_done"):
+                lines.append("24H exit: DONE")
+            elif local.get("btc_ai_24h_wait_be_notified"):
+                lines.append("24H exit: waiting for breakeven")
+        else:
+            lines.append("\nBTC AI plan metadata: none in local cache")
+
+        # Protection orders from exchange.
+        try:
+            orders = await asyncio.wait_for(ex.fetch_open_orders("BTC_USDT"), timeout=12)
+        except Exception as e:
+            orders = []
+            lines.append(f"\nProtection/orders read error: {str(e)[:220]}")
+        if orders:
+            lines.append("\nMEXC BTC open orders/protection:")
+            tp_count = sl_count = other_count = 0
+            shown = 0
+            for o in orders:
+                if shown >= 12:
+                    break
+                kind = _btc_status_order_kind(o)
+                if kind == "TP": tp_count += 1
+                elif kind == "SL": sl_count += 1
+                else: other_count += 1
+                price = float(o.get("price") or 0)
+                amount = float(o.get("amount") or o.get("remaining") or 0)
+                oid = str(o.get("id") or "")[:18]
+                src = str((o.get("info") or {}).get("_source_endpoint") or "").replace("/api/v1/private/", "")
+                lines.append(f"{kind}: price={price:.2f} amount={amount:.8f} id={oid} src={src}")
+                shown += 1
+            lines.append(f"Orders summary: TP={tp_count} SL={sl_count} OTHER={other_count} total={len(orders)}")
+        else:
+            lines.append("\nMEXC BTC open orders/protection: none")
+
+        lines.append(f"\nTime: {(time.perf_counter() - started):.1f}s")
+        await reply(update, "\n".join(lines)[:4050], reply_markup=MAIN_MENU)
+    except Exception as e:
+        log_event("status_btc_error", ok=False, error=str(e)[:1200])
+        await reply(update, f"📊 BTC Status error: {str(e)[:900]}", reply_markup=MAIN_MENU)
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
@@ -4340,6 +4554,7 @@ def _button_mapping():
         ("📊 AI Stats", ai_stats_cmd), ("AI Stats", ai_stats_cmd),
         ("🤖 AI BTC/ETH scalping", ai_scalping_toggle_cmd), ("AI BTC/ETH scalping", ai_scalping_toggle_cmd),
         ("₿ BTC AI 4H автопилот", btc_ai_autopilot_cmd), ("BTC AI 4H автопилот", btc_ai_autopilot_cmd),
+        ("📊 BTC Status", status_btc_cmd), ("BTC Status", status_btc_cmd), ("/status_btc", status_btc_cmd),
         ("⚡ быстрый отскок", quick_bounce_cmd), ("быстрый отскок", quick_bounce_cmd), ("Быстрый отскок", quick_bounce_cmd),
         ("🔻 импульсный слив", impulse_dump_cmd), ("импульсный слив", impulse_dump_cmd), ("Импульсный слив", impulse_dump_cmd),
         ("📊 orderflow impulse", orderflow_impulse_cmd), ("orderflow impulse", orderflow_impulse_cmd), ("Orderflow impulse", orderflow_impulse_cmd),
@@ -6179,6 +6394,7 @@ def build_app():
     # often type/click these variants, so wire them directly to the real actions.
     app.add_handler(CommandHandler(["panic", "Panic", "PANIC"], _wrap_command(panic_cmd, "/panic")))
     app.add_handler(CommandHandler("status", _wrap_command(status_cmd, "/status")))
+    app.add_handler(CommandHandler("status_btc", _wrap_command(status_btc_cmd, "/status_btc")))
     app.add_handler(CommandHandler("ping", _wrap_command(ping_cmd, "/ping")))
     app.add_handler(CommandHandler("balance", _wrap_command(balance_cmd, "/balance")))
     app.add_handler(CommandHandler("positions", _wrap_command(positions_cmd, "/positions")))

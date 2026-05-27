@@ -201,44 +201,49 @@ class ExecutionEngine:
         if original_entry <= 0 or fill_price <= 0:
             return pos
         side = str(pos.get("side", "")).upper()
+        strategy = str(pos.get("strategy") or "").lower()
         old_stop = float(pos.get("stop_price") or 0)
         old_take = float(pos.get("take_price") or 0)
+        old_partial_take = float(pos.get("partial_take_price") or 0)
+        old_final_take = float(pos.get("final_take_price") or old_take or 0)
         if side == "SHORT":
             if old_stop > 0:
                 stop_pct = abs(old_stop - original_entry) / original_entry
                 pos["stop_price"] = fill_price * (1 + stop_pct)
-            if old_take > 0:
+            if old_take > 0 and strategy != "btc_ai_4h":
                 take_pct = abs(original_entry - old_take) / original_entry
                 pos["take_price"] = fill_price * (1 - take_pct)
         else:
             if old_stop > 0:
                 stop_pct = abs(original_entry - old_stop) / original_entry
                 pos["stop_price"] = fill_price * (1 - stop_pct)
-            if old_take > 0:
+            if old_take > 0 and strategy != "btc_ai_4h":
                 take_pct = abs(old_take - original_entry) / original_entry
                 pos["take_price"] = fill_price * (1 + take_pct)
 
-        strategy = str(pos.get("strategy") or "").lower()
         if strategy == "btc_ai_4h":
-            # BTC AI autopilot uses fixed percentage exits by design:
-            # TP1 = 2% close 50%, TP2 = 4% close the rest. Do not convert these
-            # into R-multiples from the stop distance, because the stop is allowed
-            # to be 1-2% while the take-profits must remain exactly 2%/4%.
+            # BTC AI autopilot: the AI owns TP1/TP2. Do not convert them into
+            # fixed percentages and do not re-anchor them after fill. The bot may
+            # only adjust SL according to its risk guard; TP levels stay as AI prices.
             details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
-            tp1_pct = float(pos.get("tp1_percent") or details.get("tp1_percent") or 2.0) / 100.0
-            tp2_pct = float(pos.get("tp2_percent") or details.get("tp2_percent") or 4.0) / 100.0
             frac = float(pos.get("partial_take_fraction") or details.get("tp1_fraction") or 0.50)
-            frac = max(0.01, min(0.99, frac))
-            if side == "SHORT":
-                pos["partial_take_price"] = fill_price * (1 - tp1_pct)
-                pos["final_take_price"] = fill_price * (1 - tp2_pct)
+            reduced = str(details.get("risk_mode") or "") == "reduced_65_74" or frac >= 0.999
+            if old_partial_take > 0:
+                pos["partial_take_price"] = old_partial_take
+            if old_final_take > 0:
+                pos["final_take_price"] = old_final_take
+                pos["take_price"] = old_final_take
+            elif old_take > 0:
+                pos["take_price"] = old_take
+                pos["final_take_price"] = old_take
+            if reduced:
+                pos["partial_take_fraction"] = 1.0
+                if old_partial_take > 0:
+                    pos["take_price"] = old_partial_take
+                    pos["final_take_price"] = old_partial_take
             else:
-                pos["partial_take_price"] = fill_price * (1 + tp1_pct)
-                pos["final_take_price"] = fill_price * (1 + tp2_pct)
-            pos["take_price"] = pos["final_take_price"]
-            pos["partial_take_fraction"] = frac
-            pos["tp1_percent"] = tp1_pct * 100.0
-            pos["tp2_percent"] = tp2_pct * 100.0
+                pos["partial_take_fraction"] = max(0.01, min(0.99, frac))
+            pos["tp_source"] = "ai"
         elif strategy in {"cascade_hunter", "strongest_coin"}:
             stop = float(pos.get("stop_price") or 0)
             risk_abs = abs(fill_price - stop) if stop > 0 else 0.0
@@ -384,15 +389,17 @@ class ExecutionEngine:
         tp = float(pos.get("take_price") or 0)
         sl = float(pos.get("stop_price") or 0)
         changed = []
+        strategy = str(pos.get("strategy") or "").lower()
+        allow_tp_adjust = strategy != "btc_ai_4h"
         if side == "SHORT":
             # TP below entry, SL above entry.
-            if tp > 0 and (entry - tp) < min_abs:
+            if allow_tp_adjust and tp > 0 and (entry - tp) < min_abs:
                 pos["take_price"] = max(0.0, entry - min_abs); changed.append("tp")
             if sl > 0 and (sl - entry) < min_abs:
                 pos["stop_price"] = entry + min_abs; changed.append("sl")
         else:
             # LONG: TP above entry, SL below entry.
-            if tp > 0 and (tp - entry) < min_abs:
+            if allow_tp_adjust and tp > 0 and (tp - entry) < min_abs:
                 pos["take_price"] = entry + min_abs; changed.append("tp")
             if sl > 0 and (entry - sl) < min_abs:
                 pos["stop_price"] = max(0.0, entry - min_abs); changed.append("sl")

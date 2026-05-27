@@ -1699,12 +1699,12 @@ class ExchangeClient:
         """HARD panic-close MEXC futures positions and all child orders.
 
         This method is intentionally exchange-native and verification-driven:
-        1) cancel normal/plan/stop orders,
-        2) read real open_positions from MEXC,
-        3) submit market CLOSE orders using exact holdVol contracts,
-        4) if MEXC temporarily hides positions while account margin remains,
+        1) read real open_positions from MEXC,
+        2) submit market CLOSE orders using exact holdVol contracts,
+        3) if MEXC temporarily hides positions while account margin remains,
            run a BTC safety sweep using estimated contract volume,
-        5) cancel orders again and verify open_positions + account margin.
+        4) cancel normal/plan/stop orders after close,
+        5) verify open_positions + account margin.
 
         It does not trust local bot cache. It is used by /close all only.
         """
@@ -1784,29 +1784,22 @@ class ExchangeClient:
             except Exception as e:
                 errors.append(f"synthetic_btc_sweep: {e}")
 
-        # Build an EARLY cancel list from requested/open-position symbols only.
-        # Do NOT run global cancel discovery before closing positions: on accounts
-        # with many old plan/trigger rows that sweep can spend the whole Telegram
-        # timeout cancelling unrelated symbols (NIL/EIGEN/etc.) before any close
-        # order is sent.  Close the live position first, then do cleanup.
-        cancel_syms: list[str | None] = []
-        cancel_syms.extend(wanted)
+        # Build a cleanup list, but DO NOT cancel before close.
+        # V33 still cancelled BTC orders before sending /order/create, which could
+        # leave Telegram/log output showing only cancel_all calls and no real close.
+        # V34 sends close market orders first, then cleans TP/SL/limit orders.
+        cleanup_syms: list[str | None] = []
+        cleanup_syms.extend(wanted)
         try:
-            cancel_syms.extend([p.get("mexc_symbol") or p.get("symbol") for p in await _positions_for(None)])
+            cleanup_syms.extend([p.get("mexc_symbol") or p.get("symbol") for p in await _positions_for(None)])
         except Exception:
             pass
-        cancel_syms.append("BTC_USDT")
+        cleanup_syms.append("BTC_USDT")
         seen_cancel = []
-        for sym in cancel_syms:
+        for sym in cleanup_syms:
             key = sym or "*"
-            if key in seen_cancel:
-                continue
-            seen_cancel.append(key)
-            try:
-                res = await self._mexc_cancel_all_orders(sym)
-                results.append({"stage": "cancel_before", "symbol": key, "result": res})
-            except Exception as e:
-                errors.append(f"cancel_before {key}: {e}")
+            if key not in seen_cancel:
+                seen_cancel.append(key)
 
         for attempt in range(1, max(1, int(retries)) + 1):
             positions = await _positions_for(wanted or None)
