@@ -1466,6 +1466,7 @@ async def test_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "btc_ai_a_plus_probability": 85,
         "btc_ai_limit_timeout_sec": 14400,
         "btc_ai_pause_until": 0,
+        "btc_ai_pause_manual_override_ts": time.time(),
         "limit_timeout_sec": 14400,
         "live_trading": True,
         "strategy_mode": "hybrid",
@@ -1600,6 +1601,7 @@ async def btc_ai_autopilot_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "btc_ai_a_plus_probability": 85,
             "btc_ai_limit_timeout_sec": 14400,
             "btc_ai_pause_until": 0,
+            "btc_ai_pause_manual_override_ts": time.time(),
             "limit_timeout_sec": 14400,
             "live_trading": True,
             "strategy_mode": "hybrid",
@@ -1641,7 +1643,7 @@ async def btc_ai_autopilot_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
                "Торговля: MEXC BTC_USDT futures.\n"
                "Данные: MEXC chart/volume/funding/liquidation proxy + Binance spot pressure.\n"
                "Баланс: 10%, плечо x10.\n"
-               "Порог: 75%, A+ от 85%.\n"
+               "Порог: 65%, A+ от 85%.\n"
                "Следующий анализ: " + autopilot._fmt_msk(next_ts))
         await reply(update, msg, reply_markup=MAIN_MENU)
     else:

@@ -260,6 +260,24 @@ class BTCVisionAutopilot:
         return base
 
     async def active_btc_position(self) -> dict | None:
+        """Exchange-first active BTC position lookup.
+
+        Local storage is useful for plan metadata, but it is not the source of
+        truth for live exposure.  If MEXC shows a BTC position, return it even
+        when ACTIVE_POSITIONS is empty so the 4H cycle cannot open a second BTC
+        trade over an existing exchange position.
+        """
+        try:
+            ex_rows = await self._exchange_btc_positions()
+        except Exception:
+            ex_rows = []
+        local_rows = []
+        try:
+            local_rows = await self.storage.positions()
+        except Exception:
+            local_rows = []
+        if ex_rows:
+            return self._exchange_stub_position(ex_rows[0], self._match_local_btc_position(local_rows, ex_rows[0]))
         for p in await self._btc_ai_positions():
             if str(p.get("status") or "").lower() == "open":
                 return p
@@ -422,7 +440,7 @@ class BTCVisionAutopilot:
         if not force_live_test and not self._bool(settings, "btc_ai_autopilot_enabled", False):
             return
         await self._hard_disable_other_modes(settings)
-        if await self._apply_stop_loss_pause_if_needed(app):
+        if (not force_live_test) and await self._apply_stop_loss_pause_if_needed(app):
             return
         symbol = str(settings.get("btc_ai_symbol", self.symbol) or self.symbol)
 
@@ -437,9 +455,11 @@ class BTCVisionAutopilot:
             # If the previous 4H limit was not filled, replace it with a fresh signal.
             await self.cancel_pending_btc_entries(app, reason="btc_ai_4h_new_candle_replace")
 
-        candles = await self.exchange_client.fetch_ohlcv(symbol, timeframe="4h", limit=160)
+        candles_raw = await self.exchange_client.fetch_ohlcv(symbol, timeframe="4h", limit=160)
+        candles = self._closed_4h_candles(candles_raw)
         if len(candles) < 80:
-            await self._notify(app, "⚠️ BTC AI: мало свечей MEXC для анализа")
+            log_event("btc_ai_skip_not_enough_closed_4h_candles", ok=False, raw_count=len(candles_raw or []), closed_count=len(candles), min_required=80)
+            await self._notify(app, f"⚠️ BTC AI: мало закрытых 4H свечей MEXC для анализа ({len(candles)}/80). Сделка не открывается.")
             return
         market_data = await self.collect_market_data(symbol, candles)
         fatal = self._market_data_fatal_error(market_data)
@@ -794,12 +814,62 @@ class BTCVisionAutopilot:
             log_event("btc_ai_levels_error", ok=False, error=str(e)[:500], decision=getattr(d, "__dict__", {}))
             return {}
 
+    def _closed_4h_candles(self, candles: list) -> list:
+        """Return only confirmed closed 4H candles and log the decision.
+
+        MEXC can include the currently forming 4H candle as the last OHLCV row.
+        BTC AI must analyse closed candles only, so a candle is accepted only when:
+            candle_open_time + 4h <= current_server_time
+        No positive time tolerance is used: a candle is never treated as closed early.
+        If the filtered result is too short, the caller will skip trading instead of
+        silently falling back to unfiltered data.
+        """
+        raw = list(candles or [])
+        out = []
+        now_ms = int(time.time() * 1000)
+        tf_ms = 4 * 60 * 60 * 1000
+        last_raw_ts = None
+        last_used_ts = None
+        parse_errors = 0
+
+        for row in raw:
+            try:
+                ts = int(float(row[0] or 0))
+                ts = ts * 1000 if ts < 10_000_000_000 else ts
+                last_raw_ts = ts
+                if ts + tf_ms <= now_ms:
+                    out.append(row)
+                    last_used_ts = ts
+            except Exception:
+                parse_errors += 1
+                continue
+
+        dropped = max(0, len(raw) - len(out) - parse_errors)
+        try:
+            log_event(
+                "btc_ai_closed_4h_filter",
+                ok=bool(out),
+                raw_count=len(raw),
+                closed_count=len(out),
+                dropped_open_or_future=dropped,
+                parse_errors=parse_errors,
+                now_ms=now_ms,
+                last_raw_ts=last_raw_ts,
+                last_raw_iso=(datetime.fromtimestamp(last_raw_ts / 1000, tz=timezone.utc).isoformat() if last_raw_ts else None),
+                last_used_ts=last_used_ts,
+                last_used_iso=(datetime.fromtimestamp(last_used_ts / 1000, tz=timezone.utc).isoformat() if last_used_ts else None),
+            )
+        except Exception:
+            pass
+        return out
+
     def _prepare_chart_df(self, candles: list, tail: int = 90) -> pd.DataFrame:
         df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "volume"])
         df["dt"] = pd.to_datetime(df.ts, unit="ms")
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = df[c].astype(float)
-        df = df.tail(tail).reset_index(drop=True)
+        # Compute indicators on the full history first, then crop. Otherwise MA99
+        # is always NaN on a 90-candle chart and the AI loses long-trend context.
         df["MA7"] = df.close.rolling(7).mean()
         df["MA25"] = df.close.rolling(25).mean()
         df["MA99"] = df.close.rolling(99).mean()
@@ -808,7 +878,7 @@ class BTCVisionAutopilot:
         df["MACD"] = ema12 - ema26
         df["Signal"] = df.MACD.ewm(span=9, adjust=False).mean()
         df["Hist"] = df.MACD - df.Signal
-        return df
+        return df.tail(tail).reset_index(drop=True)
 
     def _draw_clean_btc_chart(self, df: pd.DataFrame, market_data: dict, levels: dict | None = None, decision: BTCAutopilotDecision | None = None, filename_prefix: str = "btc_ai_clean") -> str:
         import matplotlib.pyplot as plt
@@ -1171,6 +1241,157 @@ class BTCVisionAutopilot:
                 self._last_24h_warning_ts = now
                 log_event("btc_ai_24h_monitor_warning", ok=False, error=msg[:800])
                 await self._notify(app, f"⚠️ BTC AI 24H monitor warning: {msg[:300]}")
+
+    async def cancel_stale_pending(self):
+        try:
+            positions = await self.storage.positions()
+            for p in positions:
+                if p.get("status") != "pending":
+                    continue
+                if str(p.get("strategy")) != "btc_ai_4h":
+                    continue
+                if time.time() - float(p.get("opened_at") or 0) >= 14400:
+                    await self.execution_engine.cancel_entry(p, live=True, reason="btc_ai_4h_limit_timeout")
+        except Exception:
+            pass
+
+    async def collect_market_data(self, symbol: str, candles: list) -> dict:
+        ticker = await self.exchange_client.fetch_ticker(symbol)
+        ticker_info = ticker.get("info") if isinstance(ticker, dict) else {}
+        if not isinstance(ticker_info, dict):
+            ticker_info = {}
+        depth = await self.exchange_client.fetch_order_book(symbol, limit=50)
+        funding = await self._mexc_funding(symbol)
+        spot = await self._binance_spot_pressure("BTCUSDT")
+        liq = await self._mexc_liquidation_proxy(symbol)
+        df = pd.DataFrame(candles, columns=["ts","open","high","low","close","volume"])
+        for c in ["open","high","low","close","volume"]:
+            df[c] = df[c].astype(float)
+        last = float(df.close.iloc[-1])
+        vol_ratio = float(df.volume.iloc[-1] / max(1e-9, df.volume.tail(30).mean()))
+        spot_norm = self._normalize_cross_exchange_pressure(spot, vol_ratio)
+        return {
+            "symbol": symbol,
+            "timeframe": "4h",
+            "execution_venue": "MEXC futures",
+            "chart_source": "MEXC futures",
+            "volume_source": "MEXC futures",
+            "funding_source": "MEXC futures",
+            "liquidation_source": "MEXC futures/proxy",
+            "spot_confirmation_source": "Binance spot",
+            "normalization_note": "Do NOT compare raw MEXC futures volume USDT to raw Binance spot volume USDT. MEXC futures liquidity is lower. Use each venue only in its own context: MEXC for executable futures structure/volume/funding/orderbook, Binance spot only as directional confirmation using buy_ratio/delta_score, not absolute size.",
+            "last_price": float(ticker.get("last") or last),
+            "high_24h": float(df.high.tail(6).max()),
+            "low_24h": float(df.low.tail(6).min()),
+            "mexc_ticker_high_24h": float(ticker_info.get("high24Price") or ticker_info.get("high24") or ticker_info.get("high") or 0),
+            "mexc_ticker_low_24h": float(ticker_info.get("lower24Price") or ticker_info.get("low24Price") or ticker_info.get("low24") or ticker_info.get("low") or 0),
+            "mexc_volume_last": float(df.volume.iloc[-1]),
+            "mexc_volume_ratio_30": vol_ratio,
+            "funding": funding,
+            "mexc_orderbook": self._book_summary(depth),
+            "binance_spot_pressure": spot,
+            "cross_exchange_pressure_normalized": spot_norm,
+            "mexc_liquidations_proxy": liq,
+            "closed_candle_msk": self._fmt_msk(float(df.ts.iloc[-1]) / 1000),
+            "candles_count": len(candles)
+        }
+
+    def _normalize_cross_exchange_pressure(self, spot: dict, mexc_volume_ratio_30: float) -> dict:
+        try:
+            buy_ratio = float((spot or {}).get("buy_ratio") or 0.5)
+            delta = float((spot or {}).get("delta_usdt") or 0.0)
+            total = float((spot or {}).get("buy_usdt") or 0.0) + float((spot or {}).get("sell_usdt") or 0.0)
+            delta_score = (delta / total) if total > 0 else 0.0
+            if buy_ratio >= 0.58:
+                direction = "BUY_CONFIRMATION"
+            elif buy_ratio <= 0.42:
+                direction = "SELL_CONFIRMATION"
+            else:
+                direction = "NEUTRAL"
+            return {
+                "binance_spot_direction": direction,
+                "binance_spot_buy_ratio": buy_ratio,
+                "binance_spot_delta_score": delta_score,
+                "mexc_futures_volume_ratio_30": float(mexc_volume_ratio_30 or 0.0),
+                "ai_rule": "Use Binance spot as directional confirmation only; never penalize/boost because raw Binance spot volume is larger than MEXC futures volume."
+            }
+        except Exception as e:
+            return {"error": str(e)[:120], "ai_rule": "ignore raw cross-exchange volume size"}
+
+    def _market_data_fatal_error(self, market_data: dict) -> str:
+        checks = [
+            ("MEXC funding", market_data.get("funding")),
+            ("MEXC liquidation proxy", market_data.get("mexc_liquidations_proxy")),
+            ("Binance spot pressure", market_data.get("binance_spot_pressure")),
+        ]
+        if not market_data.get("last_price"):
+            return "MEXC ticker/last_price missing"
+        if not market_data.get("mexc_orderbook"):
+            return "MEXC orderbook missing"
+        for name, obj in checks:
+            if isinstance(obj, dict) and obj.get("error"):
+                return f"{name}: {obj.get('error')}"
+        return ""
+
+    async def _recent_btc_ai_stop_losses(self) -> int:
+        """Return count of recent consecutive BTC AI stop-loss exits.
+
+        This is a safety gate only. It must never crash the live/test cycle;
+        if trade history cannot be read, return 0 and allow the scan to continue.
+        """
+        try:
+            rows = await self.storage.trade_rows()
+        except Exception as e:
+            log_event("btc_ai_recent_sl_read_error", ok=False, error=str(e)[:500])
+            return 0
+        try:
+            settings = await self.storage.all_settings()
+            override_ts = float(settings.get("btc_ai_pause_manual_override_ts", 0) or 0)
+        except Exception:
+            override_ts = 0.0
+
+        def _ts(row: dict) -> float:
+            for key in ("ts_close", "closed_at", "ts", "updated_at"):
+                try:
+                    val = float(row.get(key) or 0)
+                    if val > 0:
+                        return val
+                except Exception:
+                    pass
+            return 0.0
+
+        def _is_btc_ai(row: dict) -> bool:
+            try:
+                strat = str(row.get("strategy") or "").lower()
+                sym = str(row.get("symbol") or "").upper().replace("/", "_").replace(":USDT", "")
+                return strat == "btc_ai_4h" and sym in {"BTC_USDT", "BTCUSDT"}
+            except Exception:
+                return False
+
+        def _is_stop_loss(row: dict) -> bool:
+            text = " ".join(str(row.get(k) or "") for k in ("reason", "result", "close_reason", "event", "type")).lower()
+            try:
+                pnl = float(row.get("pnl_usdt") or row.get("pnl") or 0)
+            except Exception:
+                pnl = 0.0
+            stop_markers = ("stop", "stop_loss", "sl", "tpsl_sl", "bot_sl")
+            return any(m in text for m in stop_markers) and pnl <= 0
+
+        count = 0
+        filtered = []
+        for r in rows or []:
+            if not isinstance(r, dict) or not _is_btc_ai(r):
+                continue
+            if override_ts > 0 and _ts(r) <= override_ts:
+                continue
+            filtered.append(r)
+        for row in sorted(filtered, key=_ts, reverse=True):
+            if _is_stop_loss(row):
+                count += 1
+                continue
+            # Consecutive streak ends at the first non-stop BTC AI closed trade.
+            break
+        return count
 
     async def _apply_stop_loss_pause_if_needed(self, app) -> bool:
         """Pause BTC AI entries after 3 consecutive stop-losses.
