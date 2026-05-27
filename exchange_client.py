@@ -1336,10 +1336,15 @@ class ExchangeClient:
         results = []
         errors = []
         # Normal order, plan order and stop/TP-SL cleanup.
+        # Only call normal/plan cancel_all here.  MEXC TP/SL stoporder cancel_all
+        # is account-sensitive and may return code 600 Parameter error when no
+        # compatible TP/SL rows exist.  TP/SL rows discovered from
+        # /stoporder/open_orders are still cancelled individually below by the
+        # exact stoporder/cancel endpoint, so we avoid noisy false errors without
+        # skipping real discovered protection cleanup.
         cancel_paths = [
             ("/api/v1/private/order/cancel_all", "POST"),
             ("/api/v1/private/planorder/cancel_all", "POST"),
-            ("/api/v1/private/stoporder/cancel_all", "POST"),
         ]
         for sym in seen:
             msym = self._mexc_symbol(sym)
@@ -1445,37 +1450,87 @@ class ExchangeClient:
             close_side = 2
         else:
             raise RuntimeError(f"cannot infer MEXC close side from positionType={pt!r}")
-        body = {
+        # For a close order, MEXC docs mark leverage as optional and required
+        # only when opening.  Sending an old/default leverage can make an
+        # otherwise valid panic close fail with leverage mismatch, so the first
+        # payload deliberately omits leverage.
+        base_body = {
             "symbol": msym,
             "price": 0,
             "vol": vol,
             "side": close_side,
             "type": 5,
             "openType": int(info.get("openType") or os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or "1"),
-            "leverage": int(info.get("leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or "5"),
         }
         # Some MEXC hedge-mode accounts require positionId for an unambiguous
         # panic close.  Passing it when available keeps the close tied to the
         # exact position row and prevents a no-op close order.
         pid = info.get("positionId") or info.get("id") or pos.get("positionId")
         if pid not in (None, ""):
-            body["positionId"] = pid
+            try:
+                base_body["positionId"] = int(float(pid))
+            except Exception:
+                base_body["positionId"] = pid
 
         attempts = []
         errors = []
-        # Try the exact body first, then a tiny set of safe variants.  All are
-        # CLOSE side codes (2/4), so they cannot open a new position.
-        variants = [body]
-        rb = dict(body); rb["reduceOnly"] = True; variants.append(rb)
-        if "positionId" in body:
-            b = dict(body); b.pop("positionId", None); variants.append(b)
-            rb = dict(b); rb["reduceOnly"] = True; variants.append(rb)
-        for ot in (1, 2):
-            b = dict(body); b["openType"] = ot; variants.append(b)
-            rb = dict(b); rb["reduceOnly"] = True; variants.append(rb)
-            if "positionId" in b:
-                c = dict(b); c.pop("positionId", None); variants.append(c)
-                rc = dict(c); rc["reduceOnly"] = True; variants.append(rc)
+        variants = []
+
+        def add_variant(d: dict):
+            # Never mutate caller dictionaries and never send empty None fields.
+            clean = {k: v for k, v in dict(d).items() if v not in (None, "")}
+            variants.append(clean)
+
+        open_types = []
+        for ot in (base_body.get("openType"), info.get("openType"), os.getenv("MEXC_ORDER_OPEN_TYPE"), 1, 2):
+            try:
+                oti = int(float(ot))
+                if oti in (1, 2) and oti not in open_types:
+                    open_types.append(oti)
+            except Exception:
+                pass
+        if not open_types:
+            open_types = [1, 2]
+
+        leverage_candidates = []
+        for lv in (info.get("leverage"), os.getenv("MEXC_ORDER_LEVERAGE"), 10, 5, 20, 1):
+            try:
+                lvi = int(float(lv))
+                if lvi > 0 and lvi not in leverage_candidates:
+                    leverage_candidates.append(lvi)
+            except Exception:
+                pass
+
+        vol_candidates = []
+        for vv in (vol, str(vol)):
+            if vv not in vol_candidates:
+                vol_candidates.append(vv)
+
+        # 1) documented close by position: no leverage, no reduceOnly.
+        # 2) same without positionId for accounts that reject positionId.
+        # 3) flashClose/marketCeiling variants for MEXC accounts that need the
+        #    emergency-close flags.
+        # 4) reduceOnly variants only last, because reduceOnly is one-way only.
+        for ot in open_types:
+            for vv in vol_candidates:
+                b = dict(base_body, openType=ot, vol=vv)
+                add_variant(b)
+                if "positionId" in b:
+                    c = dict(b); c.pop("positionId", None); add_variant(c)
+                f = dict(b); f["flashClose"] = True; add_variant(f)
+                m = dict(b); m["marketCeiling"] = True; add_variant(m)
+        for lv in leverage_candidates:
+            for ot in open_types:
+                b = dict(base_body, openType=ot, leverage=lv)
+                add_variant(b)
+                if "positionId" in b:
+                    c = dict(b); c.pop("positionId", None); add_variant(c)
+        for ot in open_types:
+            rb = dict(base_body, openType=ot, reduceOnly=True)
+            add_variant(rb)
+            if "positionId" in rb:
+                c = dict(rb); c.pop("positionId", None); add_variant(c)
+
         seen_payloads = set()
         for b in variants:
             key = json.dumps(b, sort_keys=True, default=str)
@@ -1488,7 +1543,10 @@ class ExchangeClient:
                 return {"ok": True, "symbol": self._mexc_id_to_symbol(msym), "mexc_symbol": msym, "vol": vol, "side": close_side, "positionId": pid, "attempts": attempts, "result": out}
             except Exception as e:
                 errors.append({"body": b, "error": str(e)[:260]})
-        raise RuntimeError("MEXC native close failed: " + json.dumps(errors[-4:], ensure_ascii=False))
+                # If the error is a leverage mismatch, continue to the no/other
+                # leverage variants; otherwise keep sweeping through safe close
+                # variants because side 2/4 cannot open a position.
+        raise RuntimeError("MEXC native close failed: " + json.dumps(errors[-6:], ensure_ascii=False))
 
 
     def _mexc_position_qty_contracts_from_parsed(self, pos: dict) -> int:
@@ -1708,9 +1766,15 @@ class ExchangeClient:
                                 "side": close_side,
                                 "type": 5,
                                 "openType": open_type,
-                                "leverage": lev,
                             }
-                            for attempt_body in (body, dict(body, reduceOnly=True)):
+                            sweep_variants = [
+                                body,
+                                dict(body, flashClose=True),
+                                dict(body, marketCeiling=True),
+                                dict(body, leverage=lev),
+                                dict(body, reduceOnly=True),
+                            ]
+                            for attempt_body in sweep_variants:
                                 try:
                                     out = await self._mexc_private("POST", "/api/v1/private/order/create", body=attempt_body)
                                     results.append({"stage": "synthetic_btc_sweep", "reason": reason, "side": close_side, "openType": open_type, "vol": sweep_vol, "position_margin": pm, "price": price, "body": attempt_body, "result": out})
