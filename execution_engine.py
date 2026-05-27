@@ -1057,6 +1057,27 @@ class ExecutionEngine:
             except Exception as e:
                 out_extra = {"mexc_split_qty_warning": str(e)[:180]}
 
+        # Reduced BTC AI mode: one TP closes 100% at +2%, no TP2 runner and no BE move.
+        sig_details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
+        reduced_single_tp = (
+            str(pos.get("strategy") or "").lower() == "btc_ai_4h"
+            and (str(sig_details.get("risk_mode") or "") == "reduced_65_74" or float(pos.get("partial_take_fraction") or 0) >= 0.999)
+        )
+        if reduced_single_tp:
+            full_tp = float(pos.get("partial_take_price") or pos.get("take_price") or tp1 or tp2 or 0)
+            out = {"tp1_price": full_tp, "tp2_price": 0.0, "tp1_fraction": 1.0, "tp1_qty": qty, "tp2_qty": 0.0, **out_extra, "reduced_single_tp": True}
+            if full_tp <= 0 or qty <= 0:
+                out["tp_error"] = "missing reduced TP price/qty"
+                return out
+            o1 = await self._create_take_profit_market_order(pos["symbol"], close_side, qty, full_tp)
+            out.update({
+                "tp1_order_id": o1.get("id"),
+                "tp2_order_id": "REDUCED_SINGLE_TP",
+                "tp_order_id": str(o1.get("id") or ""),
+                "tp_raw": {"tp1": o1},
+            })
+            return out
+
         out = {"tp1_price": tp1, "tp2_price": tp2, "tp1_fraction": frac, "tp1_qty": qty1, "tp2_qty": qty2, **out_extra}
         if tp1 <= 0 or tp2 <= 0 or qty1 <= 0 or qty2 <= 0:
             out["tp_error"] = "missing cascade split TP price/qty"
@@ -1437,14 +1458,15 @@ class ExecutionEngine:
                     out["boost_unsafe_position"] = False
                     out["boost_defensive_mode"] = False
                 elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin", "btc_ai_4h"} and out.get("tp1_order_id") and out.get("tp2_order_id") and out.get("sl_order_id"):
-                    # v0286: split TP/SL are MEXC planorders, not stoporder rows.
-                    # Verify exact planorder ids when possible; during MEXC indexing
-                    # lag, keep returned ids as protected for watchdog grace.
+                    # v0286/v21: split TP/SL are MEXC planorders. Reduced BTC AI may use one TP closing 100%.
                     verified_split = {}
                     if hasattr(self.exchange_client, "mexc_find_active_plan_order"):
                         try:
                             tp1_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=str(out.get("tp1_order_id") or ""))
-                            tp2_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=str(out.get("tp2_order_id") or ""))
+                            if out.get("reduced_single_tp"):
+                                tp2_row = True
+                            else:
+                                tp2_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=str(out.get("tp2_order_id") or ""))
                             sl_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=str(out.get("sl_order_id") or ""))
                             verified_split = {"tp1_plan_verified": bool(tp1_row), "tp2_plan_verified": bool(tp2_row), "sl_plan_verified": bool(sl_row)}
                         except Exception as e:
@@ -1456,8 +1478,8 @@ class ExecutionEngine:
                     out["stop_loss_ok"] = True
                     out["ok"] = True
                     out["protection_status"] = "EXCHANGE PROTECTED"
-                    out["protection_mode"] = "exchange_split_planorder"
-                    out["protection_note"] = "Split TP/SL are MEXC planorders: TP1 50% at 1R, TP2 rest at 2R, SL under pullback"
+                    out["protection_mode"] = "exchange_single_tp_planorder" if out.get("reduced_single_tp") else "exchange_split_planorder"
+                    out["protection_note"] = "Reduced BTC AI: TP closes 100% at +2%, SL 1%" if out.get("reduced_single_tp") else "Split TP/SL are MEXC planorders: TP1 50% at 1R, TP2 rest at 2R, SL under pullback"
                 else:
                     verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), str(out.get("sl_order_id") or ""))
                     out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})

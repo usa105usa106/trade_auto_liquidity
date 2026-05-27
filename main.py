@@ -1361,8 +1361,29 @@ async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "tp2": p.get("final_take_price") or p.get("take_price"),
                 "protection": p.get("protection_status"),
             })
+        exchange_positions = []
+        try:
+            ex = await get_exchange(settings)
+            rows = await asyncio.wait_for(ex.fetch_positions(), timeout=12)
+            for row in rows or []:
+                try:
+                    info = row.get("info") or {}
+                    sym = str(row.get("symbol") or info.get("symbol") or "")
+                    hold = float(info.get("holdVol") or row.get("contracts") or row.get("amount") or 0)
+                    if "BTC" in sym.upper() and hold > 0:
+                        exchange_positions.append({
+                            "symbol": sym,
+                            "side": row.get("side") or info.get("positionType"),
+                            "holdVol": hold,
+                            "entry": row.get("entryPrice") or info.get("holdAvgPrice"),
+                            "unrealized": row.get("unrealizedPnl") or info.get("unrealized"),
+                        })
+                except Exception:
+                    pass
+        except Exception as e:
+            exchange_positions = [{"error": str(e)[:180]}]
         text = tail_text(files=["btc_ai.log", "trade.log", "errors.log"], lines=35, max_chars=1600)
-        header = "🧾 BTC AI краткий лог\nSETTINGS=" + json.dumps(settings_view, ensure_ascii=False, default=str) + "\nACTIVE_POSITIONS=" + json.dumps(compact_positions, ensure_ascii=False, default=str) + "\n"
+        header = "🧾 BTC AI краткий лог\nSETTINGS=" + json.dumps(settings_view, ensure_ascii=False, default=str) + "\nACTIVE_POSITIONS=" + json.dumps(compact_positions, ensure_ascii=False, default=str) + "\nEXCHANGE_BTC_POSITIONS=" + json.dumps(exchange_positions, ensure_ascii=False, default=str) + "\n"
         msg = header + "```\n" + text[-1600:] + "\n```\nПолный сырой JSON: /log_full"
         await reply(update, msg[:4050], reply_markup=MAIN_MENU)
     except Exception as e:
@@ -1441,7 +1462,7 @@ async def test_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "btc_ai_symbol": "BTC_USDT",
         "btc_ai_balance_share": 0.10,
         "btc_ai_leverage": 10,
-        "btc_ai_min_trade_probability": 75,
+        "btc_ai_min_trade_probability": 65,
         "btc_ai_a_plus_probability": 85,
         "btc_ai_limit_timeout_sec": 14400,
         "btc_ai_pause_until": 0,
@@ -1574,7 +1595,7 @@ async def btc_ai_autopilot_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "btc_ai_symbol": "BTC_USDT",
             "btc_ai_balance_share": 0.10,
             "btc_ai_leverage": 10,
-            "btc_ai_min_trade_probability": 75,
+            "btc_ai_min_trade_probability": 65,
             "btc_ai_a_plus_probability": 85,
             "btc_ai_limit_timeout_sec": 14400,
             "btc_ai_pause_until": 0,
@@ -3363,94 +3384,148 @@ async def open_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await reply(update, f"📋 Open orders failed: {e}", reply_markup=MAIN_MENU)
 
+async def _get_exchange_emergency(settings: dict, timeout_sec: float = 25.0):
+    """Get an exchange client for panic commands without a short 6s timeout.
+
+    /close_all and /cancel_all must not fail just because ccxt/load_markets is slow.
+    Reuse the existing initialized client when possible; otherwise allow a longer
+    init window. ExchangeClient.init already skips slow load_markets internally.
+    """
+    global exchange_client
+    if exchange_client is not None:
+        return exchange_client
+    return await _await_with_timeout(get_exchange(settings), timeout_sec, "exchange init")
+
+
 async def cancel_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global entries_enabled
     if not allowed(update): return
     entries_enabled = False
     _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
+    await storage.set("btc_ai_autopilot_enabled", False, bump_revision=False)
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
-    await reply(update, "⏳ Cancel all orders: command received. BOOST/new entries are OFF.", reply_markup=MAIN_MENU)
+    await reply(update, "⏳ Cancel all orders: command received. New entries are OFF. Cancelling MEXC orders now...", reply_markup=MAIN_MENU)
     s = await storage.all_settings()
+    results = []
+    failures = []
     try:
-        ex = await _await_with_timeout(get_exchange(s), 6, "exchange init")
-        res = await _await_with_timeout(ex.cancel_all_orders(), 25, "cancel_all_orders")
-        await reply(update, f"🧹 Cancel all orders sent\n{str(res)[:1200]}", reply_markup=MAIN_MENU)
+        ex = await _get_exchange_emergency(s, 25)
+        # First cancel BTC explicitly. This catches BTC AI planorders even when
+        # order discovery is slow or MEXC rate-limits list endpoints.
+        for sym in ["BTC_USDT", "BTC/USDT:USDT", None]:
+            try:
+                res = await _await_with_timeout(ex.cancel_all_orders(sym), 35, f"cancel_all_orders {sym or '*'}")
+                results.append({"symbol": sym or "*", "result": res})
+            except Exception as e:
+                failures.append(f"{sym or '*'}: {e}")
+        ok_count = sum(1 for r in results if r.get("result") is not None)
+        msg = f"🧹 Cancel all finished\nRequests sent: {ok_count}\nFailures: {failures[:3] if failures else '-'}"
+        await reply(update, msg[:3500], reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"🧹 Cancel all failed: {e}", reply_markup=MAIN_MENU)
+
 
 async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global entries_enabled
     if not allowed(update): return
     s = await storage.all_settings()
-    quick_bounce_active = str(s.get("strategy_mode", "hybrid")).lower() == "quick_bounce" and _bool_setting(s, "quick_bounce_enabled", False)
-    entries_enabled = bool(quick_bounce_active)
+    entries_enabled = False
     _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
-    if not quick_bounce_active:
-        await storage.set("strategy_mode", "hybrid", bump_revision=False)
-    await reply(update, "⏳ Close all positions: command received." + (" Быстрый отскок останется ON и продолжит новые сканы." if quick_bounce_active else " BOOST/new entries are OFF."), reply_markup=MAIN_MENU)
+    await storage.set("btc_ai_autopilot_enabled", False, bump_revision=False)
+    await storage.set("strategy_mode", "hybrid", bump_revision=False)
+    await reply(update, "⏳ Close all positions: command received. New entries are OFF. Closing MEXC positions now...", reply_markup=MAIN_MENU)
+    failures = []
+    closed = 0
+    cancel_before = None
+    cancel_after = None
+    native_res = None
+    post_used = post_pm = None
+    local_cache_cleared = False
     try:
-        ex = await _await_with_timeout(get_exchange(s), 6, "exchange init")
+        ex = await _get_exchange_emergency(s, 25)
         exec_engine = ExecutionEngine(storage, ex)
-        positions = [p for p in (await _await_with_timeout(ex.fetch_positions(), 10, "fetch_positions") or []) if exec_engine.exchange_position_qty(p) > 0]
-        failures = []
-        closed = 0
-        for p in positions:
-            res = await _await_with_timeout(exec_engine.close_exchange_position(p, "manual_close_all"), 20, "close_exchange_position")
-            if res.get("ok"):
-                closed += 1
-            else:
-                failures.append(f"{p.get('symbol')}: {res.get('reason')}")
-        native_res = None
-        cancel_res = None
+
+        # Cancel pending entries/protection first so they cannot fire while closing.
         try:
-            cancel_res = await _await_with_timeout(ex.cancel_all_orders(), 10, "cancel_all_orders")
+            cancel_before = await _await_with_timeout(ex.cancel_all_orders("BTC_USDT"), 35, "cancel BTC orders before close")
         except Exception as e:
-            failures.append(f"cancel_all: {e}")
-        # Extra safety: call native close_all only when nothing was listed and
-        # closed manually. If listed positions were already closed, MEXC often
-        # returns code 2009 (Position is nonexistent or closed), which is not a
-        # real failure and only confuses the operator.
+            failures.append(f"cancel_before_btc: {e}")
+
+        # Close every listed position individually using the tested execution path.
+        try:
+            positions = [p for p in (await _await_with_timeout(ex.fetch_positions(), 20, "fetch_positions") or []) if exec_engine.exchange_position_qty(p) > 0]
+        except Exception as e:
+            positions = []
+            failures.append(f"fetch_positions: {e}")
+
+        for p in positions:
+            try:
+                res = await _await_with_timeout(exec_engine.close_exchange_position(p, "manual_close_all"), 35, "close_exchange_position")
+                if isinstance(res, dict) and res.get("ok"):
+                    closed += 1
+                else:
+                    failures.append(f"{p.get('symbol')}: {(res or {}).get('reason') if isinstance(res, dict) else res}")
+            except Exception as e:
+                failures.append(f"{p.get('symbol')}: {e}")
+
+        # Native exchange close_all as an extra hard fallback, even if positions
+        # listing missed something. MEXC may return 2009 when already closed.
         if hasattr(ex, "mexc_close_all_positions_native"):
             try:
-                native_res = await _await_with_timeout(ex.mexc_close_all_positions_native(), 15, "native_close_all")
+                native_res = await _await_with_timeout(ex.mexc_close_all_positions_native(), 25, "native_close_all")
             except Exception as e:
                 if "2009" not in str(e) and "nonexistent or closed" not in str(e).lower():
                     failures.append(f"native_close_all: {e}")
                 else:
                     native_res = {"ok": True, "skipped": "already closed"}
-        # v0067: clear local cache only after balance confirms there is no hidden
-        # position margin left. Previously the bot could erase local state while
-        # MEXC still showed used/positionMargin > 0.
-        local_cache_cleared = False
-        post_pm = post_used = None
+
+        # Cancel again after closing to remove TP1/TP2/SL planorders.
         try:
-            await asyncio.sleep(float(os.getenv("POST_CLOSE_BALANCE_CHECK_DELAY_SEC", "0.8")))
-            bal = await asyncio.wait_for(ex.fetch_balance(), timeout=5)
+            cancel_after = await _await_with_timeout(ex.cancel_all_orders("BTC_USDT"), 35, "cancel BTC orders after close")
+        except Exception as e:
+            failures.append(f"cancel_after_btc: {e}")
+        try:
+            await _await_with_timeout(ex.cancel_all_orders(), 35, "cancel all orders after close")
+        except Exception as e:
+            # Non-fatal if BTC explicit cancel succeeded.
+            failures.append(f"cancel_after_all: {e}")
+
+        await asyncio.sleep(float(os.getenv("POST_CLOSE_BALANCE_CHECK_DELAY_SEC", "1.2")))
+        try:
+            bal = await asyncio.wait_for(ex.fetch_balance(), timeout=10)
             usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
             post_pm = float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
             post_used = float(usdt.get("used") or ((bal or {}).get("used", {}) or {}).get("USDT") or 0)
-            try:
-                post_positions = [p for p in (await asyncio.wait_for(ex.fetch_positions(), timeout=10) or []) if exec_engine.exchange_position_qty(p) > 0]
-            except Exception:
-                post_positions = []
-            # Balance.used/frozen can stay non-zero because of leftover orders.
-            # Local position cache must follow real exchange positions, not stale
-            # frozen margin, otherwise the bot monitors ghosts after /close_all.
-            if not post_positions:
-                for lp in await storage.positions():
-                    try:
-                        await storage.remove_position(lp.get("symbol"))
-                    except Exception:
-                        pass
-                local_cache_cleared = True
-            else:
-                local_cache_cleared = False
-                failures.append(f"positions still open after close_all: {len(post_positions)}")
         except Exception as e:
-            failures.append(f"post-close balance check: {e}")
-        await reply(update, f"🧯 Close all sent\nListed positions closed: {closed}\nCancel all: {str(cancel_res)[:220] if cancel_res is not None else '-'}\nNative close_all: {str(native_res)[:300] if native_res is not None else '-'}\nPost used: {post_used if post_used is not None else '-'}\nPost position margin: {post_pm if post_pm is not None else '-'}\nLocal cache cleared: {'yes' if local_cache_cleared else 'no'}\nFailures: {[f for f in failures[:5] if 'hidden margin' not in str(f).lower()] if failures else '-'}", reply_markup=MAIN_MENU)
+            failures.append(f"post_balance: {e}")
+        try:
+            post_positions = [p for p in (await asyncio.wait_for(ex.fetch_positions(), timeout=15) or []) if exec_engine.exchange_position_qty(p) > 0]
+        except Exception:
+            post_positions = []
+        if not post_positions:
+            for lp in await storage.positions():
+                try:
+                    await storage.remove_position(lp.get("symbol"))
+                except Exception:
+                    pass
+            local_cache_cleared = True
+        else:
+            failures.append(f"positions still open after close_all: {len(post_positions)}")
+
+        msg = (
+            "🧯 Close all finished\n"
+            f"Listed positions closed: {closed}\n"
+            f"Native close_all: {'sent' if native_res is not None else '-'}\n"
+            f"Cancel before: {'sent' if cancel_before is not None else '-'}\n"
+            f"Cancel after: {'sent' if cancel_after is not None else '-'}\n"
+            f"Post used: {post_used if post_used is not None else '-'}\n"
+            f"Post position margin: {post_pm if post_pm is not None else '-'}\n"
+            f"Local cache cleared: {'yes' if local_cache_cleared else 'no'}\n"
+            f"Failures: {failures[:5] if failures else '-'}"
+        )
+        await reply(update, msg[:3800], reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"🧯 Close all failed: {e}", reply_markup=MAIN_MENU)
 
