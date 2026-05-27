@@ -1199,7 +1199,7 @@ class ExchangeClient:
         # v0224 fast path: /stoporder/list/orders repeatedly returns [] on current
         # MEXC futures and adds ~1-2s latency per protection/rotation check.
         # Keep the live TP/SL endpoints that matter now: planorder emergency SL,
-        # stoporder/open_orders, and position/stop_orders.  Legacy stoporder/list
+        # stoporder/open_orders. Legacy stoporder/list
         # can be re-enabled only if MEXC changes visibility again.
         include_legacy_stop_list = str(os.getenv("MEXC_LEGACY_STOPORDER_LIST", "0")).lower() in {"1", "true", "yes", "on"}
         if symbol:
@@ -1210,7 +1210,6 @@ class ExchangeClient:
                 ("/api/v1/private/planorder/list/orders", {"symbol": msym, "state": 1, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/planorder/list/orders", {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/stoporder/open_orders", {"symbol": msym}),
-                ("/api/v1/private/position/stop_orders", {"symbol": msym}),
             ])
             if include_legacy_stop_list:
                 candidates.extend([
@@ -1223,7 +1222,6 @@ class ExchangeClient:
                 ("/api/v1/private/planorder/list/orders", {"state": 1, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/planorder/list/orders", {"is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/stoporder/open_orders", {}),
-                ("/api/v1/private/position/stop_orders", {}),
             ])
             if include_legacy_stop_list:
                 candidates.extend([
@@ -1244,7 +1242,7 @@ class ExchangeClient:
             except Exception as e:
                 errors.append(f"{path}: {e}")
         # De-duplicate across endpoints. MEXC often exposes the same TP/SL via
-        # stoporder/open_orders and position/stop_orders; /open_orders should not
+        # stoporder/open_orders; /open_orders should not
         # count the same protection twice. Keep TP and SL separate when a combined
         # row was expanded.
         unique = []
@@ -1358,14 +1356,24 @@ class ExchangeClient:
             for o in discovered:
                 info = o.get("info") if isinstance(o.get("info"), dict) else {}
                 oid = str(o.get("id") or info.get("orderId") or info.get("planOrderId") or info.get("stopOrderId") or "")
+                # Expanded TP/SL pseudo ids look like "123:TP"/"123:SL";
+                # MEXC cancel endpoints need the real base order id only.
+                oid = oid.split(":", 1)[0].strip()
                 if not oid:
                     continue
                 msym = self._mexc_symbol(o.get("symbol") or symbol)
-                candidates = [
-                    ("/api/v1/private/order/cancel", {"symbol": msym, "orderId": oid}),
-                    ("/api/v1/private/planorder/cancel", {"symbol": msym, "orderId": oid}),
-                    ("/api/v1/private/stoporder/cancel", {"symbol": msym, "orderId": oid}),
-                ]
+                src = str(info.get("_source_endpoint") or "").lower()
+                # Do not try every cancel endpoint for every id: MEXC returns
+                # code 600 Parameter error when a normal/plan id is sent to
+                # stoporder/cancel. Route the id back to the endpoint family
+                # where it was discovered, and only use normal order cancel as
+                # the safe default when the source is unknown.
+                if "planorder" in src:
+                    candidates = [("/api/v1/private/planorder/cancel", {"symbol": msym, "orderId": oid})]
+                elif "stoporder" in src:
+                    candidates = [("/api/v1/private/stoporder/cancel", {"symbol": msym, "orderId": oid})]
+                else:
+                    candidates = [("/api/v1/private/order/cancel", {"symbol": msym, "orderId": oid})]
                 for path, body in candidates:
                     try:
                         out = await self._mexc_private("POST", path, body=body)
@@ -1381,12 +1389,16 @@ class ExchangeClient:
             errors.append({"symbol": symbol or "*", "endpoint": "individual_cancel_discovery", "error": str(e)[:220]})
 
         if not seen and not symbol:
-            # Do not call ccxt.cancel_all_orders(None) on MEXC. ccxt may route
-            # it to https://contract.mexc.com/api/v1/private/order/cancel_all,
-            # which is exactly the CDN-403 path this client is designed to
-            # avoid. With no discovered symbols there is nothing safe to cancel.
-            return {"ok": True, "cancelled_symbols": 0, "results": [], "errors": [], "skipped": "no symbols with open orders/positions"}
-        return {"ok": len(errors) == 0, "cancelled_symbols": len(results), "results": results, "errors": errors}
+            # Always try BTC as an emergency default because the BTC AI module can
+            # have planorders even when discovery is temporarily empty/rate-limited.
+            for msym in ["BTC_USDT"]:
+                for path, method in cancel_paths:
+                    try:
+                        out = await self._mexc_private(method, path, body={"symbol": msym})
+                        results.append({"symbol": "BTC/USDT:USDT", "mexc_symbol": msym, "endpoint": path, "result": out, "fallback": True})
+                    except Exception as e:
+                        errors.append({"symbol": "BTC_USDT", "mexc_symbol": msym, "endpoint": path, "error": str(e)[:220], "fallback": True})
+        return {"ok": len(errors) == 0 or len(results) > 0, "cancelled_symbols": len(results), "results": results, "errors": errors}
 
 
     async def mexc_close_position_market_native(self, pos: dict) -> dict:
@@ -1442,8 +1454,41 @@ class ExchangeClient:
             "openType": int(info.get("openType") or os.getenv("MEXC_ORDER_OPEN_TYPE", "1") or "1"),
             "leverage": int(info.get("leverage") or os.getenv("MEXC_ORDER_LEVERAGE", "5") or "5"),
         }
-        out = await self._mexc_private("POST", "/api/v1/private/order/create", body=body)
-        return {"ok": True, "symbol": self._mexc_id_to_symbol(msym), "mexc_symbol": msym, "vol": vol, "side": close_side, "result": out}
+        # Some MEXC hedge-mode accounts require positionId for an unambiguous
+        # panic close.  Passing it when available keeps the close tied to the
+        # exact position row and prevents a no-op close order.
+        pid = info.get("positionId") or info.get("id") or pos.get("positionId")
+        if pid not in (None, ""):
+            body["positionId"] = pid
+
+        attempts = []
+        errors = []
+        # Try the exact body first, then a tiny set of safe variants.  All are
+        # CLOSE side codes (2/4), so they cannot open a new position.
+        variants = [body]
+        rb = dict(body); rb["reduceOnly"] = True; variants.append(rb)
+        if "positionId" in body:
+            b = dict(body); b.pop("positionId", None); variants.append(b)
+            rb = dict(b); rb["reduceOnly"] = True; variants.append(rb)
+        for ot in (1, 2):
+            b = dict(body); b["openType"] = ot; variants.append(b)
+            rb = dict(b); rb["reduceOnly"] = True; variants.append(rb)
+            if "positionId" in b:
+                c = dict(b); c.pop("positionId", None); variants.append(c)
+                rc = dict(c); rc["reduceOnly"] = True; variants.append(rc)
+        seen_payloads = set()
+        for b in variants:
+            key = json.dumps(b, sort_keys=True, default=str)
+            if key in seen_payloads:
+                continue
+            seen_payloads.add(key)
+            try:
+                out = await self._mexc_private("POST", "/api/v1/private/order/create", body=b)
+                attempts.append({"body": b, "result": out})
+                return {"ok": True, "symbol": self._mexc_id_to_symbol(msym), "mexc_symbol": msym, "vol": vol, "side": close_side, "positionId": pid, "attempts": attempts, "result": out}
+            except Exception as e:
+                errors.append({"body": b, "error": str(e)[:260]})
+        raise RuntimeError("MEXC native close failed: " + json.dumps(errors[-4:], ensure_ascii=False))
 
 
     def _mexc_position_qty_contracts_from_parsed(self, pos: dict) -> int:
@@ -1650,13 +1695,28 @@ class ExchangeClient:
                 vol = min(est, max_sweep)
                 if vol <= 0:
                     return
-                for close_side in (4, 2):  # 4 close long, 2 close short
-                    body = {"symbol": "BTC_USDT", "price": 0, "vol": vol, "side": close_side, "type": 5, "openType": 1, "leverage": lev}
-                    try:
-                        out = await self._mexc_private("POST", "/api/v1/private/order/create", body=body)
-                        results.append({"stage": "synthetic_btc_sweep", "reason": reason, "side": close_side, "vol": vol, "position_margin": pm, "price": price, "result": out})
-                    except Exception as e:
-                        results.append({"stage": "synthetic_btc_sweep_failed", "reason": reason, "side": close_side, "vol": vol, "error": str(e)[:220]})
+                # Sweep both close sides and both margin modes. Side 4 closes
+                # LONG, side 2 closes SHORT. These close-side codes must not open
+                # a new position; failures are logged and the next safe variant is tried.
+                for close_side in (4, 2):
+                    for open_type in (1, 2):
+                        for sweep_vol in sorted(set([vol, max(1, vol + 1), max(1, vol + 2)])):
+                            body = {
+                                "symbol": "BTC_USDT",
+                                "price": 0,
+                                "vol": int(sweep_vol),
+                                "side": close_side,
+                                "type": 5,
+                                "openType": open_type,
+                                "leverage": lev,
+                            }
+                            for attempt_body in (body, dict(body, reduceOnly=True)):
+                                try:
+                                    out = await self._mexc_private("POST", "/api/v1/private/order/create", body=attempt_body)
+                                    results.append({"stage": "synthetic_btc_sweep", "reason": reason, "side": close_side, "openType": open_type, "vol": sweep_vol, "position_margin": pm, "price": price, "body": attempt_body, "result": out})
+                                    break
+                                except Exception as e:
+                                    results.append({"stage": "synthetic_btc_sweep_failed", "reason": reason, "side": close_side, "openType": open_type, "vol": sweep_vol, "body": attempt_body, "error": str(e)[:220]})
             except Exception as e:
                 errors.append(f"synthetic_btc_sweep: {e}")
 
