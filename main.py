@@ -1402,7 +1402,10 @@ async def test_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     hard_settings = {
         "btc_ai_live_test_enabled": True,
-        "btc_ai_autopilot_enabled": True,
+        # /test_btc is a one-shot manual live test. Do NOT enable the 4H scheduler here.
+        # The monitor loop still runs with btc_ai_live_test_enabled=True for TP1->BE/24h safety,
+        # but it will not announce/wait for the next candle or start scheduled entries.
+        "btc_ai_autopilot_enabled": False,
         "btc_ai_symbol": "BTC_USDT",
         "btc_ai_balance_share": 0.10,
         "btc_ai_leverage": 10,
@@ -1448,8 +1451,8 @@ async def test_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if btc_ai_task is None or btc_ai_task.done():
         btc_ai_task = context.application.create_task(autopilot.run_loop(context.application))
 
-    log_event("btc_ai_live_test_toggle", enabled=True, ok=True, mode="immediate_cycle", version=VERSION)
-    await reply(update, "🧪 BTC AI LIVE TEST ВКЛ\nСейчас рисую MEXC 4H график, отправляю в OpenAI и открою MEXC BTC сделку только если probability >=75%. Все детали будут в /log.", reply_markup=MAIN_MENU)
+    log_event("btc_ai_live_test_toggle", enabled=True, ok=True, mode="one_shot_no_scheduler", version=VERSION)
+    await reply(update, "🧪 BTC AI LIVE TEST ВКЛ\nСейчас выполню ОДИН тест без ожидания следующей 4H свечи: рисую MEXC 4H график, отправляю в OpenAI и открою MEXC BTC MARKET сделку при любом ответе ИИ. Scheduler 4H НЕ запускается. Все детали будут в /log.", reply_markup=MAIN_MENU)
 
     async def _run_once():
         try:

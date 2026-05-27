@@ -710,9 +710,31 @@ JSON schema: {"signal":"LONG|SHORT|WAIT","probability":0,"grade":"C|B|A|A+","ent
             return {"error": str(e)[:120]}
 
     def _book_summary(self, book):
-        bids=book.get("bids") or []; asks=book.get("asks") or []
-        bid=sum(float(p)*float(q) for p,q in bids[:20]); ask=sum(float(p)*float(q) for p,q in asks[:20]); total=bid+ask
-        return {"bid_usdt_top20":bid,"ask_usdt_top20":ask,"imbalance":(bid-ask)/total if total>0 else 0}
+        """Robust MEXC orderbook summary.
+
+        Some MEXC/ccxt responses return rows as [price, qty], others as
+        [price, qty, count] or dicts. Never unpack rows directly, because
+        that can raise: too many values to unpack (expected 2).
+        """
+        def _row_notional(row):
+            try:
+                if isinstance(row, dict):
+                    p = row.get("price") or row.get("p") or row.get(0)
+                    q = row.get("amount") or row.get("qty") or row.get("size") or row.get("q") or row.get(1)
+                elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                    p, q = row[0], row[1]
+                else:
+                    return 0.0
+                return float(p) * float(q)
+            except Exception:
+                return 0.0
+
+        bids = (book or {}).get("bids") or []
+        asks = (book or {}).get("asks") or []
+        bid = sum(_row_notional(r) for r in bids[:20])
+        ask = sum(_row_notional(r) for r in asks[:20])
+        total = bid + ask
+        return {"bid_usdt_top20": bid, "ask_usdt_top20": ask, "imbalance": (bid - ask) / total if total > 0 else 0}
 
     def format_decision(self,d,md,lv=None):
         if d.error: return f"❌ BTC AI error: {d.error}"
