@@ -1338,15 +1338,48 @@ async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     try:
-        n = 80
+        # Short operator log: readable summary only. Full raw JSON is in /log_full.
+        settings = await storage.all_settings()
+        settings_view = {
+            "version": VERSION,
+            "btc_ai_autopilot_enabled": settings.get("btc_ai_autopilot_enabled"),
+            "btc_ai_live_test_enabled": settings.get("btc_ai_live_test_enabled"),
+            "btc_ai_symbol": settings.get("btc_ai_symbol"),
+            "live_trading": settings.get("live_trading"),
+        }
+        positions = await storage.positions()
+        btc_positions = [p for p in positions if str(p.get("strategy") or "") == "btc_ai_4h" or str(p.get("symbol") or "").upper() in {"BTC_USDT", "BTCUSDT", "BTC/USDT"}]
+        compact_positions = []
+        for p in btc_positions[-4:]:
+            compact_positions.append({
+                "symbol": p.get("symbol"),
+                "side": p.get("side"),
+                "status": p.get("status"),
+                "entry": p.get("entry_price"),
+                "sl": p.get("stop_price"),
+                "tp1": p.get("partial_take_price"),
+                "tp2": p.get("final_take_price") or p.get("take_price"),
+                "protection": p.get("protection_status"),
+            })
+        text = tail_text(files=["btc_ai.log", "trade.log", "errors.log"], lines=35, max_chars=1600)
+        header = "🧾 BTC AI краткий лог\nSETTINGS=" + json.dumps(settings_view, ensure_ascii=False, default=str) + "\nACTIVE_POSITIONS=" + json.dumps(compact_positions, ensure_ascii=False, default=str) + "\n"
+        msg = header + "```\n" + text[-1600:] + "\n```\nПолный сырой JSON: /log_full"
+        await reply(update, msg[:4050], reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"/log error: {e}", reply_markup=MAIN_MENU)
+
+
+async def log_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    try:
+        n = 120
         if context.args:
             try:
-                n = max(20, min(300, int(context.args[0])))
+                n = max(20, min(400, int(context.args[0])))
             except Exception:
-                n = 80
-        text = tail_text(files=["btc_ai.log", "errors.log", "mexc_raw.log", "trade.log"], lines=n, max_chars=3200)
-        # /log is read-only: never calls OpenAI. It shows cached AI/MEXC/order logs and current local positions.
-        ai_line = str(getattr(scanner, "last_openai_analysis_status", "") or "AI analysis: no cached scanner check yet")
+                n = 120
+        text = tail_text(files=["btc_ai.log", "errors.log", "mexc_raw.log", "trade.log"], lines=n, max_chars=3600)
         try:
             settings = await storage.all_settings()
             settings_view = {
@@ -1368,14 +1401,13 @@ async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             pos_text = f"positions/settings read error: {e}"
             set_text = "{}"
-        # Telegram message limit is 4096. Keep it copyable and readable.
-        header = "🧾 BTC AI / MEXC / OpenAI logs\n" + ai_line[:220] + "\nSETTINGS=" + set_text + "\nACTIVE_POSITIONS=" + pos_text + "\n"
-        msg = header + "```\n" + text[-3100:] + "\n```"
+        header = "🧾 BTC AI FULL / MEXC / OpenAI logs\nSETTINGS=" + set_text + "\nACTIVE_POSITIONS=" + pos_text + "\n"
+        msg = header + "```\n" + text[-3000:] + "\n```"
         if len(msg) > 4050:
             msg = msg[:900] + "\n...TRUNCATED...\n```\n" + text[-2700:] + "\n```"
         await reply(update, msg, reply_markup=MAIN_MENU)
     except Exception as e:
-        await reply(update, f"/log error: {e}", reply_markup=MAIN_MENU)
+        await reply(update, f"/log_full error: {e}", reply_markup=MAIN_MENU)
 
 
 async def test_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1473,7 +1505,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Команды:
 /start - меню
 /help - помощь
-/log [lines] - полный BTC AI/MEXC/OpenAI лог, токены, prompt, ордера, позиции
+/log - краткий BTC AI лог
+/log_full [lines] - полный сырой BTC AI/MEXC/OpenAI JSON, токены, prompt, ордера, позиции
 /run - запустить торговлю
 /boost_start или кнопка 🚀 BOOST MODE - запустить BOOST autopilot: 10% депозита → x20 цель
 /boost_stop или кнопка 🛑 STOP BOOST - остановить BOOST и новые входы
@@ -6077,6 +6110,7 @@ def build_app():
     app.add_handler(CommandHandler("start", _wrap_command(start, "/start")))
     app.add_handler(CommandHandler("help", _wrap_command(help_cmd, "/help")))
     app.add_handler(CommandHandler("log", _wrap_command(log_cmd, "/log")))
+    app.add_handler(CommandHandler("log_full", _wrap_command(log_full_cmd, "/log_full")))
     app.add_handler(CommandHandler("test_btc", _wrap_command(test_btc_cmd, "/test_btc")))
     app.add_handler(CommandHandler("run", _wrap_command(run_cmd, "/run")))
     app.add_handler(CommandHandler("boost_start", _wrap_command(boost_start_cmd, "/boost_start")))

@@ -41,6 +41,10 @@ class BTCVisionAutopilot:
         self.execution_engine = execution_engine
         self.app_notify = app_notify
         self._running = False
+        self._last_be_rate_limit_log_ts = 0.0
+        self._last_be_warning_ts = 0.0
+        self._last_24h_rate_limit_log_ts = 0.0
+        self._last_24h_warning_ts = 0.0
 
     @staticmethod
     def next_msk_close_ts(now: float | None = None) -> float:
@@ -95,6 +99,10 @@ class BTCVisionAutopilot:
 
     def stop(self):
         self._running = False
+        self._last_be_rate_limit_log_ts = 0.0
+        self._last_be_warning_ts = 0.0
+        self._last_24h_rate_limit_log_ts = 0.0
+        self._last_24h_warning_ts = 0.0
 
     async def _btc_ai_positions(self) -> list[dict]:
         try:
@@ -115,6 +123,33 @@ class BTCVisionAutopilot:
             if str(p.get("status") or "").lower() == "open":
                 return p
         return None
+
+    async def _active_position_in_profit(self, pos: dict, market_data: dict | None = None) -> bool:
+        """Return True only when the current BTC AI position is breakeven or better.
+
+        Used for the 4H replacement rule: the bot may close an existing BTC AI
+        position and open a fresh signal only when the old position is not losing.
+        """
+        entry = float(pos.get("entry_price") or 0)
+        if entry <= 0:
+            return False
+        side = str(pos.get("side") or "").upper()
+        price = 0.0
+        try:
+            if market_data:
+                price = float(market_data.get("last_price") or 0)
+        except Exception:
+            price = 0.0
+        if price <= 0:
+            ticker = await self.exchange_client.fetch_ticker(pos.get("symbol") or self.symbol)
+            price = float(ticker.get("last") or 0)
+        if price <= 0:
+            return False
+        if side == "LONG":
+            return price >= entry
+        if side == "SHORT":
+            return price <= entry
+        return False
 
     async def pending_btc_entries(self) -> list[dict]:
         return [p for p in await self._btc_ai_positions() if str(p.get("status") or "").lower() == "pending"]
@@ -141,13 +176,16 @@ class BTCVisionAutopilot:
             return
         symbol = str(settings.get("btc_ai_symbol", self.symbol) or self.symbol)
 
-        active = await self.active_btc_position()
-        if active:
-            await self._notify(app, "⚠️ BTC AI 4H\n\nНовая 4H свеча закрылась.\nНо уже есть активная BTC позиция.\n\nНовый вход пропущен.\nТекущая сделка продолжает виртуальное сопровождение.")
-            return
-
-        # If the previous 4H limit was not filled, replace it with a fresh signal.
-        await self.cancel_pending_btc_entries(app, reason="btc_ai_4h_new_candle_replace")
+        # Do not decide what to do with an existing active BTC position until the fresh
+        # 4H AI signal is known. Final rule after AI decision:
+        # - active position in loss: keep it, skip new entry;
+        # - active position in profit and new signal >=75%: close old, open new;
+        # - active position in profit but weak/no signal: keep it;
+        # - pending limit without active position: cancel and replace with fresh signal.
+        active_before_ai = await self.active_btc_position()
+        if not active_before_ai:
+            # If the previous 4H limit was not filled, replace it with a fresh signal.
+            await self.cancel_pending_btc_entries(app, reason="btc_ai_4h_new_candle_replace")
 
         candles = await self.exchange_client.fetch_ohlcv(symbol, timeframe="4h", limit=160)
         if len(candles) < 80:
@@ -159,18 +197,15 @@ class BTCVisionAutopilot:
             log_event("btc_ai_market_data_error", ok=False, error=fatal, market_data=market_data)
             await self._notify(app, f"❌ BTC AI: ошибка данных {fatal}. Сделка не открывается.")
             return
-        chart_path = await asyncio.to_thread(self.render_chart, symbol, candles, market_data)
-        decision = await self.ask_ai(settings, chart_path, market_data)
-        plan_levels = self.prepare_levels(decision, market_data) if not decision.error else {}
-        annotated_path = await asyncio.to_thread(self.render_signal_chart, symbol, candles, market_data, decision, plan_levels) if plan_levels else chart_path
-        caption = self.format_decision(decision, market_data, plan_levels)
-        try:
-            with open(annotated_path, "rb") as img:
-                await app.bot.send_photo(chat_id=self._admin_id(), photo=img, caption=caption[:1024])
-        except Exception:
-            await self._notify(app, caption)
+
+        # IMPORTANT: AI always gets a clean chart with no entry/SL/TP markup.
+        ai_chart_path = await asyncio.to_thread(self.render_chart, symbol, candles, market_data)
+        decision = await self.ask_ai(settings, ai_chart_path, market_data)
+        log_event("btc_ai_chart_paths", ai_chart=ai_chart_path, mode="force_live_test" if force_live_test else "autopilot")
+
         if decision.error:
             if not force_live_test:
+                await self._notify(app, f"❌ BTC AI error: {decision.error}")
                 return
             # LIVE TEST OVERRIDE: even if OpenAI failed, verify MEXC order mechanics with a tiny controlled BTC market trade.
             last_price = float(market_data.get("last_price") or 0)
@@ -186,9 +221,14 @@ class BTCVisionAutopilot:
             )
             plan_levels = self.prepare_levels(decision, market_data, forced_entry=last_price)
             log_event("btc_ai_live_test_override", ok=True, reason="ai_error", decision=decision.__dict__, plan_levels=plan_levels)
+        else:
+            plan_levels = self.prepare_levels(decision, market_data) if decision.signal in {"LONG", "SHORT"} else {}
+
         prob = float(decision.probability or 0)
         if force_live_test:
             last_price = float(market_data.get("last_price") or 0)
+            original_signal = str(decision.signal or "WAIT").upper()
+            original_probability = prob
             if decision.signal not in {"LONG", "SHORT"}:
                 decision.signal = "LONG"
                 decision.reason = (decision.reason + " | " if decision.reason else "") + "LIVE TEST OVERRIDE: AI signal was not tradable, forced LONG market to test MEXC mechanics."
@@ -199,16 +239,62 @@ class BTCVisionAutopilot:
                 decision.stop_loss = last_price * (0.99 if decision.signal == "LONG" else 1.01)
             decision.grade = str(decision.grade or "TEST") + " LIVE_TEST"
             plan_levels = self.prepare_levels(decision, market_data, forced_entry=last_price)
-            log_event("btc_ai_live_test_force_trade", ok=True, original_probability=prob, forced_signal=decision.signal, decision=decision.__dict__, plan_levels=plan_levels)
+            log_event("btc_ai_live_test_force_trade", ok=True, original_signal=original_signal, original_probability=original_probability, forced_signal=decision.signal, decision=decision.__dict__, plan_levels=plan_levels)
+
+            # Telegram receives the annotated chart AFTER levels are calculated. AI did not see this chart.
+            telegram_chart_path = await asyncio.to_thread(self.render_signal_chart, symbol, candles, market_data, decision, plan_levels)
+            log_event("btc_ai_chart_paths", ai_chart=ai_chart_path, telegram_chart=telegram_chart_path, mode="live_test")
+            caption = self.format_live_test_preview(decision, market_data, plan_levels, original_signal, original_probability)
+            try:
+                with open(telegram_chart_path, "rb") as img:
+                    await app.bot.send_photo(chat_id=self._admin_id(), photo=img, caption=caption[:1024])
+            except Exception:
+                await self._notify(app, caption)
         elif decision.signal not in {"LONG", "SHORT"} or prob < float(settings.get("btc_ai_min_trade_probability", 75) or 75):
-            await self._notify(app, f"🟡 BTC AI: сделки нет. Signal={decision.signal}, probability={prob:.1f}%")
+            await self._notify(app, f"🟡 BTC AI: сделки нет. AI signal={decision.signal}, проходимость={prob:.1f}%")
             return
-        # Race-safety: if a pending order got filled while AI was thinking, do not stack another BTC trade.
+        else:
+            telegram_chart_path = await asyncio.to_thread(self.render_signal_chart, symbol, candles, market_data, decision, plan_levels)
+            log_event("btc_ai_chart_paths", ai_chart=ai_chart_path, telegram_chart=telegram_chart_path, mode="autopilot_trade")
+            caption = self.format_decision(decision, market_data, plan_levels)
+            try:
+                with open(telegram_chart_path, "rb") as img:
+                    await app.bot.send_photo(chat_id=self._admin_id(), photo=img, caption=caption[:1024])
+            except Exception:
+                await self._notify(app, caption)
+
+        # One BTC position max. If an active position exists, replace it only when it is
+        # already breakeven/profit and the fresh 4H AI signal is tradable (>=75%).
         active = await self.active_btc_position()
         if active:
-            await self._notify(app, "⚠️ BTC AI 4H\n\nНовый анализ получен.\nНо уже есть активная BTC позиция.\n\nНовый сигнал пропущен.\nТекущая сделка продолжает сопровождение.")
-            return
-        # Race-safety: if an old pending is still present, cancel it before placing the new limit/market.
+            can_replace = (not force_live_test) and decision.signal in {"LONG", "SHORT"} and prob >= float(settings.get("btc_ai_min_trade_probability", 75) or 75)
+            in_profit = False
+            try:
+                in_profit = await self._active_position_in_profit(active, market_data)
+            except Exception as e:
+                log_event("btc_ai_active_profit_check_error", ok=False, error=str(e)[:500], active=active)
+                in_profit = False
+            if can_replace and in_profit:
+                live = self._bool(settings, "live_trading", False)
+                try:
+                    await self.exchange_client.cancel_all_orders(active.get("symbol") or self.symbol)
+                except Exception as e:
+                    log_event("btc_ai_replace_cancel_orders_warning", ok=False, error=str(e)[:500])
+                try:
+                    close_res = await self.execution_engine.close_position(active, reason="btc_ai_replace_profitable_position_new_4h_signal", live=live, exit_price=float(market_data.get("last_price") or 0) or None)
+                    log_event("btc_ai_replace_profitable_position", ok=True, close=close_res, old_position=active, new_signal=decision.__dict__)
+                    await self._notify(app, "♻️ BTC AI 4H: активная BTC позиция была в плюсе. Закрыл старую сделку и открываю новый 4H сигнал.")
+                except Exception as e:
+                    log_event("btc_ai_replace_profitable_position_error", ok=False, error=str(e)[:1200], old_position=active)
+                    await self._notify(app, f"❌ BTC AI: новая сделка не открыта — не смог закрыть старую прибыльную позицию: {str(e)[:250]}")
+                    return
+            else:
+                if can_replace and not in_profit:
+                    await self._notify(app, "⚠️ BTC AI 4H\n\nНовый сигнал >=75%, но текущая BTC позиция не в плюсе. Новая сделка не открывается, текущая продолжает сопровождение.")
+                else:
+                    await self._notify(app, "⚠️ BTC AI 4H\n\nНовый анализ получен, но уже есть активная BTC позиция. Новый вход пропущен, текущая сделка продолжает сопровождение.")
+                return
+        # Race-safety: if an old pending is still present and there is no active position, cancel it before placing the new limit/market.
         await self.cancel_pending_btc_entries(app, reason="btc_ai_4h_new_signal_replace")
         await self.execute_decision(app, settings, symbol, decision, market_data, plan_levels, force_market=force_live_test)
 
@@ -475,7 +561,21 @@ class BTCVisionAutopilot:
                 await self.storage.upsert_position(pos)
                 await self._notify(app, f"🟢 BTC AI TP1 взят. Стоп перенесен в Б/У: {entry:.2f}. TP2 остается: {tp2:.2f}")
         except Exception as e:
-            await self._notify(app, f"⚠️ BTC AI BE monitor warning: {str(e)[:300]}")
+            msg = str(e)
+            low = msg.lower()
+            # MEXC 510/rate-limit during virtual monitoring is non-critical: do not spam Telegram.
+            # The next monitor tick will retry. Keep one throttled log entry for diagnostics.
+            if "510" in msg or "too frequent" in low or "rate" in low:
+                now = time.time()
+                if now - self._last_be_rate_limit_log_ts > 300:
+                    self._last_be_rate_limit_log_ts = now
+                    log_event("btc_ai_be_monitor_rate_limited", ok=False, error=msg[:600], action="silent_retry")
+                return
+            now = time.time()
+            if now - self._last_be_warning_ts > 300:
+                self._last_be_warning_ts = now
+                log_event("btc_ai_be_monitor_warning", ok=False, error=msg[:600])
+                await self._notify(app, f"⚠️ BTC AI BE monitor warning: {msg[:300]}")
 
     async def monitor_24h_time_exit(self, app):
         """BTC AI time-stop: after 24h, do not force-close a loser.
@@ -525,7 +625,19 @@ class BTCVisionAutopilot:
                     pass
                 await self._notify(app, f"⏰ BTC AI 24H: сделка открыта больше суток и вышла в Б/У/плюс. Закрыл по рынку. Entry {entry:.2f}, current {price:.2f}. Детали в /log")
         except Exception as e:
-            await self._notify(app, f"⚠️ BTC AI 24H monitor warning: {str(e)[:300]}")
+            msg = str(e)
+            low = msg.lower()
+            if "510" in msg or "too frequent" in low or "rate" in low:
+                now = time.time()
+                if now - self._last_24h_rate_limit_log_ts > 300:
+                    self._last_24h_rate_limit_log_ts = now
+                    log_event("btc_ai_24h_monitor_rate_limited", ok=False, error=msg[:600], action="silent_retry")
+                return
+            now = time.time()
+            if now - self._last_24h_warning_ts > 300:
+                self._last_24h_warning_ts = now
+                log_event("btc_ai_24h_monitor_warning", ok=False, error=msg[:800])
+                await self._notify(app, f"⚠️ BTC AI 24H monitor warning: {msg[:300]}")
 
     async def cancel_stale_pending(self):
         try:
@@ -828,6 +940,21 @@ JSON schema: {"signal":"LONG|SHORT|WAIT","probability":0,"grade":"C|B|A|A+","ent
         total = bid + ask
         return {"bid_usdt_top20": bid, "ask_usdt_top20": ask, "imbalance": (bid - ask) / total if total > 0 else 0}
 
+    def format_live_test_preview(self, d, md, lv=None, original_signal="WAIT", original_probability=0.0):
+        lv = lv or {}
+        entry_mid = float(lv.get("entry_mid") or 0)
+        stop = float(lv.get("stop_loss") or 0)
+        tp1 = float(lv.get("take_profit_1") or 0)
+        tp2 = float(lv.get("take_profit_2") or 0)
+        return (f"🧪 BTC AI LIVE TEST\n"
+                f"ИИ ответил: {original_signal} ({float(original_probability or 0):.1f}%)\n"
+                f"Тест принудительно откроет MARKET {d.signal}\n"
+                f"Вход: ~{entry_mid:.2f}\n"
+                f"SL: {stop:.2f}\n"
+                f"TP1: {tp1:.2f} (50%)\n"
+                f"TP2: {tp2:.2f} (остаток)\n"
+                f"График для ИИ: чистый. Этот график: с уровнями.")
+
     def format_decision(self,d,md,lv=None):
         if d.error: return f"❌ BTC AI error: {d.error}"
         lv = lv or {}
@@ -835,18 +962,15 @@ JSON schema: {"signal":"LONG|SHORT|WAIT","probability":0,"grade":"C|B|A|A+","ent
         stop = float(lv.get("stop_loss") or 0)
         tp1 = float(lv.get("take_profit_1") or 0)
         tp2 = float(lv.get("take_profit_2") or 0)
-        trade_status = "Сделка открыта" if d.signal in {"LONG","SHORT"} and float(d.probability or 0) >= 75 else "Сделка не открыта"
-        return (f"{trade_status}: {d.signal}\n"
+        return (f"✅ BTC AI 4H сигнал: {d.signal}\n"
+                f"Проходимость ИИ: {float(d.probability or 0):.1f}%\n"
                 f"Вход: {entry_mid:.2f}\n"
                 f"Enter zone: {float(lv.get('entry_low') or d.entry_zone_low):.2f}-{float(lv.get('entry_high') or d.entry_zone_high):.2f}\n"
-                f"Средняя цена лимитки: {entry_mid:.2f}\n"
-                f"Стоп: {stop:.2f} ({float(lv.get('stop_pct') or 0):.2f}%)\n"
-                f"Тейк1: {tp1:.2f} (+/-2%, закрыть 50%)\n"
-                f"Тейк2: {tp2:.2f} (+/-4%, закрыть остаток)\n"
-                f"Проходимость сделки по 4 часам: {d.probability:.1f}%\n"
-                f"Свеча 4h, по закрытию: {md.get('closed_candle_msk')}\n"
-                f"Дополнительно: виртуальное сопровождение включено\n"
-                f"Spot buy ratio: {((md.get('binance_spot_pressure') or {}).get('buy_ratio') or 0):.2f}")
+                f"SL: {stop:.2f} ({float(lv.get('stop_pct') or 0):.2f}%)\n"
+                f"TP1: {tp1:.2f} (+/-2%, закрыть 50%)\n"
+                f"TP2: {tp2:.2f} (+/-4%, закрыть остаток)\n"
+                f"Свеча 4H закрыта: {md.get('closed_candle_msk')}\n"
+                f"Виртуальное сопровождение: ВКЛ")
 
     async def _hard_disable_other_modes(self, settings):
         keys={"strategy_mode":"hybrid","max_open_positions":1,"live_trading":True,"openai_analysis_enabled":True,"boost_autopilot_active":False,"boost_parallel_scan_enabled":False,"ai_scalping_quality_filters_enabled":False,"liquidity_runner_enabled":False,"quick_bounce_enabled":False,"impulse_dump_enabled":False,"orderflow_impulse_enabled":False,"cascade_hunter_enabled":False,"strongest_coin_enabled":False,"auto_strategy_adaptation":False,"regime_adaptation":False,"spot_confirmation_enabled":False,"session_filter_enabled":False,"america_short_bias_enabled":False,"mirror_mode":"off","trade_margin_pct":0.10,"margin_allocation_enabled":True,"mexc_order_leverage":10,"limit_timeout_sec":14400,"scan_market_source":"mexc_binance"}
