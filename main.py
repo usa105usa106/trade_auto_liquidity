@@ -3449,7 +3449,7 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # v026 hard panic close: use native MEXC open_positions + holdVol close.
         if hasattr(ex, "mexc_hard_close_all_positions"):
             hard_res = await _await_with_timeout(
-                ex.mexc_hard_close_all_positions(["BTC_USDT"], retries=4),
+                ex.mexc_hard_close_all_positions(None, retries=5),
                 90,
                 "mexc_hard_close_all_positions",
             )

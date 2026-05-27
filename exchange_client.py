@@ -1593,18 +1593,22 @@ class ExchangeClient:
         return await self._mexc_private("POST", "/api/v1/private/position/close_all", body={})
 
     async def mexc_hard_close_all_positions(self, symbols: list[str] | None = None, retries: int = 3) -> dict:
-        """Panic-close real MEXC futures positions and cancel TP/SL planorders.
+        """HARD panic-close MEXC futures positions and all child orders.
 
-        This is intentionally native and contract-volume based.  It does not
-        rely on the local SQLite cache.  For each raw open_positions row it sends
-        MEXC order/create type=5 with side=4 for LONG close and side=2 for SHORT
-        close using holdVol.  Then it cancels all normal/plan/stop orders again
-        and verifies open_positions is empty.
+        This method is intentionally exchange-native and verification-driven:
+        1) cancel normal/plan/stop orders,
+        2) read real open_positions from MEXC,
+        3) submit market CLOSE orders using exact holdVol contracts,
+        4) if MEXC temporarily hides positions while account margin remains,
+           run a BTC safety sweep using estimated contract volume,
+        5) cancel orders again and verify open_positions + account margin.
+
+        It does not trust local bot cache. It is used by /close all only.
         """
         if self.exchange_id != "mexc":
             raise NotImplementedError("hard close is MEXC only")
-        import asyncio
-        wanted = symbols or ["BTC_USDT"]
+        import asyncio, math
+        wanted = list(symbols) if symbols else []  # empty means ALL discovered positions
         results: list[dict] = []
         errors: list[str] = []
         snapshots: list[dict] = []
@@ -1617,31 +1621,86 @@ class ExchangeClient:
                 errors.append(f"fetch_positions: {e}")
                 return []
 
-        # Always try broad cancel first and per-symbol cancel for BTC.
-        for sym in [None] + list(wanted):
+        async def _position_margin_usdt() -> float:
+            try:
+                bal = await self.fetch_balance()
+                usdt = (bal or {}).get("USDT", {}) if isinstance(bal, dict) else {}
+                return float(usdt.get("positionMargin") or usdt.get("position_margin") or 0)
+            except Exception as e:
+                errors.append(f"balance_position_margin: {e}")
+                return 0.0
+
+        async def _panic_close_synthetic_btc(reason: str) -> None:
+            """Last-resort BTC sweep when balance shows margin but open_positions is empty.
+
+            MEXC close-side order codes (4 close long, 2 close short) should fail
+            harmlessly if that side has no position; they must not open a new one.
+            Volume is estimated from positionMargin * leverage / price / contractSize.
+            """
+            try:
+                pm = await _position_margin_usdt()
+                if pm <= 0.0001:
+                    return
+                ticker = await self.fetch_ticker("BTC_USDT")
+                price = float(ticker.get("last") or ticker.get("close") or 0)
+                lev = int(os.getenv("MEXC_ORDER_LEVERAGE", "10") or "10")
+                contract_size = float(os.getenv("MEXC_BTC_CONTRACT_SIZE", "0.0001") or "0.0001")
+                est = int(max(1, round((pm * lev) / max(price * contract_size, 1e-12)))) if price > 0 else 0
+                max_sweep = int(os.getenv("MEXC_PANIC_MAX_SWEEP_VOL", "1000") or "1000")
+                vol = min(est, max_sweep)
+                if vol <= 0:
+                    return
+                for close_side in (4, 2):  # 4 close long, 2 close short
+                    body = {"symbol": "BTC_USDT", "price": 0, "vol": vol, "side": close_side, "type": 5, "openType": 1, "leverage": lev}
+                    try:
+                        out = await self._mexc_private("POST", "/api/v1/private/order/create", body=body)
+                        results.append({"stage": "synthetic_btc_sweep", "reason": reason, "side": close_side, "vol": vol, "position_margin": pm, "price": price, "result": out})
+                    except Exception as e:
+                        results.append({"stage": "synthetic_btc_sweep_failed", "reason": reason, "side": close_side, "vol": vol, "error": str(e)[:220]})
+            except Exception as e:
+                errors.append(f"synthetic_btc_sweep: {e}")
+
+        # Build cancel sweep list: all discovered symbols + requested symbols + BTC fallback.
+        cancel_syms: list[str | None] = [None]
+        cancel_syms.extend(wanted)
+        try:
+            cancel_syms.extend([p.get("mexc_symbol") or p.get("symbol") for p in await _positions_for(None)])
+        except Exception:
+            pass
+        cancel_syms.append("BTC_USDT")
+        seen_cancel = []
+        for sym in cancel_syms:
+            key = sym or "*"
+            if key in seen_cancel:
+                continue
+            seen_cancel.append(key)
             try:
                 res = await self._mexc_cancel_all_orders(sym)
-                results.append({"stage": "cancel_before", "symbol": sym or "*", "result": res})
+                results.append({"stage": "cancel_before", "symbol": key, "result": res})
             except Exception as e:
-                errors.append(f"cancel_before {sym or '*'}: {e}")
+                errors.append(f"cancel_before {key}: {e}")
 
         for attempt in range(1, max(1, int(retries)) + 1):
-            positions = await _positions_for(wanted if wanted else None)
-            # If symbol-filtered fetch missed hidden positions, try broad fetch.
+            positions = await _positions_for(wanted or None)
             if not positions:
                 positions = await _positions_for(None)
-            snapshots.append({"attempt": attempt, "positions": positions})
+            snapshots.append({"attempt": attempt, "positions": positions, "position_margin": await _position_margin_usdt()})
             if not positions:
+                # If balance still shows margin, MEXC did not expose open_positions; do a BTC safety sweep.
+                if (await _position_margin_usdt()) > 0.0001:
+                    await _panic_close_synthetic_btc(f"no_open_positions_attempt_{attempt}")
+                    await asyncio.sleep(0.8 * attempt)
+                    continue
                 break
             for pos in positions:
                 try:
                     close_res = await self.mexc_close_position_market_native(pos)
-                    results.append({"stage": "close", "attempt": attempt, "position": {"symbol": pos.get("mexc_symbol") or pos.get("symbol"), "side": pos.get("side"), "contracts": pos.get("contracts"), "info": {"holdVol": (pos.get("info") or {}).get("holdVol"), "positionType": (pos.get("info") or {}).get("positionType")}}, "result": close_res})
+                    results.append({"stage": "close_position", "attempt": attempt, "position": {"symbol": pos.get("mexc_symbol") or pos.get("symbol"), "side": pos.get("side"), "contracts": pos.get("contracts"), "info": {"holdVol": (pos.get("info") or {}).get("holdVol"), "positionType": (pos.get("info") or {}).get("positionType")}}, "result": close_res})
                 except Exception as e:
                     errors.append(f"close {pos.get('mexc_symbol') or pos.get('symbol')}: {e}")
             await asyncio.sleep(0.8 * attempt)
 
-        # Native close_all as final fallback.
+        # Native close_all as additional fallback.
         try:
             native = await self.mexc_close_all_positions_native()
             results.append({"stage": "native_close_all_fallback", "result": native})
@@ -1651,19 +1710,21 @@ class ExchangeClient:
                 errors.append(f"native_close_all_fallback: {e}")
 
         # Cancel TP/SL and limits after closing.
-        for sym in [None] + list(wanted):
+        for key in seen_cancel:
+            sym = None if key == "*" else key
             try:
                 res = await self._mexc_cancel_all_orders(sym)
-                results.append({"stage": "cancel_after", "symbol": sym or "*", "result": res})
+                results.append({"stage": "cancel_after", "symbol": key, "result": res})
             except Exception as e:
-                errors.append(f"cancel_after {sym or '*'}: {e}")
+                errors.append(f"cancel_after {key}: {e}")
 
-        await asyncio.sleep(1.0)
-        remaining = await _positions_for(wanted if wanted else None)
+        await asyncio.sleep(1.2)
+        remaining = await _positions_for(wanted or None)
         if not remaining:
             remaining = await _positions_for(None)
-        ok = len(remaining) == 0
-        return {"ok": ok, "results": results, "errors": errors, "remaining_positions": remaining, "snapshots": snapshots[-2:]}
+        pm_after = await _position_margin_usdt()
+        ok = len(remaining) == 0 and pm_after < 0.0001
+        return {"ok": ok, "results": results, "errors": errors, "remaining_positions": remaining, "position_margin_after": pm_after, "snapshots": snapshots[-3:]}
 
     def _mexc_plan_trigger_type(self, close_side: str, kind: str) -> int:
         """Return MEXC plan triggerType for a close TP/SL order.
