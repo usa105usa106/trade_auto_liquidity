@@ -638,14 +638,24 @@ JSON schema: {"signal":"LONG|SHORT|WAIT","probability":0,"grade":"C|B|A|A+","ent
             chart_size_kb=round(chart_size_bytes/1024, 2),
             openai_image_detail="high",
         )
-        payload={"model":model,"temperature":0.1,"response_format":{"type":"json_object"},"messages":[{"role":"user","content":[{"type":"text","text":prompt_with_data},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+img64,"detail":"high"}}]}],"max_tokens":700}
+        payload={"model":model,"response_format":{"type":"json_object"},"messages":[{"role":"user","content":[{"type":"text","text":prompt_with_data},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+img64,"detail":"high"}}]}],"max_completion_tokens":700}
         timeout=aiohttp.ClientTimeout(total=60)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(OPENAI_CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},json=payload) as r:
                 txt=await r.text()
                 if r.status>=300:
-                    log_event("btc_ai_openai_error", ok=False, status=r.status, response=txt[:1000])
-                    return BTCAutopilotDecision(error=f"OpenAI {r.status}: {txt[:300]}")
+                    # Compatibility fallback for older Chat models that still expect max_tokens.
+                    if "max_completion_tokens" in txt and "unsupported" in txt.lower():
+                        payload.pop("max_completion_tokens", None)
+                        payload["max_tokens"] = 700
+                        async with session.post(OPENAI_CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},json=payload) as r2:
+                            txt=await r2.text()
+                            if r2.status>=300:
+                                log_event("btc_ai_openai_error", ok=False, status=r2.status, response=txt[:1000], fallback="max_tokens")
+                                return BTCAutopilotDecision(error=f"OpenAI {r2.status}: {txt[:300]}")
+                    else:
+                        log_event("btc_ai_openai_error", ok=False, status=r.status, response=txt[:1000])
+                        return BTCAutopilotDecision(error=f"OpenAI {r.status}: {txt[:300]}")
         try:
             response_json=json.loads(txt)
             usage=response_json.get("usage") or {}
