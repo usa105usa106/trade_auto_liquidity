@@ -241,13 +241,31 @@ class BTCVisionAutopilot:
             log_event("btc_ai_order_request", symbol=symbol, side=d.signal, order_type="market", force_live_test=force_market, qty=qty_total, entry=price, stop=stop, tp1=tp1, tp2=tp2, probability=d.probability, margin=margin, leverage=leverage, venue="MEXC")
             res_m = await self.execution_engine.place_entry(plan_m, live=live)
             log_event("btc_ai_order_response", symbol=symbol, side=d.signal, order_type="market", response=res_m, ok=bool(isinstance(res_m, dict) and res_m.get("ok", True)))
-            await self._notify(app, f"✅ Сделка открыта: BTC AI {'LIVE TEST' if force_market else 'A+'} MARKET 100%\nВход ~ {price:.2f}\nTP1 {tp1:.2f} | TP2 {tp2:.2f} | SL {stop:.2f}\nПроходимость {d.probability:.1f}%\nВиртуальное сопровождение включено\nresult={res_m}")
+            
+            status_ok = bool(isinstance(res_m, dict) and res_m.get("ok", True))
+            protection = "EXCHANGE PROTECTED" if status_ok else "ПРОВЕРЬ /log"
+            await self._notify(app, f"✅ BTC AI {'LIVE TEST' if force_market else 'A+'} MARKET 100%\n"
+                                    f"Вход: ~{price:.2f}\n"
+                                    f"SL: {stop:.2f}\n"
+                                    f"TP1: {tp1:.2f} (50%)\n"
+                                    f"TP2: {tp2:.2f} (остаток)\n"
+                                    f"Проходимость: {d.probability:.1f}%\n"
+                                    f"Защита: {protection}\n"
+                                    f"Виртуальное сопровождение: ВКЛ")
             return
         plan = TradePlan(symbol=symbol, side=d.signal, order_type="limit", qty=qty_total, entry_price=entry_mid, stop_price=stop, take_price=tp2, partial_take_price=tp1, partial_take_fraction=0.50, final_take_price=tp2, risk_pct=0.0, confidence=d.probability/100, strategy="btc_ai_4h", max_open_positions=maxpos, planned_notional_usdt=notional, expected_margin_usdt=margin, leverage=leverage, signal_details=common)
         log_event("btc_ai_order_request", symbol=symbol, side=d.signal, order_type="limit", qty=qty_total, entry=entry_mid, entry_zone=[entry_low, entry_high], stop=stop, tp1=tp1, tp2=tp2, probability=d.probability, margin=margin, leverage=leverage, venue="MEXC")
         res = await self.execution_engine.place_entry(plan, live=live)
         log_event("btc_ai_order_response", symbol=symbol, side=d.signal, order_type="limit", response=res, ok=bool(isinstance(res, dict) and res.get("ok", True)))
-        await self._notify(app, f"✅ BTC AI LIMIT выставлен\nВход {entry_mid:.2f}\nTP1 {tp1:.2f} | TP2 {tp2:.2f} | SL {stop:.2f}\nПроходимость {d.probability:.1f}%\nЛимитка живет 4 часа\nВиртуальное сопровождение включено\nresult={res}")
+        
+        await self._notify(app, f"✅ BTC AI LIMIT выставлен\n"
+                                f"Вход: {entry_mid:.2f}\n"
+                                f"SL: {stop:.2f}\n"
+                                f"TP1: {tp1:.2f} (50%)\n"
+                                f"TP2: {tp2:.2f} (остаток)\n"
+                                f"Проходимость: {d.probability:.1f}%\n"
+                                f"Лимитка живет: 4 часа\n"
+                                f"Виртуальное сопровождение: ВКЛ")
 
     def prepare_levels(self, d: BTCAutopilotDecision, market_data: dict, forced_entry: float | None = None) -> dict:
         if d.signal not in {"LONG", "SHORT"}:
@@ -284,44 +302,133 @@ class BTCVisionAutopilot:
         except Exception:
             return {}
 
-    def render_signal_chart(self, symbol: str, candles: list, market_data: dict, d: BTCAutopilotDecision, lv: dict) -> str:
-        path = self.render_chart(symbol, candles, market_data)
-        if not lv:
-            return path
-        # Re-render with annotated entry/stop/take zones for the user-visible Telegram card.
+    def _prepare_chart_df(self, candles: list, tail: int = 90) -> pd.DataFrame:
+        df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["dt"] = pd.to_datetime(df.ts, unit="ms")
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = df[c].astype(float)
+        df = df.tail(tail).reset_index(drop=True)
+        df["MA7"] = df.close.rolling(7).mean()
+        df["MA25"] = df.close.rolling(25).mean()
+        df["MA99"] = df.close.rolling(99).mean()
+        ema12 = df.close.ewm(span=12, adjust=False).mean()
+        ema26 = df.close.ewm(span=26, adjust=False).mean()
+        df["MACD"] = ema12 - ema26
+        df["Signal"] = df.MACD.ewm(span=9, adjust=False).mean()
+        df["Hist"] = df.MACD - df.Signal
+        return df
+
+    def _draw_clean_btc_chart(self, df: pd.DataFrame, market_data: dict, levels: dict | None = None, decision: BTCAutopilotDecision | None = None, filename_prefix: str = "btc_ai_clean") -> str:
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
-        df = pd.DataFrame(candles, columns=["ts","open","high","low","close","volume"])
-        df["dt"] = pd.to_datetime(df.ts, unit="ms")
-        for c in ["open","high","low","close","volume"]: df[c] = df[c].astype(float)
-        df = df.tail(120).reset_index(drop=True)
-        df["MA7"] = df.close.rolling(7).mean(); df["MA25"] = df.close.rolling(25).mean(); df["MA99"] = df.close.rolling(99).mean()
-        ema12 = df.close.ewm(span=12, adjust=False).mean(); ema26 = df.close.ewm(span=26, adjust=False).mean()
-        df["MACD"] = ema12-ema26; df["Signal"] = df.MACD.ewm(span=9, adjust=False).mean(); df["Hist"] = df.MACD-df.Signal
-        fig = plt.figure(figsize=(12.8,7.2), dpi=100); gs=fig.add_gridspec(3,1,height_ratios=[4.5,1,1.3],hspace=.05)
-        ax=fig.add_subplot(gs[0]); av=fig.add_subplot(gs[1],sharex=ax); am=fig.add_subplot(gs[2],sharex=ax)
-        bg="#0f1722"; grid="#263241"; txt="#d5dde8"; fig.patch.set_facecolor(bg)
-        for a in (ax,av,am):
-            a.set_facecolor(bg); a.grid(True,color=grid,alpha=.55); a.tick_params(colors=txt,labelsize=8); a.yaxis.tick_right()
-            for sp in a.spines.values(): sp.set_color(grid)
-        x=np.arange(len(df)); w=.58
-        for i,r in enumerate(df.itertuples()):
-            col="#21c087" if r.close>=r.open else "#f6465d"; ax.vlines(i,r.low,r.high,color=col,linewidth=1); ax.add_patch(Rectangle((i-w/2,min(r.open,r.close)),w,max(abs(r.close-r.open),.5),facecolor=col,edgecolor=col,linewidth=.7))
-        ax.plot(x,df.MA7,label=f"MA7 {df.MA7.iloc[-1]:.1f}"); ax.plot(x,df.MA25,label=f"MA25 {df.MA25.iloc[-1]:.1f}"); ax.plot(x,df.MA99,label=f"MA99 {df.MA99.iloc[-1]:.1f}")
-        entry=float(lv["entry_mid"]); sl=float(lv["stop_loss"]); tp1=float(lv["take_profit_1"]); tp2=float(lv["take_profit_2"]); e_low=float(lv["entry_low"]); e_high=float(lv["entry_high"])
-        right=len(df)+8; left=max(0,len(df)-35)
-        ax.axhspan(min(entry, sl), max(entry, sl), xmin=left/(len(df)+10), xmax=1.0, color="#f6465d", alpha=0.18)
-        ax.axhspan(min(entry, tp2), max(entry, tp2), xmin=left/(len(df)+10), xmax=1.0, color="#21c087", alpha=0.14)
-        ax.axhspan(min(e_low, e_high), max(e_low, e_high), xmin=left/(len(df)+10), xmax=1.0, color="#f59e0b", alpha=0.20)
-        for val,label,col in [(entry,"ENTRY mid", "#f59e0b"),(sl,"STOP", "#f6465d"),(tp1,"TP1 2% / 50%", "#21c087"),(tp2,"TP2 4% / rest", "#21c087")]:
-            ax.axhline(val, ls="--", color=col, linewidth=1.2, alpha=.95); ax.text(len(df)-1, val, f" {label} {val:.2f}", color=txt, va="center", fontsize=8)
-        ax.set_title(f"BTC_USDT MEXC Futures · 4H · {d.signal} {d.probability:.1f}% · close {market_data.get('closed_candle_msk')}",color=txt,loc="left",fontsize=12,fontweight="bold"); ax.legend(loc="upper left",frameon=False,labelcolor=txt,fontsize=8)
-        cols=["#21c087" if c>=o else "#f6465d" for o,c in zip(df.open,df.close)]; av.bar(x,df.volume,color=cols,alpha=.65,width=w); av.text(0,df.volume.max()*.8,f"MEXC volume ratio {market_data.get('mexc_volume_ratio_30',0):.2f}x",color=txt,fontsize=8)
-        hcols=["#21c087" if h>=0 else "#f6465d" for h in df.Hist]; am.bar(x,df.Hist,color=hcols,alpha=.75,width=w); am.plot(x,df.MACD,label="MACD"); am.plot(x,df.Signal,label="Signal"); am.axhline(0,color=txt,alpha=.5); am.legend(loc="upper left",frameon=False,labelcolor=txt,fontsize=8)
-        step=14; am.set_xticks(x[::step]); am.set_xticklabels([df.dt.iloc[i].strftime("%m-%d %H:%M") for i in range(0,len(df),step)],color=txt)
-        plt.setp(ax.get_xticklabels(),visible=False); plt.setp(av.get_xticklabels(),visible=False)
-        ax.set_xlim(-1, len(df)+10)
-        out=Path("/tmp")/f"btc_ai_signal_{int(time.time())}.png"; fig.savefig(out,facecolor=fig.get_facecolor(),bbox_inches="tight",pad_inches=.08); plt.close(fig); return str(out)
+
+        bg = "#0f1722"
+        grid = "#263241"
+        txt = "#d5dde8"
+        green = "#21c087"
+        red = "#f6465d"
+        orange = "#f59e0b"
+        blue = "#3b82f6"
+        purple = "#a855f7"
+
+        fig = plt.figure(figsize=(12.8, 7.2), dpi=100)
+        gs = fig.add_gridspec(3, 1, height_ratios=[5.2, 1.2, 1.5], hspace=0.06)
+        ax = fig.add_subplot(gs[0])
+        av = fig.add_subplot(gs[1], sharex=ax)
+        am = fig.add_subplot(gs[2], sharex=ax)
+        fig.patch.set_facecolor(bg)
+        for a in (ax, av, am):
+            a.set_facecolor(bg)
+            a.grid(True, color=grid, alpha=0.42, linewidth=0.8)
+            a.tick_params(colors=txt, labelsize=9)
+            a.yaxis.tick_right()
+            for sp in a.spines.values():
+                sp.set_color(grid)
+
+        x = np.arange(len(df))
+        w = 0.58
+        for i, r in enumerate(df.itertuples()):
+            col = green if r.close >= r.open else red
+            ax.vlines(i, r.low, r.high, color=col, linewidth=1.05, alpha=0.95)
+            body_low = min(r.open, r.close)
+            body_h = max(abs(r.close - r.open), max(df.close.iloc[-1] * 0.00005, 1.0))
+            ax.add_patch(Rectangle((i - w / 2, body_low), w, body_h, facecolor=col, edgecolor=col, linewidth=0.6))
+
+        ax.plot(x, df.MA7, color=blue, linewidth=1.25, label=f"MA7 {df.MA7.iloc[-1]:.1f}")
+        ax.plot(x, df.MA25, color=orange, linewidth=1.25, label=f"MA25 {df.MA25.iloc[-1]:.1f}")
+        if not np.isnan(df.MA99.iloc[-1]):
+            ax.plot(x, df.MA99, color=purple, linewidth=1.35, label=f"MA99 {df.MA99.iloc[-1]:.1f}")
+
+        last = float(market_data.get("last_price") or df.close.iloc[-1])
+        all_price_levels = [float(df.low.min()), float(df.high.max()), last]
+        if levels:
+            all_price_levels += [float(levels.get(k) or 0) for k in ["entry_mid", "stop_loss", "take_profit_1", "take_profit_2"]]
+        all_price_levels = [v for v in all_price_levels if v > 0]
+        ymin, ymax = min(all_price_levels), max(all_price_levels)
+        pad = max((ymax - ymin) * 0.12, last * 0.003)
+        ax.set_ylim(ymin - pad, ymax + pad)
+        ax.set_xlim(-1, len(df) + 12)
+
+        # Current price line
+        ax.axhline(last, color=txt, linestyle=":", linewidth=1.1, alpha=0.75)
+        ax.text(len(df) + 0.4, last, f"LAST {last:.1f}", color=txt, va="center", fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="#111827", edgecolor=txt, alpha=0.75))
+
+        if levels:
+            entry = float(levels.get("entry_mid") or 0)
+            sl = float(levels.get("stop_loss") or 0)
+            tp1 = float(levels.get("take_profit_1") or 0)
+            tp2 = float(levels.get("take_profit_2") or 0)
+            e_low = float(levels.get("entry_low") or entry)
+            e_high = float(levels.get("entry_high") or entry)
+            span_left = 0.58
+            if entry > 0 and sl > 0:
+                ax.axhspan(min(entry, sl), max(entry, sl), xmin=span_left, xmax=1.0, color=red, alpha=0.12)
+            if entry > 0 and tp2 > 0:
+                ax.axhspan(min(entry, tp2), max(entry, tp2), xmin=span_left, xmax=1.0, color=green, alpha=0.10)
+            if e_low > 0 and e_high > 0:
+                ax.axhspan(min(e_low, e_high), max(e_low, e_high), xmin=span_left, xmax=1.0, color=orange, alpha=0.18)
+            level_rows = [(entry, "ENTRY", orange), (sl, "SL", red), (tp1, "TP1 +2%", green), (tp2, "TP2 +4%", green)]
+            for val, label, col in level_rows:
+                if val <= 0:
+                    continue
+                ax.axhline(val, color=col, linestyle="--", linewidth=1.15, alpha=0.95)
+                ax.text(len(df) + 0.4, val, f"{label} {val:.1f}", color=col, va="center", fontsize=9,
+                        bbox=dict(boxstyle="round,pad=0.22", facecolor="#111827", edgecolor=col, alpha=0.78))
+
+        title_sig = ""
+        if decision:
+            title_sig = f" · {decision.signal} {decision.probability:.1f}%"
+        ax.set_title(f"BTC_USDT · MEXC Futures · 4H{title_sig} · Last {last:.1f}",
+                     color=txt, loc="left", fontsize=13, fontweight="bold")
+        ax.legend(loc="upper left", frameon=False, labelcolor=txt, fontsize=8)
+
+        cols = [green if c >= o else red for o, c in zip(df.open, df.close)]
+        av.bar(x, df.volume, color=cols, alpha=0.62, width=w)
+        av.text(0, max(df.volume.max() * 0.78, 1), f"MEXC Volume ratio {float(market_data.get('mexc_volume_ratio_30') or 0):.2f}x", color=txt, fontsize=8)
+
+        hcols = [green if h >= 0 else red for h in df.Hist]
+        am.bar(x, df.Hist, color=hcols, alpha=0.72, width=w)
+        am.plot(x, df.MACD, color=blue, linewidth=1.15, label="MACD")
+        am.plot(x, df.Signal, color=orange, linewidth=1.15, label="Signal")
+        am.axhline(0, color=txt, alpha=0.45, linewidth=0.8)
+        am.legend(loc="upper left", frameon=False, labelcolor=txt, fontsize=8)
+
+        step = max(10, len(df) // 6)
+        ticks = list(range(0, len(df), step))
+        am.set_xticks(ticks)
+        am.set_xticklabels([df.dt.iloc[i].strftime("%m-%d %H:%M") for i in ticks], color=txt)
+        plt.setp(ax.get_xticklabels(), visible=False)
+        plt.setp(av.get_xticklabels(), visible=False)
+
+        out = Path("/tmp") / f"{filename_prefix}_{int(time.time())}.jpg"
+        fig.savefig(out, facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.08, dpi=100)
+        plt.close(fig)
+        return str(out)
+
+    def render_signal_chart(self, symbol: str, candles: list, market_data: dict, d: BTCAutopilotDecision, lv: dict) -> str:
+        df = self._prepare_chart_df(candles, tail=90)
+        return self._draw_clean_btc_chart(df, market_data, levels=lv, decision=d, filename_prefix="btc_ai_signal_clean")
 
     async def monitor_tp1_breakeven(self, app):
         """After TP1 is no longer active and price has touched TP1, move SL to breakeven for the remaining BTC position."""
@@ -416,7 +523,7 @@ class BTCVisionAutopilot:
                     await self.storage.upsert_position(pos)
                 except Exception:
                     pass
-                await self._notify(app, f"⏰ BTC AI 24H: сделка открыта больше суток и вышла в Б/У/плюс. Закрываю по рынку. Entry {entry:.2f}, current {price:.2f}, result={res}")
+                await self._notify(app, f"⏰ BTC AI 24H: сделка открыта больше суток и вышла в Б/У/плюс. Закрыл по рынку. Entry {entry:.2f}, current {price:.2f}. Детали в /log")
         except Exception as e:
             await self._notify(app, f"⚠️ BTC AI 24H monitor warning: {str(e)[:300]}")
 
@@ -566,33 +673,8 @@ class BTCVisionAutopilot:
         return False
 
     def render_chart(self, symbol: str, candles: list, market_data: dict) -> str:
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
-        df = pd.DataFrame(candles, columns=["ts","open","high","low","close","volume"])
-        df["dt"] = pd.to_datetime(df.ts, unit="ms")
-        for c in ["open","high","low","close","volume"]: df[c] = df[c].astype(float)
-        df = df.tail(120).reset_index(drop=True)
-        df["MA7"] = df.close.rolling(7).mean(); df["MA25"] = df.close.rolling(25).mean(); df["MA99"] = df.close.rolling(99).mean()
-        ema12 = df.close.ewm(span=12, adjust=False).mean(); ema26 = df.close.ewm(span=26, adjust=False).mean()
-        df["MACD"] = ema12-ema26; df["Signal"] = df.MACD.ewm(span=9, adjust=False).mean(); df["Hist"] = df.MACD-df.Signal
-        fig = plt.figure(figsize=(12.8,7.2), dpi=100); gs=fig.add_gridspec(3,1,height_ratios=[4.5,1,1.3],hspace=.05)
-        ax=fig.add_subplot(gs[0]); av=fig.add_subplot(gs[1],sharex=ax); am=fig.add_subplot(gs[2],sharex=ax)
-        bg="#0f1722"; grid="#263241"; txt="#d5dde8"; fig.patch.set_facecolor(bg)
-        for a in (ax,av,am):
-            a.set_facecolor(bg); a.grid(True,color=grid,alpha=.55); a.tick_params(colors=txt,labelsize=8); a.yaxis.tick_right()
-            for sp in a.spines.values(): sp.set_color(grid)
-        x=np.arange(len(df)); w=.58
-        for i,r in enumerate(df.itertuples()):
-            col="#21c087" if r.close>=r.open else "#f6465d"; ax.vlines(i,r.low,r.high,color=col,linewidth=1); ax.add_patch(Rectangle((i-w/2,min(r.open,r.close)),w,max(abs(r.close-r.open),.5),facecolor=col,edgecolor=col,linewidth=.7))
-        ax.plot(x,df.MA7,label=f"MA7 {df.MA7.iloc[-1]:.1f}"); ax.plot(x,df.MA25,label=f"MA25 {df.MA25.iloc[-1]:.1f}"); ax.plot(x,df.MA99,label=f"MA99 {df.MA99.iloc[-1]:.1f}")
-        sup=float(df.low.tail(45).min()); res=float(df.high.tail(45).max()); ax.axhline(sup,ls="--",alpha=.8); ax.axhline(res,ls="--",alpha=.8)
-        ax.text(len(df)-1,sup,f" Support {sup:.0f}",color=txt,va="center"); ax.text(len(df)-1,res,f" Resistance {res:.0f}",color=txt,va="center")
-        ax.set_title(f"BTC_USDT MEXC Futures · 4H · Close {df.close.iloc[-1]:.1f} · Funding {market_data.get('funding')}",color=txt,loc="left",fontsize=13,fontweight="bold"); ax.legend(loc="upper left",frameon=False,labelcolor=txt,fontsize=8)
-        cols=["#21c087" if c>=o else "#f6465d" for o,c in zip(df.open,df.close)]; av.bar(x,df.volume,color=cols,alpha=.65,width=w); av.text(0,df.volume.max()*.8,f"MEXC Volume ratio {market_data.get('mexc_volume_ratio_30',0):.2f}x",color=txt,fontsize=8)
-        hcols=["#21c087" if h>=0 else "#f6465d" for h in df.Hist]; am.bar(x,df.Hist,color=hcols,alpha=.75,width=w); am.plot(x,df.MACD,label="MACD"); am.plot(x,df.Signal,label="Signal"); am.axhline(0,color=txt,alpha=.5); am.legend(loc="upper left",frameon=False,labelcolor=txt,fontsize=8)
-        step=14; am.set_xticks(x[::step]); am.set_xticklabels([df.dt.iloc[i].strftime("%m-%d %H:%M") for i in range(0,len(df),step)],color=txt)
-        plt.setp(ax.get_xticklabels(),visible=False); plt.setp(av.get_xticklabels(),visible=False)
-        out=Path("/tmp")/f"btc_ai_4h_{int(time.time())}.png"; fig.savefig(out,facecolor=fig.get_facecolor(),bbox_inches="tight",pad_inches=.08); plt.close(fig); return str(out)
+        df = self._prepare_chart_df(candles, tail=90)
+        return self._draw_clean_btc_chart(df, market_data, levels=None, decision=None, filename_prefix="btc_ai_4h_clean")
 
     async def ask_ai(self, settings: dict, chart_path: str, market_data: dict) -> BTCAutopilotDecision:
         key = openai_key(settings)
