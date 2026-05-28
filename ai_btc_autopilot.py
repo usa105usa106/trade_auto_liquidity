@@ -1152,6 +1152,125 @@ class BTCVisionAutopilot:
         df = self._prepare_chart_df(candles, tail=90)
         return self._draw_clean_btc_chart(df, market_data, levels=lv, decision=d, filename_prefix="btc_ai_signal_clean")
 
+
+    def _plan_order_ts(self, row: dict) -> float:
+        for k in ("updateTime", "updatedTime", "createTime", "createdTime", "timestamp"):
+            try:
+                v = row.get(k)
+                if v not in (None, ""):
+                    f = float(v)
+                    return f / 1000.0 if f > 10_000_000_000 else f
+            except Exception:
+                pass
+        return 0.0
+
+    def _plan_order_price(self, order_or_row: dict) -> float:
+        info = order_or_row.get("info") if isinstance(order_or_row.get("info"), dict) else order_or_row
+        for k in ("price", "triggerPrice", "trigger_price", "stopPrice"):
+            try:
+                v = order_or_row.get(k) if k in order_or_row else info.get(k)
+                if v not in (None, "") and float(v) > 0:
+                    return float(v)
+            except Exception:
+                pass
+        return 0.0
+
+    def _plan_order_id(self, order_or_row: dict) -> str:
+        info = order_or_row.get("info") if isinstance(order_or_row.get("info"), dict) else order_or_row
+        return str(order_or_row.get("id") or info.get("id") or info.get("orderId") or info.get("planOrderId") or "")
+
+    def _plan_order_kind(self, order: dict, side: str, entry: float) -> str:
+        price = self._plan_order_price(order)
+        side_u = str(side or "").upper()
+        if price > 0 and entry > 0:
+            if side_u == "LONG":
+                return "TP" if price > entry else "SL"
+            if side_u == "SHORT":
+                return "TP" if price < entry else "SL"
+        return "ORDER"
+
+    async def _latest_exchange_btc_protection(self, ex_pos: dict) -> dict:
+        """Recover current BTC AI protection from MEXC active planorders only.
+
+        Local SQLite positions are cleared on deploy, so TP1->BE must be able to
+        use the latest active protection batch from the exchange.  Old active
+        planorders are ignored by create/update time.
+        """
+        side = self._exchange_position_side(ex_pos) or ""
+        entry = self._exchange_position_entry(ex_pos) or 0.0
+        if not side or entry <= 0 or not hasattr(self.exchange_client, "_mexc_private_read_any_base"):
+            return {}
+        try:
+            msym = self.exchange_client.mexc_contract_symbol(self.symbol) if hasattr(self.exchange_client, "mexc_contract_symbol") else "BTC_USDT"
+        except Exception:
+            msym = "BTC_USDT"
+        rows = []
+        try:
+            out = await self.exchange_client._mexc_private_read_any_base("/api/v1/private/planorder/list/orders", query={"symbol": msym, "state": 1, "page_num": 1, "page_size": 100})
+            raw = self.exchange_client._mexc_rows(out.get("data")) if hasattr(self.exchange_client, "_mexc_rows") else ((out or {}).get("data") or [])
+            for r in raw:
+                if not isinstance(r, dict):
+                    continue
+                sym_raw = str(r.get("symbol") or r.get("contract") or "")
+                try:
+                    sym_ok = self.exchange_client._mexc_normalize_contract_id(sym_raw) == self.exchange_client._mexc_normalize_contract_id(msym)
+                except Exception:
+                    sym_ok = sym_raw.upper().replace("/", "_").replace(":USDT", "") == "BTC_USDT"
+                if not sym_ok:
+                    continue
+                state = str(r.get("state", "1")).lower()
+                finished = str(r.get("is_finished", r.get("isFinished", 0))).lower()
+                err_code = str(r.get("errorCode", r.get("error_code", 0))).lower()
+                if state not in {"1", "open", "created", "new"}:
+                    continue
+                if finished in {"1", "true", "yes"} or err_code not in {"0", "", "none"}:
+                    continue
+                rows.append(dict(r))
+        except Exception as e:
+            log_event("btc_ai_latest_protection_read_failed", ok=False, error=str(e)[:400])
+            return {}
+
+        annotated = []
+        for r in rows:
+            price = self._plan_order_price(r)
+            kind = self._plan_order_kind(r, side, entry)
+            annotated.append({"row": r, "kind": kind, "price": price, "ts": self._plan_order_ts(r), "id": self._plan_order_id(r)})
+        sls = [x for x in annotated if x["kind"] == "SL"]
+        tps = [x for x in annotated if x["kind"] == "TP"]
+        if not sls or not tps:
+            return {}
+        latest_sl = max(sls, key=lambda x: (x["ts"], x["id"]))
+        sl_ts = latest_sl["ts"]
+        same_batch = [x for x in tps if x["ts"] and sl_ts and abs(x["ts"] - sl_ts) <= 600]
+        if not same_batch:
+            same_batch = sorted(tps, key=lambda x: (x["ts"], x["id"]), reverse=True)[:2]
+        if str(side).upper() == "SHORT":
+            same_batch = sorted(same_batch, key=lambda x: x["price"], reverse=True)[:2]
+        else:
+            same_batch = sorted(same_batch, key=lambda x: x["price"])[:2]
+        tp1 = same_batch[0] if same_batch else None
+        tp2 = same_batch[1] if len(same_batch) > 1 else None
+        out = {
+            "symbol": self.symbol,
+            "side": side,
+            "strategy": "btc_ai_4h",
+            "status": "open",
+            "entry_price": entry,
+            "stop_price": latest_sl["price"],
+            "partial_take_price": tp1["price"] if tp1 else 0,
+            "partial_take_fraction": 0.5 if tp2 else 1.0,
+            "final_take_price": tp2["price"] if tp2 else (tp1["price"] if tp1 else 0),
+            "take_price": tp2["price"] if tp2 else (tp1["price"] if tp1 else 0),
+            "tp1_order_id": tp1["id"] if tp1 else "",
+            "tp2_order_id": tp2["id"] if tp2 else "",
+            "sl_order_id": latest_sl["id"],
+            "signal_details": {"recovered_from_exchange": True},
+            "move_sl_to_be_after_tp1": bool(tp2),
+        }
+        stale_count = max(0, len(rows) - (1 + len(same_batch)))
+        log_event("btc_ai_latest_exchange_protection_selected", ok=True, side=side, entry=entry, sl=out["stop_price"], tp1=out["partial_take_price"], tp2=out["final_take_price"], sl_order_id=out["sl_order_id"], tp1_order_id=out["tp1_order_id"], tp2_order_id=out["tp2_order_id"], stale_active_ignored=stale_count)
+        return out
+
     async def monitor_tp1_breakeven(self, app):
         """Exchange-first TP1 monitor.
 
@@ -1172,8 +1291,11 @@ class BTCVisionAutopilot:
             for ex_pos in exchange_positions:
                 local = self._match_local_btc_position(local_positions, ex_pos)
                 if not local:
-                    log_event("btc_ai_be_exchange_position_no_local_metadata", ok=False, symbol=self.symbol, exchange_position=ex_pos)
-                    continue
+                    local = await self._latest_exchange_btc_protection(ex_pos)
+                    if not local:
+                        log_event("btc_ai_be_exchange_position_no_current_protection", ok=False, symbol=self.symbol, exchange_position=ex_pos)
+                        continue
+                    log_event("btc_ai_be_using_exchange_recovered_metadata", ok=True, tp1=local.get("partial_take_price"), tp2=local.get("final_take_price"), sl=local.get("stop_price"), tp1_order_id=local.get("tp1_order_id"), tp2_order_id=local.get("tp2_order_id"), sl_order_id=local.get("sl_order_id"))
                 if local.get("btc_ai_tp1_be_done") or local.get("breakeven_moved"):
                     continue
 

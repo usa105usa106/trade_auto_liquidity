@@ -1541,6 +1541,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /panic - закрыть позиции и отменить ордера
 /status - статус
 /status_btc - реальный BTC AI статус по MEXC: позиция, TP/SL, TP1→BE, 24H exit
+/clean_btc_orders - удалить старые активные BTC TP/SL planorders, оставить последнюю актуальную защиту
 /ping - отклик ms, RAM, uptime, открыто сейчас и общий счётчик открытий
 /balance - futures balance + IP/proxy; если MEXC margin=0 при открытых позициях, показывает estimated margin
 /positions - локальные + реальные позиции MEXC + protection mode
@@ -2654,6 +2655,98 @@ def _btc_status_order_kind(order: dict, side: str = "", entry: float = 0.0) -> s
     return "ORDER"
 
 
+
+
+def _btc_status_order_ts(order: dict) -> float:
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    vals = [
+        info.get("updateTime"), info.get("updatedTime"), info.get("updated_at"),
+        info.get("createTime"), info.get("createdTime"), info.get("created_at"),
+        order.get("timestamp"), order.get("datetime"),
+    ]
+    best = 0.0
+    for v in vals:
+        ts = _btc_status_parse_ts(v)
+        if ts and ts > best:
+            best = ts
+    return best
+
+
+def _btc_status_order_price(order: dict) -> float:
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    for k in ("price", "triggerPrice", "trigger_price", "stopPrice"):
+        try:
+            v = order.get(k) if k in order else info.get(k)
+            if v not in (None, "") and float(v) > 0:
+                return float(v)
+        except Exception:
+            pass
+    return 0.0
+
+
+def _btc_status_order_id(order: dict) -> str:
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    return str(order.get("id") or info.get("id") or info.get("orderId") or info.get("planOrderId") or "")
+
+
+def _btc_status_split_current_protection(orders: list[dict], side: str, entry: float, batch_window_sec: float = 600.0):
+    """Return (current_orders, stale_orders).
+
+    For BTC AI after redeploy, local cache is intentionally empty.  The only
+    safe exchange-first rule is: use the latest active SL for the current BTC
+    position, then use TP planorders from the same creation batch.  Old active
+    BTC planorders may still be live on MEXC, but they must not be used for
+    status/BE tracking.
+    """
+    side_u = str(side or "").upper()
+    try:
+        entry_f = float(entry or 0)
+    except Exception:
+        entry_f = 0.0
+    annotated = []
+    for o in orders or []:
+        kind = _btc_status_order_kind(o, side=side_u, entry=entry_f)
+        price = _btc_status_order_price(o)
+        ts = _btc_status_order_ts(o)
+        oid = _btc_status_order_id(o)
+        if not oid:
+            oid = str(id(o))
+        annotated.append({"order": o, "kind": kind, "price": price, "ts": ts, "id": oid})
+
+    if not annotated:
+        return [], []
+
+    sls = [x for x in annotated if x["kind"] == "SL"]
+    tps = [x for x in annotated if x["kind"] == "TP"]
+    current_ids = set()
+
+    if sls:
+        latest_sl = max(sls, key=lambda x: (x["ts"], x["id"]))
+        current_ids.add(latest_sl["id"])
+        sl_ts = latest_sl["ts"]
+        if sl_ts > 0:
+            same_batch_tps = [x for x in tps if x["ts"] > 0 and abs(x["ts"] - sl_ts) <= batch_window_sec]
+        else:
+            same_batch_tps = []
+        if not same_batch_tps:
+            # Fall back to the newest two TPs when exchange timestamps are missing.
+            same_batch_tps = sorted(tps, key=lambda x: (x["ts"], x["id"]), reverse=True)[:2]
+    else:
+        same_batch_tps = sorted(tps, key=lambda x: (x["ts"], x["id"]), reverse=True)[:2]
+
+    # For a LONG, TP1 is the lower active TP above entry and TP2 the higher one.
+    # For a SHORT, TP1 is the higher active TP below entry and TP2 the lower one.
+    if side_u == "SHORT":
+        same_batch_tps = sorted(same_batch_tps, key=lambda x: x["price"], reverse=True)[:2]
+    else:
+        same_batch_tps = sorted(same_batch_tps, key=lambda x: x["price"])[:2]
+    for x in same_batch_tps:
+        current_ids.add(x["id"])
+
+    current = [x["order"] for x in annotated if x["id"] in current_ids]
+    stale = [x["order"] for x in annotated if x["id"] not in current_ids]
+    return current, stale
+
 def _btc_status_local_meta(local_rows: list[dict]) -> dict:
     for p in local_rows or []:
         sym = str(p.get("symbol") or p.get("mexc_symbol") or "").upper().replace('/', '_')
@@ -2690,6 +2783,153 @@ def _btc_status_deep_values(obj, keys: set[str], limit: int = 12) -> list[str]:
 
     walk(obj)
     return out
+
+
+async def clean_btc_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel stale active BTC planorders while keeping the latest current TP/SL batch."""
+    if not allowed(update):
+        return
+    started = time.perf_counter()
+    s = await storage.all_settings()
+    api_key, api_secret = _api_creds(s)
+    if not (api_key and api_secret):
+        await reply(update, "🧽 Clean BTC Orders\n❌ MEXC API key/secret не настроены. Используй /api set KEY SECRET", reply_markup=MAIN_MENU)
+        return
+    try:
+        ex = await get_exchange(s)
+        exec_engine = ExecutionEngine(storage, ex)
+        msym = ex.mexc_contract_symbol("BTC_USDT") if hasattr(ex, "mexc_contract_symbol") else "BTC_USDT"
+
+        # 1) Real BTC position from exchange.  If there is no BTC position, every
+        # active BTC planorder is stale and can be cancelled safely.
+        raw_positions = await asyncio.wait_for(ex.fetch_positions(), timeout=12)
+        exchange_positions = _dedupe_exchange_positions([p for p in (raw_positions or []) if exec_engine.exchange_position_qty(p) > 0], ex)
+        btc_positions = []
+        for p in exchange_positions:
+            info = p.get("info") if isinstance(p.get("info"), dict) else {}
+            sym = str(p.get("symbol") or p.get("mexc_symbol") or info.get("symbol") or "").upper()
+            if "BTC" in sym:
+                btc_positions.append(p)
+
+        protect_side = ""
+        protect_entry = 0.0
+        if btc_positions:
+            p0 = btc_positions[0]
+            i0 = p0.get("info") if isinstance(p0.get("info"), dict) else {}
+            protect_side = str(p0.get("side") or ("LONG" if str(i0.get("positionType")) == "1" else "SHORT" if str(i0.get("positionType")) == "2" else "")).upper()
+            for k in ("entryPrice", "entry_price", "average", "holdAvgPrice", "openAvgPrice"):
+                try:
+                    v = p0.get(k) if k in p0 else i0.get(k)
+                    if v not in (None, "") and float(v) > 0:
+                        protect_entry = float(v); break
+                except Exception:
+                    pass
+
+        # 2) Read only active BTC planorders from MEXC.  Do not use local cache.
+        orders = []
+        raw_ids = []
+        out = await asyncio.wait_for(ex._mexc_private_read_any_base("/api/v1/private/planorder/list/orders", query={"symbol": msym, "state": 1, "page_num": 1, "page_size": 100}), timeout=12)
+        rows = ex._mexc_rows(out.get("data")) if hasattr(ex, "_mexc_rows") else ((out or {}).get("data") or [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sym_raw = str(row.get("symbol") or row.get("contract") or "")
+            try:
+                sym_ok = ex._mexc_normalize_contract_id(sym_raw) == ex._mexc_normalize_contract_id(msym)
+            except Exception:
+                sym_ok = sym_raw.upper().replace("/", "_").replace(":USDT", "") == "BTC_USDT"
+            if not sym_ok:
+                continue
+            state = str(row.get("state", "1")).lower()
+            finished = str(row.get("is_finished", row.get("isFinished", 0))).lower()
+            err_code = str(row.get("errorCode", row.get("error_code", 0))).lower()
+            finished_yes = finished in {"1", "true", "yes"}
+            active = state in {"1", "open", "created", "new"} and (not finished_yes) and err_code in {"0", "", "none"}
+            if not active:
+                continue
+            row = dict(row)
+            row.setdefault("_source_endpoint", "/api/v1/private/planorder/list/orders")
+            raw_ids.append(str(row.get("id") or row.get("orderId") or ""))
+            try:
+                orders.append(ex._mexc_parse_order(row))
+            except Exception:
+                trig = float(row.get("triggerPrice") or row.get("price") or 0 or 0)
+                vol = float(row.get("vol") or row.get("volume") or row.get("remainVol") or 0 or 0)
+                orders.append({"id": str(row.get("id") or row.get("orderId") or ""), "symbol": "BTC/USDT:USDT", "side": "sell", "type": "planorder", "price": trig, "amount": vol, "remaining": vol, "status": "open", "info": row})
+
+        if not orders:
+            await reply(update, "🧽 Clean BTC Orders\nАктивных BTC TP/SL planorders на MEXC не найдено.", reply_markup=MAIN_MENU)
+            return
+
+        if btc_positions:
+            current_orders, stale_orders = _btc_status_split_current_protection(orders, protect_side, protect_entry)
+        else:
+            current_orders, stale_orders = [], list(orders)
+
+        current_ids = {_btc_status_order_id(o).split(":", 1)[0] for o in current_orders if _btc_status_order_id(o)}
+        stale_unique = []
+        seen = set()
+        for o in stale_orders:
+            oid = _btc_status_order_id(o).split(":", 1)[0].strip()
+            if not oid or oid in current_ids or oid in seen:
+                continue
+            seen.add(oid)
+            stale_unique.append(o)
+
+        if not stale_unique:
+            lines = ["🧽 Clean BTC Orders", "Старых активных BTC TP/SL не найдено."]
+            if current_orders:
+                lines.append("Оставлена актуальная защита:")
+                for o in current_orders:
+                    lines.append(f"KEEP {_btc_status_order_kind(o, protect_side, protect_entry)} price={_btc_status_order_price(o):.2f} id={_btc_status_order_id(o)[:18]}")
+            await reply(update, "\n".join(lines)[:4050], reply_markup=MAIN_MENU)
+            return
+
+        # 3) Cancel only stale orders.  Never call cancel_all here.
+        cancelled = []
+        errors = []
+        for o in stale_unique:
+            oid = _btc_status_order_id(o).split(":", 1)[0].strip()
+            try:
+                res = await asyncio.wait_for(ex._mexc_private("POST", "/api/v1/private/planorder/cancel", body={"symbol": msym, "orderId": oid}), timeout=10)
+                ok = bool((res or {}).get("success", False) or (res or {}).get("code") in (0, "0"))
+                cancelled.append({"id": oid, "ok": ok, "price": _btc_status_order_price(o), "kind": _btc_status_order_kind(o, protect_side, protect_entry), "res": res})
+            except Exception as e:
+                errors.append({"id": oid, "price": _btc_status_order_price(o), "kind": _btc_status_order_kind(o, protect_side, protect_entry), "error": str(e)[:260]})
+
+        log_event(
+            "clean_btc_orders",
+            ok=(len(errors) == 0),
+            active=len(orders), current=len(current_orders), stale=len(stale_unique),
+            current_ids=list(current_ids), cancelled=[x.get("id") for x in cancelled], errors=errors[:10],
+            side=protect_side, entry=protect_entry,
+        )
+
+        lines = [f"🧽 Clean BTC Orders v{VERSION}", "Source: MEXC active BTC planorders state=1"]
+        if btc_positions:
+            lines.append(f"Position: {protect_side or '?'} entry={protect_entry:.2f}")
+        else:
+            lines.append("Position: NONE — отменяю все активные BTC TP/SL planorders")
+        lines.append(f"Found active: {len(orders)} | keep current: {len(current_orders)} | stale to cancel: {len(stale_unique)}")
+        if current_orders:
+            lines.append("\nKEEP current protection:")
+            for o in current_orders[:4]:
+                lines.append(f"KEEP {_btc_status_order_kind(o, protect_side, protect_entry)} price={_btc_status_order_price(o):.2f} id={_btc_status_order_id(o)[:18]}")
+        lines.append("\nCancelled stale:")
+        for x in cancelled[:12]:
+            mark = "✅" if x.get("ok") else "⚠️"
+            lines.append(f"{mark} {x['kind']} price={x['price']:.2f} id={str(x['id'])[:18]}")
+        if len(cancelled) > 12:
+            lines.append(f"... ещё {len(cancelled)-12}")
+        if errors:
+            lines.append("\nErrors:")
+            for e in errors[:6]:
+                lines.append(f"❌ {e['kind']} price={e['price']:.2f} id={str(e['id'])[:18]}: {e['error']}")
+        lines.append(f"\nTime: {(time.perf_counter() - started):.1f}s")
+        await reply(update, "\n".join(lines)[:4050], reply_markup=MAIN_MENU)
+    except Exception as e:
+        log_event("clean_btc_orders_error", ok=False, error=str(e)[:1200])
+        await reply(update, f"🧽 Clean BTC Orders error: {str(e)[:900]}", reply_markup=MAIN_MENU)
 
 
 async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2973,23 +3213,33 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         if orders:
-            lines.append("\nMEXC BTC open orders/protection:")
+            current_orders, stale_orders = _btc_status_split_current_protection(orders, protect_side, protect_entry)
+            display_orders = current_orders or orders
+            lines.append("\nMEXC BTC current protection (latest active batch):")
             tp_count = sl_count = other_count = 0
             shown = 0
-            for o in orders:
-                if shown >= 12:
+            for o in display_orders:
+                if shown >= 6:
                     break
                 kind = _btc_status_order_kind(o, side=protect_side, entry=protect_entry)
                 if kind == "TP": tp_count += 1
                 elif kind == "SL": sl_count += 1
                 else: other_count += 1
-                price = float(o.get("price") or 0)
+                price = _btc_status_order_price(o)
                 amount = float(o.get("amount") or o.get("remaining") or 0)
-                oid = str(o.get("id") or "")[:18]
+                oid = _btc_status_order_id(o)[:18]
                 src = str((o.get("info") or {}).get("_source_endpoint") or "").replace("/api/v1/private/", "")
-                lines.append(f"{kind}: price={price:.2f} amount={amount:.8f} id={oid} src={src}")
+                age_ts = _btc_status_order_ts(o)
+                age_txt = datetime.fromtimestamp(age_ts, tz=timezone.utc).strftime("%H:%M:%S UTC") if age_ts else "no-ts"
+                lines.append(f"{kind}: price={price:.2f} amount={amount:.8f} id={oid} ts={age_txt} src={src}")
                 shown += 1
-            lines.append(f"Orders summary: TP={tp_count} SL={sl_count} OTHER={other_count} total={len(orders)}")
+            lines.append(f"Current summary: TP={tp_count} SL={sl_count} OTHER={other_count} current={len(display_orders)}")
+            if stale_orders:
+                lines.append(f"Stale active BTC planorders ignored by bot: {len(stale_orders)}")
+                for o in stale_orders[:4]:
+                    kind = _btc_status_order_kind(o, side=protect_side, entry=protect_entry)
+                    lines.append(f"STALE {kind}: price={_btc_status_order_price(o):.2f} id={_btc_status_order_id(o)[:18]}")
+            log_event("status_btc_current_protection_selected", ok=True, current=len(display_orders), stale=len(stale_orders), side=protect_side, entry=protect_entry, current_ids=[_btc_status_order_id(o) for o in display_orders], stale_ids=[_btc_status_order_id(o) for o in stale_orders[:20]])
         else:
             lines.append("\nMEXC BTC open orders/protection: none")
             if btc_positions:
@@ -4760,6 +5010,7 @@ def _button_mapping():
         ("🤖 AI BTC/ETH scalping", ai_scalping_toggle_cmd), ("AI BTC/ETH scalping", ai_scalping_toggle_cmd),
         ("₿ BTC AI 4H автопилот", btc_ai_autopilot_cmd), ("BTC AI 4H автопилот", btc_ai_autopilot_cmd),
         ("📊 BTC Status", status_btc_cmd), ("BTC Status", status_btc_cmd), ("/status_btc", status_btc_cmd),
+        ("🧽 Clean BTC Orders", clean_btc_orders_cmd), ("Clean BTC Orders", clean_btc_orders_cmd), ("/clean_btc_orders", clean_btc_orders_cmd),
         ("⚡ быстрый отскок", quick_bounce_cmd), ("быстрый отскок", quick_bounce_cmd), ("Быстрый отскок", quick_bounce_cmd),
         ("🔻 импульсный слив", impulse_dump_cmd), ("импульсный слив", impulse_dump_cmd), ("Импульсный слив", impulse_dump_cmd),
         ("📊 orderflow impulse", orderflow_impulse_cmd), ("orderflow impulse", orderflow_impulse_cmd), ("Orderflow impulse", orderflow_impulse_cmd),
@@ -6607,6 +6858,7 @@ def build_app():
     app.add_handler(CommandHandler(["panic", "Panic", "PANIC"], _wrap_command(panic_cmd, "/panic")))
     app.add_handler(CommandHandler("status", _wrap_command(status_cmd, "/status")))
     app.add_handler(CommandHandler("status_btc", _wrap_command(status_btc_cmd, "/status_btc")))
+    app.add_handler(CommandHandler("clean_btc_orders", _wrap_command(clean_btc_orders_cmd, "/clean_btc_orders")))
     app.add_handler(CommandHandler("ping", _wrap_command(ping_cmd, "/ping")))
     app.add_handler(CommandHandler("balance", _wrap_command(balance_cmd, "/balance")))
     app.add_handler(CommandHandler("positions", _wrap_command(positions_cmd, "/positions")))
