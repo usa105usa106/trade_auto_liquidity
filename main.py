@@ -2655,6 +2655,35 @@ def _btc_status_local_meta(local_rows: list[dict]) -> dict:
     return {}
 
 
+def _btc_status_deep_values(obj, keys: set[str], limit: int = 12) -> list[str]:
+    """Return saved order ids from local BTC AI metadata, including nested exchange_result/protection attempts."""
+    out = []
+    seen = set()
+
+    def walk(x):
+        if len(out) >= limit:
+            return
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if str(k) in keys and v not in (None, "", 0, "0"):
+                    for part in str(v).replace(";", ",").split(","):
+                        oid = part.strip()
+                        if oid and oid not in seen:
+                            seen.add(oid); out.append(oid)
+                            if len(out) >= limit:
+                                return
+                if isinstance(v, (dict, list, tuple)):
+                    walk(v)
+        elif isinstance(x, (list, tuple)):
+            for v in x:
+                walk(v)
+                if len(out) >= limit:
+                    return
+
+    walk(obj)
+    return out
+
+
 async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Exchange-first BTC AI status: real MEXC position, orders, BE/24H state."""
     if not allowed(update):
@@ -2747,8 +2776,15 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     be_or_profit = ("YES" if ok else "NO") + f" ({pct:+.3f}%)"
                 lines.append("\nExchange BTC position:")
                 lines.append(f"{side or '?'} | entry={entry:.2f} | qty={qty:.8f} BTC | contracts={contracts:.0f} | lev={lev}x")
-                if margin not in (None, "") or upnl not in (None, ""):
-                    lines.append(f"Margin={_fmt_money_value(margin)} | uPnL={_fmt_money_value(upnl)}")
+                est_price_pnl = None
+                try:
+                    if (upnl in (None, "", "n/a") or str(upnl).lower() == "nan") and last > 0 and entry > 0 and qty > 0 and side in {"LONG", "SHORT"}:
+                        est_price_pnl = (last - entry) * qty if side == "LONG" else (entry - last) * qty
+                except Exception:
+                    est_price_pnl = None
+                if margin not in (None, "") or upnl not in (None, "") or est_price_pnl is not None:
+                    upnl_text = _fmt_money_value(upnl) if upnl not in (None, "", "n/a") else (f"est {_fmt_money_value(est_price_pnl)}" if est_price_pnl is not None else "n/a")
+                    lines.append(f"Margin={_fmt_money_value(margin)} | uPnL={upnl_text}")
 
                 def _pick_info_num(*keys, default=None):
                     for k in keys:
@@ -2787,12 +2823,25 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lines.append("Costs/PnL: " + " | ".join(cost_parts))
 
                 try:
-                    upnl_f = float(upnl) if upnl not in (None, "") else 0.0
-                    realised_f = float(realised) if realised is not None else 0.0
+                    if upnl not in (None, "", "n/a"):
+                        upnl_f = float(upnl)
+                    elif est_price_pnl is not None:
+                        upnl_f = float(est_price_pnl)
+                    else:
+                        upnl_f = 0.0
+                    realised_f = float(realised) if realised is not None else None
                     fee_f = float(fee) if fee is not None else 0.0
+                    total_fee_f = float(total_fee) if total_fee is not None else None
                     hold_fee_f = float(hold_fee) if hold_fee is not None else 0.0
-                    approx_net = upnl_f + realised_f + fee_f + hold_fee_f
-                    lines.append(f"Approx net now: {_fmt_money_value(approx_net)} (uPnL + realised/fees/funding fields)")
+                    # On MEXC futures, realised commonly already includes executed fees/funding impact.
+                    # Do not add fee/totalFee again when realised is present, otherwise status double-counts costs.
+                    if realised_f is not None:
+                        approx_net = upnl_f + realised_f + hold_fee_f
+                        approx_note = "uPnL/est + realised + funding"
+                    else:
+                        approx_net = upnl_f + (total_fee_f if total_fee_f is not None else fee_f) + hold_fee_f
+                        approx_note = "uPnL/est + fee + funding"
+                    lines.append(f"Approx net now: {_fmt_money_value(approx_net)} ({approx_note}; no double-count fee)")
                 except Exception:
                     pass
                 lines.append(f"Age: {_btc_status_age_text(opened_ts)} | 24H BE/profit exit allowed now: {be_or_profit}")
@@ -2824,6 +2873,38 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             orders = []
             lines.append(f"\nProtection/orders read error: {str(e)[:220]}")
+
+        # MEXC BTC AI protection is created as planorders. In some accounts/endpoint
+        # combinations, generic fetch_open_orders() can return [] while the exact
+        # saved TP1/TP2/SL planorder ids are still active and verifiable. For /status_btc,
+        # verify the saved ids directly before warning that protection is missing.
+        status_planorder_verified = False
+        if (not orders) and btc_positions and local and hasattr(ex, "mexc_find_active_plan_order"):
+            try:
+                plan_ids = []
+                for kind, keys in [
+                    ("tp", {"tp1_order_id", "tp2_order_id", "tp_order_id"}),
+                    ("sl", {"sl_order_id", "stop_order_id"}),
+                ]:
+                    for oid in _btc_status_deep_values(local, keys):
+                        row = await asyncio.wait_for(ex.mexc_find_active_plan_order("BTC_USDT", order_id=oid), timeout=8)
+                        if row:
+                            row = dict(row)
+                            row["_protection_kind"] = kind
+                            row.setdefault("_source_endpoint", "/api/v1/private/planorder/list/orders")
+                            try:
+                                orders.append(ex._mexc_parse_order(row))
+                            except Exception:
+                                trig = float(row.get("triggerPrice") or row.get("price") or 0 or 0)
+                                vol = float(row.get("vol") or row.get("volume") or row.get("remainVol") or 0 or 0)
+                                orders.append({"id": str(row.get("id") or row.get("orderId") or oid), "symbol": "BTC/USDT:USDT", "side": "sell", "type": f"tpsl_{kind}", "price": trig, "amount": vol, "remaining": vol, "status": "open", "info": row})
+                            plan_ids.append(str(oid))
+                status_planorder_verified = bool(orders)
+                if status_planorder_verified:
+                    lines.append(f"\nProtection source: verified saved MEXC planorder ids ({len(orders)})")
+            except Exception as e:
+                lines.append(f"\nPlanorder id verify warning: {str(e)[:220]}")
+
         if orders:
             lines.append("\nMEXC BTC open orders/protection:")
             tp_count = sl_count = other_count = 0

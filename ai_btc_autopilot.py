@@ -1003,44 +1003,61 @@ class BTCVisionAutopilot:
         # Clean AI chart: mark the real 24H extremes on the candles that made them.
         # On 4H BTC chart, 24 hours = last 6 candles. Do not place labels at a fixed X offset,
         # because that makes HIGH/LOW look random and can confuse visual AI analysis.
+        # STRICT 24H extremes for a 4H chart: use ONLY the last 6 CLOSED 4H candles.
+        # Never use AI levels, SL/TP, ticker rolling high/low, y-axis limits, or future/open candles here.
         lookback_24h = min(len(df), 6)
         high24 = 0.0
         low24 = 0.0
         high24_idx = None
         low24_idx = None
+        df24 = None
         if lookback_24h > 0:
-            df24 = df.tail(lookback_24h)
-            high24_idx = int(df24["high"].idxmax())
-            low24_idx = int(df24["low"].idxmin())
-            high24 = float(df.loc[high24_idx, "high"])
-            low24 = float(df.loc[low24_idx, "low"])
+            df24 = df.iloc[-lookback_24h:].copy()
+            high24_idx = int(df24["high"].astype(float).idxmax())
+            low24_idx = int(df24["low"].astype(float).idxmin())
+            high24 = float(df.at[high24_idx, "high"])
+            low24 = float(df.at[low24_idx, "low"])
+            # Shade the exact 24H window so it is obvious what candles are being measured.
+            ax.axvspan(len(df) - lookback_24h - 0.5, len(df) - 0.5, color="#94a3b8", alpha=0.045, zorder=0)
         if high24 > 0 and high24_idx is not None:
-            ax.axhline(high24, color="#94a3b8", linestyle=":", linewidth=0.75, alpha=0.28)
-            ax.axvline(high24_idx, color="#cbd5e1", linestyle=":", linewidth=0.75, alpha=0.35)
-            ax.scatter([high24_idx], [high24], marker="^", s=86, color="#f8fafc", edgecolor="#0b111c", linewidth=0.9, zorder=8)
-            ax.annotate(f"▲ 24H HIGH {high24:.1f}", xy=(high24_idx, high24), xytext=(0, 16), textcoords="offset points",
+            ax.axhline(high24, color="#94a3b8", linestyle=":", linewidth=0.75, alpha=0.30)
+            ax.axvline(high24_idx, color="#cbd5e1", linestyle=":", linewidth=0.75, alpha=0.40)
+            ax.scatter([high24_idx], [high24], marker="^", s=96, color="#f8fafc", edgecolor="#0b111c", linewidth=0.9, zorder=8)
+            ax.annotate(f"▲ 24H(6x4H) HIGH {high24:.1f}", xy=(high24_idx, high24), xytext=(0, 16), textcoords="offset points",
                         color="#f8fafc", va="bottom", ha="center", fontsize=8,
-                        bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#94a3b8", alpha=0.82),
-                        arrowprops=dict(arrowstyle="->", color="#cbd5e1", alpha=0.75, linewidth=0.8))
+                        bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#94a3b8", alpha=0.84),
+                        arrowprops=dict(arrowstyle="->", color="#cbd5e1", alpha=0.78, linewidth=0.8))
         if low24 > 0 and low24_idx is not None:
-            ax.axhline(low24, color="#94a3b8", linestyle=":", linewidth=0.75, alpha=0.28)
-            ax.axvline(low24_idx, color="#cbd5e1", linestyle=":", linewidth=0.75, alpha=0.35)
-            ax.scatter([low24_idx], [low24], marker="v", s=86, color="#f8fafc", edgecolor="#0b111c", linewidth=0.9, zorder=8)
-            ax.annotate(f"▼ 24H LOW {low24:.1f}", xy=(low24_idx, low24), xytext=(0, -18), textcoords="offset points",
+            ax.axhline(low24, color="#94a3b8", linestyle=":", linewidth=0.75, alpha=0.30)
+            ax.axvline(low24_idx, color="#cbd5e1", linestyle=":", linewidth=0.75, alpha=0.40)
+            ax.scatter([low24_idx], [low24], marker="v", s=96, color="#f8fafc", edgecolor="#0b111c", linewidth=0.9, zorder=8)
+            ax.annotate(f"▼ 24H(6x4H) LOW {low24:.1f}", xy=(low24_idx, low24), xytext=(0, -18), textcoords="offset points",
                         color="#f8fafc", va="top", ha="center", fontsize=8,
-                        bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#94a3b8", alpha=0.82),
-                        arrowprops=dict(arrowstyle="->", color="#cbd5e1", alpha=0.75, linewidth=0.8))
+                        bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#94a3b8", alpha=0.84),
+                        arrowprops=dict(arrowstyle="->", color="#cbd5e1", alpha=0.78, linewidth=0.8))
 
-        # Audit only: record where the 24H labels were placed. This helps verify
-        # that HIGH/LOW are tied to the actual last-6-candle extremes, not a fixed X offset.
+        # Audit: record the exact 6 candles used for HIGH/LOW so screenshots can be verified.
         try:
+            last6_ohlc = []
+            if df24 is not None:
+                for rr in df24.itertuples():
+                    last6_ohlc.append({
+                        "idx": int(rr.Index),
+                        "ts": str(rr.dt),
+                        "open": float(rr.open),
+                        "high": float(rr.high),
+                        "low": float(rr.low),
+                        "close": float(rr.close),
+                    })
             log_event("btc_ai_chart_extreme_markers",
                       filename_prefix=filename_prefix,
+                      source="last_6_closed_4h_candles_only",
                       lookback_24h_candles=lookback_24h,
                       high24_idx=high24_idx, high24=high24,
                       high24_ts=str(df.dt.iloc[high24_idx]) if high24_idx is not None else "",
                       low24_idx=low24_idx, low24=low24,
-                      low24_ts=str(df.dt.iloc[low24_idx]) if low24_idx is not None else "")
+                      low24_ts=str(df.dt.iloc[low24_idx]) if low24_idx is not None else "",
+                      last6_ohlc=last6_ohlc)
         except Exception:
             pass
 
