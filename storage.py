@@ -585,6 +585,20 @@ class Storage:
             await db.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
             await db.commit()
 
+    async def clear_positions(self) -> int:
+        """Clear volatile local position cache.
+
+        Exchange positions/orders are the source of truth for live management;
+        this only removes SQLite cached rows, not trades/settings/API keys.
+        """
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT COUNT(*) FROM positions")
+            row = await cur.fetchone()
+            count = int(row[0] or 0) if row else 0
+            await db.execute("DELETE FROM positions")
+            await db.commit()
+            return count
+
     async def positions(self) -> list[dict]:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute("SELECT raw FROM positions")

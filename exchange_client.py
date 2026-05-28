@@ -1207,10 +1207,10 @@ class ExchangeClient:
             candidates.extend([
                 ("/api/v1/private/order/list/open_orders/" + msym, {}),
                 ("/api/v1/private/order/list/open_orders", {"symbol": msym}),
+                # IMPORTANT: For MEXC futures planorders, state=1 is the active/untriggered set.
+                # state=2 and unfiltered list/orders can include historical triggered/failed orders;
+                # showing or managing those as live protection caused stale BTC TP rows in /status_btc.
                 ("/api/v1/private/planorder/list/orders", {"symbol": msym, "state": 1, "page_num": 1, "page_size": 100}),
-                ("/api/v1/private/planorder/list/orders", {"symbol": msym, "state": 2, "page_num": 1, "page_size": 100}),
-                ("/api/v1/private/planorder/list/orders", {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100}),
-                ("/api/v1/private/planorder/list/orders", {"symbol": msym, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/stoporder/open_orders", {"symbol": msym}),
             ])
             if include_legacy_stop_list:
@@ -1221,9 +1221,8 @@ class ExchangeClient:
         else:
             candidates.extend([
                 ("/api/v1/private/order/list/open_orders", {}),
+                # Only active/untriggered planorders. Do not read state=2/history as open orders.
                 ("/api/v1/private/planorder/list/orders", {"state": 1, "page_num": 1, "page_size": 100}),
-                ("/api/v1/private/planorder/list/orders", {"state": 2, "page_num": 1, "page_size": 100}),
-                ("/api/v1/private/planorder/list/orders", {"is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/stoporder/open_orders", {}),
             ])
             if include_legacy_stop_list:
@@ -1238,6 +1237,12 @@ class ExchangeClient:
                 out = await self._mexc_private_read_any_base(path, query=query)
                 rows = [r for r in self._mexc_rows(out.get("data")) if isinstance(r, dict)]
                 for r in rows:
+                    if "planorder/list/orders" in path:
+                        st = str(r.get("state", "1")).lower()
+                        err = str(r.get("errorCode", r.get("error_code", 0))).lower()
+                        fin = str(r.get("is_finished", r.get("isFinished", 0))).lower()
+                        if st not in {"1", "open", "created", "new"} or fin in {"1", "true", "yes"} or err not in {"0", "", "none"}:
+                            continue
                     r.setdefault("_source_endpoint", path)
                     for expanded in self._mexc_expand_tpsl_row(r):
                         expanded.setdefault("_source_endpoint", path)
@@ -1251,6 +1256,7 @@ class ExchangeClient:
         unique = []
         seen = set()
         for o in orders:
+            info = o.get("info") if isinstance(o.get("info"), dict) else {}
             if symbol:
                 # MEXC futures rows may normalize as BTC/USDT, BTC/USDT:USDT, or BTC_USDT.
                 # Do not drop valid planorders just because ccxt/our parser used a different display form.
@@ -1264,7 +1270,6 @@ class ExchangeClient:
                 except Exception:
                     if o.get("symbol") not in {self.normalize_symbol(symbol), str(symbol)}:
                         continue
-            info = o.get("info") if isinstance(o.get("info"), dict) else {}
             kind = str(info.get("_protection_kind") or "").lower()
             raw_id = str(o.get("id") or info.get("orderId") or info.get("planOrderId") or info.get("stopOrderId") or info.get("positionId") or "")
             base_id = raw_id.split(":", 1)[0]
@@ -1293,9 +1298,7 @@ class ExchangeClient:
         ext = str(external_oid or "").strip()
         queries = [
             {"symbol": msym, "state": 1, "page_num": 1, "page_size": 100},
-            {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100},
             {"state": 1, "page_num": 1, "page_size": 100},
-            {"is_finished": 0, "page_num": 1, "page_size": 100},
         ]
         last_err = ""
         for query in queries:
@@ -1311,9 +1314,9 @@ class ExchangeClient:
                     state = str(row.get("state", "1")).lower()
                     finished = str(row.get("is_finished", row.get("isFinished", 0))).lower()
                     err_code = str(row.get("errorCode", row.get("error_code", 0))).lower()
-                    terminal = state in {"3", "4", "5", "6", "cancel", "canceled", "cancelled", "failed", "finish", "finished", "done"}
+                    # For MEXC planorders, only state=1 is active/untriggered. state=2 is history/triggered.
                     finished_yes = finished in {"1", "true", "yes"}
-                    active = (not terminal) and (not finished_yes) and err_code in {"0", "", "none"}
+                    active = state in {"1", "open", "created", "new"} and (not finished_yes) and err_code in {"0", "", "none"}
                     txt = " ".join(str(row.get(k) or "").lower() for k in ("externalOid", "clientOrderId", "orderType", "type", "side", "reduceOnly"))
                     reduce_ok = str(row.get("reduceOnly") or row.get("reduce_only") or "").lower() in {"1", "true", "yes"}
                     id_ok = (oid and oid in row_ids) or (ext and ext == row_ext)

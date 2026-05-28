@@ -2892,10 +2892,8 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msym = ex.mexc_contract_symbol("BTC_USDT") if hasattr(ex, "mexc_contract_symbol") else "BTC_USDT"
                 raw_plan_orders = []
                 for q in (
+                    # MEXC Futures: state=1 is active/untriggered. state=2/unfiltered list includes history.
                     {"symbol": msym, "state": 1, "page_num": 1, "page_size": 100},
-                    {"symbol": msym, "state": 2, "page_num": 1, "page_size": 100},
-                    {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100},
-                    {"symbol": msym, "page_num": 1, "page_size": 100},
                 ):
                     out = await asyncio.wait_for(ex._mexc_private_read_any_base("/api/v1/private/planorder/list/orders", query=q), timeout=8)
                     rows = ex._mexc_rows(out.get("data")) if hasattr(ex, "_mexc_rows") else ((out or {}).get("data") or [])
@@ -2912,11 +2910,10 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         state = str(row.get("state", "1")).lower()
                         finished = str(row.get("is_finished", row.get("isFinished", 0))).lower()
                         err_code = str(row.get("errorCode", row.get("error_code", 0))).lower()
-                        # MEXC has used both state=1 and state=2 for currently relevant plan orders
-                        # depending on endpoint/trigger type. Treat only explicit terminal/failed states as inactive.
-                        terminal = state in {"3", "4", "5", "6", "cancel", "canceled", "cancelled", "failed", "finish", "finished", "done"}
+                        # Only state=1 is active/untriggered. state=2 and unfiltered rows are history/triggered
+                        # on MEXC planorder/list/orders and must not be shown as current BTC protection.
                         finished_yes = finished in {"1", "true", "yes"}
-                        active = (not terminal) and (not finished_yes) and err_code in {"0", "", "none"}
+                        active = state in {"1", "open", "created", "new"} and (not finished_yes) and err_code in {"0", "", "none"}
                         if not active:
                             continue
                         row = dict(row)
@@ -2931,7 +2928,7 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             raw_plan_orders.append(str(row.get("id") or row.get("orderId") or ""))
                 if raw_plan_orders:
                     status_planorder_verified = True
-                    lines.append(f"\nProtection source: MEXC active BTC planorders ({len(raw_plan_orders)})")
+                    lines.append(f"\nProtection source: MEXC state=1 active BTC planorders ({len(raw_plan_orders)})")
             except Exception as e:
                 lines.append(f"\nPlanorder raw read warning: {str(e)[:220]}")
 
@@ -4077,8 +4074,14 @@ async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await storage.set("mexc_api_key", context.args[1])
         await storage.set("mexc_api_secret", context.args[2])
+        cleared = 0
+        try:
+            cleared = await storage.clear_positions()
+            log_event("api_set_local_position_cache_cleared", ok=True, cleared=cleared, source="v52_exchange_source_of_truth")
+        except Exception as e:
+            log_event("api_set_local_position_cache_clear_failed", ok=False, error=str(e)[:500])
         await reset_exchange()
-        await reply(update, f"✅ API saved\nKey: {mask_secret(context.args[1])}\nSecret: {mask_secret(context.args[2])}\n\nТеперь можно /api test", reply_markup=MAIN_MENU)
+        await reply(update, f"✅ API saved\nKey: {mask_secret(context.args[1])}\nSecret: {mask_secret(context.args[2])}\nLocal position cache cleared: {cleared}\n\nТеперь можно /api test", reply_markup=MAIN_MENU)
         return
     if cmd == "clear":
         await storage.set("mexc_api_key", "")
@@ -6538,25 +6541,32 @@ async def trading_loop(app):
 
 async def on_startup(app):
     await storage.init()
+
+    # V52: local positions are volatile cache only.  On deploy/restart wipe the
+    # SQLite position cache so stale BTC AI TP/SL/order ids can never steer live
+    # management.  MEXC open_positions + active planorders are the source of
+    # truth after boot.  Trades/settings/API keys are intentionally preserved.
+    try:
+        cleared = await storage.clear_positions()
+        log_event("startup_local_position_cache_cleared", ok=True, cleared=cleared, source="v52_exchange_source_of_truth")
+        app.bot_data["startup_local_position_cache_cleared"] = cleared
+    except Exception as e:
+        log_event("startup_local_position_cache_clear_failed", ok=False, error=str(e)[:500])
+        app.bot_data["startup_local_position_cache_clear_error"] = str(e)
+
     settings = await storage.all_settings()
     apply_mexc_runtime_env(settings)
     app.bot_data.setdefault("trading_start_lock", asyncio.Lock())
     app.bot_data.setdefault("scan_wakeup_event", asyncio.Event())
-    # v0071: real startup recovery. If Railway restarts while MEXC positions
-    # remain open, rebuild local state from exchange positions and reattach
-    # protection/local monitoring before the scanner starts opening new trades.
-    try:
-        if str(settings.get("live_trading", False)).lower() in {"1", "true", "yes", "on"}:
-            api_key, api_secret = _api_creds(settings)
-            if api_key and api_secret:
-                ex = await _await_with_timeout(get_exchange(settings), 8, "exchange init")
-                exec_engine = ExecutionEngine(storage, ex)
-                report = await RecoveryEngine(storage, ex, exec_engine).recover(
-                    reattach=str(os.getenv("RECOVERY_REATTACH_PROTECTION", "true")).lower() in {"1", "true", "yes", "on"}
-                )
-                app.bot_data["startup_recovery_report"] = report
-    except Exception as e:
-        app.bot_data["startup_recovery_error"] = str(e)
+
+    # V52: Do NOT rebuild local rows through generic RecoveryEngine here.
+    # RecoveryEngine can invent fallback TP/SL when the old local row is gone;
+    # BTC AI must instead read the live exchange position and latest active
+    # MEXC planorders directly.  /status_btc and BTC managers are exchange-first.
+    app.bot_data["startup_recovery_report"] = {
+        "mode": "disabled_v52_exchange_source_of_truth",
+        "local_cache_cleared": app.bot_data.get("startup_local_position_cache_cleared", 0),
+    }
 
 def _wrap_command(fn, name: str):
     async def _inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
