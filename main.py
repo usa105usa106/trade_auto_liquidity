@@ -2622,7 +2622,7 @@ def _btc_status_age_text(opened_ts: float) -> str:
     return f"{h}h {m}m"
 
 
-def _btc_status_order_kind(order: dict, side: str = "") -> str:
+def _btc_status_order_kind(order: dict, side: str = "", entry: float = 0.0) -> str:
     info = order.get("info") if isinstance(order.get("info"), dict) else {}
     kind = str(info.get("_protection_kind") or "").lower()
     typ = str(order.get("type") or info.get("orderType") or info.get("type") or "").lower()
@@ -2633,15 +2633,23 @@ def _btc_status_order_kind(order: dict, side: str = "") -> str:
         return "TP"
     if kind == "sl" or "tpsl_sl" in typ or "stoploss" in txt or "stop_loss" in txt or "bot_sl" in txt:
         return "SL"
-    # MEXC plan/stop orders often expose only triggerType. Treat unknown reduce-only orders as protection.
-    trigger_type = str(info.get("triggerType") or "")
-    price = float(order.get("price") or info.get("triggerPrice") or 0 or 0)
+    # MEXC planorders made by BTC AI may not include a readable TP/SL kind.
+    # Classify by trigger price relative to the real exchange entry.
+    try:
+        price = float(order.get("price") or info.get("triggerPrice") or info.get("trigger_price") or info.get("price") or 0)
+    except Exception:
+        price = 0.0
     side_u = str(side or "").upper()
-    entry = 0.0
-    # Caller can still display UNKNOWN; do not over-classify without entry.
-    if trigger_type == "1":
-        return "TRIGGER"
-    if trigger_type == "2":
+    try:
+        entry_f = float(entry or 0)
+    except Exception:
+        entry_f = 0.0
+    if price > 0 and entry_f > 0 and side_u in {"LONG", "SHORT"}:
+        if side_u == "LONG":
+            return "TP" if price > entry_f else "SL"
+        return "TP" if price < entry_f else "SL"
+    trigger_type = str(info.get("triggerType") or "")
+    if trigger_type in {"1", "2"}:
         return "TRIGGER"
     return "ORDER"
 
@@ -2875,10 +2883,58 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"\nProtection/orders read error: {str(e)[:220]}")
 
         # MEXC BTC AI protection is created as planorders. In some accounts/endpoint
-        # combinations, generic fetch_open_orders() can return [] while the exact
-        # saved TP1/TP2/SL planorder ids are still active and verifiable. For /status_btc,
-        # verify the saved ids directly before warning that protection is missing.
+        # combinations, generic fetch_open_orders() can return [] while active planorders
+        # exist. First do a symbol-wide raw planorder read, so /status_btc remains
+        # exchange-first even when local cache is empty after redeploy.
         status_planorder_verified = False
+        if btc_positions and hasattr(ex, "_mexc_private_read_any_base"):
+            try:
+                msym = ex.mexc_contract_symbol("BTC_USDT") if hasattr(ex, "mexc_contract_symbol") else "BTC_USDT"
+                raw_plan_orders = []
+                for q in (
+                    {"symbol": msym, "state": 1, "page_num": 1, "page_size": 100},
+                    {"symbol": msym, "state": 2, "page_num": 1, "page_size": 100},
+                    {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100},
+                    {"symbol": msym, "page_num": 1, "page_size": 100},
+                ):
+                    out = await asyncio.wait_for(ex._mexc_private_read_any_base("/api/v1/private/planorder/list/orders", query=q), timeout=8)
+                    rows = ex._mexc_rows(out.get("data")) if hasattr(ex, "_mexc_rows") else ((out or {}).get("data") or [])
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        sym_raw = str(row.get("symbol") or row.get("contract") or "")
+                        try:
+                            sym_ok = ex._mexc_normalize_contract_id(sym_raw) == ex._mexc_normalize_contract_id(msym)
+                        except Exception:
+                            sym_ok = sym_raw.upper().replace("/", "_").replace(":USDT", "") == "BTC_USDT"
+                        if not sym_ok:
+                            continue
+                        state = str(row.get("state", "1")).lower()
+                        finished = str(row.get("is_finished", row.get("isFinished", 0))).lower()
+                        err_code = str(row.get("errorCode", row.get("error_code", 0))).lower()
+                        # MEXC has used both state=1 and state=2 for currently relevant plan orders
+                        # depending on endpoint/trigger type. Treat only explicit terminal/failed states as inactive.
+                        terminal = state in {"3", "4", "5", "6", "cancel", "canceled", "cancelled", "failed", "finish", "finished", "done"}
+                        finished_yes = finished in {"1", "true", "yes"}
+                        active = (not terminal) and (not finished_yes) and err_code in {"0", "", "none"}
+                        if not active:
+                            continue
+                        row = dict(row)
+                        row.setdefault("_source_endpoint", "/api/v1/private/planorder/list/orders")
+                        if not any(str((o.get("info") or {}).get("id") or o.get("id")) == str(row.get("id") or row.get("orderId")) for o in orders):
+                            try:
+                                orders.append(ex._mexc_parse_order(row))
+                            except Exception:
+                                trig = float(row.get("triggerPrice") or row.get("price") or 0 or 0)
+                                vol = float(row.get("vol") or row.get("volume") or row.get("remainVol") or 0 or 0)
+                                orders.append({"id": str(row.get("id") or row.get("orderId") or ""), "symbol": "BTC/USDT:USDT", "side": "sell", "type": "planorder", "price": trig, "amount": vol, "remaining": vol, "status": "open", "info": row})
+                            raw_plan_orders.append(str(row.get("id") or row.get("orderId") or ""))
+                if raw_plan_orders:
+                    status_planorder_verified = True
+                    lines.append(f"\nProtection source: MEXC active BTC planorders ({len(raw_plan_orders)})")
+            except Exception as e:
+                lines.append(f"\nPlanorder raw read warning: {str(e)[:220]}")
+
         if (not orders) and btc_positions and local and hasattr(ex, "mexc_find_active_plan_order"):
             try:
                 plan_ids = []
@@ -2905,6 +2961,20 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 lines.append(f"\nPlanorder id verify warning: {str(e)[:220]}")
 
+        protect_side = ""
+        protect_entry = 0.0
+        try:
+            if btc_positions:
+                p0 = btc_positions[0]
+                i0 = p0.get("info") if isinstance(p0.get("info"), dict) else {}
+                protect_side = str(p0.get("side") or ("LONG" if str(i0.get("positionType")) == "1" else "SHORT" if str(i0.get("positionType")) == "2" else "")).upper()
+                for k in ("entryPrice", "entry_price", "average", "holdAvgPrice", "openAvgPrice"):
+                    v = p0.get(k) if k in p0 else i0.get(k)
+                    if v not in (None, "") and float(v) > 0:
+                        protect_entry = float(v); break
+        except Exception:
+            pass
+
         if orders:
             lines.append("\nMEXC BTC open orders/protection:")
             tp_count = sl_count = other_count = 0
@@ -2912,7 +2982,7 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for o in orders:
                 if shown >= 12:
                     break
-                kind = _btc_status_order_kind(o)
+                kind = _btc_status_order_kind(o, side=protect_side, entry=protect_entry)
                 if kind == "TP": tp_count += 1
                 elif kind == "SL": sl_count += 1
                 else: other_count += 1

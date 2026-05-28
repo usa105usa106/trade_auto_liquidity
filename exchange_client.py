@@ -1208,7 +1208,9 @@ class ExchangeClient:
                 ("/api/v1/private/order/list/open_orders/" + msym, {}),
                 ("/api/v1/private/order/list/open_orders", {"symbol": msym}),
                 ("/api/v1/private/planorder/list/orders", {"symbol": msym, "state": 1, "page_num": 1, "page_size": 100}),
+                ("/api/v1/private/planorder/list/orders", {"symbol": msym, "state": 2, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/planorder/list/orders", {"symbol": msym, "is_finished": 0, "page_num": 1, "page_size": 100}),
+                ("/api/v1/private/planorder/list/orders", {"symbol": msym, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/stoporder/open_orders", {"symbol": msym}),
             ])
             if include_legacy_stop_list:
@@ -1220,6 +1222,7 @@ class ExchangeClient:
             candidates.extend([
                 ("/api/v1/private/order/list/open_orders", {}),
                 ("/api/v1/private/planorder/list/orders", {"state": 1, "page_num": 1, "page_size": 100}),
+                ("/api/v1/private/planorder/list/orders", {"state": 2, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/planorder/list/orders", {"is_finished": 0, "page_num": 1, "page_size": 100}),
                 ("/api/v1/private/stoporder/open_orders", {}),
             ])
@@ -1248,8 +1251,19 @@ class ExchangeClient:
         unique = []
         seen = set()
         for o in orders:
-            if symbol and o.get("symbol") != self.normalize_symbol(symbol):
-                continue
+            if symbol:
+                # MEXC futures rows may normalize as BTC/USDT, BTC/USDT:USDT, or BTC_USDT.
+                # Do not drop valid planorders just because ccxt/our parser used a different display form.
+                try:
+                    want = self._mexc_normalize_contract_id(self._mexc_symbol(symbol))
+                    got_raw = str(o.get("symbol") or info.get("symbol") or info.get("contract") or "")
+                    got = self._mexc_normalize_contract_id(got_raw)
+                    got_alt = self._mexc_normalize_contract_id(got_raw.replace(":USDT", ""))
+                    if want not in {got, got_alt}:
+                        continue
+                except Exception:
+                    if o.get("symbol") not in {self.normalize_symbol(symbol), str(symbol)}:
+                        continue
             info = o.get("info") if isinstance(o.get("info"), dict) else {}
             kind = str(info.get("_protection_kind") or "").lower()
             raw_id = str(o.get("id") or info.get("orderId") or info.get("planOrderId") or info.get("stopOrderId") or info.get("positionId") or "")
@@ -1296,7 +1310,10 @@ class ExchangeClient:
                     row_ext = str(row.get("externalOid") or row.get("clientOrderId") or "").strip()
                     state = str(row.get("state", "1")).lower()
                     finished = str(row.get("is_finished", row.get("isFinished", 0))).lower()
-                    active = state in {"1", "", "created", "wait", "pending"} and finished in {"0", "false", "", "none"}
+                    err_code = str(row.get("errorCode", row.get("error_code", 0))).lower()
+                    terminal = state in {"3", "4", "5", "6", "cancel", "canceled", "cancelled", "failed", "finish", "finished", "done"}
+                    finished_yes = finished in {"1", "true", "yes"}
+                    active = (not terminal) and (not finished_yes) and err_code in {"0", "", "none"}
                     txt = " ".join(str(row.get(k) or "").lower() for k in ("externalOid", "clientOrderId", "orderType", "type", "side", "reduceOnly"))
                     reduce_ok = str(row.get("reduceOnly") or row.get("reduce_only") or "").lower() in {"1", "true", "yes"}
                     id_ok = (oid and oid in row_ids) or (ext and ext == row_ext)
