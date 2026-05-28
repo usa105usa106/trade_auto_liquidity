@@ -187,47 +187,58 @@ class ExecutionEngine:
         return float(fallback or 0)
 
     def _rebase_protection_to_fill(self, pos: dict, fill_price: float) -> dict:
-        """Keep the original SL/TP percentages but anchor them to the real fill price.
+        """Align stored entry to the real exchange fill.
 
-        v0285: split-TP strategies (cascade_hunter/strongest_coin) also need
-        partial_take_price/final_take_price rebased.  Older builds only rebased
-        stop_price and take_price, so TP1 could stay anchored to the scanner
-        signal price while the real MEXC fill moved.  That made the displayed
-        final take look roughly correct while the actual split TP plan could be
-        inconsistent.  Recompute TP1/TP2 from the live entry and live SL by R.
+        BTC AI rule: the AI owns TP1/TP2 and the bot must not silently move them.
+        The bot also must not re-anchor the AI stop just because a MARKET fill is
+        a few dollars away from the planned/last price. It may only widen SL if
+        the real fill made it closer than 1%. This keeps Telegram/status/exchange
+        levels consistent with the AI plan.
         """
         original_entry = float(pos.get("entry_price") or 0)
         fill_price = float(fill_price or 0)
         if original_entry <= 0 or fill_price <= 0:
             return pos
-        side = str(pos.get("side", "")).upper()
+        side = str(pos.get("side", "") or "").upper()
         strategy = str(pos.get("strategy") or "").lower()
         old_stop = float(pos.get("stop_price") or 0)
         old_take = float(pos.get("take_price") or 0)
         old_partial_take = float(pos.get("partial_take_price") or 0)
         old_final_take = float(pos.get("final_take_price") or old_take or 0)
-        if side == "SHORT":
-            if old_stop > 0:
-                stop_pct = abs(old_stop - original_entry) / original_entry
-                pos["stop_price"] = fill_price * (1 + stop_pct)
-            if old_take > 0 and strategy != "btc_ai_4h":
-                take_pct = abs(original_entry - old_take) / original_entry
-                pos["take_price"] = fill_price * (1 - take_pct)
-        else:
-            if old_stop > 0:
-                stop_pct = abs(original_entry - old_stop) / original_entry
-                pos["stop_price"] = fill_price * (1 - stop_pct)
-            if old_take > 0 and strategy != "btc_ai_4h":
-                take_pct = abs(old_take - original_entry) / original_entry
-                pos["take_price"] = fill_price * (1 + take_pct)
 
         if strategy == "btc_ai_4h":
-            # BTC AI autopilot: the AI owns TP1/TP2. Do not convert them into
-            # fixed percentages and do not re-anchor them after fill. The bot may
-            # only adjust SL according to its risk guard; TP levels stay as AI prices.
+            # Preserve AI TP prices exactly. Preserve AI/bot-guard SL unless the
+            # real fill made it invalid/too close (<1%). Do NOT compress a wider
+            # AI stop here; if >2% happens it is logged for operator review.
             details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
             frac = float(pos.get("partial_take_fraction") or details.get("tp1_fraction") or 0.50)
             reduced = str(details.get("risk_mode") or "") == "reduced_65_74" or frac >= 0.999
+
+            final_stop = old_stop
+            stop_adjust_note = "kept_ai_stop"
+            if old_stop > 0 and fill_price > 0:
+                if side == "SHORT":
+                    valid_side = old_stop > fill_price
+                    pct = abs(old_stop - fill_price) / fill_price * 100.0
+                    if (not valid_side) or pct < 1.0:
+                        final_stop = fill_price * 1.01
+                        stop_adjust_note = "widened_to_1pct_from_real_fill"
+                else:
+                    valid_side = old_stop < fill_price
+                    pct = abs(fill_price - old_stop) / fill_price * 100.0
+                    if (not valid_side) or pct < 1.0:
+                        final_stop = fill_price * 0.99
+                        stop_adjust_note = "widened_to_1pct_from_real_fill"
+                try:
+                    final_pct = abs(fill_price - float(final_stop or 0)) / fill_price * 100.0 if final_stop else 0.0
+                    pos["btc_ai_real_fill_stop_pct"] = final_pct
+                    if final_pct > 2.0:
+                        pos["btc_ai_stop_warning"] = "real fill makes stop distance above 2%; stop kept because AI owns SL unless too close"
+                except Exception:
+                    pass
+                pos["stop_price"] = final_stop
+                pos["btc_ai_stop_fill_alignment"] = stop_adjust_note
+
             if old_partial_take > 0:
                 pos["partial_take_price"] = old_partial_take
             if old_final_take > 0:
@@ -244,7 +255,27 @@ class ExecutionEngine:
             else:
                 pos["partial_take_fraction"] = max(0.01, min(0.99, frac))
             pos["tp_source"] = "ai"
-        elif strategy in {"cascade_hunter", "strongest_coin"}:
+            pos["entry_price"] = fill_price
+            pos["fill_price_source"] = "exchange_order"
+            pos["planned_entry_price"] = original_entry
+            return pos
+
+        if side == "SHORT":
+            if old_stop > 0:
+                stop_pct = abs(old_stop - original_entry) / original_entry
+                pos["stop_price"] = fill_price * (1 + stop_pct)
+            if old_take > 0:
+                take_pct = abs(original_entry - old_take) / original_entry
+                pos["take_price"] = fill_price * (1 - take_pct)
+        else:
+            if old_stop > 0:
+                stop_pct = abs(original_entry - old_stop) / original_entry
+                pos["stop_price"] = fill_price * (1 - stop_pct)
+            if old_take > 0:
+                take_pct = abs(old_take - original_entry) / original_entry
+                pos["take_price"] = fill_price * (1 + take_pct)
+
+        if strategy in {"cascade_hunter", "strongest_coin"}:
             stop = float(pos.get("stop_price") or 0)
             risk_abs = abs(fill_price - stop) if stop > 0 else 0.0
             details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
@@ -1465,9 +1496,13 @@ class ExecutionEngine:
                     out["boost_unsafe_position"] = False
                     out["boost_defensive_mode"] = False
                 elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin", "btc_ai_4h"} and out.get("tp1_order_id") and out.get("tp2_order_id") and out.get("sl_order_id"):
-                    # v0286/v21: split TP/SL are MEXC planorders. Reduced BTC AI may use one TP closing 100%.
+                    # V42 strict rule: returned planorder ids are NOT enough on MEXC.
+                    # /status_btc is exchange-first, so protection is considered OK only
+                    # when the TP/SL planorders are actually visible on the exchange.
                     verified_split = {}
-                    if hasattr(self.exchange_client, "mexc_find_active_plan_order"):
+                    mexc_exchange = str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc"
+                    verifier_available = hasattr(self.exchange_client, "mexc_find_active_plan_order")
+                    if verifier_available:
                         try:
                             tp1_row = await self.exchange_client.mexc_find_active_plan_order(symbol, order_id=str(out.get("tp1_order_id") or ""))
                             if out.get("reduced_single_tp"):
@@ -1479,14 +1514,19 @@ class ExecutionEngine:
                         except Exception as e:
                             verified_split = {"split_plan_verify_warning": str(e)[:220]}
                     out.update(verified_split)
-                    out["tp_exists"] = True
-                    out["sl_exists"] = True
-                    out["take_profit_ok"] = True
-                    out["stop_loss_ok"] = True
-                    out["ok"] = True
-                    out["protection_status"] = "EXCHANGE PROTECTED"
-                    out["protection_mode"] = "exchange_single_tp_planorder" if out.get("reduced_single_tp") else "exchange_split_planorder"
-                    out["protection_note"] = "Reduced BTC AI: TP closes 100% at +2%, SL 1%" if out.get("reduced_single_tp") else "Split TP/SL are MEXC planorders: TP1 50% at 1R, TP2 rest at 2R, SL under pullback"
+                    if mexc_exchange and verifier_available:
+                        split_ok = bool(out.get("tp1_plan_verified") and out.get("tp2_plan_verified") and out.get("sl_plan_verified"))
+                    else:
+                        # Non-MEXC test adapters may not support planorder visibility; ids are best-effort there.
+                        split_ok = True
+                    out["tp_exists"] = bool(split_ok)
+                    out["sl_exists"] = bool(split_ok)
+                    out["take_profit_ok"] = bool(split_ok)
+                    out["stop_loss_ok"] = bool(split_ok)
+                    out["ok"] = bool(split_ok)
+                    out["protection_status"] = "EXCHANGE PROTECTED" if split_ok else "LOCAL BOT PROTECTED"
+                    out["protection_mode"] = ("exchange_single_tp_planorder" if out.get("reduced_single_tp") else "exchange_split_planorder") if split_ok else "split_planorder_not_visible"
+                    out["protection_note"] = ("Reduced BTC AI: one AI TP + SL verified on MEXC planorders" if out.get("reduced_single_tp") else "BTC AI TP1/TP2/SL verified on MEXC planorders") if split_ok else "MEXC returned TP/SL ids, but active planorders were not visible; retry/close protection rule applies"
                 else:
                     verified = await self._verify_exchange_protection(pos, str(out.get("tp_order_id") or ""), str(out.get("sl_order_id") or ""))
                     out.update({k: v for k, v in verified.items() if k not in {"tp_order_id", "sl_order_id"} or v})

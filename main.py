@@ -2749,6 +2749,52 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"{side or '?'} | entry={entry:.2f} | qty={qty:.8f} BTC | contracts={contracts:.0f} | lev={lev}x")
                 if margin not in (None, "") or upnl not in (None, ""):
                     lines.append(f"Margin={_fmt_money_value(margin)} | uPnL={_fmt_money_value(upnl)}")
+
+                def _pick_info_num(*keys, default=None):
+                    for k in keys:
+                        try:
+                            v = info.get(k) if isinstance(info, dict) else None
+                            if v not in (None, ""):
+                                return float(v)
+                        except Exception:
+                            pass
+                        try:
+                            v = pos.get(k)
+                            if v not in (None, ""):
+                                return float(v)
+                        except Exception:
+                            pass
+                    return default
+
+                realised = _pick_info_num("realised", "realized", "realizedPnl", "realisedPnl", "realizedProfit")
+                fee = _pick_info_num("fee", "openFee", "closeFee", "takerFee", "makerFee")
+                total_fee = _pick_info_num("totalFee", "total_fee", "totalFees")
+                hold_fee = _pick_info_num("holdFee", "fundingFee", "funding", "funding_fee")
+                extra_fee = _pick_info_num("extraTakerFee", "extraTakerFeeRate")
+
+                cost_parts = []
+                if realised is not None:
+                    cost_parts.append(f"realised={_fmt_money_value(realised)}")
+                if fee is not None:
+                    cost_parts.append(f"fee={_fmt_money_value(fee)}")
+                if total_fee is not None:
+                    cost_parts.append(f"totalFee={_fmt_money_value(total_fee)}")
+                if hold_fee is not None:
+                    cost_parts.append(f"hold/funding={_fmt_money_value(hold_fee)}")
+                if extra_fee is not None and abs(float(extra_fee or 0)) > 0:
+                    cost_parts.append(f"extra={_fmt_money_value(extra_fee)}")
+                if cost_parts:
+                    lines.append("Costs/PnL: " + " | ".join(cost_parts))
+
+                try:
+                    upnl_f = float(upnl) if upnl not in (None, "") else 0.0
+                    realised_f = float(realised) if realised is not None else 0.0
+                    fee_f = float(fee) if fee is not None else 0.0
+                    hold_fee_f = float(hold_fee) if hold_fee is not None else 0.0
+                    approx_net = upnl_f + realised_f + fee_f + hold_fee_f
+                    lines.append(f"Approx net now: {_fmt_money_value(approx_net)} (uPnL + realised/fees/funding fields)")
+                except Exception:
+                    pass
                 lines.append(f"Age: {_btc_status_age_text(opened_ts)} | 24H BE/profit exit allowed now: {be_or_profit}")
 
         # Local metadata is not source of truth, but useful for AI TP/BE plan display.
@@ -2798,6 +2844,9 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Orders summary: TP={tp_count} SL={sl_count} OTHER={other_count} total={len(orders)}")
         else:
             lines.append("\nMEXC BTC open orders/protection: none")
+            if btc_positions:
+                lines.append("⚠️ ВНИМАНИЕ: BTC позиция есть, но видимых TP/SL на MEXC не найдено.")
+                lines.append("Если это не сразу после открытия, нажми 🧯 Panic или Close All, либо проверь /log_full.")
 
         lines.append(f"\nTime: {(time.perf_counter() - started):.1f}s")
         await reply(update, "\n".join(lines)[:4050], reply_markup=MAIN_MENU)

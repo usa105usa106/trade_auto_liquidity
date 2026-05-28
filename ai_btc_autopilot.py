@@ -46,6 +46,52 @@ class BTCVisionAutopilot:
         self._last_24h_rate_limit_log_ts = 0.0
         self._last_24h_warning_ts = 0.0
 
+    def _chart_file_meta(self, path: str) -> dict:
+        """Return exact chart file size/pixels for /log_full audit.
+
+        This does not resize or modify the chart. It only records what the AI /
+        Telegram sender actually received from /tmp, so Telegram compression can
+        be distinguished from bot-side output.
+        """
+        meta = {"path": str(path or ""), "exists": False, "size_kb": 0.0, "width": 0, "height": 0, "pixels": "unknown"}
+        try:
+            fp = Path(path)
+            if not fp.exists():
+                return meta
+            meta["exists"] = True
+            meta["size_kb"] = round(fp.stat().st_size / 1024.0, 2)
+            try:
+                from PIL import Image
+                with Image.open(fp) as im:
+                    w, h = im.size
+                meta["width"] = int(w)
+                meta["height"] = int(h)
+                meta["pixels"] = f"{int(w)}x{int(h)}"
+            except Exception as e:
+                meta["image_probe_error"] = str(e)[:120]
+        except Exception as e:
+            meta["error"] = str(e)[:120]
+        return meta
+
+    def _log_chart_paths(self, *, ai_chart: str = "", telegram_chart: str = "", mode: str = "") -> None:
+        ai_meta = self._chart_file_meta(ai_chart) if ai_chart else {}
+        tg_meta = self._chart_file_meta(telegram_chart) if telegram_chart else {}
+        log_event(
+            "btc_ai_chart_paths",
+            ai_chart=ai_chart,
+            telegram_chart=telegram_chart or "",
+            mode=mode,
+            ai_chart_pixels=ai_meta.get("pixels", "unknown"),
+            ai_chart_width=ai_meta.get("width", 0),
+            ai_chart_height=ai_meta.get("height", 0),
+            ai_chart_size_kb=ai_meta.get("size_kb", 0.0),
+            telegram_chart_pixels=tg_meta.get("pixels", "unknown") if tg_meta else "",
+            telegram_chart_width=tg_meta.get("width", 0) if tg_meta else 0,
+            telegram_chart_height=tg_meta.get("height", 0) if tg_meta else 0,
+            telegram_chart_size_kb=tg_meta.get("size_kb", 0.0) if tg_meta else 0.0,
+            note="bot_file_original_before_telegram_compression_no_resize",
+        )
+
     @staticmethod
     def next_msk_close_ts(now: float | None = None) -> float:
         now_dt = datetime.fromtimestamp(now or time.time(), tz=timezone.utc) + timedelta(hours=3)
@@ -476,7 +522,7 @@ class BTCVisionAutopilot:
         finally:
             # Delete the temporary clean chart from Telegram after AI has answered.
             await self._delete_temp_message(app, temp_ai_msg)
-        log_event("btc_ai_chart_paths", ai_chart=ai_chart_path, mode="force_live_test" if force_live_test else "autopilot")
+        self._log_chart_paths(ai_chart=ai_chart_path, mode="force_live_test" if force_live_test else "autopilot")
 
         if decision.error:
             if not force_live_test:
@@ -525,7 +571,7 @@ class BTCVisionAutopilot:
 
             # Telegram receives the annotated chart AFTER levels are calculated. AI did not see this chart.
             telegram_chart_path = await asyncio.to_thread(self.render_signal_chart, symbol, candles, market_data, decision, plan_levels)
-            log_event("btc_ai_chart_paths", ai_chart=ai_chart_path, telegram_chart=telegram_chart_path, mode="live_test")
+            self._log_chart_paths(ai_chart=ai_chart_path, telegram_chart=telegram_chart_path, mode="live_test")
             caption = self.format_live_test_preview(decision, market_data, plan_levels, original_signal, original_probability)
             try:
                 with open(telegram_chart_path, "rb") as img:
@@ -537,7 +583,7 @@ class BTCVisionAutopilot:
             return
         else:
             telegram_chart_path = await asyncio.to_thread(self.render_signal_chart, symbol, candles, market_data, decision, plan_levels)
-            log_event("btc_ai_chart_paths", ai_chart=ai_chart_path, telegram_chart=telegram_chart_path, mode="autopilot_trade")
+            self._log_chart_paths(ai_chart=ai_chart_path, telegram_chart=telegram_chart_path, mode="autopilot_trade")
             caption = self.format_decision(decision, market_data, plan_levels)
             try:
                 with open(telegram_chart_path, "rb") as img:
@@ -664,24 +710,35 @@ class BTCVisionAutopilot:
                                         f"Причина: {reason}\n"
                                         f"Позиция/ордера не изменены. Подробности: /log")
                 return
-            protection = "EXCHANGE PROTECTED"
+            pos_after = res_m.get('position') if isinstance(res_m, dict) and isinstance(res_m.get('position'), dict) else {}
+            protection = str(pos_after.get('protection_status') or (res_m.get('protection', {}) or {}).get('protection_status') or 'EXCHANGE PROTECTION UNKNOWN') if isinstance(res_m, dict) else 'EXCHANGE PROTECTION UNKNOWN'
+            # For MARKET entries the real MEXC fill can differ from the last price
+            # used in the chart. Report the final executable values from position
+            # after fill/re-risk guard so /status_btc and the Telegram message agree.
+            actual_entry = float(pos_after.get('entry_price') or price)
+            actual_stop = float(pos_after.get('stop_price') or stop)
+            actual_tp1 = float(pos_after.get('partial_take_price') or tp1)
+            actual_tp2 = float(pos_after.get('final_take_price') or pos_after.get('take_price') or tp2)
+            stop_note = str(pos_after.get('btc_ai_stop_fill_alignment') or '')
             if reduced_mode:
                 await self._notify(app, f"✅ BTC AI {'LIVE TEST' if force_market else 'MARKET'} REDUCED 65–74%\n"
-                                        f"Вход: ~{price:.2f}\n"
-                                        f"SL: {stop:.2f} ({float(lv.get('stop_pct') or 0):.2f}%)\n"
-                                        f"TP: {tp1:.2f} (ИИ, закрыть 100%)\n"
+                                        f"Вход MEXC: ~{actual_entry:.2f}\n"
+                                        f"SL: {actual_stop:.2f} ({(abs(actual_entry-actual_stop)/actual_entry*100 if actual_entry else 0):.2f}%)\n"
+                                        f"TP: {actual_tp1:.2f} (ИИ, закрыть 100%)\n"
                                         f"Проходимость: {d.probability:.1f}%\n"
                                         f"Размер: 5% от total balance · x{leverage}\n"
                                         f"Защита: {protection}\n"
+                                        f"SL guard: {stop_note or 'kept'}\n"
                                         f"Виртуальное сопровождение: ВКЛ")
             else:
-                await self._notify(app, f"✅ BTC AI {'LIVE TEST' if force_market else 'A+'} MARKET 100%\n"
-                                        f"Вход: ~{price:.2f}\n"
-                                        f"SL: {stop:.2f}\n"
-                                        f"TP1: {tp1:.2f} (ИИ, 50%)\n"
-                                        f"TP2: {tp2:.2f} (ИИ, остаток)\n"
+                await self._notify(app, f"✅ BTC AI {'LIVE TEST' if force_market else 'A+'} MARKET TP1/TP2\n"
+                                        f"Вход MEXC: ~{actual_entry:.2f}\n"
+                                        f"SL: {actual_stop:.2f}\n"
+                                        f"TP1: {actual_tp1:.2f} (ИИ, 50%)\n"
+                                        f"TP2: {actual_tp2:.2f} (ИИ, остаток)\n"
                                         f"Проходимость: {d.probability:.1f}%\n"
                                         f"Защита: {protection}\n"
+                                        f"SL guard: {stop_note or 'kept'}\n"
                                         f"Виртуальное сопровождение: ВКЛ")
             return
         final_take = tp1 if reduced_mode else tp2
@@ -958,19 +1015,34 @@ class BTCVisionAutopilot:
             high24 = float(df.loc[high24_idx, "high"])
             low24 = float(df.loc[low24_idx, "low"])
         if high24 > 0 and high24_idx is not None:
-            ax.axhline(high24, color="#94a3b8", linestyle=":", linewidth=0.8, alpha=0.42)
-            ax.scatter([high24_idx], [high24], marker="^", s=42, color="#cbd5e1", edgecolor="#0b111c", linewidth=0.7, zorder=6)
-            ax.annotate(f"24H HIGH {high24:.1f}", xy=(high24_idx, high24), xytext=(0, 12), textcoords="offset points",
-                        color="#cbd5e1", va="bottom", ha="center", fontsize=8,
-                        bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#334155", alpha=0.70),
-                        arrowprops=dict(arrowstyle="-", color="#64748b", alpha=0.65, linewidth=0.8))
+            ax.axhline(high24, color="#94a3b8", linestyle=":", linewidth=0.75, alpha=0.28)
+            ax.axvline(high24_idx, color="#cbd5e1", linestyle=":", linewidth=0.75, alpha=0.35)
+            ax.scatter([high24_idx], [high24], marker="^", s=86, color="#f8fafc", edgecolor="#0b111c", linewidth=0.9, zorder=8)
+            ax.annotate(f"▲ 24H HIGH {high24:.1f}", xy=(high24_idx, high24), xytext=(0, 16), textcoords="offset points",
+                        color="#f8fafc", va="bottom", ha="center", fontsize=8,
+                        bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#94a3b8", alpha=0.82),
+                        arrowprops=dict(arrowstyle="->", color="#cbd5e1", alpha=0.75, linewidth=0.8))
         if low24 > 0 and low24_idx is not None:
-            ax.axhline(low24, color="#94a3b8", linestyle=":", linewidth=0.8, alpha=0.42)
-            ax.scatter([low24_idx], [low24], marker="v", s=42, color="#cbd5e1", edgecolor="#0b111c", linewidth=0.7, zorder=6)
-            ax.annotate(f"24H LOW {low24:.1f}", xy=(low24_idx, low24), xytext=(0, -14), textcoords="offset points",
-                        color="#cbd5e1", va="top", ha="center", fontsize=8,
-                        bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#334155", alpha=0.70),
-                        arrowprops=dict(arrowstyle="-", color="#64748b", alpha=0.65, linewidth=0.8))
+            ax.axhline(low24, color="#94a3b8", linestyle=":", linewidth=0.75, alpha=0.28)
+            ax.axvline(low24_idx, color="#cbd5e1", linestyle=":", linewidth=0.75, alpha=0.35)
+            ax.scatter([low24_idx], [low24], marker="v", s=86, color="#f8fafc", edgecolor="#0b111c", linewidth=0.9, zorder=8)
+            ax.annotate(f"▼ 24H LOW {low24:.1f}", xy=(low24_idx, low24), xytext=(0, -18), textcoords="offset points",
+                        color="#f8fafc", va="top", ha="center", fontsize=8,
+                        bbox=dict(boxstyle="round,pad=0.18", facecolor="#0b111c", edgecolor="#94a3b8", alpha=0.82),
+                        arrowprops=dict(arrowstyle="->", color="#cbd5e1", alpha=0.75, linewidth=0.8))
+
+        # Audit only: record where the 24H labels were placed. This helps verify
+        # that HIGH/LOW are tied to the actual last-6-candle extremes, not a fixed X offset.
+        try:
+            log_event("btc_ai_chart_extreme_markers",
+                      filename_prefix=filename_prefix,
+                      lookback_24h_candles=lookback_24h,
+                      high24_idx=high24_idx, high24=high24,
+                      high24_ts=str(df.dt.iloc[high24_idx]) if high24_idx is not None else "",
+                      low24_idx=low24_idx, low24=low24,
+                      low24_ts=str(df.dt.iloc[low24_idx]) if low24_idx is not None else "")
+        except Exception:
+            pass
 
         if levels:
             entry = float(levels.get("entry_mid") or 0)
@@ -1021,7 +1093,24 @@ class BTCVisionAutopilot:
             return f"{sign}{value:.0f}"
         av.yaxis.set_major_formatter(FuncFormatter(_compact_volume_formatter))
         av.yaxis.get_offset_text().set_visible(False)
-        av.text(0, max(df.volume.max() * 0.78, 1), f"MEXC Volume ratio {float(market_data.get('mexc_volume_ratio_30') or 0):.2f}x", color=txt, fontsize=8)
+        try:
+            av.yaxis.offsetText.set_visible(False)
+            av.yaxis.offsetText.set_text("")
+        except Exception:
+            pass
+
+        # Middle panel bars are per 4H candle volume. Add explicit 24H aggregate
+        # so neither the user nor the vision model has to infer daily volume from
+        # the y-axis scale. On a 4H chart, closed 24H volume = last 6 closed candles.
+        vol_24h = float(market_data.get("mexc_volume_24h_4h_sum") or 0)
+        if vol_24h <= 0:
+            vol_24h = float(df.volume.tail(min(len(df), 6)).sum())
+        vol_ratio = float(market_data.get('mexc_volume_ratio_30') or 0)
+        vol_label = _compact_volume_formatter(vol_24h, None)
+        av.text(0.01, 0.86, f"MEXC VOL 24H {vol_label} | ratio {vol_ratio:.2f}x",
+                transform=av.transAxes, color=txt, fontsize=9, fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.20", facecolor="#111827", edgecolor=grid, alpha=0.76),
+                va="top", ha="left")
 
         hcols = [green if h >= 0 else red for h in df.Hist]
         am.bar(x, df.Hist, color=hcols, alpha=0.72, width=w)
@@ -1285,7 +1374,8 @@ class BTCVisionAutopilot:
             "low_24h": float(df.low.tail(6).min()),
             "mexc_ticker_high_24h": float(ticker_info.get("high24Price") or ticker_info.get("high24") or ticker_info.get("high") or 0),
             "mexc_ticker_low_24h": float(ticker_info.get("lower24Price") or ticker_info.get("low24Price") or ticker_info.get("low24") or ticker_info.get("low") or 0),
-            "mexc_volume_last": float(df.volume.iloc[-1]),
+            "mexc_volume_last_4h": float(df.volume.iloc[-1]),
+            "mexc_volume_24h_4h_sum": float(df.volume.tail(min(len(df), 6)).sum()),
             "mexc_volume_ratio_30": vol_ratio,
             "funding": funding,
             "mexc_orderbook": self._book_summary(depth),
@@ -1447,7 +1537,9 @@ Trading rules:
 - SHORT geometry: take_profit_2 <= take_profit_1 < entry < stop_loss. For reduced 65-74.9: take_profit_1 < entry < stop_loss and take_profit_2=0.
 - If a trade is open longer than 24h, bot will close it only when price is breakeven or better; if negative, bot waits until breakeven.
 
-Probability must include: MEXC 4H market structure, MEXC volume ratio, MEXC funding, MEXC orderbook, MEXC liquidation proxy, Binance spot directional confirmation, support/resistance, and risk/reward.
+The chart volume panel shows per-4H-candle MEXC futures volume bars plus an explicit "MEXC VOL 24H" label. Use mexc_volume_24h_4h_sum as the 24H futures volume context, not the y-axis scale.
+
+Probability must include: MEXC 4H market structure, MEXC 24H volume, MEXC volume ratio, MEXC funding, MEXC orderbook, MEXC liquidation proxy, Binance spot directional confirmation, support/resistance, and risk/reward.
 
 JSON schema: {"signal":"LONG|SHORT|WAIT","probability":0,"grade":"C|B|A|A+","entry_zone_low":0,"entry_zone_high":0,"stop_loss":0,"take_profit_1":0,"take_profit_2":0,"take_profit_3":0,"reason":"short"}"""
         prompt_with_data = prompt+"\nMarket JSON:\n"+json.dumps(market_data,ensure_ascii=False)
