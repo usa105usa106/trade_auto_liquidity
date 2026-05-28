@@ -815,19 +815,44 @@ class ExchangeClient:
         raw = f"{self.api_key}{req_time}{payload}"
         return hmac.new(self.api_secret.encode(), raw.encode(), hashlib.sha256).hexdigest()
 
-    async def _mexc_private(self, method: str, path: str, body: dict | None = None, query: dict | None = None, base_url: str | None = None):
+    async def _mexc_private(self, method: str, path: str, body=None, query: dict | None = None, base_url: str | None = None):
         if not self.api_key or not self.api_secret:
             raise RuntimeError("MEXC API key/secret is missing")
         await self._mexc_private_rate_limit()
-        body = dict(body or {})
         query = dict(query or {})
+
         # Native MEXC futures private endpoints require underscore contract ids
-        # such as BTC_USDT.  Normalize at the final request boundary so no
-        # caller can accidentally send a display/ccxt symbol like BTC/USDT.
-        if body.get("symbol") not in (None, ""):
-            body["symbol"] = self._mexc_normalize_contract_id(body.get("symbol"))
+        # such as BTC_USDT.  Some endpoints, notably /planorder/cancel, require
+        # the POST body to be a JSON ARRAY like
+        #   [{"symbol":"BTC_USDT","orderId":"..."}]
+        # not an object.  Preserve list bodies; sending an object makes MEXC
+        # return code 600 Parameter error.
+        if body is None:
+            body = {}
+        elif isinstance(body, list):
+            body = [dict(x) if isinstance(x, dict) else x for x in body]
+        elif isinstance(body, dict):
+            body = dict(body)
+        else:
+            body = body
+
+        # Safety net for callers that still pass a single object to the MEXC
+        # planned-order cancel endpoint: convert it to the documented array form.
+        if path.rstrip("/") == "/api/v1/private/planorder/cancel" and isinstance(body, dict):
+            body = [body]
+
+        def _norm_symbol_in_obj(obj):
+            if isinstance(obj, dict) and obj.get("symbol") not in (None, ""):
+                obj["symbol"] = self._mexc_normalize_contract_id(obj.get("symbol"))
+            return obj
+
+        if isinstance(body, list):
+            body = [_norm_symbol_in_obj(x) for x in body]
+        else:
+            body = _norm_symbol_in_obj(body)
         if query.get("symbol") not in (None, ""):
             query["symbol"] = self._mexc_normalize_contract_id(query.get("symbol"))
+
         method = method.upper()
         base = (base_url or self._mexc_rest_base()).rstrip("/")
         if method == "GET":
@@ -1394,7 +1419,7 @@ class ExchangeClient:
                 # where it was discovered, and only use normal order cancel as
                 # the safe default when the source is unknown.
                 if "planorder" in src:
-                    candidates = [("/api/v1/private/planorder/cancel", {"symbol": msym, "orderId": oid})]
+                    candidates = [("/api/v1/private/planorder/cancel", [{"symbol": msym, "orderId": oid}])]
                 elif "stoporder" in src:
                     candidates = [("/api/v1/private/stoporder/cancel", {"symbol": msym, "orderId": oid})]
                 else:

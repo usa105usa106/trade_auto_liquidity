@@ -2891,7 +2891,7 @@ async def clean_btc_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         for o in stale_unique:
             oid = _btc_status_order_id(o).split(":", 1)[0].strip()
             try:
-                res = await asyncio.wait_for(ex._mexc_private("POST", "/api/v1/private/planorder/cancel", body={"symbol": msym, "orderId": oid}), timeout=10)
+                res = await asyncio.wait_for(ex._mexc_private("POST", "/api/v1/private/planorder/cancel", body=[{"symbol": msym, "orderId": oid}]), timeout=10)
                 ok = bool((res or {}).get("success", False) or (res or {}).get("code") in (0, "0"))
                 cancelled.append({"id": oid, "ok": ok, "price": _btc_status_order_price(o), "kind": _btc_status_order_kind(o, protect_side, protect_entry), "res": res})
             except Exception as e:
