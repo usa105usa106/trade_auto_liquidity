@@ -35,6 +35,7 @@ from chart_renderer import render_trade_setup_chart
 from ai_btc_autopilot import BTCVisionAutopilot
 from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
+from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
@@ -808,10 +809,13 @@ async def sleep_until_next_scan(app, seconds: int | float) -> None:
         ev.clear()
 
 def _api_creds(settings: dict) -> tuple[str, str]:
-    # Telegram-saved credentials have priority. Environment variables remain a fallback
-    # for server-side deployment. Secrets are never printed back to chat.
-    api_key = str(settings.get("mexc_api_key") or os.getenv("MEXC_API_KEY", "") or "").strip()
-    api_secret = str(settings.get("mexc_api_secret") or os.getenv("MEXC_API_SECRET", "") or "").strip()
+    # v75: Telegram/SQLite settings have priority, then Railway env, then
+    # a local backup file written by /api set. This prevents the bot from
+    # "losing" keys during runtime when settings reload empty/default values.
+    # For persistence across Railway redeploys, Railway Variables or a volume
+    # are still the safest source. Secrets are never printed unmasked.
+    api_key = secret_value(settings, "mexc_api_key", "MEXC_API_KEY")
+    api_secret = secret_value(settings, "mexc_api_secret", "MEXC_API_SECRET")
     return api_key, api_secret
 
 
@@ -4624,10 +4628,15 @@ async def openai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply(update, "❌ This does not look like an OpenAI API key.", reply_markup=MAIN_MENU)
             return
         await storage.set("openai_api_key", key)
+        os.environ["OPENAI_API_KEY"] = key
+        save_secret_backup({"openai_api_key": key})
+        log_event("openai_key_persisted_v75", ok=True, sqlite=True, env_runtime=True, backup=True)
         await reply(update, "✅ OpenAI API key saved", reply_markup=MAIN_MENU)
         return
     if cmd == "clear":
         await storage.set("openai_api_key", "")
+        os.environ.pop("OPENAI_API_KEY", None)
+        clear_secret_backup(["openai_api_key"])
         await reply(update, "🗑 OpenAI API key cleared", reply_markup=MAIN_MENU)
         return
     if cmd == "test":
@@ -4660,8 +4669,14 @@ async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(context.args) < 3:
             await reply(update, "Usage: /api set API_KEY API_SECRET", reply_markup=MAIN_MENU)
             return
-        await storage.set("mexc_api_key", context.args[1])
-        await storage.set("mexc_api_secret", context.args[2])
+        api_key_new = str(context.args[1]).strip()
+        api_secret_new = str(context.args[2]).strip()
+        await storage.set("mexc_api_key", api_key_new)
+        await storage.set("mexc_api_secret", api_secret_new)
+        os.environ["MEXC_API_KEY"] = api_key_new
+        os.environ["MEXC_API_SECRET"] = api_secret_new
+        save_secret_backup({"mexc_api_key": api_key_new, "mexc_api_secret": api_secret_new})
+        log_event("api_keys_persisted_v75", ok=True, sqlite=True, env_runtime=True, backup=True)
         cleared = 0
         try:
             cleared = await storage.clear_positions()
@@ -4674,6 +4689,9 @@ async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cmd == "clear":
         await storage.set("mexc_api_key", "")
         await storage.set("mexc_api_secret", "")
+        os.environ.pop("MEXC_API_KEY", None)
+        os.environ.pop("MEXC_API_SECRET", None)
+        clear_secret_backup(["mexc_api_key", "mexc_api_secret"])
         await reset_exchange()
         await reply(update, "🗑 API keys cleared from bot storage", reply_markup=MAIN_MENU)
         return
@@ -7131,6 +7149,11 @@ async def trading_loop(app):
 
 async def on_startup(app):
     await storage.init()
+    try:
+        apply_secret_backup_to_env()
+        log_event("runtime_secrets_loaded_v75", ok=True)
+    except Exception as e:
+        log_event("runtime_secrets_load_failed_v75", ok=False, error=str(e)[:300])
 
     # V52: local positions are volatile cache only.  On deploy/restart wipe the
     # SQLite position cache so stale BTC AI TP/SL/order ids can never steer live

@@ -5,6 +5,7 @@ import os
 import aiosqlite
 from typing import Any, Optional
 from config import DB_PATH, DEFAULTS
+from runtime_secrets import merge_secrets_into_settings, apply_secret_backup_to_env, save_secret_backup
 
 DEFAULT_SETTINGS = {
     "live_trading": DEFAULTS.live_trading,
@@ -401,6 +402,29 @@ class Storage:
             if await self.get(k) is None:
                 await self.set(k, v, bump_revision=False)
 
+        # v75: protect API keys from disappearing when SQLite/default settings are missing
+        # or Railway restarts with only env/backup available. This does not change
+        # trading logic; it only mirrors existing env/backup secrets into runtime settings.
+        try:
+            apply_secret_backup_to_env()
+            env_mexc_key = str(os.getenv("MEXC_API_KEY", "") or "").strip()
+            env_mexc_secret = str(os.getenv("MEXC_API_SECRET", "") or "").strip()
+            env_openai_key = str(os.getenv("OPENAI_API_KEY", "") or "").strip()
+            if env_mexc_key and not str(await self.get("mexc_api_key", "") or "").strip():
+                await self.set("mexc_api_key", env_mexc_key, bump_revision=False)
+            if env_mexc_secret and not str(await self.get("mexc_api_secret", "") or "").strip():
+                await self.set("mexc_api_secret", env_mexc_secret, bump_revision=False)
+            if env_openai_key and not str(await self.get("openai_api_key", "") or "").strip():
+                await self.set("openai_api_key", env_openai_key, bump_revision=False)
+            if env_mexc_key or env_mexc_secret or env_openai_key:
+                save_secret_backup({
+                    "mexc_api_key": env_mexc_key,
+                    "mexc_api_secret": env_mexc_secret,
+                    "openai_api_key": env_openai_key,
+                })
+        except Exception:
+            pass
+
         # One-time safety migration for older deployments where these values
         # may already exist in the DB and therefore are not replaced by defaults.
         # MEXC push.tickers sends the full futures universe, so batch=250 makes
@@ -565,6 +589,13 @@ class Storage:
         # forcing it false prevents stale websocket warnings from stopping scans
         # or blocking entries when REST/scanner data is usable.
         out["ws_require_healthy_for_entries"] = False
+        # v75: secrets can come from SQLite, Railway env, or local backup file.
+        # This prevents status/sync loops from seeing empty credentials after
+        # transient DB/default reloads in Railway.
+        try:
+            out = merge_secrets_into_settings(out)
+        except Exception:
+            pass
         return out
 
     async def upsert_position(self, pos: dict) -> None:
