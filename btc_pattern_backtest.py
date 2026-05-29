@@ -72,6 +72,27 @@ def _max_drawdown(equity: list[float]) -> float:
     return dd
 
 
+def _max_dd_from_returns(returns: list[float]) -> float:
+    """Max drawdown from sequential trade returns.
+
+    Round-level TP0.5 first-touch test stores individual trade returns, not an
+    equity curve. Convert returns into a cumulative return curve and reuse the
+    standard drawdown helper. This keeps the test read-only and avoids breaking
+    strategy code.
+    """
+    equity: list[float] = []
+    total = 0.0
+    for r in returns or []:
+        try:
+            v = float(r)
+        except Exception:
+            v = 0.0
+        if math.isfinite(v):
+            total += v
+            equity.append(total)
+    return _max_drawdown(equity) if equity else 0.0
+
+
 async def fetch_ohlcv_history(exchange, symbol: str = "BTC_USDT", timeframe: str = "4h", years: float = 3.0, limit_per_call: int = 200) -> list[list[float]]:
     """Fetch up to N years of candles with ccxt pagination when possible.
 
@@ -2135,3 +2156,249 @@ async def run_strategy_lab_backtest(exchange, years: float = 3.0, mode: str = "s
         "ИТОГ: это только backtest. Подключать можно только после detail/paper test. Сырой JSON: /log_full",
     ]
     return "\n".join(lines[:80]), payload
+
+# ---------------- V74 Detailed BTC 4H RSI divergence SHORT-only real exits ----------------
+
+def _month_key_from_ms(ts_ms: int) -> str:
+    try:
+        return datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc).strftime("%Y-%m")
+    except Exception:
+        return "unknown"
+
+
+def _positive_month_stats(trades: list[dict]) -> dict:
+    by: dict[str, float] = {}
+    for t in trades or []:
+        k = _month_key_from_ms(int(t.get("ts", 0)))
+        by[k] = by.get(k, 0.0) + float(t.get("ret", 0.0))
+    vals = list(by.values())
+    return {
+        "months": len(vals),
+        "positive_months": sum(1 for v in vals if v > 0),
+        "negative_months": sum(1 for v in vals if v <= 0),
+        "positive_month_rate": (sum(1 for v in vals if v > 0) / len(vals)) if vals else 0.0,
+        "monthly_returns": by,
+    }
+
+
+def _first_touch_exit_return_with_outcome(side: str, entry: float, highs, lows, closes, stop: float, take: float, cost: float = 0.0006) -> tuple[float, str, int]:
+    """Conservative first-touch simulation. If TP and SL are inside same candle, SL wins."""
+    side = str(side).upper()
+    entry = float(entry); stop = float(stop); take = float(take)
+    for j, (hi, lo, cl) in enumerate(zip(highs, lows, closes), start=1):
+        hi = float(hi); lo = float(lo); cl = float(cl)
+        if side == "LONG":
+            hit_sl = lo <= stop
+            hit_tp = hi >= take
+            if hit_sl:
+                return _trade_ret(side, entry, stop, cost=cost), "SL", j
+            if hit_tp:
+                return _trade_ret(side, entry, take, cost=cost), "TP", j
+        else:
+            hit_sl = hi >= stop
+            hit_tp = lo <= take
+            if hit_sl:
+                return _trade_ret(side, entry, stop, cost=cost), "SL", j
+            if hit_tp:
+                return _trade_ret(side, entry, take, cost=cost), "TP", j
+    if len(closes):
+        return _trade_ret(side, entry, float(closes[-1]), cost=cost), "TIME", len(closes)
+    return -cost, "NO_DATA", 0
+
+
+def _generate_btc_4h_rsi_short_real_trades(df_in: pd.DataFrame, params: dict, cost: float = 0.0006) -> list[dict]:
+    """BTC 4H RSI bearish divergence SHORT-only with real first-touch SL/TP."""
+    df = _add_strategy_indicators(df_in)
+    c = df["close"].to_numpy(float); h = df["high"].to_numpy(float); l = df["low"].to_numpy(float); o = df["open"].to_numpy(float)
+    rsi14 = df["rsi14"].to_numpy(float); atr14 = df["atr14"].to_numpy(float); ts_arr = df["ts"].to_numpy(np.int64)
+    look = int(params.get("lookback", 6))
+    ob = float(params.get("overbought", 62))
+    horizon = int(params.get("horizon", 6))
+    cooldown = int(params.get("cooldown", 3))
+    rr = float(params.get("rr", 1.5))
+    stop_atr = float(params.get("stop_atr", 0.15))
+    trades: list[dict] = []
+    last_trade_i = -10**9
+    n = len(df)
+    for i in range(max(120, look + 2), n - horizon - 1):
+        if i - last_trade_i < cooldown:
+            continue
+        try:
+            prev_high = float(np.nanmax(h[i-look:i]))
+            prev_rsi_high = float(np.nanmax(rsi14[i-look:i]))
+            # Bearish divergence: price takes prior high, RSI fails to confirm, candle closes red, RSI is high enough.
+            if not (h[i] > prev_high and rsi14[i] < prev_rsi_high and rsi14[i] >= ob and c[i] < o[i]):
+                continue
+            entry = float(c[i])
+            atr_abs = max(float(atr14[i]), entry * 0.002)
+            stop = float(h[i] + stop_atr * atr_abs)
+            risk = max(stop - entry, entry * 0.001)
+            take = float(entry - rr * risk)
+            ret, outcome, bars = _first_touch_exit_return_with_outcome("SHORT", entry, h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], stop, take, cost=cost)
+            trades.append({
+                "ts": int(ts_arr[i]),
+                "iso": datetime.fromtimestamp(int(ts_arr[i]) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "symbol": "BTC_USDT",
+                "timeframe": "4h",
+                "family": "rsi_divergence_short_first_touch",
+                "side": "SHORT",
+                "entry": entry,
+                "stop": stop,
+                "take": take,
+                "rr": rr,
+                "ret": float(ret),
+                "outcome": outcome,
+                "bars_to_exit": int(bars),
+                "params": dict(params),
+            })
+            last_trade_i = i
+        except Exception:
+            continue
+    return trades
+
+
+def _detail_variant_metrics(df: pd.DataFrame, trades: list[dict]) -> dict:
+    split_ts = _split_ts_70(df)
+    train = [t for t in trades if int(t.get("ts", 0)) < split_ts]
+    test = [t for t in trades if int(t.get("ts", 0)) >= split_ts]
+    now_ts = int(df["ts"].iloc[-1]) if len(df) else int(time.time()*1000)
+    recent = {}
+    for months in (6, 12, 18, 24):
+        sub = [t for t in trades if int(t.get("ts", 0)) >= now_ts - int(months*30.4375*86400*1000)]
+        m = _trade_subset_metrics(sub)
+        m.update(_positive_month_stats(sub))
+        recent[f"{months}m"] = m
+    m_all = _trade_subset_metrics(trades); m_all.update(_positive_month_stats(trades))
+    m_train = _trade_subset_metrics(train); m_train.update(_positive_month_stats(train))
+    m_test = _trade_subset_metrics(test); m_test.update(_positive_month_stats(test))
+    tp = sum(1 for t in test if t.get("outcome") == "TP")
+    sl = sum(1 for t in test if t.get("outcome") == "SL")
+    tm = sum(1 for t in test if t.get("outcome") == "TIME")
+    score = (
+        min(float(m_test.get("profit_factor", 0.0)), 4.0) * 0.45
+        + float(m_test.get("winrate", 0.0)) * 0.55
+        + max(float(m_test.get("net_return_sum", 0.0)), 0.0) * 0.35
+        - min(abs(float(m_test.get("max_drawdown", 0.0))) / 0.30, 1.0) * 0.25
+        + min(int(m_test.get("trades", 0)) / 40.0, 1.0) * 0.15
+    )
+    return {"all": m_all, "train": m_train, "test": m_test, "recent": recent, "test_outcomes": {"TP": tp, "SL": sl, "TIME": tm}, "score": float(score)}
+
+
+def _fmt_months(m: dict) -> str:
+    return f"months+={int(m.get('positive_months',0))}/{int(m.get('months',0))} ({_pct_str(m.get('positive_month_rate',0))})"
+
+
+def _fmt_short_detail(m: dict) -> str:
+    return _format_detail_metrics(m) + " " + _fmt_months(m)
+
+
+async def run_strategy_detail_backtest(exchange, years: float = 3.0, progress_cb=None) -> tuple[str, dict]:
+    """V74: detailed read-only test only for BTC 4H RSI divergence SHORT-only.
+
+    Checks lookback 6/12/24, overbought 60/62/65/68, and first-touch SL/TP
+    exits, plus recent 6/12/18/24 months and positive-month count.
+    """
+    async def _progress(line: str, **extra):
+        try:
+            log_event("strategy_detail_short_progress", stage=str(line), **extra)
+        except Exception:
+            pass
+        if progress_cb is not None:
+            try:
+                await progress_cb(str(line))
+            except Exception as e:
+                log_event("strategy_detail_short_progress_cb_error", ok=False, error=str(e)[:300])
+
+    started = time.time()
+    errors: list[dict] = []
+    await _progress("BTC 4H RSI SHORT-only loading candles", years=years)
+    candles = await fetch_ohlcv_history(exchange, symbol="BTC_USDT", timeframe="4h", years=years, limit_per_call=500)
+    await _progress(f"BTC 4H loaded: {len(candles)} candles")
+    df = _to_df(candles)
+    tfms = _tf_ms("4h"); now_ms = int(time.time() * 1000)
+    df = df[df["ts"] + tfms <= now_ms].reset_index(drop=True)
+    first_iso = datetime.fromtimestamp(int(df["ts"].iloc[0])/1000, tz=timezone.utc).strftime("%Y-%m-%d") if len(df) else "n/a"
+    last_iso = datetime.fromtimestamp(int(df["ts"].iloc[-1])/1000, tz=timezone.utc).strftime("%Y-%m-%d") if len(df) else "n/a"
+    variants: list[dict] = []
+    lookbacks = [6, 12, 24]
+    overboughts = [60, 62, 65, 68]
+    rrs = [1.0, 1.5, 2.0]
+    stop_atrs = [0.10, 0.15, 0.25]
+    horizon = 6
+    cooldown = 3
+    total = len(lookbacks) * len(overboughts) * len(rrs) * len(stop_atrs)
+    done = 0
+    for look in lookbacks:
+        for ob in overboughts:
+            for rr in rrs:
+                for satr in stop_atrs:
+                    done += 1
+                    params = {"horizon": horizon, "lookback": look, "overbought": ob, "cooldown": cooldown, "rr": rr, "stop_atr": satr}
+                    try:
+                        trades = _generate_btc_4h_rsi_short_real_trades(df, params)
+                        met = _detail_variant_metrics(df, trades)
+                        variants.append({"params": params, "trades": len(trades), "metrics": met, "sample_last_trades": trades[-5:]})
+                    except Exception as e:
+                        errors.append({"params": params, "error": str(e)[:500]})
+                    if done in (1, 12, 24, 36, total):
+                        await _progress(f"BTC 4H RSI SHORT-only calculated {done}/{total}")
+    variants.sort(key=lambda x: float(x.get("metrics", {}).get("score", 0.0)), reverse=True)
+    stable = []
+    for v in variants:
+        mt = v["metrics"]["test"]
+        r12 = v["metrics"]["recent"].get("12m", {})
+        if int(mt.get("trades", 0)) >= 20 and float(mt.get("profit_factor", 0)) >= 1.4 and float(mt.get("net_return_sum", 0)) > 0 and float(r12.get("net_return_sum", 0)) > 0:
+            stable.append(v)
+    best = variants[:8]
+    payload = {
+        "ok": True,
+        "years_requested": years,
+        "mode": "btc_4h_rsi_divergence_short_only_first_touch",
+        "runtime_sec": round(time.time() - started, 2),
+        "candles": len(df),
+        "from": first_iso,
+        "to": last_iso,
+        "variants_total": len(variants),
+        "stable_total": len(stable),
+        "top": best,
+        "stable": stable[:10],
+        "errors": errors,
+        "notes": [
+            "manual Strategy Detail only; no trading logic changed",
+            "BTC 4H RSI divergence SHORT-only",
+            "grid: lookback 6/12/24, overbought 60/62/65/68, RR 1/1.5/2, stop ATR buffer 0.10/0.15/0.25",
+            "first-touch SL/TP; if SL and TP inside same candle, SL wins conservatively",
+            "reports recent 6/12/18/24 months and positive-month count",
+        ],
+    }
+    log_event("strategy_detail_btc_rsi_short_only_result", **payload)
+    lines = [
+        "🧪 STRATEGY DETAIL REPORT — BTC 4H RSI SHORT-only",
+        f"History: {years:g}y | Trading logic: НЕ изменялась | OpenAI не вызывается",
+        "Mode: BTC 4H RSI bearish divergence SHORT-only, real first-touch SL/TP.",
+        "Grid: lookback 6/12/24; overbought 60/62/65/68; RR 1/1.5/2; stop ATR buffer 0.10/0.15/0.25.",
+        f"Data: candles={len(df)} | {first_iso}→{last_iso}",
+        f"Runtime={payload['runtime_sec']}s | variants={len(variants)} | stable={len(stable)} | errors={len(errors)}",
+        "",
+        "🏆 TOP BY DETAIL SCORE:",
+    ]
+    for idx, v in enumerate(best, start=1):
+        p = v["params"]; mt = v["metrics"]["test"]; r6 = v["metrics"]["recent"].get("6m", {}); r12 = v["metrics"]["recent"].get("12m", {})
+        out = v["metrics"].get("test_outcomes", {})
+        usd100 = 100.0 * float(mt.get("monthly_compound", 0.0))
+        lines.append(
+            f"{idx}. {p} | TEST {_fmt_short_detail(mt)} | outcomes TP/SL/TIME={out.get('TP',0)}/{out.get('SL',0)}/{out.get('TIME',0)} | $100≈${usd100:.2f}/mo\n"
+            f"   Recent 6M {_fmt_short_detail(r6)} | 12M {_fmt_short_detail(r12)}"
+        )
+    lines += ["", "✅ STABLE SHORT-only CANDIDATES:"]
+    if stable:
+        for idx, v in enumerate(stable[:5], start=1):
+            p = v["params"]; mt = v["metrics"]["test"]; r12 = v["metrics"]["recent"].get("12m", {}); r24 = v["metrics"]["recent"].get("24m", {})
+            lines.append(f"{idx}. {p} | TEST {_fmt_short_detail(mt)} | 12M {_fmt_short_detail(r12)} | 24M {_fmt_short_detail(r24)}")
+    else:
+        lines.append("Нет кандидатов, которые проходят фильтр PF≥1.4, trades≥20, TEST net>0 и 12M net>0.")
+    lines += [
+        "",
+        "ИТОГ: это detail-backtest, не автоторговля. Если стабильных кандидатов нет — не подключать. Сырой JSON: /log_full",
+    ]
+    return "\n".join(lines[:120]), payload

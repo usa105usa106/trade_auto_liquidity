@@ -3041,8 +3041,8 @@ async def backtest_strategy_lab_extra_cmd(update: Update, context: ContextTypes.
         msg = await reply(
             update,
             "🧪 STRATEGY DETAIL — progress\n"
-            f"History requested: {years:g}y | mode=DETAIL | BTC/ETH\n"
-            "Подробно считаю только 3 режима: BTC 4H RSI divergence, BTC 1H RSI divergence, ETH 1H gap imbalance fill.\n"
+            f"History requested: {years:g}y | mode=DETAIL | BTC 4H SHORT-only\n"
+            "Подробно считаю только BTC 4H RSI divergence SHORT-only: lookback 6/12/24, overbought 60/62/65/68, first-touch SL/TP.\n"
             "Trading logic: НЕ изменяется, сделок не открываю.\n\n"
             "Strategy Detail started\n\n⏳ Это живое сообщение: этапы загрузки/расчёта будут обновляться здесь.",
             reply_markup=MAIN_MENU,
