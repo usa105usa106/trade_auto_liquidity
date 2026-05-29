@@ -306,6 +306,113 @@ def pattern_match_backtest(df: pd.DataFrame, window: int = 6, horizon: int = 6, 
     }
 
 
+
+def pattern_match_backtest_knn(df: pd.DataFrame, window: int = 24, horizon: int = 24, top_k: int = 40, min_train: int = 1200, min_edge: float = 0.60, max_neighbors: int = 500, eval_stride: int = 3) -> dict:
+    """Fast approximate walk-forward pattern test for larger 1H datasets.
+
+    Uses nearest-neighbor search over candle fingerprints, then for each decision keeps
+    only neighbors that were strictly older than the decision candle. No trading side effects.
+    This is much faster than full O(N^2) scanning and is intended for manual backtests.
+    """
+    if len(df) < min_train + window + horizon + 50:
+        return {"ok": False, "error": f"not enough candles: {len(df)}"}
+    X = _window_features(df, window)
+    closes = df["close"].to_numpy(float)
+    n = len(X)
+    if n < top_k + 50:
+        return {"ok": False, "error": f"not enough feature rows: {n}"}
+    # Standardize to prevent one feature group from dominating.
+    mu = np.nanmean(X, axis=0)
+    sig = np.nanstd(X, axis=0)
+    sig = np.where(sig < 1e-9, 1.0, sig)
+    Xs = np.nan_to_num((X - mu) / sig, nan=0.0, posinf=6.0, neginf=-6.0)
+    k_search = int(min(max_neighbors, max(top_k * 8, top_k + 50), max(2, n - 1)))
+    try:
+        from sklearn.neighbors import NearestNeighbors
+        nn_model = NearestNeighbors(n_neighbors=k_search, algorithm="auto", metric="euclidean")
+        nn_model.fit(Xs)
+        distances, indices = nn_model.kneighbors(Xs, return_distance=True)
+    except Exception as e:
+        log_event("btc_pattern_backtest_knn_error", ok=False, error=str(e)[:500], window=window, horizon=horizon)
+        return pattern_match_backtest(df, window=window, horizon=horizon, top_k=top_k, min_train=min_train, min_edge=min_edge)
+
+    returns: list[float] = []
+    directions: list[str] = []
+    equity: list[float] = []
+    eq = 0.0
+    skipped = 0
+    evaluated = 0
+    pred_records: list[dict] = []
+    first_i = max(min_train, window + horizon + 10)
+    last_i = len(df) - horizon - 1
+    stride = max(1, int(eval_stride or 1))
+    for i in range(first_i, last_i, stride):
+        r_idx = i - window + 1
+        if r_idx < 0 or r_idx >= len(indices):
+            continue
+        evaluated += 1
+        train_end_i = i - horizon
+        train_rows = train_end_i - window + 1
+        if train_rows < top_k + 20:
+            continue
+        fut = []
+        picked = 0
+        for rr in indices[r_idx]:
+            rr = int(rr)
+            if rr == r_idx or rr >= train_rows:
+                continue
+            j = rr + window - 1
+            if j + horizon >= len(closes):
+                continue
+            fut.append((closes[j + horizon] - closes[j]) / max(closes[j], 1e-9))
+            picked += 1
+            if picked >= top_k:
+                break
+        if len(fut) < max(12, int(top_k * 0.65)):
+            skipped += 1
+            continue
+        pos_rate = sum(1 for x in fut if x > 0) / len(fut)
+        avg = float(np.mean(fut))
+        if pos_rate >= min_edge and avg > 0:
+            side = "LONG"
+            ret = (closes[i + horizon] - closes[i]) / max(closes[i], 1e-9)
+        elif pos_rate <= (1.0 - min_edge) and avg < 0:
+            side = "SHORT"
+            ret = (closes[i] - closes[i + horizon]) / max(closes[i], 1e-9)
+        else:
+            skipped += 1
+            continue
+        ret_net = ret - 0.0006
+        returns.append(float(ret_net))
+        directions.append(side)
+        eq += float(ret_net)
+        equity.append(eq)
+        if len(pred_records) < 5 or i > last_i - 200:
+            pred_records.append({"ts": int(df.iloc[i]["ts"]), "side": side, "pos_rate": round(pos_rate, 3), "avg_future": round(avg, 5), "ret_net": round(ret_net, 5)})
+    if not returns:
+        return {"ok": True, "window": window, "horizon": horizon, "top_k": top_k, "signals": 0, "skipped": skipped, "evaluated": evaluated, "message": "no historical edge >= threshold", "fast_knn": True}
+    wins = [r for r in returns if r > 0]
+    return {
+        "ok": True,
+        "window": window,
+        "horizon": horizon,
+        "top_k": top_k,
+        "signals": len(returns),
+        "skipped": skipped,
+        "evaluated": evaluated,
+        "eval_stride": stride,
+        "fast_knn": True,
+        "winrate": len(wins) / len(returns),
+        "profit_factor": _profit_factor(returns),
+        "avg_return": float(np.mean(returns)),
+        "median_return": float(np.median(returns)),
+        "max_drawdown_sum_return": _max_drawdown(equity),
+        "long_signals": directions.count("LONG"),
+        "short_signals": directions.count("SHORT"),
+        "examples": pred_records[-8:],
+    }
+
+
 def current_pattern_stats(df: pd.DataFrame, window: int = 6, horizon: int = 6, top_k: int = 30) -> dict:
     if len(df) < window + horizon + top_k + 50:
         return {"ok": False, "error": "not enough candles"}
@@ -530,6 +637,7 @@ async def run_btc_pattern_backtest(exchange, symbol: str = "BTC_USDT", years: fl
             "manual backtest only; no trading logic changed",
             "pattern backtest is walk-forward: each decision uses only older candles",
             "returns include rough 0.06% round-trip cost placeholder",
+            "funding-based contrarian is candle-only proxy because historical funding is not in OHLCV",
             "US-open reference candle = 15:00-19:00 MSK 4H candle containing 16:30 MSK",
         ],
     }
@@ -580,9 +688,12 @@ async def run_btc_pattern_backtest_1h(exchange, symbol: str = "BTC_USDT", years:
     current_results = []
     # Same idea as 4H, but equivalent time windows: 24 candles=24h, 48 candles=48h.
     # Forecast: +12h and +24h.
+    log_event("btc_pattern_backtest_1h_progress", stage="candles_loaded", candles=int(len(df)), from_date=date_from, to_date=date_to)
     for w in (24, 48):
         for h in (12, 24):
-            pattern_results.append(pattern_match_backtest(df, window=w, horizon=h, top_k=40, min_train=min(3000, max(800, len(df)//5)), min_edge=0.60))
+            log_event("btc_pattern_backtest_1h_progress", stage="calc_start", window=w, horizon=h)
+            pattern_results.append(pattern_match_backtest_knn(df, window=w, horizon=h, top_k=40, min_train=min(3000, max(800, len(df)//5)), min_edge=0.60, max_neighbors=600, eval_stride=3))
+            log_event("btc_pattern_backtest_1h_progress", stage="calc_done", window=w, horizon=h, signals=(pattern_results[-1] or {}).get("signals"), evaluated=(pattern_results[-1] or {}).get("evaluated"))
         current_results.append(current_pattern_stats(df, window=w, horizon=24, top_k=40))
 
     payload = {
@@ -601,6 +712,7 @@ async def run_btc_pattern_backtest_1h(exchange, symbol: str = "BTC_USDT", years:
             "walk-forward: each decision uses only older candles",
             "windows: 24 candles=24h and 48 candles=48h",
             "returns include rough 0.06% round-trip cost placeholder",
+            "funding-based contrarian is candle-only proxy because historical funding is not in OHLCV",
         ],
     }
     log_event("btc_pattern_backtest_1h_result", **payload)
@@ -769,19 +881,39 @@ def _line_summary_round(res: dict) -> str:
     )
 
 
-async def run_round_level_backtest(exchange, years: float = 3.0) -> tuple[str, dict]:
-    """Manual BTC/ETH psychological round-level reaction backtest. No trading side effects."""
+async def run_round_level_backtest(exchange, years: float = 3.0, progress_cb=None) -> tuple[str, dict]:
+    """Manual BTC/ETH psychological round-level reaction backtest. No trading side effects.
+
+    progress_cb, when provided, is an async callback receiving human-readable
+    status lines for Telegram progress updates.  It has no trading side effects.
+    """
+    async def _progress(line: str, **extra):
+        try:
+            log_event("round_level_backtest_progress", stage=str(line), **extra)
+        except Exception:
+            pass
+        if progress_cb is not None:
+            try:
+                await progress_cb(str(line))
+            except Exception as e:
+                log_event("round_level_backtest_progress_cb_error", ok=False, error=str(e)[:300])
+
     started = time.time()
     symbols = ["BTC_USDT", "ETH_USDT"]
-    timeframes = ["15m", "1h"]
+    # Order chosen for clear progress in chat: BTC 1H, BTC 15m, ETH 1H, ETH 15m.
+    timeframes = ["1h", "15m"]
     payload_results = []
+    await _progress("Round Levels started", years=years)
     for symbol in symbols:
         step = _round_step_for_symbol(symbol)
         for tf in timeframes:
+            tf_label = str(tf).upper()
             try:
                 candles = await fetch_ohlcv_history(exchange, symbol=symbol, timeframe=tf, years=years, limit_per_call=500)
+                await _progress(f"{symbol.split('_')[0]} {tf_label} loaded: {len(candles)} candles", symbol=symbol, timeframe=tf, candles=len(candles))
                 if len(candles) < 500:
                     payload_results.append({"ok": False, "symbol": symbol, "timeframe": tf, "error": f"not enough candles fetched: {len(candles)}"})
+                    await _progress(f"{symbol.split('_')[0]} {tf_label} skipped: not enough candles", symbol=symbol, timeframe=tf, candles=len(candles))
                     continue
                 df = _to_df(candles)
                 tf_ms = _tf_ms(tf)
@@ -794,8 +926,10 @@ async def run_round_level_backtest(exchange, years: float = 3.0) -> tuple[str, d
                     horizon_bars = 24
                     cooldown_bars = 24
                 payload_results.append(_round_level_scan(df, symbol=symbol, timeframe=tf, step=step, horizon_bars=horizon_bars, cooldown_bars=cooldown_bars, target_pct=0.005))
+                await _progress(f"{symbol.split('_')[0]} {tf_label} calculated", symbol=symbol, timeframe=tf, result_ok=bool(payload_results[-1].get("ok")))
             except Exception as e:
                 payload_results.append({"ok": False, "symbol": symbol, "timeframe": tf, "error": str(e)[:500]})
+                await _progress(f"{symbol.split('_')[0]} {tf_label} error: {str(e)[:160]}", symbol=symbol, timeframe=tf)
 
     payload = {
         "ok": True,
@@ -832,3 +966,468 @@ async def run_round_level_backtest(exchange, years: float = 3.0) -> tuple[str, d
         "Сырой JSON и ошибки: /log_full",
     ]
     return "\n".join(lines), payload
+
+# ---------------- V63 Strategy Lab backtest (manual only, no trading side effects) ----------------
+
+def _pct_str(x: float) -> str:
+    try:
+        return f"{float(x)*100:.2f}%"
+    except Exception:
+        return "n/a"
+
+
+def _strategy_metrics(rets: list[float]) -> dict:
+    clean = [float(r) for r in (rets or []) if math.isfinite(float(r))]
+    if not clean:
+        return {"trades": 0, "winrate": 0.0, "profit_factor": 0.0, "avg_return": 0.0, "net_return_sum": 0.0, "max_drawdown": 0.0}
+    eq = []
+    s = 0.0
+    for r in clean:
+        s += r
+        eq.append(s)
+    return {
+        "trades": len(clean),
+        "winrate": sum(1 for r in clean if r > 0) / len(clean),
+        "profit_factor": _profit_factor(clean),
+        "avg_return": float(np.mean(clean)),
+        "median_return": float(np.median(clean)),
+        "net_return_sum": float(sum(clean)),
+        "max_drawdown": float(_max_drawdown(eq)),
+        "best": float(max(clean)),
+        "worst": float(min(clean)),
+    }
+
+
+def _trade_ret(side: str, entry: float, exit_: float, cost: float = 0.0006) -> float:
+    if entry <= 0 or exit_ <= 0:
+        return 0.0
+    if str(side).upper() == "SHORT":
+        return (entry - exit_) / entry - cost
+    return (exit_ - entry) / entry - cost
+
+
+def _add_strategy_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy().reset_index(drop=True)
+    d["ret1"] = d["close"].pct_change().fillna(0.0)
+    d["range_pct"] = ((d["high"] - d["low"]) / d["close"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    d["vol_ratio"] = (d["volume"] / d["volume"].rolling(30, min_periods=5).mean()).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    d["ma20"] = d["close"].rolling(20, min_periods=5).mean()
+    d["ma50"] = d["close"].rolling(50, min_periods=10).mean()
+    d["ma100"] = d["close"].rolling(100, min_periods=20).mean()
+    d["ema12"] = d["close"].ewm(span=12, adjust=False, min_periods=5).mean()
+    d["ema26"] = d["close"].ewm(span=26, adjust=False, min_periods=8).mean()
+    delta = d["close"].diff().fillna(0.0)
+    gain = delta.clip(lower=0).rolling(14, min_periods=5).mean()
+    loss = (-delta.clip(upper=0)).rolling(14, min_periods=5).mean().replace(0, np.nan)
+    rs = gain / loss
+    d["rsi14"] = (100 - (100 / (1 + rs))).replace([np.inf, -np.inf], np.nan).fillna(50.0)
+    bb_mid = d["close"].rolling(20, min_periods=10).mean()
+    bb_std = d["close"].rolling(20, min_periods=10).std().fillna(0.0)
+    d["bb_mid"] = bb_mid
+    d["bb_upper"] = bb_mid + 2.0 * bb_std
+    d["bb_lower"] = bb_mid - 2.0 * bb_std
+    d["bb_width"] = ((d["bb_upper"] - d["bb_lower"]) / d["close"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    pv = (d["close"] * d["volume"]).rolling(24, min_periods=6).sum()
+    vv = d["volume"].rolling(24, min_periods=6).sum().replace(0, np.nan)
+    d["rvwap24"] = (pv / vv).replace([np.inf, -np.inf], np.nan).fillna(d["close"])
+    d["atr_pct"] = (d["atr14"] / d["close"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(d["range_pct"].rolling(20, min_periods=3).mean()).fillna(0.005)
+    d["roll_high_24"] = d["high"].rolling(24, min_periods=6).max().shift(1)
+    d["roll_low_24"] = d["low"].rolling(24, min_periods=6).min().shift(1)
+    d["roll_high_12"] = d["high"].rolling(12, min_periods=4).max().shift(1)
+    d["roll_low_12"] = d["low"].rolling(12, min_periods=4).min().shift(1)
+    d["body_pct_abs"] = ((d["close"] - d["open"]).abs() / d["close"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return d
+
+
+def _level_step_for_symbol(symbol: str) -> float:
+    s = str(symbol).upper()
+    return 50.0 if s.startswith("ETH") else 500.0
+
+
+def _generate_strategy_returns(df_in: pd.DataFrame, symbol: str, timeframe: str, family: str, params: dict, cost: float = 0.0006) -> dict:
+    """Simple, bounded strategy simulation. Entry at signal close; exit by horizon close.
+
+    This is intentionally conservative and fast: it does not place live orders and does
+    not change bot trading logic. It is a scanner to find candidates for later review.
+    """
+    df = _add_strategy_indicators(df_in)
+    c = df["close"].to_numpy(float); h = df["high"].to_numpy(float); l = df["low"].to_numpy(float); o = df["open"].to_numpy(float)
+    volr = df["vol_ratio"].to_numpy(float); atrp = df["atr_pct"].to_numpy(float)
+    ma20 = df["ma20"].to_numpy(float); ma50 = df["ma50"].to_numpy(float); ma100 = df["ma100"].to_numpy(float)
+    ema12 = df["ema12"].to_numpy(float); ema26 = df["ema26"].to_numpy(float); rsi14 = df["rsi14"].to_numpy(float)
+    bbu = df["bb_upper"].to_numpy(float); bbl = df["bb_lower"].to_numpy(float); bbw = df["bb_width"].to_numpy(float); rvwap = df["rvwap24"].to_numpy(float)
+    body_abs = df["body_pct_abs"].to_numpy(float)
+    rh24 = df["roll_high_24"].to_numpy(float); rl24 = df["roll_low_24"].to_numpy(float)
+    rh12 = df["roll_high_12"].to_numpy(float); rl12 = df["roll_low_12"].to_numpy(float)
+    ts_arr = df["ts"].to_numpy(np.int64)
+    horizon = int(params.get("horizon", 6))
+    cooldown = int(params.get("cooldown", max(1, horizon // 2)))
+    rets: list[float] = []
+    sides: list[str] = []
+    times: list[int] = []
+    last_trade_i = -10**9
+    n = len(df)
+    start = 120
+    for i in range(start, n - horizon - 1):
+        if i - last_trade_i < cooldown:
+            continue
+        side = None
+        fam = str(family)
+        try:
+            if fam == "momentum_breakout":
+                look = int(params.get("lookback", 24)); vr = float(params.get("vol_ratio", 1.1))
+                if i - look < 1: continue
+                prev_hi = np.nanmax(h[i-look:i]); prev_lo = np.nanmin(l[i-look:i])
+                if c[i] > prev_hi and volr[i] >= vr:
+                    side = "LONG"
+                elif c[i] < prev_lo and volr[i] >= vr:
+                    side = "SHORT"
+            elif fam == "trend_pullback":
+                near = float(params.get("near_atr", 0.35))
+                trend_ok_long = np.isfinite(ma50[i]) and np.isfinite(ma100[i]) and ma50[i] > ma100[i] and c[i] > ma100[i]
+                trend_ok_short = np.isfinite(ma50[i]) and np.isfinite(ma100[i]) and ma50[i] < ma100[i] and c[i] < ma100[i]
+                if trend_ok_long and np.isfinite(ma20[i]) and l[i] <= ma20[i] * (1 + near * max(atrp[i], 0.001)) and c[i] > o[i]:
+                    side = "LONG"
+                elif trend_ok_short and np.isfinite(ma20[i]) and h[i] >= ma20[i] * (1 - near * max(atrp[i], 0.001)) and c[i] < o[i]:
+                    side = "SHORT"
+            elif fam == "super_volume_reversal":
+                vr = float(params.get("vol_ratio", 1.5)); wick = float(params.get("wick", 0.45))
+                rng = max(h[i]-l[i], c[i]*1e-9)
+                upper = (h[i] - max(o[i], c[i])) / rng
+                lower = (min(o[i], c[i]) - l[i]) / rng
+                if volr[i] >= vr and lower >= wick and c[i] > o[i]:
+                    side = "LONG"
+                elif volr[i] >= vr and upper >= wick and c[i] < o[i]:
+                    side = "SHORT"
+            elif fam == "liquidity_sweep":
+                buf = float(params.get("buffer", 0.0005)); look = int(params.get("lookback", 24))
+                if i - look < 1: continue
+                prev_hi = np.nanmax(h[i-look:i]); prev_lo = np.nanmin(l[i-look:i])
+                if h[i] > prev_hi * (1 + buf) and c[i] < prev_hi:
+                    side = "SHORT"
+                elif l[i] < prev_lo * (1 - buf) and c[i] > prev_lo:
+                    side = "LONG"
+            elif fam == "mean_reversion_ma":
+                z = float(params.get("atr_z", 1.6))
+                if np.isfinite(ma50[i]) and c[i] < ma50[i] * (1 - z * max(atrp[i], 0.001)):
+                    side = "LONG"
+                elif np.isfinite(ma50[i]) and c[i] > ma50[i] * (1 + z * max(atrp[i], 0.001)):
+                    side = "SHORT"
+            elif fam == "ma_trend_continuation":
+                slope = int(params.get("slope", 5)); vr = float(params.get("vol_ratio", 1.0))
+                if i - slope < 1: continue
+                if np.isfinite(ma20[i]) and np.isfinite(ma50[i]) and ma20[i] > ma50[i] and ma20[i] > ma20[i-slope] and c[i] > ma20[i] and volr[i] >= vr:
+                    side = "LONG"
+                elif np.isfinite(ma20[i]) and np.isfinite(ma50[i]) and ma20[i] < ma50[i] and ma20[i] < ma20[i-slope] and c[i] < ma20[i] and volr[i] >= vr:
+                    side = "SHORT"
+            elif fam == "round_level_reversal":
+                step = _level_step_for_symbol(symbol); band = float(params.get("band", 0.0015))
+                level = round(c[i] / step) * step
+                if level > 0:
+                    # Came from below into round resistance zone with upper rejection.
+                    if c[i-1] < level and h[i] >= level * (1 - band) and c[i] < level and c[i] < o[i]:
+                        side = "SHORT"
+                    # Came from above into round support zone with lower rejection.
+                    elif c[i-1] > level and l[i] <= level * (1 + band) and c[i] > level and c[i] > o[i]:
+                        side = "LONG"
+            elif fam == "vwap_reversal":
+                band = float(params.get("band", 0.0015))
+                if np.isfinite(rvwap[i]) and l[i] < rvwap[i] * (1 - band) and c[i] > rvwap[i] and c[i] > o[i]:
+                    side = "LONG"
+                elif np.isfinite(rvwap[i]) and h[i] > rvwap[i] * (1 + band) and c[i] < rvwap[i] and c[i] < o[i]:
+                    side = "SHORT"
+            elif fam == "bollinger_squeeze_breakout":
+                sq = float(params.get("squeeze", 0.75)); vr = float(params.get("vol_ratio", 1.0))
+                base_w = np.nanmedian(bbw[max(0, i-80):i]) if i > 30 else np.nan
+                if np.isfinite(base_w) and bbw[i] < base_w * sq and volr[i] >= vr:
+                    if np.isfinite(bbu[i]) and c[i] > bbu[i]:
+                        side = "LONG"
+                    elif np.isfinite(bbl[i]) and c[i] < bbl[i]:
+                        side = "SHORT"
+            elif fam == "rsi_divergence":
+                look = int(params.get("lookback", 12)); os = float(params.get("oversold", 35)); ob = float(params.get("overbought", 65))
+                if i - look < 2: continue
+                prev_low = np.nanmin(l[i-look:i]); prev_high = np.nanmax(h[i-look:i])
+                prev_rsi_low = np.nanmin(rsi14[i-look:i]); prev_rsi_high = np.nanmax(rsi14[i-look:i])
+                if l[i] < prev_low and rsi14[i] > prev_rsi_low and rsi14[i] <= os and c[i] > o[i]:
+                    side = "LONG"
+                elif h[i] > prev_high and rsi14[i] < prev_rsi_high and rsi14[i] >= ob and c[i] < o[i]:
+                    side = "SHORT"
+            elif fam == "atr_volatility_expansion":
+                mult = float(params.get("atr_mult", 1.8)); vr = float(params.get("vol_ratio", 1.2))
+                if (h[i] - l[i]) / max(c[i], 1e-9) >= mult * max(atrp[i], 0.001) and volr[i] >= vr:
+                    side = "LONG" if c[i] > o[i] else "SHORT"
+            elif fam == "funding_contrarian_proxy":
+                # Candle-only proxy: funding history is not available in OHLCV backtest, so test contrarian after strong overextension.
+                look = int(params.get("lookback", 8)); thr = float(params.get("move", 0.025))
+                if i - look < 1: continue
+                move = (c[i] - c[i-look]) / max(c[i-look], 1e-9)
+                if move >= thr and np.isfinite(ma50[i]) and c[i] > ma50[i] * (1 + max(atrp[i], 0.001)):
+                    side = "SHORT"
+                elif move <= -thr and np.isfinite(ma50[i]) and c[i] < ma50[i] * (1 - max(atrp[i], 0.001)):
+                    side = "LONG"
+            elif fam == "ema_cross_trend_filter":
+                if i < 2: continue
+                if np.isfinite(ema12[i]) and np.isfinite(ema26[i]) and np.isfinite(ma100[i]) and ema12[i-1] <= ema26[i-1] and ema12[i] > ema26[i] and c[i] > ma100[i]:
+                    side = "LONG"
+                elif np.isfinite(ema12[i]) and np.isfinite(ema26[i]) and np.isfinite(ma100[i]) and ema12[i-1] >= ema26[i-1] and ema12[i] < ema26[i] and c[i] < ma100[i]:
+                    side = "SHORT"
+            elif fam == "donchian_breakout":
+                look = int(params.get("lookback", 20)); vr = float(params.get("vol_ratio", 1.0))
+                if i - look < 1: continue
+                prev_hi = np.nanmax(h[i-look:i]); prev_lo = np.nanmin(l[i-look:i])
+                if c[i] > prev_hi and volr[i] >= vr:
+                    side = "LONG"
+                elif c[i] < prev_lo and volr[i] >= vr:
+                    side = "SHORT"
+            elif fam == "opening_range_breakout":
+                # UTC 13:30 US open ≈ Moscow 16:30.  For candle data, use the first complete 1H/15m candles after US open.
+                dt = datetime.fromtimestamp(int(ts_arr[i]) / 1000, tz=timezone.utc)
+                if dt.hour in (14, 15, 16):
+                    look = int(params.get("lookback", 4))
+                    if i - look < 1: continue
+                    rhi = np.nanmax(h[i-look:i]); rlo = np.nanmin(l[i-look:i])
+                    if c[i] > rhi and c[i] > o[i]:
+                        side = "LONG"
+                    elif c[i] < rlo and c[i] < o[i]:
+                        side = "SHORT"
+            elif fam == "false_breakout_us_open":
+                dt = datetime.fromtimestamp(int(ts_arr[i]) / 1000, tz=timezone.utc)
+                if dt.hour in (13, 14, 15, 16, 17):
+                    look = int(params.get("lookback", 12)); buf = float(params.get("buffer", 0.0005))
+                    if i - look < 1: continue
+                    prev_hi = np.nanmax(h[i-look:i]); prev_lo = np.nanmin(l[i-look:i])
+                    if h[i] > prev_hi * (1 + buf) and c[i] < prev_hi:
+                        side = "SHORT"
+                    elif l[i] < prev_lo * (1 - buf) and c[i] > prev_lo:
+                        side = "LONG"
+            elif fam == "support_resistance_retest":
+                look = int(params.get("lookback", 24)); band = float(params.get("band", 0.001))
+                if i - look - 2 < 1: continue
+                prev_hi = np.nanmax(h[i-look-2:i-2]); prev_lo = np.nanmin(l[i-look-2:i-2])
+                if c[i-1] > prev_hi and l[i] <= prev_hi * (1 + band) and c[i] > prev_hi:
+                    side = "LONG"
+                elif c[i-1] < prev_lo and h[i] >= prev_lo * (1 - band) and c[i] < prev_lo:
+                    side = "SHORT"
+            elif fam == "gap_imbalance_fill":
+                mult = float(params.get("body_atr", 1.4))
+                if i < 2: continue
+                big_prev = body_abs[i-1] >= mult * max(atrp[i-1], 0.001)
+                mid_prev = (o[i-1] + c[i-1]) / 2.0
+                if big_prev and c[i-1] > o[i-1] and l[i] <= mid_prev and c[i] > mid_prev:
+                    side = "LONG"
+                elif big_prev and c[i-1] < o[i-1] and h[i] >= mid_prev and c[i] < mid_prev:
+                    side = "SHORT"
+        except Exception:
+            continue
+        if not side:
+            continue
+        entry = c[i]
+        exit_ = c[i + horizon]
+        ret = _trade_ret(side, entry, exit_, cost=cost)
+        rets.append(ret); sides.append(side); times.append(int(df.loc[i, "ts"]))
+        last_trade_i = i
+    split_ts = int(df["ts"].iloc[int(len(df) * 0.70)]) if len(df) else 0
+    train_rets = [r for r,t in zip(rets,times) if t < split_ts]
+    test_rets = [r for r,t in zip(rets,times) if t >= split_ts]
+    m_all = _strategy_metrics(rets); m_train = _strategy_metrics(train_rets); m_test = _strategy_metrics(test_rets)
+    # Stability favors test PF, enough trades, positive test return, and modest drawdown.
+    test_pf = min(float(m_test.get("profit_factor", 0.0)), 3.0)
+    trade_bonus = min(float(m_test.get("trades", 0)) / 80.0, 1.0)
+    dd_penalty = min(abs(float(m_test.get("max_drawdown", 0.0))) / 1.0, 1.0)
+    score = test_pf * 0.55 + float(m_test.get("winrate", 0.0)) * 0.7 + trade_bonus * 0.25 + max(float(m_test.get("net_return_sum", 0.0)), 0.0) * 0.1 - dd_penalty * 0.25
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "family": family,
+        "params": params,
+        "all": m_all,
+        "train": m_train,
+        "test": m_test,
+        "long_signals": sum(1 for s in sides if s == "LONG"),
+        "short_signals": sum(1 for s in sides if s == "SHORT"),
+        "score": float(score),
+    }
+
+
+def _strategy_param_grid(timeframe: str) -> list[tuple[str, dict]]:
+    tf = str(timeframe).lower()
+    if tf == "4h":
+        horizons = [3, 6]
+        looks = [6, 12, 24]
+    elif tf == "15m":
+        horizons = [16, 48, 96]
+        looks = [24, 48, 96]
+    else:
+        horizons = [6, 12, 24]
+        looks = [12, 24, 48]
+    out: list[tuple[str, dict]] = []
+    for hzn in horizons:
+        for look in looks:
+            out.append(("momentum_breakout", {"horizon": hzn, "lookback": look, "vol_ratio": 1.2, "cooldown": max(2, hzn//2)}))
+            out.append(("liquidity_sweep", {"horizon": hzn, "lookback": look, "buffer": 0.0008, "cooldown": max(2, hzn//2)}))
+    for hzn in horizons:
+        out += [
+            ("trend_pullback", {"horizon": hzn, "near_atr": 0.35, "cooldown": max(2, hzn//2)}),
+            ("super_volume_reversal", {"horizon": hzn, "vol_ratio": 1.5, "wick": 0.45, "cooldown": max(2, hzn//2)}),
+            ("mean_reversion_ma", {"horizon": hzn, "atr_z": 1.5, "cooldown": max(2, hzn//2)}),
+            ("ma_trend_continuation", {"horizon": hzn, "slope": 5, "vol_ratio": 1.0, "cooldown": max(2, hzn//2)}),
+            ("round_level_reversal", {"horizon": hzn, "band": 0.0015, "cooldown": max(2, hzn//2)}),
+        ]
+    # Bound work while still scanning many variants.
+    return out[:90]
+
+
+
+
+def _strategy_param_grid_extra(timeframe: str) -> list[tuple[str, dict]]:
+    tf = str(timeframe).lower()
+    if tf == "4h":
+        horizons = [3, 6]
+        looks = [6, 12, 24]
+    elif tf == "15m":
+        horizons = [16, 48, 96]
+        looks = [16, 32, 64]
+    else:
+        horizons = [6, 12, 24]
+        looks = [12, 24, 48]
+    out: list[tuple[str, dict]] = []
+    for hzn in horizons:
+        cd = max(2, hzn // 2)
+        out += [
+            ("vwap_reversal", {"horizon": hzn, "band": 0.0015, "cooldown": cd}),
+            ("bollinger_squeeze_breakout", {"horizon": hzn, "squeeze": 0.75, "vol_ratio": 1.05, "cooldown": cd}),
+            ("atr_volatility_expansion", {"horizon": hzn, "atr_mult": 1.7, "vol_ratio": 1.15, "cooldown": cd}),
+            ("funding_contrarian_proxy", {"horizon": hzn, "lookback": max(4, hzn), "move": 0.02, "cooldown": cd}),
+            ("ema_cross_trend_filter", {"horizon": hzn, "cooldown": cd}),
+            ("gap_imbalance_fill", {"horizon": hzn, "body_atr": 1.35, "cooldown": cd}),
+        ]
+        for look in looks:
+            out += [
+                ("rsi_divergence", {"horizon": hzn, "lookback": look, "oversold": 38, "overbought": 62, "cooldown": cd}),
+                ("donchian_breakout", {"horizon": hzn, "lookback": look, "vol_ratio": 1.05, "cooldown": cd}),
+                ("opening_range_breakout", {"horizon": hzn, "lookback": max(3, min(look, 12)), "cooldown": cd}),
+                ("false_breakout_us_open", {"horizon": hzn, "lookback": max(6, min(look, 24)), "buffer": 0.0005, "cooldown": cd}),
+                ("support_resistance_retest", {"horizon": hzn, "lookback": look, "band": 0.001, "cooldown": cd}),
+            ]
+    return out[:120]
+
+
+def _strategy_family_names(mode: str) -> str:
+    if str(mode).lower() == "extra":
+        return "VWAP reversal, Bollinger squeeze/breakout, RSI divergence, ATR volatility expansion, funding-contrarian proxy, EMA cross, Donchian breakout, opening range breakout, false breakout after US open, S/R retest, gap/imbalance fill"
+    return "momentum, trend pullback, super volume, liquidity sweep, mean reversion, MA trend, round levels"
+
+def _strategy_lab_line(r: dict) -> str:
+    try:
+        tm = r.get("test") or {}
+        return (
+            f"{r.get('symbol')} {str(r.get('timeframe')).upper()} {r.get('family')} "
+            f"{r.get('params')} | test trades={tm.get('trades')} WR={_pct_str(tm.get('winrate',0))} "
+            f"PF={float(tm.get('profit_factor',0)):.2f} net={_pct_str(tm.get('net_return_sum',0))} "
+            f"DD={_pct_str(tm.get('max_drawdown',0))} score={float(r.get('score',0)):.2f}"
+        )
+    except Exception:
+        return str(r)[:250]
+
+
+async def run_strategy_lab_backtest(exchange, years: float = 3.0, mode: str = "safe", progress_cb=None) -> tuple[str, dict]:
+    """Manual strategy lab. Read-only.  Safe mode is designed not to hang Telegram/Railway.
+
+    mode=safe: BTC/ETH, 1H+4H, core bounded parameter grid.
+    mode=full: BTC/ETH, 15m+1H+4H, core grid.
+    mode=extra: BTC/ETH, 1H+4H, extended strategy families, bounded and background-progress friendly.
+    """
+    async def _progress(line: str, **extra):
+        try:
+            log_event("strategy_lab_progress", stage=str(line), **extra)
+        except Exception:
+            pass
+        if progress_cb is not None:
+            try:
+                await progress_cb(str(line))
+            except Exception as e:
+                log_event("strategy_lab_progress_cb_error", ok=False, error=str(e)[:300])
+
+    started = time.time()
+    symbols = ["BTC_USDT", "ETH_USDT"]
+    mlow = str(mode).lower()
+    timeframes = ["1h", "4h"] if mlow not in ("full", "extra_full") else ["15m", "1h", "4h"]
+    all_results: list[dict] = []
+    errors: list[dict] = []
+    await _progress("Strategy Lab started", years=years, mode=mode)
+    for symbol in symbols:
+        for tf in timeframes:
+            label = f"{symbol.split('_')[0]} {tf.upper()}"
+            try:
+                await _progress(f"{label} loading candles")
+                candles = await fetch_ohlcv_history(exchange, symbol=symbol, timeframe=tf, years=years, limit_per_call=500)
+                await _progress(f"{label} loaded: {len(candles)} candles", symbol=symbol, timeframe=tf, candles=len(candles))
+                if len(candles) < 700:
+                    errors.append({"symbol": symbol, "timeframe": tf, "error": f"not enough candles: {len(candles)}"})
+                    await _progress(f"{label} skipped: not enough candles")
+                    continue
+                df = _to_df(candles)
+                tfms = _tf_ms(tf); now_ms = int(time.time() * 1000)
+                df = df[df["ts"] + tfms <= now_ms].reset_index(drop=True)
+                grid = _strategy_param_grid_extra(tf) if mlow.startswith("extra") else _strategy_param_grid(tf)
+                await _progress(f"{label} calculating {len(grid)} variants")
+                for family, params in grid:
+                    try:
+                        res = _generate_strategy_returns(df, symbol=symbol, timeframe=tf, family=family, params=params)
+                        if int((res.get("test") or {}).get("trades") or 0) >= 20:
+                            all_results.append(res)
+                    except Exception as e:
+                        errors.append({"symbol": symbol, "timeframe": tf, "family": family, "error": str(e)[:240]})
+                await _progress(f"{label} calculated", variants=len(grid))
+            except Exception as e:
+                errors.append({"symbol": symbol, "timeframe": tf, "error": str(e)[:500]})
+                await _progress(f"{label} error: {str(e)[:160]}")
+
+    ranked = sorted(all_results, key=lambda r: (float(r.get("score", 0)), float((r.get("test") or {}).get("profit_factor", 0))), reverse=True)
+    stable = [r for r in ranked if float((r.get("test") or {}).get("profit_factor", 0)) >= 1.20 and float((r.get("test") or {}).get("winrate", 0)) >= 0.52 and int((r.get("test") or {}).get("trades", 0)) >= 40 and float((r.get("test") or {}).get("net_return_sum", 0)) > 0]
+    payload = {
+        "ok": True,
+        "years_requested": years,
+        "mode": mode,
+        "families": _strategy_family_names(mode),
+        "runtime_sec": round(time.time() - started, 2),
+        "tested_variants": len(all_results),
+        "errors": errors[:50],
+        "top": ranked[:20],
+        "stable_candidates": stable[:10],
+        "notes": [
+            "manual Strategy Lab only; no trading logic changed",
+            "train/test split: first 70% train, last 30% test",
+            "selection is by test stability, not just winrate",
+            "returns include rough 0.06% round-trip cost placeholder",
+            "funding-based contrarian is candle-only proxy because historical funding is not in OHLCV",
+            "do not integrate unless a candidate stays strong on test period and enough trades",
+        ],
+    }
+    log_event("strategy_lab_backtest_result", **payload)
+    lines = [
+        "🧪 STRATEGY LAB EXTRA BACKTEST — BTC/ETH" if str(mode).lower().startswith("extra") else "🧪 STRATEGY LAB BACKTEST — BTC/ETH",
+        f"History: {years:g}y | Mode: {mode.upper()} | Trading logic: НЕ изменялась",
+        f"Tested families: {_strategy_family_names(mode)}.",
+        "Validation: train 70% / test 30%, selection by PF + net + DD + trades, not only winrate.",
+        "",
+        f"Variants with enough test trades: {len(all_results)} | runtime={payload['runtime_sec']}s | errors={len(errors)}",
+        "",
+        "🏆 TOP BY STABILITY SCORE:",
+    ]
+    for idx, r in enumerate(ranked[:8], 1):
+        lines.append(f"{idx}. " + _strategy_lab_line(r))
+    lines.append("")
+    lines.append("✅ STABLE CANDIDATES PF≥1.20, WR≥52%, trades≥40, net>0:")
+    if stable:
+        for idx, r in enumerate(stable[:5], 1):
+            lines.append(f"{idx}. " + _strategy_lab_line(r))
+    else:
+        lines.append("Нет устойчивых кандидатов по текущим фильтрам. Не подключать в торговлю.")
+    lines += [
+        "",
+        "ИТОГ: подключать можно только кандидатов из STABLE после отдельной проверки/paper test. Сырой JSON: /log_full",
+    ]
+    return "\n".join(lines[:80]), payload
