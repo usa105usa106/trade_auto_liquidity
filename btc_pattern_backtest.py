@@ -93,7 +93,7 @@ async def fetch_ohlcv_history(exchange, symbol: str = "BTC_USDT", timeframe: str
     # Prefer ccxt because it supports `since` pagination on many venues.
     ccxt_ex = getattr(exchange, "exchange", None)
     if ccxt_ex is not None and hasattr(ccxt_ex, "fetch_ohlcv"):
-        for _ in range(80):  # 80*200 4h candles > 7 years; safety cap.
+        for _ in range(260):  # enough for ~3y of 15m candles with 500 limit; safety cap.
             try:
                 batch = await asyncio.wait_for(ccxt_ex.fetch_ohlcv(norm_symbol, timeframe=timeframe, since=cur, limit=limit), timeout=15)
             except Exception as e:
@@ -133,7 +133,7 @@ async def fetch_ohlcv_history(exchange, symbol: str = "BTC_USDT", timeframe: str
             cur_sec = since_ms // 1000
             end_all_sec = now_ms // 1000
             step_sec = int(tf_ms // 1000 * 190)
-            while cur_sec < end_all_sec and len(rows) < 20000:
+            while cur_sec < end_all_sec and len(rows) < 150000:
                 end_sec = min(end_all_sec, cur_sec + step_sec)
                 resp = await asyncio.wait_for(exchange._mexc_public("GET", f"/api/v1/contract/kline/{msym}", query={"interval": _mexc_interval(timeframe), "start": cur_sec, "end": end_sec}), timeout=15)
                 data = resp.get("data") if isinstance(resp, dict) else resp
@@ -759,73 +759,111 @@ def _fmt_num(x: float) -> str:
 
 
 def _round_level_scan(df: pd.DataFrame, symbol: str, timeframe: str, step: float, horizon_bars: int, cooldown_bars: int, target_pct: float = 0.005) -> dict:
-    """Backtest first approach/probe of psychological round levels.
+    """Backtest reactions around psychological round levels.
 
-    Resistance case: price approaches a round level from below.  Example BTC 74500-75000.
-    Support case: price approaches a round level from above.     Example BTC 50500-50000.
+    V66 logic is deliberately simple and auditable:
+    - BTC levels every 500, ETH levels every 50.
+    - A resistance event happens when previous close is below the round-level zone
+      and the next candle reaches that zone from below.
+    - A support event happens when previous close is above the round-level zone
+      and the next candle reaches that zone from above.
+    - Same level/direction is ignored for `cooldown_bars` after an event.
 
-    This is intentionally read-only and statistical.  It does not create orders.
+    This avoids the old over-strict "outside full step band for 24h" rule that
+    produced zero events. It is read-only and never creates/cancels orders.
     """
     if len(df) < max(300, cooldown_bars + horizon_bars + 20):
         return {"ok": False, "symbol": symbol, "timeframe": timeframe, "error": f"not enough candles: {len(df)}"}
+
     step = float(step)
-    lower_hits: dict[tuple[str, int], int] = {}
+    band_pct = 0.0015  # 0.15% zone around the round level
+    min_band_abs = step * 0.05  # avoid too tiny zones on low prices
+    last_hit: dict[tuple[str, int], int] = {}
     trades: list[dict] = []
+
     closes = df["close"].to_numpy(float)
     highs = df["high"].to_numpy(float)
     lows = df["low"].to_numpy(float)
-    # Start after cooldown so "first approach" has a lookback.
-    for i in range(max(2, cooldown_bars), len(df) - horizon_bars - 1):
-        prev_close = closes[i - 1]
-        hi = highs[i]
-        lo = lows[i]
-        close = closes[i]
+
+    # Start after a small warmup so previous values are valid.  Cooldown is per level/direction.
+    for i in range(1, len(df) - horizon_bars - 1):
+        prev_close = float(closes[i - 1])
+        hi = float(highs[i])
+        lo = float(lows[i])
+        close = float(closes[i])
         ts = int(df.iloc[i]["ts"])
+        if not all(math.isfinite(x) and x > 0 for x in (prev_close, hi, lo, close)):
+            continue
 
-        # Rising into resistance: nearest round level above previous close.
-        res_level = math.ceil(prev_close / step) * step
-        res_band_low = res_level - step
-        res_key = ("RES", int(res_level))
-        # First touch of the 1-step band below the round level after being outside it for cooldown.
-        res_prev_outside = np.nanmax(highs[i - cooldown_bars:i]) < res_band_low
-        res_event = hi >= res_band_low and close < res_level * 1.002 and res_prev_outside
-        if res_event and i - lower_hits.get(res_key, -10**9) >= cooldown_bars:
-            entry = close
-            fut_lows = lows[i + 1:i + 1 + horizon_bars]
-            fut_highs = highs[i + 1:i + 1 + horizon_bars]
-            if len(fut_lows) > 0:
-                max_correction = max(0.0, (entry - float(np.nanmin(fut_lows))) / max(entry, 1e-9))
-                max_adverse = max(0.0, (float(np.nanmax(fut_highs)) - entry) / max(entry, 1e-9))
-                close_ret = (entry - closes[i + horizon_bars]) / max(entry, 1e-9) - 0.0006
-                touched_round = bool(hi >= res_level)
-                trades.append({
-                    "ts": ts, "kind": "RESISTANCE_SHORT_REACTION", "level": float(res_level), "entry": float(entry),
-                    "max_favorable": float(max_correction), "max_adverse": float(max_adverse), "horizon_ret": float(close_ret),
-                    "success_0_5pct": bool(max_correction >= target_pct), "touched_round": touched_round,
-                })
-                lower_hits[res_key] = i
+        # Candidate round levels that the candle could have approached/touched.
+        level_start = max(step, math.floor((lo - step) / step) * step)
+        level_end = math.ceil((hi + step) / step) * step
+        levels = np.arange(level_start, level_end + step * 0.5, step)
 
-        # Falling into support: nearest round level below previous close.
-        sup_level = math.floor(prev_close / step) * step
-        sup_band_high = sup_level + step
-        sup_key = ("SUP", int(sup_level))
-        sup_prev_outside = np.nanmin(lows[i - cooldown_bars:i]) > sup_band_high
-        sup_event = lo <= sup_band_high and close > sup_level * 0.998 and sup_prev_outside
-        if sup_event and i - lower_hits.get(sup_key, -10**9) >= cooldown_bars:
-            entry = close
-            fut_lows = lows[i + 1:i + 1 + horizon_bars]
-            fut_highs = highs[i + 1:i + 1 + horizon_bars]
-            if len(fut_highs) > 0:
-                max_bounce = max(0.0, (float(np.nanmax(fut_highs)) - entry) / max(entry, 1e-9))
-                max_adverse = max(0.0, (entry - float(np.nanmin(fut_lows))) / max(entry, 1e-9))
-                close_ret = (closes[i + horizon_bars] - entry) / max(entry, 1e-9) - 0.0006
-                touched_round = bool(lo <= sup_level)
-                trades.append({
-                    "ts": ts, "kind": "SUPPORT_LONG_REACTION", "level": float(sup_level), "entry": float(entry),
-                    "max_favorable": float(max_bounce), "max_adverse": float(max_adverse), "horizon_ret": float(close_ret),
-                    "success_0_5pct": bool(max_bounce >= target_pct), "touched_round": touched_round,
-                })
-                lower_hits[sup_key] = i
+        for level_f in levels:
+            level = float(level_f)
+            if level <= 0:
+                continue
+            band_abs = max(level * band_pct, min_band_abs)
+            zone_low = level - band_abs
+            zone_high = level + band_abs
+            level_key = int(round(level / step))
+
+            # Approaching resistance from below / probe of round level area.
+            res_key = ("RES", level_key)
+            if prev_close < zone_low and hi >= zone_low and i - last_hit.get(res_key, -10**9) >= cooldown_bars:
+                entry = close
+                fut_lows = lows[i + 1:i + 1 + horizon_bars]
+                fut_highs = highs[i + 1:i + 1 + horizon_bars]
+                if len(fut_lows) > 0:
+                    max_correction = max(0.0, (entry - float(np.nanmin(fut_lows))) / max(entry, 1e-9))
+                    max_adverse = max(0.0, (float(np.nanmax(fut_highs)) - entry) / max(entry, 1e-9))
+                    horizon_close = float(closes[i + horizon_bars])
+                    close_ret = (entry - horizon_close) / max(entry, 1e-9) - 0.0006
+                    touched_round = bool(hi >= level)
+                    trades.append({
+                        "ts": ts,
+                        "kind": "RESISTANCE_SHORT_REACTION",
+                        "level": level,
+                        "entry": float(entry),
+                        "approach_zone_low": float(zone_low),
+                        "approach_zone_high": float(zone_high),
+                        "band_pct": band_pct,
+                        "max_favorable": float(max_correction),
+                        "max_adverse": float(max_adverse),
+                        "horizon_ret": float(close_ret),
+                        "success_0_5pct": bool(max_correction >= target_pct),
+                        "touched_round": touched_round,
+                    })
+                    last_hit[res_key] = i
+
+            # Approaching support from above / probe of round level area.
+            sup_key = ("SUP", level_key)
+            if prev_close > zone_high and lo <= zone_high and i - last_hit.get(sup_key, -10**9) >= cooldown_bars:
+                entry = close
+                fut_lows = lows[i + 1:i + 1 + horizon_bars]
+                fut_highs = highs[i + 1:i + 1 + horizon_bars]
+                if len(fut_highs) > 0:
+                    max_bounce = max(0.0, (float(np.nanmax(fut_highs)) - entry) / max(entry, 1e-9))
+                    max_adverse = max(0.0, (entry - float(np.nanmin(fut_lows))) / max(entry, 1e-9))
+                    horizon_close = float(closes[i + horizon_bars])
+                    close_ret = (horizon_close - entry) / max(entry, 1e-9) - 0.0006
+                    touched_round = bool(lo <= level)
+                    trades.append({
+                        "ts": ts,
+                        "kind": "SUPPORT_LONG_REACTION",
+                        "level": level,
+                        "entry": float(entry),
+                        "approach_zone_low": float(zone_low),
+                        "approach_zone_high": float(zone_high),
+                        "band_pct": band_pct,
+                        "max_favorable": float(max_bounce),
+                        "max_adverse": float(max_adverse),
+                        "horizon_ret": float(close_ret),
+                        "success_0_5pct": bool(max_bounce >= target_pct),
+                        "touched_round": touched_round,
+                    })
+                    last_hit[sup_key] = i
 
     def summarize(kind: str) -> dict:
         xs = [t for t in trades if t["kind"] == kind]
@@ -855,10 +893,13 @@ def _round_level_scan(df: pd.DataFrame, symbol: str, timeframe: str, step: float
         "symbol": symbol,
         "timeframe": timeframe,
         "step": step,
+        "band_pct": band_pct,
         "horizon_bars": horizon_bars,
         "cooldown_bars": cooldown_bars,
         "target_pct": target_pct,
         "candles": int(len(df)),
+        "period_start": str(pd.to_datetime(int(df.iloc[0]["ts"]), unit="ms", utc=True)) if len(df) else None,
+        "period_end": str(pd.to_datetime(int(df.iloc[-1]["ts"]), unit="ms", utc=True)) if len(df) else None,
         "events_total": len(trades),
         "resistance_from_below_short_reaction": res,
         "support_from_above_long_reaction": sup,
@@ -866,14 +907,23 @@ def _round_level_scan(df: pd.DataFrame, symbol: str, timeframe: str, step: float
         "combined_avg_horizon_return_after_cost": float(np.mean(all_rets)) if all_rets else 0.0,
     }
 
-
 def _line_summary_round(res: dict) -> str:
     if not res.get("ok"):
         return f"{res.get('symbol')} {res.get('timeframe')}: error {res.get('error')}"
     a = res.get("resistance_from_below_short_reaction") or {}
     b = res.get("support_from_above_long_reaction") or {}
+    coverage = res.get('coverage_pct')
+    coverage_txt = f" coverage={_fmt_pct(coverage)}" if coverage is not None else ""
+    period_txt = ""
+    try:
+        ps = str(res.get('period_start') or '')[:10]
+        pe = str(res.get('period_end') or '')[:10]
+        if ps and pe:
+            period_txt = f" {ps}→{pe}"
+    except Exception:
+        pass
     return (
-        f"{res.get('symbol')} {str(res.get('timeframe')).upper()} step={_fmt_num(res.get('step',0))}: "
+        f"{res.get('symbol')} {str(res.get('timeframe')).upper()} step={_fmt_num(res.get('step',0))}{coverage_txt}{period_txt}: "
         f"RES↘ events={a.get('events',0)} corr≥0.5={_fmt_pct(a.get('reaction_rate_0_5pct',0))} "
         f"avgCorr={_fmt_pct(a.get('avg_max_reaction',0))} avgBad={_fmt_pct(a.get('avg_adverse',0))} PF={a.get('profit_factor_horizon',0):.2f}; "
         f"SUP↗ events={b.get('events',0)} bounce≥0.5={_fmt_pct(b.get('reaction_rate_0_5pct',0))} "
@@ -925,8 +975,17 @@ async def run_round_level_backtest(exchange, years: float = 3.0, progress_cb=Non
                 else:
                     horizon_bars = 24
                     cooldown_bars = 24
-                payload_results.append(_round_level_scan(df, symbol=symbol, timeframe=tf, step=step, horizon_bars=horizon_bars, cooldown_bars=cooldown_bars, target_pct=0.005))
-                await _progress(f"{symbol.split('_')[0]} {tf_label} calculated", symbol=symbol, timeframe=tf, result_ok=bool(payload_results[-1].get("ok")))
+
+                res = _round_level_scan(df, symbol=symbol, timeframe=tf, step=step, horizon_bars=horizon_bars, cooldown_bars=cooldown_bars, target_pct=0.005)
+                try:
+                    expected = max(1, int(float(years) * 365.25 * 24 * 60 * 60 * 1000 / max(tf_ms, 1)))
+                    res["expected_candles_approx"] = expected
+                    res["coverage_pct"] = min(1.0, len(df) / expected)
+                    res["coverage_note"] = "OK" if len(df) >= expected * 0.80 else "PARTIAL_HISTORY"
+                except Exception:
+                    pass
+                payload_results.append(res)
+                await _progress(f"{symbol.split('_')[0]} {tf_label} calculated: events={res.get('events_total',0)} coverage={_fmt_pct(res.get('coverage_pct',0))}", symbol=symbol, timeframe=tf, result_ok=bool(payload_results[-1].get("ok")), events=res.get('events_total',0), coverage=res.get('coverage_pct'))
             except Exception as e:
                 payload_results.append({"ok": False, "symbol": symbol, "timeframe": tf, "error": str(e)[:500]})
                 await _progress(f"{symbol.split('_')[0]} {tf_label} error: {str(e)[:160]}", symbol=symbol, timeframe=tf)
@@ -1006,6 +1065,61 @@ def _trade_ret(side: str, entry: float, exit_: float, cost: float = 0.0006) -> f
     return (exit_ - entry) / entry - cost
 
 
+
+
+
+def _first_touch_exit_return(side: str, entry: float, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
+                             stop: float, take: float | None = None, cost: float = 0.0006,
+                             conservative_same_bar_stop_first: bool = True) -> float:
+    """Return pct using first-touch SL/TP simulation over future bars.
+
+    If SL and TP are touched in the same candle, assume SL first by default. This is
+    intentionally conservative for backtests and has no live trading side effects.
+    """
+    if entry <= 0 or stop <= 0 or len(closes) == 0:
+        return 0.0
+    is_long = str(side).upper() == "LONG"
+    final_exit = float(closes[-1])
+    take = float(take) if take and take > 0 else None
+    for hh, ll, cc in zip(highs, lows, closes):
+        hh = float(hh); ll = float(ll)
+        stop_hit = (ll <= stop) if is_long else (hh >= stop)
+        take_hit = False
+        if take is not None:
+            take_hit = (hh >= take) if is_long else (ll <= take)
+        if stop_hit and take_hit:
+            exit_price = stop if conservative_same_bar_stop_first else take
+            return _trade_ret(side, entry, exit_price, cost=cost)
+        if stop_hit:
+            return _trade_ret(side, entry, stop, cost=cost)
+        if take_hit:
+            return _trade_ret(side, entry, take, cost=cost)
+    return _trade_ret(side, entry, final_exit, cost=cost)
+
+
+def _trailing_exit_return(side: str, entry: float, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
+                          initial_stop: float, trail_dist: float, cost: float = 0.0006) -> float:
+    """Simple ATR-like trailing stop simulation; conservative stop-first by bar."""
+    if entry <= 0 or initial_stop <= 0 or trail_dist <= 0 or len(closes) == 0:
+        return 0.0
+    is_long = str(side).upper() == "LONG"
+    stop = float(initial_stop)
+    best = float(entry)
+    final_exit = float(closes[-1])
+    for hh, ll, cc in zip(highs, lows, closes):
+        hh = float(hh); ll = float(ll)
+        if is_long:
+            best = max(best, hh)
+            stop = max(stop, best - trail_dist)
+            if ll <= stop:
+                return _trade_ret(side, entry, stop, cost=cost)
+        else:
+            best = min(best, ll)
+            stop = min(stop, best + trail_dist)
+            if hh >= stop:
+                return _trade_ret(side, entry, stop, cost=cost)
+    return _trade_ret(side, entry, final_exit, cost=cost)
+
 def _add_strategy_indicators(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy().reset_index(drop=True)
     d["ret1"] = d["close"].pct_change().fillna(0.0)
@@ -1072,6 +1186,7 @@ def _generate_strategy_returns(df_in: pd.DataFrame, symbol: str, timeframe: str,
         if i - last_trade_i < cooldown:
             continue
         side = None
+        ret_override = None
         fam = str(family)
         try:
             if fam == "momentum_breakout":
@@ -1218,13 +1333,93 @@ def _generate_strategy_returns(df_in: pd.DataFrame, symbol: str, timeframe: str,
                     side = "LONG"
                 elif big_prev and c[i-1] < o[i-1] and h[i] >= mid_prev and c[i] < mid_prev:
                     side = "SHORT"
+            elif fam == "impulse_breakout_trailing":
+                look = int(params.get("lookback", 24)); vr = float(params.get("vol_ratio", 1.2)); atr_mult = float(params.get("atr_mult", 1.2)); trail_mult = float(params.get("trail_atr", 1.0))
+                if i - look < 1: continue
+                prev_hi = np.nanmax(h[i-look:i]); prev_lo = np.nanmin(l[i-look:i]); atr_abs = max(float(df.loc[i, "atr14"]), c[i] * 0.002)
+                if c[i] > prev_hi and volr[i] >= vr and c[i] > o[i]:
+                    side = "LONG"; stop = entry_stop = c[i] - atr_mult * atr_abs
+                    ret_override = _trailing_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], entry_stop, trail_mult * atr_abs, cost=cost)
+                elif c[i] < prev_lo and volr[i] >= vr and c[i] < o[i]:
+                    side = "SHORT"; stop = entry_stop = c[i] + atr_mult * atr_abs
+                    ret_override = _trailing_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], entry_stop, trail_mult * atr_abs, cost=cost)
+            elif fam == "liquidity_sweep_2r":
+                buf = float(params.get("buffer", 0.0005)); look = int(params.get("lookback", 24)); rr = float(params.get("rr", 2.0)); stop_buf_atr = float(params.get("stop_buf_atr", 0.15))
+                if i - look < 1: continue
+                prev_hi = np.nanmax(h[i-look:i]); prev_lo = np.nanmin(l[i-look:i]); atr_abs = max(float(df.loc[i, "atr14"]), c[i]*0.002); sb = stop_buf_atr * atr_abs
+                if h[i] > prev_hi * (1 + buf) and c[i] < prev_hi:
+                    side = "SHORT"; stop = h[i] + sb; risk = max(stop - c[i], c[i]*0.001); take = c[i] - rr * risk
+                    ret_override = _first_touch_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], stop, take, cost=cost)
+                elif l[i] < prev_lo * (1 - buf) and c[i] > prev_lo:
+                    side = "LONG"; stop = l[i] - sb; risk = max(c[i] - stop, c[i]*0.001); take = c[i] + rr * risk
+                    ret_override = _first_touch_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], stop, take, cost=cost)
+            elif fam == "rsi_divergence_trend":
+                look = int(params.get("lookback", 24)); os = float(params.get("oversold", 38)); ob = float(params.get("overbought", 62)); rr = float(params.get("rr", 1.5)); trend = str(params.get("trend", "ma100"))
+                if i - look < 2: continue
+                prev_low = np.nanmin(l[i-look:i]); prev_high = np.nanmax(h[i-look:i]); prev_rsi_low = np.nanmin(rsi14[i-look:i]); prev_rsi_high = np.nanmax(rsi14[i-look:i]); atr_abs = max(float(df.loc[i, "atr14"]), c[i]*0.002)
+                long_trend = (c[i] > ma100[i]) if trend == "ma100" and np.isfinite(ma100[i]) else (ma20[i] > ma50[i] if np.isfinite(ma20[i]) and np.isfinite(ma50[i]) else True)
+                short_trend = (c[i] < ma100[i]) if trend == "ma100" and np.isfinite(ma100[i]) else (ma20[i] < ma50[i] if np.isfinite(ma20[i]) and np.isfinite(ma50[i]) else True)
+                if long_trend and l[i] < prev_low and rsi14[i] > prev_rsi_low and rsi14[i] <= os and c[i] > o[i]:
+                    side = "LONG"; stop = l[i] - 0.15*atr_abs; risk = max(c[i]-stop, c[i]*0.001); take = c[i] + rr*risk
+                    ret_override = _first_touch_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], stop, take, cost=cost)
+                elif short_trend and h[i] > prev_high and rsi14[i] < prev_rsi_high and rsi14[i] >= ob and c[i] < o[i]:
+                    side = "SHORT"; stop = h[i] + 0.15*atr_abs; risk = max(stop-c[i], c[i]*0.001); take = c[i] - rr*risk
+                    ret_override = _first_touch_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], stop, take, cost=cost)
+            elif fam == "gap_imbalance_strict":
+                mult = float(params.get("body_atr", 1.35)); rr = float(params.get("rr", 1.3)); vr = float(params.get("vol_ratio", 1.05))
+                if i < 3: continue
+                big_prev = body_abs[i-1] >= mult * max(atrp[i-1], 0.001) and volr[i-1] >= vr
+                mid_prev = (o[i-1] + c[i-1]) / 2.0; atr_abs = max(float(df.loc[i, "atr14"]), c[i]*0.002)
+                trend_long = np.isfinite(ma50[i]) and c[i] >= ma50[i]
+                trend_short = np.isfinite(ma50[i]) and c[i] <= ma50[i]
+                if big_prev and trend_long and c[i-1] > o[i-1] and l[i] <= mid_prev and c[i] > mid_prev and c[i] > o[i]:
+                    side = "LONG"; stop = min(l[i], mid_prev - 0.2*atr_abs); risk = max(c[i]-stop, c[i]*0.001); take = c[i] + rr*risk
+                    ret_override = _first_touch_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], stop, take, cost=cost)
+                elif big_prev and trend_short and c[i-1] < o[i-1] and h[i] >= mid_prev and c[i] < mid_prev and c[i] < o[i]:
+                    side = "SHORT"; stop = max(h[i], mid_prev + 0.2*atr_abs); risk = max(stop-c[i], c[i]*0.001); take = c[i] - rr*risk
+                    ret_override = _first_touch_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], stop, take, cost=cost)
+            elif fam == "high_volume_reversal_rr":
+                vr = float(params.get("vol_ratio", 1.8)); wick = float(params.get("wick", 0.5)); rr = float(params.get("rr", 1.5))
+                rng = max(h[i]-l[i], c[i]*1e-9); atr_abs = max(float(df.loc[i, "atr14"]), c[i]*0.002)
+                upper = (h[i] - max(o[i], c[i])) / rng; lower = (min(o[i], c[i]) - l[i]) / rng
+                if volr[i] >= vr and lower >= wick and c[i] > o[i]:
+                    side = "LONG"; stop = l[i] - 0.1*atr_abs; risk = max(c[i]-stop, c[i]*0.001); take = c[i] + rr*risk
+                    ret_override = _first_touch_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], stop, take, cost=cost)
+                elif volr[i] >= vr and upper >= wick and c[i] < o[i]:
+                    side = "SHORT"; stop = h[i] + 0.1*atr_abs; risk = max(stop-c[i], c[i]*0.001); take = c[i] - rr*risk
+                    ret_override = _first_touch_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], stop, take, cost=cost)
+            elif fam == "atr_expansion_trailing":
+                mult = float(params.get("atr_mult", 1.7)); vr = float(params.get("vol_ratio", 1.2)); stop_mult = float(params.get("stop_atr", 1.0)); trail_mult = float(params.get("trail_atr", 1.0))
+                atr_abs = max(float(df.loc[i, "atr14"]), c[i]*0.002)
+                if (h[i] - l[i]) >= mult * atr_abs and volr[i] >= vr:
+                    if c[i] > o[i]:
+                        side = "LONG"; stop = c[i] - stop_mult*atr_abs
+                    else:
+                        side = "SHORT"; stop = c[i] + stop_mult*atr_abs
+                    ret_override = _trailing_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], stop, trail_mult*atr_abs, cost=cost)
+            elif fam == "range_compression_breakout_rr":
+                look = int(params.get("lookback", 48)); comp = float(params.get("compression", 0.8)); vr = float(params.get("vol_ratio", 1.05)); rr = float(params.get("rr", 1.5))
+                if i - look < 20: continue
+                range_now = (np.nanmax(h[i-look:i]) - np.nanmin(l[i-look:i])) / max(c[i], 1e-9)
+                base_range = np.nanmedian(((df["high"]-df["low"])/df["close"].replace(0,np.nan)).iloc[max(0,i-look*2):i-look])
+                prev_hi = np.nanmax(h[i-look:i]); prev_lo = np.nanmin(l[i-look:i]); atr_abs = max(float(df.loc[i,"atr14"]), c[i]*0.002)
+                compressed = np.isfinite(base_range) and range_now <= base_range * comp
+                if compressed and c[i] > prev_hi and volr[i] >= vr:
+                    side = "LONG"; stop = max(prev_lo, c[i] - 1.2*atr_abs); risk = max(c[i]-stop, c[i]*0.001); take = c[i] + rr*risk
+                    ret_override = _first_touch_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], stop, take, cost=cost)
+                elif compressed and c[i] < prev_lo and volr[i] >= vr:
+                    side = "SHORT"; stop = min(prev_hi, c[i] + 1.2*atr_abs); risk = max(stop-c[i], c[i]*0.001); take = c[i] - rr*risk
+                    ret_override = _first_touch_exit_return(side, c[i], h[i+1:i+horizon+1], l[i+1:i+horizon+1], c[i+1:i+horizon+1], stop, take, cost=cost)
         except Exception:
             continue
         if not side:
             continue
-        entry = c[i]
-        exit_ = c[i + horizon]
-        ret = _trade_ret(side, entry, exit_, cost=cost)
+        if ret_override is not None:
+            ret = float(ret_override)
+        else:
+            entry = c[i]
+            exit_ = c[i + horizon]
+            ret = _trade_ret(side, entry, exit_, cost=cost)
         rets.append(ret); sides.append(side); times.append(int(df.loc[i, "ts"]))
         last_trade_i = i
     split_ts = int(df["ts"].iloc[int(len(df) * 0.70)]) if len(df) else 0
@@ -1314,8 +1509,65 @@ def _strategy_param_grid_extra(timeframe: str) -> list[tuple[str, dict]]:
     return out[:120]
 
 
+
+def _strategy_param_grid_aggressive(timeframe: str) -> list[tuple[str, dict]]:
+    """Aggressive read-only search with REAL exits.
+
+    V69 adds first-touch SL/TP and trailing simulations for the high-potential
+    families.  It still never changes live trading logic.
+    """
+    tf = str(timeframe).lower()
+    if tf == "4h":
+        horizons = [3, 6, 9, 12]
+        looks = [6, 12, 24, 36]
+    elif tf == "15m":
+        horizons = [16, 32, 48, 96]
+        looks = [24, 48, 96, 144]
+    else:
+        horizons = [6, 12, 18, 24, 36]
+        looks = [12, 24, 48, 72]
+    out: list[tuple[str, dict]] = []
+    for hzn in horizons:
+        cd = max(2, hzn // 3)
+        for look in looks:
+            for vr in (1.1, 1.25, 1.5):
+                out.append(("impulse_breakout_trailing", {"horizon": hzn, "lookback": look, "vol_ratio": vr, "atr_mult": 1.1, "trail_atr": 1.0, "cooldown": cd}))
+            for buf in (0.0003, 0.0008, 0.0015):
+                for rr in (1.5, 2.0, 2.5):
+                    out.append(("liquidity_sweep_2r", {"horizon": hzn, "lookback": look, "buffer": buf, "rr": rr, "stop_buf_atr": 0.15, "cooldown": cd}))
+            for os, ob in ((35, 65), (38, 62), (40, 60)):
+                for rr in (1.2, 1.5, 2.0):
+                    out.append(("rsi_divergence_trend", {"horizon": hzn, "lookback": look, "oversold": os, "overbought": ob, "rr": rr, "trend": "ma100", "cooldown": cd}))
+            for comp in (0.65, 0.8):
+                for rr in (1.5, 2.0):
+                    out.append(("range_compression_breakout_rr", {"horizon": hzn, "lookback": look, "compression": comp, "vol_ratio": 1.05, "rr": rr, "cooldown": cd}))
+        for body in (1.1, 1.35, 1.7):
+            for rr in (1.2, 1.5, 2.0):
+                out.append(("gap_imbalance_strict", {"horizon": hzn, "body_atr": body, "vol_ratio": 1.05, "rr": rr, "cooldown": cd}))
+        for vr in (1.6, 1.9, 2.3):
+            for rr in (1.2, 1.5, 2.0):
+                out.append(("high_volume_reversal_rr", {"horizon": hzn, "vol_ratio": vr, "wick": 0.50, "rr": rr, "cooldown": cd}))
+        for atrm in (1.3, 1.7, 2.1):
+            out.append(("atr_expansion_trailing", {"horizon": hzn, "atr_mult": atrm, "vol_ratio": 1.15, "stop_atr": 1.0, "trail_atr": 1.0, "cooldown": cd}))
+        # Keep a small comparison set of old horizon-exit families so the report can compare real-exit vs horizon-exit.
+        out += [
+            ("ma_trend_continuation", {"horizon": hzn, "slope": 5, "vol_ratio": 1.0, "cooldown": cd}),
+            ("vwap_reversal", {"horizon": hzn, "band": 0.0015, "cooldown": cd}),
+            ("bollinger_squeeze_breakout", {"horizon": hzn, "squeeze": 0.60, "vol_ratio": 1.05, "cooldown": cd}),
+        ]
+    seen = set(); dedup: list[tuple[str, dict]] = []
+    for fam, par in out:
+        key = (fam, tuple(sorted(par.items())))
+        if key in seen:
+            continue
+        seen.add(key); dedup.append((fam, par))
+    return dedup[:260]
+
 def _strategy_family_names(mode: str) -> str:
-    if str(mode).lower() == "extra":
+    m = str(mode).lower()
+    if m.startswith("aggressive"):
+        return "AGGRESSIVE REAL EXITS: impulse breakout trailing, liquidity sweep 2R, RSI divergence+trend, ETH gap imbalance strict, high-volume reversal RR, ATR trailing, range compression breakout"
+    if m.startswith("extra"):
         return "VWAP reversal, Bollinger squeeze/breakout, RSI divergence, ATR volatility expansion, funding-contrarian proxy, EMA cross, Donchian breakout, opening range breakout, false breakout after US open, S/R retest, gap/imbalance fill"
     return "momentum, trend pullback, super volume, liquidity sweep, mean reversion, MA trend, round levels"
 
@@ -1338,6 +1590,7 @@ async def run_strategy_lab_backtest(exchange, years: float = 3.0, mode: str = "s
     mode=safe: BTC/ETH, 1H+4H, core bounded parameter grid.
     mode=full: BTC/ETH, 15m+1H+4H, core grid.
     mode=extra: BTC/ETH, 1H+4H, extended strategy families, bounded and background-progress friendly.
+    mode=aggressive: BTC/ETH, 15m+1H+4H, wider bounded parameter grid to find highest-return candidates.
     """
     async def _progress(line: str, **extra):
         try:
@@ -1353,7 +1606,7 @@ async def run_strategy_lab_backtest(exchange, years: float = 3.0, mode: str = "s
     started = time.time()
     symbols = ["BTC_USDT", "ETH_USDT"]
     mlow = str(mode).lower()
-    timeframes = ["1h", "4h"] if mlow not in ("full", "extra_full") else ["15m", "1h", "4h"]
+    timeframes = ["15m", "1h", "4h"] if mlow.startswith("aggressive") or mlow in ("full", "extra_full") else ["1h", "4h"]
     all_results: list[dict] = []
     errors: list[dict] = []
     await _progress("Strategy Lab started", years=years, mode=mode)
@@ -1371,7 +1624,7 @@ async def run_strategy_lab_backtest(exchange, years: float = 3.0, mode: str = "s
                 df = _to_df(candles)
                 tfms = _tf_ms(tf); now_ms = int(time.time() * 1000)
                 df = df[df["ts"] + tfms <= now_ms].reset_index(drop=True)
-                grid = _strategy_param_grid_extra(tf) if mlow.startswith("extra") else _strategy_param_grid(tf)
+                grid = _strategy_param_grid_aggressive(tf) if mlow.startswith("aggressive") else (_strategy_param_grid_extra(tf) if mlow.startswith("extra") else _strategy_param_grid(tf))
                 await _progress(f"{label} calculating {len(grid)} variants")
                 for family, params in grid:
                     try:
@@ -1387,6 +1640,7 @@ async def run_strategy_lab_backtest(exchange, years: float = 3.0, mode: str = "s
 
     ranked = sorted(all_results, key=lambda r: (float(r.get("score", 0)), float((r.get("test") or {}).get("profit_factor", 0))), reverse=True)
     stable = [r for r in ranked if float((r.get("test") or {}).get("profit_factor", 0)) >= 1.20 and float((r.get("test") or {}).get("winrate", 0)) >= 0.52 and int((r.get("test") or {}).get("trades", 0)) >= 40 and float((r.get("test") or {}).get("net_return_sum", 0)) > 0]
+    high_profit = [r for r in ranked if float((r.get("test") or {}).get("profit_factor", 0)) >= 1.50 and int((r.get("test") or {}).get("trades", 0)) >= 30 and float((r.get("test") or {}).get("net_return_sum", 0)) >= 0.35]
     payload = {
         "ok": True,
         "years_requested": years,
@@ -1397,6 +1651,7 @@ async def run_strategy_lab_backtest(exchange, years: float = 3.0, mode: str = "s
         "errors": errors[:50],
         "top": ranked[:20],
         "stable_candidates": stable[:10],
+        "high_profit_candidates": high_profit[:10],
         "notes": [
             "manual Strategy Lab only; no trading logic changed",
             "train/test split: first 70% train, last 30% test",
@@ -1408,7 +1663,7 @@ async def run_strategy_lab_backtest(exchange, years: float = 3.0, mode: str = "s
     }
     log_event("strategy_lab_backtest_result", **payload)
     lines = [
-        "🧪 STRATEGY LAB EXTRA BACKTEST — BTC/ETH" if str(mode).lower().startswith("extra") else "🧪 STRATEGY LAB BACKTEST — BTC/ETH",
+        "🧪 AGGRESSIVE STRATEGY LAB — BTC/ETH" if str(mode).lower().startswith("aggressive") else ("🧪 STRATEGY LAB EXTRA BACKTEST — BTC/ETH" if str(mode).lower().startswith("extra") else "🧪 STRATEGY LAB BACKTEST — BTC/ETH"),
         f"History: {years:g}y | Mode: {mode.upper()} | Trading logic: НЕ изменялась",
         f"Tested families: {_strategy_family_names(mode)}.",
         "Validation: train 70% / test 30%, selection by PF + net + DD + trades, not only winrate.",
@@ -1426,8 +1681,16 @@ async def run_strategy_lab_backtest(exchange, years: float = 3.0, mode: str = "s
             lines.append(f"{idx}. " + _strategy_lab_line(r))
     else:
         lines.append("Нет устойчивых кандидатов по текущим фильтрам. Не подключать в торговлю.")
+    if str(mode).lower().startswith("aggressive"):
+        lines.append("")
+        lines.append("🔥 HIGH-PROFIT CANDIDATES PF≥1.50, trades≥30, net≥35% on test:")
+        if high_profit:
+            for idx, r in enumerate(high_profit[:5], 1):
+                lines.append(f"{idx}. " + _strategy_lab_line(r))
+        else:
+            lines.append("Нет кандидатов с высокой доходностью по текущим фильтрам.")
     lines += [
         "",
-        "ИТОГ: подключать можно только кандидатов из STABLE после отдельной проверки/paper test. Сырой JSON: /log_full",
+        "ИТОГ: это только backtest. Подключать можно только после detail/paper test. Сырой JSON: /log_full",
     ]
     return "\n".join(lines[:80]), payload

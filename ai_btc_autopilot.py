@@ -55,6 +55,7 @@ class BTCVisionAutopilot:
         self._last_pending_cleanup_ts = 0.0
         self._btc_exchange_position_seen = False
         self._btc_exchange_position_cache = []
+        self._last_orphan_planorder_cleanup_ts = 0.0
 
     def _chart_file_meta(self, path: str) -> dict:
         """Return exact chart file size/pixels for /log_full audit.
@@ -137,6 +138,7 @@ class BTCVisionAutopilot:
             self._btc_exchange_position_cache = list(ex_rows or [])
             self._btc_exchange_position_seen = bool(ex_rows)
             has_pos = self._btc_exchange_position_seen
+            changed = (previous != has_pos)
             log_event(
                 "btc_ai_position_sync",
                 ok=True,
@@ -144,8 +146,19 @@ class BTCVisionAutopilot:
                 exchange_positions=len(ex_rows or []),
                 interval_sec=pos_interval,
                 mode="position_open" if has_pos else "no_position",
-                changed=(previous != has_pos),
+                changed=changed,
             )
+            # If the real BTC position disappeared, any remaining active BTC
+            # planorders are orphaned TP/SL triggers. They must not stay live on
+            # MEXC, otherwise a future price touch can open/close unexpectedly.
+            # Run silently in background; /status_btc will also mark them as
+            # ORPHAN instead of current protection.
+            if (not has_pos) and (changed or now - self._last_orphan_planorder_cleanup_ts >= 300.0):
+                self._last_orphan_planorder_cleanup_ts = now
+                try:
+                    await self._cancel_orphan_btc_planorders(reason="no_exchange_btc_position")
+                except Exception as e:
+                    log_event("btc_ai_orphan_planorder_cleanup_error", ok=False, error=str(e)[:600])
 
         # Pending limit entries are local objects and only need sparse cleanup.
         if now - self._last_pending_cleanup_ts >= 300.0:
@@ -229,6 +242,7 @@ class BTCVisionAutopilot:
         self._last_pending_cleanup_ts = 0.0
         self._btc_exchange_position_seen = False
         self._btc_exchange_position_cache = []
+        self._last_orphan_planorder_cleanup_ts = 0.0
 
     async def _btc_ai_positions(self) -> list[dict]:
         try:
@@ -1350,6 +1364,55 @@ class BTCVisionAutopilot:
         stale_count = max(0, len(rows) - (1 + len(same_batch)))
         log_event("btc_ai_latest_exchange_protection_selected", ok=True, side=side, entry=entry, sl=out["stop_price"], tp1=out["partial_take_price"], tp2=out["final_take_price"], sl_order_id=out["sl_order_id"], tp1_order_id=out["tp1_order_id"], tp2_order_id=out["tp2_order_id"], stale_active_ignored=stale_count)
         return out
+
+    async def _active_btc_planorder_ids(self) -> list[str]:
+        """Return active BTC planorder ids from MEXC state=1 only."""
+        if not hasattr(self.exchange_client, "_mexc_private_read_any_base"):
+            return []
+        try:
+            msym = self.exchange_client.mexc_contract_symbol(self.symbol) if hasattr(self.exchange_client, "mexc_contract_symbol") else "BTC_USDT"
+        except Exception:
+            msym = "BTC_USDT"
+        ids = []
+        try:
+            out = await self.exchange_client._mexc_private_read_any_base(
+                "/api/v1/private/planorder/list/orders",
+                query={"symbol": msym, "state": 1, "page_num": 1, "page_size": 100},
+            )
+            rows = self.exchange_client._mexc_rows(out.get("data")) if hasattr(self.exchange_client, "_mexc_rows") else ((out or {}).get("data") or [])
+            for r in rows or []:
+                if not isinstance(r, dict):
+                    continue
+                sym_raw = str(r.get("symbol") or r.get("contract") or "")
+                try:
+                    sym_ok = self.exchange_client._mexc_normalize_contract_id(sym_raw) == self.exchange_client._mexc_normalize_contract_id(msym)
+                except Exception:
+                    sym_ok = sym_raw.upper().replace("/", "_").replace(":USDT", "") == "BTC_USDT"
+                if not sym_ok:
+                    continue
+                state = str(r.get("state", "1")).lower()
+                finished = str(r.get("is_finished", r.get("isFinished", 0))).lower()
+                err_code = str(r.get("errorCode", r.get("error_code", 0))).lower()
+                if state not in {"1", "open", "created", "new"}:
+                    continue
+                if finished in {"1", "true", "yes"} or err_code not in {"0", "", "none"}:
+                    continue
+                oid = str(r.get("id") or r.get("orderId") or "").strip()
+                if oid and oid not in ids:
+                    ids.append(oid)
+        except Exception as e:
+            log_event("btc_ai_active_planorders_read_failed", ok=False, error=str(e)[:500])
+        return ids
+
+    async def _cancel_orphan_btc_planorders(self, *, reason: str = "") -> dict:
+        """Cancel all active BTC planorders when there is no exchange BTC position."""
+        ids = await self._active_btc_planorder_ids()
+        if not ids:
+            log_event("btc_ai_orphan_planorder_cleanup", ok=True, reason=reason, active=0, cancelled=[], errors=[])
+            return {"ok": True, "cancelled": [], "errors": []}
+        res = await self._cancel_btc_plan_order_ids(ids, reason=f"orphan_{reason or 'no_position'}")
+        log_event("btc_ai_orphan_planorder_cleanup", ok=res.get("ok", False), reason=reason, active=len(ids), cancelled=res.get("cancelled", []), errors=res.get("errors", []))
+        return res
 
     async def _cancel_btc_plan_order_ids(self, order_ids: list[str], *, reason: str = "") -> dict:
         """Cancel specific BTC MEXC planorders only.

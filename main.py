@@ -1547,6 +1547,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /backtest_round_levels - тест BTC/ETH круглых уровней 15m/1H без торговли
 /backtest_strategy_lab - Strategy Lab core BTC/ETH 1H/4H без торговли
 /backtest_strategy_lab_extra - Strategy Lab Extra: VWAP/BB/RSI/ATR/EMA/Donchian/US-open/SR/imbalance
+/backtest_aggressive_lab - Aggressive Strategy Lab: ищет самые доходные стратегии без торговли
 /clean_btc_orders - удалить старые активные BTC TP/SL planorders, оставить последнюю актуальную защиту
 /ping - отклик ms, RAM, uptime, открыто сейчас и общий счётчик открытий
 /balance - futures balance + IP/proxy; если MEXC margin=0 при открытых позициях, показывает estimated margin
@@ -2938,14 +2939,27 @@ async def _strategy_lab_backtest_background(app, chat_id: int, progress_message_
     ]
     last_edit_ts = 0.0
 
-    async def progress(line: str):
+    async def progress(line: str, **meta):
+        """Live Strategy Lab progress in the same chat message.
+        Force an edit on every logical stage so the user sees that the test is alive.
+        Heavy candle loading/calculation still runs in background and never trades.
+        """
         nonlocal last_edit_ts
         line = str(line)
+        if meta:
+            try:
+                details = []
+                for k, v in meta.items():
+                    if k in ("symbol", "timeframe", "candles", "variants", "years", "mode"):
+                        details.append(f"{k}={v}")
+                if details:
+                    line = f"{line} ({', '.join(details)})"
+            except Exception:
+                pass
         lines.append(line)
-        now = time.time()
-        if line.endswith("calculated") or "error" in line.lower() or line.startswith("Strategy Lab") or now - last_edit_ts >= 2.0:
-            last_edit_ts = now
-            await _safe_edit_progress_message(app, chat_id, progress_message_id, "\n".join(lines[-18:])[:3900])
+        last_edit_ts = time.time()
+        await _safe_edit_progress_message(app, chat_id, progress_message_id, "\n".join(lines[-22:])[:3900])
+        log_event("strategy_lab_live_progress", ok=True, line=str(line)[:300], mode=mode)
 
     try:
         settings = await storage.all_settings()
@@ -2991,7 +3005,7 @@ async def backtest_strategy_lab_cmd(update: Update, context: ContextTypes.DEFAUL
             "🧪 STRATEGY LAB BACKTEST — progress\n"
             f"History requested: {years:g}y | mode={mode.upper()} | BTC/ETH\n"
             "Trading logic: НЕ изменяется, сделок не открываю.\n\n"
-            "Strategy Lab started",
+            "Strategy Lab started\n\n⏳ Это живое сообщение: этапы загрузки/расчёта будут обновляться здесь.",
             reply_markup=MAIN_MENU,
         )
         chat = update.effective_chat
@@ -3033,7 +3047,7 @@ async def backtest_strategy_lab_extra_cmd(update: Update, context: ContextTypes.
             f"History requested: {years:g}y | mode={mode.upper()} | BTC/ETH\n"
             "Families: VWAP, Bollinger, RSI, ATR, funding-proxy, EMA, Donchian, US-open, S/R, imbalance.\n"
             "Trading logic: НЕ изменяется, сделок не открываю.\n\n"
-            "Strategy Lab Extra started",
+            "Strategy Lab Extra started\n\n⏳ Это живое сообщение: этапы загрузки/расчёта будут обновляться здесь.",
             reply_markup=MAIN_MENU,
         )
         chat = update.effective_chat
@@ -3046,6 +3060,48 @@ async def backtest_strategy_lab_extra_cmd(update: Update, context: ContextTypes.
         app.bot_data["strategy_lab_backtest_running"] = False
         log_event("strategy_lab_extra_cmd_error", ok=False, error=str(e)[:1200])
         await reply(update, f"❌ /backtest_strategy_lab_extra error: {e}\nСырой лог: /log_full", reply_markup=MAIN_MENU)
+
+
+async def backtest_aggressive_lab_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual aggressive strategy lab. Wider read-only search, no trading side effects."""
+    if not allowed(update):
+        return
+    app = context.application
+    if bool(app.bot_data.get("strategy_lab_backtest_running")):
+        await reply(update, "⏳ Strategy Lab уже выполняется. Дождись Report ready или проверь /log_full.", reply_markup=MAIN_MENU)
+        return
+    try:
+        years = 3.0
+        mode = "aggressive"
+        args = list(getattr(context, "args", []) or [])
+        for a in args:
+            aa = str(a).strip().lower()
+            if aa in ("full", "max", "15m"):
+                mode = "aggressive_full"
+            else:
+                try:
+                    years = max(0.5, min(5.0, float(aa)))
+                except Exception:
+                    pass
+        msg = await reply(
+            update,
+            "🔥 AGGRESSIVE STRATEGY LAB — progress\n"
+            f"History requested: {years:g}y | mode={mode.upper()} | BTC/ETH | 15m+1H+4H\n"
+            "Goal: найти максимальную доходность и устойчивость.\n"
+            "Trading logic: НЕ изменяется, сделок не открываю. OpenAI не вызываю.\n\n"
+            "Aggressive Lab started\n\n⏳ Живое сообщение: этапы загрузки/расчёта будут обновляться здесь.",
+            reply_markup=MAIN_MENU,
+        )
+        chat = update.effective_chat
+        if not msg or not chat:
+            await reply(update, "❌ Не смог создать progress-сообщение. Попробуй ещё раз. /log_full", reply_markup=MAIN_MENU)
+            return
+        app.bot_data["strategy_lab_backtest_running"] = True
+        app.create_task(_strategy_lab_backtest_background(app, int(chat.id), int(msg.message_id), years, mode))
+    except Exception as e:
+        app.bot_data["strategy_lab_backtest_running"] = False
+        log_event("aggressive_strategy_lab_cmd_error", ok=False, error=str(e)[:1200])
+        await reply(update, f"❌ /backtest_aggressive_lab error: {e}\nСырой лог: /log_full", reply_markup=MAIN_MENU)
 
 async def clean_btc_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel stale active BTC planorders while keeping the latest current TP/SL batch."""
@@ -3475,33 +3531,56 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         if orders:
-            current_orders, stale_orders = _btc_status_split_current_protection(orders, protect_side, protect_entry)
-            display_orders = current_orders or orders
-            lines.append("\nMEXC BTC current protection (latest active batch):")
-            tp_count = sl_count = other_count = 0
-            shown = 0
-            for o in display_orders:
-                if shown >= 6:
-                    break
-                kind = _btc_status_order_kind(o, side=protect_side, entry=protect_entry)
-                if kind == "TP": tp_count += 1
-                elif kind == "SL": sl_count += 1
-                else: other_count += 1
-                price = _btc_status_order_price(o)
-                amount = float(o.get("amount") or o.get("remaining") or 0)
-                oid = _btc_status_order_id(o)[:18]
-                src = str((o.get("info") or {}).get("_source_endpoint") or "").replace("/api/v1/private/", "")
-                age_ts = _btc_status_order_ts(o)
-                age_txt = datetime.fromtimestamp(age_ts, tz=timezone.utc).strftime("%H:%M:%S UTC") if age_ts else "no-ts"
-                lines.append(f"{kind}: price={price:.2f} amount={amount:.8f} id={oid} ts={age_txt} src={src}")
-                shown += 1
-            lines.append(f"Current summary: TP={tp_count} SL={sl_count} OTHER={other_count} current={len(display_orders)}")
-            if stale_orders:
-                lines.append(f"Stale active BTC planorders ignored by bot: {len(stale_orders)}")
-                for o in stale_orders[:4]:
+            if not btc_positions:
+                # No real BTC position means there is no valid current protection.
+                # Any active BTC planorders are orphaned leftovers and must not be
+                # classified as TP/SL for management.  /clean_btc_orders can cancel
+                # them manually; the background manager also attempts silent cleanup.
+                display_orders = list(orders)
+                lines.append("\nMEXC BTC orphan active planorders: POSITION NONE")
+                shown = 0
+                for o in display_orders:
+                    if shown >= 8:
+                        break
+                    price = _btc_status_order_price(o)
+                    amount = float(o.get("amount") or o.get("remaining") or 0)
+                    oid = _btc_status_order_id(o)[:18]
+                    src = str((o.get("info") or {}).get("_source_endpoint") or "").replace("/api/v1/private/", "")
+                    age_ts = _btc_status_order_ts(o)
+                    age_txt = datetime.fromtimestamp(age_ts, tz=timezone.utc).strftime("%H:%M:%S UTC") if age_ts else "no-ts"
+                    lines.append(f"ORPHAN TRIGGER: price={price:.2f} amount={amount:.8f} id={oid} ts={age_txt} src={src}")
+                    shown += 1
+                lines.append(f"Orphan summary: active={len(display_orders)} current=0")
+                lines.append("⚠️ BTC позиции нет, эти активные triggers не являются защитой. Нажми /clean_btc_orders, если они не исчезли автоматически.")
+                log_event("status_btc_orphan_planorders", ok=True, current=0, orphan=len(display_orders), ids=[_btc_status_order_id(o) for o in display_orders[:20]])
+            else:
+                current_orders, stale_orders = _btc_status_split_current_protection(orders, protect_side, protect_entry)
+                display_orders = current_orders or orders
+                lines.append("\nMEXC BTC current protection (latest active batch):")
+                tp_count = sl_count = other_count = 0
+                shown = 0
+                for o in display_orders:
+                    if shown >= 6:
+                        break
                     kind = _btc_status_order_kind(o, side=protect_side, entry=protect_entry)
-                    lines.append(f"STALE {kind}: price={_btc_status_order_price(o):.2f} id={_btc_status_order_id(o)[:18]}")
-            log_event("status_btc_current_protection_selected", ok=True, current=len(display_orders), stale=len(stale_orders), side=protect_side, entry=protect_entry, current_ids=[_btc_status_order_id(o) for o in display_orders], stale_ids=[_btc_status_order_id(o) for o in stale_orders[:20]])
+                    if kind == "TP": tp_count += 1
+                    elif kind == "SL": sl_count += 1
+                    else: other_count += 1
+                    price = _btc_status_order_price(o)
+                    amount = float(o.get("amount") or o.get("remaining") or 0)
+                    oid = _btc_status_order_id(o)[:18]
+                    src = str((o.get("info") or {}).get("_source_endpoint") or "").replace("/api/v1/private/", "")
+                    age_ts = _btc_status_order_ts(o)
+                    age_txt = datetime.fromtimestamp(age_ts, tz=timezone.utc).strftime("%H:%M:%S UTC") if age_ts else "no-ts"
+                    lines.append(f"{kind}: price={price:.2f} amount={amount:.8f} id={oid} ts={age_txt} src={src}")
+                    shown += 1
+                lines.append(f"Current summary: TP={tp_count} SL={sl_count} OTHER={other_count} current={len(display_orders)}")
+                if stale_orders:
+                    lines.append(f"Stale active BTC planorders ignored by bot: {len(stale_orders)}")
+                    for o in stale_orders[:4]:
+                        kind = _btc_status_order_kind(o, side=protect_side, entry=protect_entry)
+                        lines.append(f"STALE {kind}: price={_btc_status_order_price(o):.2f} id={_btc_status_order_id(o)[:18]}")
+                log_event("status_btc_current_protection_selected", ok=True, current=len(display_orders), stale=len(stale_orders), side=protect_side, entry=protect_entry, current_ids=[_btc_status_order_id(o) for o in display_orders], stale_ids=[_btc_status_order_id(o) for o in stale_orders[:20]])
         else:
             lines.append("\nMEXC BTC open orders/protection: none")
             if btc_positions:
@@ -5272,7 +5351,7 @@ def _button_mapping():
         ("🤖 AI BTC/ETH scalping", ai_scalping_toggle_cmd), ("AI BTC/ETH scalping", ai_scalping_toggle_cmd),
         ("₿ BTC AI 4H автопилот", btc_ai_autopilot_cmd), ("BTC AI 4H автопилот", btc_ai_autopilot_cmd),
         ("📊 BTC Status", status_btc_cmd), ("BTC Status", status_btc_cmd), ("/status_btc", status_btc_cmd),
-        ("🧪 BTC Backtest", backtest_btc_patterns_cmd), ("🧪 BTC Backtest 4H", backtest_btc_patterns_cmd), ("/backtest_btc_patterns", backtest_btc_patterns_cmd), ("🧪 BTC Backtest 1H", backtest_btc_patterns_1h_cmd), ("/backtest_btc_patterns_1h", backtest_btc_patterns_1h_cmd), ("🧪 Round Levels", backtest_round_levels_cmd), ("/backtest_round_levels", backtest_round_levels_cmd), ("🧪 Strategy Lab", backtest_strategy_lab_cmd), ("/backtest_strategy_lab", backtest_strategy_lab_cmd), ("🧪 Strategy Lab Extra", backtest_strategy_lab_extra_cmd), ("/backtest_strategy_lab_extra", backtest_strategy_lab_extra_cmd),
+        ("🧪 BTC Backtest", backtest_btc_patterns_cmd), ("🧪 BTC Backtest 4H", backtest_btc_patterns_cmd), ("/backtest_btc_patterns", backtest_btc_patterns_cmd), ("🧪 BTC Backtest 1H", backtest_btc_patterns_1h_cmd), ("/backtest_btc_patterns_1h", backtest_btc_patterns_1h_cmd), ("🧪 Round Levels", backtest_round_levels_cmd), ("/backtest_round_levels", backtest_round_levels_cmd), ("🧪 Strategy Lab", backtest_strategy_lab_cmd), ("/backtest_strategy_lab", backtest_strategy_lab_cmd), ("🧪 Strategy Lab Extra", backtest_strategy_lab_extra_cmd), ("/backtest_strategy_lab_extra", backtest_strategy_lab_extra_cmd), ("🔥 Aggressive Lab", backtest_aggressive_lab_cmd), ("/backtest_aggressive_lab", backtest_aggressive_lab_cmd),
         ("🧽 Clean BTC Orders", clean_btc_orders_cmd), ("Clean BTC Orders", clean_btc_orders_cmd), ("/clean_btc_orders", clean_btc_orders_cmd),
         ("⚡ быстрый отскок", quick_bounce_cmd), ("быстрый отскок", quick_bounce_cmd), ("Быстрый отскок", quick_bounce_cmd),
         ("🔻 импульсный слив", impulse_dump_cmd), ("импульсный слив", impulse_dump_cmd), ("Импульсный слив", impulse_dump_cmd),
@@ -7126,6 +7205,7 @@ def build_app():
     app.add_handler(CommandHandler("backtest_round_levels", _wrap_command(backtest_round_levels_cmd, "/backtest_round_levels")))
     app.add_handler(CommandHandler("backtest_strategy_lab", _wrap_command(backtest_strategy_lab_cmd, "/backtest_strategy_lab")))
     app.add_handler(CommandHandler("backtest_strategy_lab_extra", _wrap_command(backtest_strategy_lab_extra_cmd, "/backtest_strategy_lab_extra")))
+    app.add_handler(CommandHandler("backtest_aggressive_lab", _wrap_command(backtest_aggressive_lab_cmd, "/backtest_aggressive_lab")))
     app.add_handler(CommandHandler("clean_btc_orders", _wrap_command(clean_btc_orders_cmd, "/clean_btc_orders")))
     app.add_handler(CommandHandler("ping", _wrap_command(ping_cmd, "/ping")))
     app.add_handler(CommandHandler("balance", _wrap_command(balance_cmd, "/balance")))
