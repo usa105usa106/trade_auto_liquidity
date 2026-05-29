@@ -1,0 +1,7 @@
+[variables]
+MISE_GITHUB_ATTESTATIONS = "false"
+MISE_GITHUB_GITHUB_ATTESTATIONS = "false"
+MISE_AQUA_GITHUB_ATTESTATIONS = "false"
+
+[start]
+cmd = "python main.py"
