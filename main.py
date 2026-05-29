@@ -33,6 +33,7 @@ from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
 from ai_btc_autopilot import BTCVisionAutopilot
+from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest
 from debug_log import tail_text, tail_important, log_event
 
 logging.basicConfig(level=logging.INFO)
@@ -1541,6 +1542,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /panic - закрыть позиции и отменить ордера
 /status - статус
 /status_btc - реальный BTC AI статус по MEXC: позиция, TP/SL, TP1→BE, 24H exit
+/backtest_btc_patterns - тест BTC 4H отпечатков свечей и US-open sweep без торговли
+/backtest_btc_patterns_1h - тест BTC 1H отпечатков свечей без торговли
+/backtest_round_levels - тест BTC/ETH круглых уровней 15m/1H без торговли
 /clean_btc_orders - удалить старые активные BTC TP/SL planorders, оставить последнюю актуальную защиту
 /ping - отклик ms, RAM, uptime, открыто сейчас и общий счётчик открытий
 /balance - futures balance + IP/proxy; если MEXC margin=0 при открытых позициях, показывает estimated margin
@@ -2784,6 +2788,79 @@ def _btc_status_deep_values(obj, keys: set[str], limit: int = 12) -> list[str]:
     walk(obj)
     return out
 
+
+
+async def backtest_btc_patterns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual BTC historical tests only: digital fingerprints + US-open sweep.
+
+    This command never opens/closes orders and never changes trading settings.
+    """
+    if not allowed(update):
+        return
+    try:
+        await reply(update, "🧪 Запускаю BTC 4H backtest за 3 года. Торговая логика не меняется, сделок не открываю...", reply_markup=MAIN_MENU)
+        years = 3.0
+        symbol = "BTC_USDT"
+        # Optional: /backtest_btc_patterns 2 or /backtest_btc_patterns BTC_USDT 3
+        args = list(getattr(context, "args", []) or [])
+        if args:
+            if str(args[0]).upper().startswith("BTC"):
+                symbol = args[0]
+                if len(args) > 1:
+                    years = max(0.5, min(5.0, float(args[1])))
+            else:
+                years = max(0.5, min(5.0, float(args[0])))
+        settings = await storage.all_settings()
+        ex = await get_exchange(settings)
+        text, payload = await run_btc_pattern_backtest(ex, symbol=symbol, years=years)
+        await reply(update, text[:3900], reply_markup=MAIN_MENU)
+    except Exception as e:
+        log_event("btc_pattern_backtest_cmd_error", ok=False, error=str(e)[:1200])
+        await reply(update, f"❌ /backtest_btc_patterns error: {e}\nСырой лог: /log_full", reply_markup=MAIN_MENU)
+
+async def backtest_btc_patterns_1h_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual BTC 1H fingerprint test only. Never trades."""
+    if not allowed(update):
+        return
+    try:
+        await reply(update, "🧪 Запускаю BTC 1H fingerprint backtest за 3 года. Торговля не меняется, сделок не открываю...", reply_markup=MAIN_MENU)
+        years = 3.0
+        symbol = "BTC_USDT"
+        args = list(getattr(context, "args", []) or [])
+        if args:
+            if str(args[0]).upper().startswith("BTC"):
+                symbol = args[0]
+                if len(args) > 1:
+                    years = max(0.5, min(5.0, float(args[1])))
+            else:
+                years = max(0.5, min(5.0, float(args[0])))
+        settings = await storage.all_settings()
+        ex = await get_exchange(settings)
+        text, payload = await run_btc_pattern_backtest_1h(ex, symbol=symbol, years=years)
+        await reply(update, text[:3900], reply_markup=MAIN_MENU)
+    except Exception as e:
+        log_event("btc_pattern_backtest_1h_cmd_error", ok=False, error=str(e)[:1200])
+        await reply(update, f"❌ /backtest_btc_patterns_1h error: {e}\nСырой лог: /log_full", reply_markup=MAIN_MENU)
+
+
+async def backtest_round_levels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual BTC/ETH round-level reaction test only. Never trades."""
+    if not allowed(update):
+        return
+    try:
+        await reply(update, "🧪 Запускаю round-level backtest BTC/ETH за 3 года на 15m и 1H. Торговля не меняется, сделок не открываю...", reply_markup=MAIN_MENU)
+        years = 3.0
+        args = list(getattr(context, "args", []) or [])
+        if args:
+            years = max(0.5, min(5.0, float(args[0])))
+        settings = await storage.all_settings()
+        ex = await get_exchange(settings)
+        text, payload = await run_round_level_backtest(ex, years=years)
+        # Telegram limit safety: report is short, but keep room for markup.
+        await reply(update, text[:3900], reply_markup=MAIN_MENU)
+    except Exception as e:
+        log_event("round_level_backtest_cmd_error", ok=False, error=str(e)[:1200])
+        await reply(update, f"❌ /backtest_round_levels error: {e}\nСырой лог: /log_full", reply_markup=MAIN_MENU)
 
 async def clean_btc_orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel stale active BTC planorders while keeping the latest current TP/SL batch."""
@@ -5010,6 +5087,7 @@ def _button_mapping():
         ("🤖 AI BTC/ETH scalping", ai_scalping_toggle_cmd), ("AI BTC/ETH scalping", ai_scalping_toggle_cmd),
         ("₿ BTC AI 4H автопилот", btc_ai_autopilot_cmd), ("BTC AI 4H автопилот", btc_ai_autopilot_cmd),
         ("📊 BTC Status", status_btc_cmd), ("BTC Status", status_btc_cmd), ("/status_btc", status_btc_cmd),
+        ("🧪 BTC Backtest", backtest_btc_patterns_cmd), ("🧪 BTC Backtest 4H", backtest_btc_patterns_cmd), ("/backtest_btc_patterns", backtest_btc_patterns_cmd), ("🧪 BTC Backtest 1H", backtest_btc_patterns_1h_cmd), ("/backtest_btc_patterns_1h", backtest_btc_patterns_1h_cmd), ("🧪 Round Levels", backtest_round_levels_cmd), ("/backtest_round_levels", backtest_round_levels_cmd),
         ("🧽 Clean BTC Orders", clean_btc_orders_cmd), ("Clean BTC Orders", clean_btc_orders_cmd), ("/clean_btc_orders", clean_btc_orders_cmd),
         ("⚡ быстрый отскок", quick_bounce_cmd), ("быстрый отскок", quick_bounce_cmd), ("Быстрый отскок", quick_bounce_cmd),
         ("🔻 импульсный слив", impulse_dump_cmd), ("импульсный слив", impulse_dump_cmd), ("Импульсный слив", impulse_dump_cmd),
@@ -6858,6 +6936,9 @@ def build_app():
     app.add_handler(CommandHandler(["panic", "Panic", "PANIC"], _wrap_command(panic_cmd, "/panic")))
     app.add_handler(CommandHandler("status", _wrap_command(status_cmd, "/status")))
     app.add_handler(CommandHandler("status_btc", _wrap_command(status_btc_cmd, "/status_btc")))
+    app.add_handler(CommandHandler("backtest_btc_patterns", _wrap_command(backtest_btc_patterns_cmd, "/backtest_btc_patterns")))
+    app.add_handler(CommandHandler("backtest_btc_patterns_1h", _wrap_command(backtest_btc_patterns_1h_cmd, "/backtest_btc_patterns_1h")))
+    app.add_handler(CommandHandler("backtest_round_levels", _wrap_command(backtest_round_levels_cmd, "/backtest_round_levels")))
     app.add_handler(CommandHandler("clean_btc_orders", _wrap_command(clean_btc_orders_cmd, "/clean_btc_orders")))
     app.add_handler(CommandHandler("ping", _wrap_command(ping_cmd, "/ping")))
     app.add_handler(CommandHandler("balance", _wrap_command(balance_cmd, "/balance")))

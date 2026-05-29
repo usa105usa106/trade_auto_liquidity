@@ -45,6 +45,16 @@ class BTCVisionAutopilot:
         self._last_be_warning_ts = 0.0
         self._last_24h_rate_limit_log_ts = 0.0
         self._last_24h_warning_ts = 0.0
+        # Lightweight exchange sync scheduler.  New AI entries stay on 4H close;
+        # position management uses these intervals so Railway/MEXC are not polled
+        # aggressively when there is no BTC exposure.
+        self._last_position_sync_ts = 0.0
+        self._last_protection_sync_ts = 0.0
+        self._last_tp1_be_sync_ts = 0.0
+        self._last_24h_exit_sync_ts = 0.0
+        self._last_pending_cleanup_ts = 0.0
+        self._btc_exchange_position_seen = False
+        self._btc_exchange_position_cache = []
 
     def _chart_file_meta(self, path: str) -> dict:
         """Return exact chart file size/pixels for /log_full audit.
@@ -103,20 +113,86 @@ class BTCVisionAutopilot:
         d = (now_dt + timedelta(days=1)).replace(hour=3, minute=0, second=0, microsecond=0)
         return (d - timedelta(hours=3)).timestamp()
 
+    async def _management_tick(self, app):
+        """Timed exchange-first management loop.
+
+        AI entries run only after a closed 4H candle.  This tick only handles
+        live exchange synchronization / protection management.  Intervals:
+        - no BTC position: exchange position sync every 5 minutes;
+        - BTC position open: protection sync every 60 seconds, TP1->BE every
+          30 seconds, 24H BE/profit exit every 5 minutes.
+        """
+        now = time.time()
+        has_pos = bool(self._btc_exchange_position_seen)
+        pos_interval = 60.0 if has_pos else 300.0
+
+        if now - self._last_position_sync_ts >= pos_interval:
+            self._last_position_sync_ts = now
+            try:
+                ex_rows = await self._exchange_btc_positions()
+            except Exception as e:
+                ex_rows = []
+                log_event("btc_ai_position_sync_error", ok=False, error=str(e)[:600])
+            previous = self._btc_exchange_position_seen
+            self._btc_exchange_position_cache = list(ex_rows or [])
+            self._btc_exchange_position_seen = bool(ex_rows)
+            has_pos = self._btc_exchange_position_seen
+            log_event(
+                "btc_ai_position_sync",
+                ok=True,
+                has_position=has_pos,
+                exchange_positions=len(ex_rows or []),
+                interval_sec=pos_interval,
+                mode="position_open" if has_pos else "no_position",
+                changed=(previous != has_pos),
+            )
+
+        # Pending limit entries are local objects and only need sparse cleanup.
+        if now - self._last_pending_cleanup_ts >= 300.0:
+            self._last_pending_cleanup_ts = now
+            await self.cancel_stale_pending()
+
+        if not has_pos:
+            return
+
+        # Sync current protection by reading active MEXC planorders; no changes.
+        if now - self._last_protection_sync_ts >= 60.0:
+            self._last_protection_sync_ts = now
+            for ex_pos in list(self._btc_exchange_position_cache or []):
+                try:
+                    current = await self._latest_exchange_btc_protection(ex_pos)
+                    log_event(
+                        "btc_ai_protection_sync",
+                        ok=bool(current),
+                        tp1=current.get("partial_take_price") if current else 0,
+                        tp2=current.get("final_take_price") if current else 0,
+                        sl=current.get("stop_price") if current else 0,
+                        tp1_order_id=current.get("tp1_order_id") if current else "",
+                        tp2_order_id=current.get("tp2_order_id") if current else "",
+                        sl_order_id=current.get("sl_order_id") if current else "",
+                    )
+                except Exception as e:
+                    log_event("btc_ai_protection_sync_error", ok=False, error=str(e)[:600])
+
+        if now - self._last_tp1_be_sync_ts >= 30.0:
+            self._last_tp1_be_sync_ts = now
+            await self.monitor_tp1_breakeven(app)
+
+        if now - self._last_24h_exit_sync_ts >= 300.0:
+            self._last_24h_exit_sync_ts = now
+            await self.monitor_24h_time_exit(app)
+
     async def run_loop(self, app):
         self._running = True
         while self._running:
             settings = await self.storage.all_settings()
-            # Virtual management must keep working even when BTC AI entry mode is OFF.
-            # OFF disables only new analysis/new entries; it must not abandon TP1 -> breakeven handling.
+            # Position management is independent from new-entry autopilot.
             try:
-                await self.cancel_stale_pending()
-                await self.monitor_tp1_breakeven(app)
-                await self.monitor_24h_time_exit(app)
+                await self._management_tick(app)
                 if self._bool(settings, "btc_ai_autopilot_enabled", False):
                     await self._apply_stop_loss_pause_if_needed(app)
-            except Exception:
-                pass
+            except Exception as e:
+                log_event("btc_ai_management_tick_error", ok=False, error=str(e)[:800])
             if not self._bool(await self.storage.all_settings(), "btc_ai_autopilot_enabled", False):
                 await asyncio.sleep(10)
                 continue
@@ -124,13 +200,10 @@ class BTCVisionAutopilot:
             await self._notify(app, f"🤖 BTC AI автопилот ON. Следующий анализ после закрытия 4H свечи: {self._fmt_msk(target)}")
             while time.time() < target:
                 try:
-                    await self.cancel_stale_pending()
-                    await self.monitor_tp1_breakeven(app)
-                    await self.monitor_24h_time_exit(app)
+                    await self._management_tick(app)
                     await self._apply_stop_loss_pause_if_needed(app)
-                    # Pending entries are also replaced on the next closed 4H candle when there is no active position.
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_event("btc_ai_management_tick_error", ok=False, error=str(e)[:800])
                 if not self._bool(await self.storage.all_settings(), "btc_ai_autopilot_enabled", False):
                     break
                 await asyncio.sleep(min(30, max(1, target - time.time())))
@@ -149,6 +222,13 @@ class BTCVisionAutopilot:
         self._last_be_warning_ts = 0.0
         self._last_24h_rate_limit_log_ts = 0.0
         self._last_24h_warning_ts = 0.0
+        self._last_position_sync_ts = 0.0
+        self._last_protection_sync_ts = 0.0
+        self._last_tp1_be_sync_ts = 0.0
+        self._last_24h_exit_sync_ts = 0.0
+        self._last_pending_cleanup_ts = 0.0
+        self._btc_exchange_position_seen = False
+        self._btc_exchange_position_cache = []
 
     async def _btc_ai_positions(self) -> list[dict]:
         try:
@@ -1271,6 +1351,45 @@ class BTCVisionAutopilot:
         log_event("btc_ai_latest_exchange_protection_selected", ok=True, side=side, entry=entry, sl=out["stop_price"], tp1=out["partial_take_price"], tp2=out["final_take_price"], sl_order_id=out["sl_order_id"], tp1_order_id=out["tp1_order_id"], tp2_order_id=out["tp2_order_id"], stale_active_ignored=stale_count)
         return out
 
+    async def _cancel_btc_plan_order_ids(self, order_ids: list[str], *, reason: str = "") -> dict:
+        """Cancel specific BTC MEXC planorders only.
+
+        Never uses cancel_all_orders here; management should touch only the
+        current protection ids it selected from the exchange.
+        """
+        ids = []
+        for oid in order_ids or []:
+            oid_s = str(oid or "").strip()
+            if oid_s and oid_s not in ids:
+                ids.append(oid_s)
+        if not ids:
+            return {"ok": True, "cancelled": [], "errors": []}
+        if not hasattr(self.exchange_client, "_mexc_private"):
+            return {"ok": False, "cancelled": [], "errors": [{"error": "mexc_private_unavailable"}]}
+        try:
+            msym = self.exchange_client.mexc_contract_symbol(self.symbol) if hasattr(self.exchange_client, "mexc_contract_symbol") else "BTC_USDT"
+        except Exception:
+            msym = "BTC_USDT"
+        cancelled = []
+        errors = []
+        for oid in ids:
+            try:
+                # MEXC planorder/cancel requires a JSON array body.
+                res = await self.exchange_client._mexc_private(
+                    "POST",
+                    "/api/v1/private/planorder/cancel",
+                    body=[{"symbol": msym, "orderId": oid}],
+                )
+                ok = isinstance(res, dict) and bool(res.get("success", res.get("ok", False))) and int(res.get("code", 0) or 0) == 0
+                if ok:
+                    cancelled.append(oid)
+                else:
+                    errors.append({"orderId": oid, "response": res})
+            except Exception as e:
+                errors.append({"orderId": oid, "error": str(e)[:400]})
+        log_event("btc_ai_cancel_specific_planorders", ok=(not errors), reason=reason, requested=ids, cancelled=cancelled, errors=errors)
+        return {"ok": not errors, "cancelled": cancelled, "errors": errors}
+
     async def monitor_tp1_breakeven(self, app):
         """Exchange-first TP1 monitor.
 
@@ -1335,10 +1454,13 @@ class BTCVisionAutopilot:
                     continue
 
                 close_side = "sell" if side == "LONG" else "buy"
-                try:
-                    await self.exchange_client.cancel_all_orders(local.get("symbol") or self.symbol)
-                except Exception as e:
-                    log_event("btc_ai_be_cancel_old_protection_warning", ok=False, error=str(e)[:300])
+                # Do not use cancel_all_orders here.  Cancel only the protection
+                # ids selected for this current exchange position, then rebuild
+                # TP2 + BE SL for the remaining live size.
+                await self._cancel_btc_plan_order_ids(
+                    [local.get("tp1_order_id"), local.get("tp2_order_id"), local.get("sl_order_id")],
+                    reason="tp1_be_reprotect_current_ids_only",
+                )
 
                 # Use live exchange amount for the runner.  Never use stale local qty.
                 if remaining_qty <= 0:
@@ -1379,8 +1501,9 @@ class BTCVisionAutopilot:
             now = time.time()
             if now - self._last_be_warning_ts > 300:
                 self._last_be_warning_ts = now
-                log_event("btc_ai_be_monitor_warning", ok=False, error=msg[:600])
-                await self._notify(app, f"⚠️ BTC AI BE monitor warning: {msg[:300]}")
+                # TP1->BE checker is intentionally silent in Telegram unless
+                # SL is actually moved to breakeven. Warnings go to /log_full only.
+                log_event("btc_ai_be_monitor_warning", ok=False, error=msg[:600], telegram="silent")
 
     async def monitor_24h_time_exit(self, app):
         """Exchange-first 24H time exit.
@@ -1418,30 +1541,59 @@ class BTCVisionAutopilot:
                 if price <= 0:
                     continue
                 pnl_ok = (side == "LONG" and price >= entry) or (side == "SHORT" and price <= entry)
+                position_key = self._btc_position_key(ex_pos, local)
                 if not pnl_ok:
                     if local and not local.get("btc_ai_24h_wait_be_notified"):
                         local["btc_ai_24h_wait_be_notified"] = True
                         local["btc_ai_24h_wait_be_started_at"] = time.time()
                         await self.storage.upsert_position(local)
-                    await self._notify(app, f"⏳ BTC AI 24H: реальная позиция MEXC открыта больше суток, но сейчас в минусе. Не закрываю. Закрою, когда цена вернется в Б/У: {entry:.2f}")
+                    await self._push_live_warning(
+                        app,
+                        event="24h_negative",
+                        position_key=position_key,
+                        repush_interval_sec=4 * 60 * 60,
+                        text=(
+                            "⏳ BTC AI 24H: позиция открыта больше суток, но сейчас в минусе.\n"
+                            f"Не закрываю. Закрою, когда цена вернётся в Б/У/плюс.\n"
+                            f"Side: {side} | Entry: {entry:.2f} | Current: {price:.2f}"
+                        ),
+                    )
                     continue
 
                 if not live:
                     log_event("btc_ai_24h_exchange_close_blocked_live_false", ok=False, symbol=self.symbol, entry=entry, price=price, side=side)
-                    await self._notify(app, "⚠️ BTC AI 24H: на MEXC есть позиция в Б/У/плюсе, но live_trading=false. Биржевое автозакрытие не выполнено.")
+                    await self._notify_once_per_position(
+                        app,
+                        event="24h_live_trading_false",
+                        position_key=position_key,
+                        text="⚠️ BTC AI 24H: на MEXC есть позиция в Б/У/плюсе, но live_trading=false. Биржевое автозакрытие не выполнено.",
+                    )
                     continue
 
-                try:
-                    await self.exchange_client.cancel_all_orders(pos.get("symbol") or self.symbol)
-                except Exception as e:
-                    log_event("btc_ai_24h_cancel_protection_warning", ok=False, error=str(e)[:300])
+                protection = local or await self._latest_exchange_btc_protection(ex_pos)
+                protection_ids = []
+                if protection:
+                    protection_ids = [protection.get("tp1_order_id"), protection.get("tp2_order_id"), protection.get("sl_order_id")]
 
-                # Close the exact live exchange row/holdVol. Do not depend on local qty.
+                # Close the exact live exchange row/holdVol first. Do not depend on local qty
+                # and do not call cancel_all_orders before closing the position.
                 res = await self.execution_engine.close_exchange_position(ex_pos, reason="btc_ai_24h_exchange_breakeven_time_exit")
                 if not isinstance(res, dict) or not res.get("ok", False):
                     log_event("btc_ai_24h_exchange_close_failed", ok=False, response=res, entry=entry, price=price, exchange_position=ex_pos)
-                    await self._notify(app, f"⚠️ BTC AI 24H: не смог закрыть реальную позицию MEXC. Ответ: {str(res)[:300]}")
+                    await self._push_live_warning(
+                        app,
+                        event="24h_close_failed",
+                        position_key=position_key,
+                        repush_interval_sec=60 * 60,
+                        text=(
+                            "⚠️ BTC AI 24H: не смог закрыть реальную позицию MEXC.\n"
+                            f"Side: {side} | Entry: {entry:.2f} | Current: {price:.2f}\n"
+                            f"Ответ: {str(res)[:500]}"
+                        ),
+                    )
                     continue
+
+                await self._cancel_btc_plan_order_ids(protection_ids, reason="24h_exit_after_position_close_current_ids_only")
 
                 if local:
                     local["btc_ai_24h_exit_done"] = True
@@ -1465,10 +1617,9 @@ class BTCVisionAutopilot:
                     log_event("btc_ai_24h_monitor_rate_limited", ok=False, error=msg[:600], action="silent_retry")
                 return
             now = time.time()
-            if now - self._last_24h_warning_ts > 300:
+            if now - self._last_24h_warning_ts > 3600:
                 self._last_24h_warning_ts = now
-                log_event("btc_ai_24h_monitor_warning", ok=False, error=msg[:800])
-                await self._notify(app, f"⚠️ BTC AI 24H monitor warning: {msg[:300]}")
+                log_event("btc_ai_24h_monitor_warning", ok=False, error=msg[:800], telegram="silent")
 
     async def cancel_stale_pending(self):
         try:
@@ -1841,6 +1992,83 @@ JSON schema: {"signal":"LONG|SHORT|WAIT","probability":0,"grade":"C|B|A|A+","ent
         for k,v in keys.items():
             try: await self.storage.set(k,v,bump_revision=False)
             except TypeError: await self.storage.set(k,v)
+
+
+    def _btc_position_key(self, ex_pos: dict, local_pos: dict | None = None) -> str:
+        """Stable key for one live BTC exchange position used by anti-spam alerts."""
+        try:
+            info = ex_pos.get("info") if isinstance(ex_pos.get("info"), dict) else {}
+            pid = str(ex_pos.get("positionId") or info.get("positionId") or info.get("id") or "").strip()
+            if pid:
+                return f"BTC_USDT:pid:{pid}"
+            side = self._exchange_position_side(ex_pos) or "UNK"
+            entry = self._exchange_position_entry(ex_pos) or 0.0
+            opened = self._exchange_position_opened_at(ex_pos, local_pos)
+            return f"BTC_USDT:{side}:{entry:.2f}:{int(opened or 0)}"
+        except Exception:
+            return "BTC_USDT:unknown"
+
+    async def _delete_bot_message_silent(self, app, message_id: Any) -> None:
+        try:
+            mid = int(message_id or 0)
+            if mid > 0:
+                await app.bot.delete_message(chat_id=self._admin_id(), message_id=mid)
+        except Exception as e:
+            log_event("btc_ai_live_warning_delete_failed", ok=False, message_id=str(message_id or ""), error=str(e)[:300])
+
+    async def _push_live_warning(self, app, *, event: str, position_key: str, text: str, repush_interval_sec: int) -> dict:
+        """Send a non-spam live warning.
+
+        First call sends a message. Subsequent calls for the same position are
+        silent until repush_interval_sec has passed; then the old message is
+        deleted and a fresh one is sent so it appears at the bottom of chat.
+        """
+        now = time.time()
+        base = f"btc_ai_live_warning_{event}"
+        try:
+            old_key = str(await self.storage.get(base + "_position_key", "") or "")
+            old_msg_id = await self.storage.get(base + "_message_id", 0)
+            last_ts = float(await self.storage.get(base + "_last_push_ts", 0) or 0)
+        except Exception:
+            old_key, old_msg_id, last_ts = "", 0, 0.0
+
+        same_position = (old_key == str(position_key or ""))
+        if same_position and last_ts > 0 and (now - last_ts) < float(repush_interval_sec or 0):
+            log_event("btc_ai_live_warning_suppressed", ok=True, event=event, position_key=position_key, age_sec=round(now-last_ts, 1), interval_sec=repush_interval_sec)
+            return {"ok": True, "sent": False, "suppressed": True}
+
+        if old_msg_id:
+            await self._delete_bot_message_silent(app, old_msg_id)
+
+        try:
+            msg = await app.bot.send_message(chat_id=self._admin_id(), text=str(text)[:3900])
+            msg_id = int(getattr(msg, "message_id", 0) or 0)
+            try:
+                await self.storage.set(base + "_position_key", str(position_key or ""), bump_revision=False)
+                await self.storage.set(base + "_message_id", msg_id, bump_revision=False)
+                await self.storage.set(base + "_last_push_ts", now, bump_revision=False)
+            except Exception:
+                pass
+            log_event("btc_ai_live_warning_sent", ok=True, event=event, position_key=position_key, message_id=msg_id, interval_sec=repush_interval_sec)
+            return {"ok": True, "sent": True, "message_id": msg_id}
+        except Exception as e:
+            log_event("btc_ai_live_warning_send_failed", ok=False, event=event, position_key=position_key, error=str(e)[:500])
+            return {"ok": False, "sent": False, "error": str(e)[:300]}
+
+    async def _notify_once_per_position(self, app, *, event: str, position_key: str, text: str) -> bool:
+        base = f"btc_ai_once_notice_{event}"
+        try:
+            old = str(await self.storage.get(base + "_position_key", "") or "")
+            if old == str(position_key or ""):
+                log_event("btc_ai_once_notice_suppressed", ok=True, event=event, position_key=position_key)
+                return False
+            await self._notify(app, text)
+            await self.storage.set(base + "_position_key", str(position_key or ""), bump_revision=False)
+            log_event("btc_ai_once_notice_sent", ok=True, event=event, position_key=position_key)
+            return True
+        except Exception as e:
+            log_event("btc_ai_once_notice_failed", ok=False, event=event, position_key=position_key, error=str(e)[:500])
+            return False
 
     async def _notify(self, app, text):
         try: await app.bot.send_message(chat_id=self._admin_id(), text=str(text)[:3900])
