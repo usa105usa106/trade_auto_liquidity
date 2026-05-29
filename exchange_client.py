@@ -12,6 +12,12 @@ import ccxt.async_support as ccxt
 from debug_log import log_mexc
 
 try:
+    from runtime_secrets import secret_value, ensure_runtime_secrets_loaded
+except Exception:  # pragma: no cover
+    secret_value = None
+    ensure_runtime_secrets_loaded = None
+
+try:
     from aiohttp_socks import ProxyConnector
 except Exception:  # pragma: no cover
     ProxyConnector = None
@@ -815,7 +821,21 @@ class ExchangeClient:
         raw = f"{self.api_key}{req_time}{payload}"
         return hmac.new(self.api_secret.encode(), raw.encode(), hashlib.sha256).hexdigest()
 
+    def _hydrate_api_keys_from_runtime(self) -> None:
+        """V77: last-line protection against empty keys in long-lived clients."""
+        if self.api_key and self.api_secret:
+            return
+        try:
+            if ensure_runtime_secrets_loaded:
+                ensure_runtime_secrets_loaded()
+            if secret_value:
+                self.api_key = self.api_key or secret_value({}, "mexc_api_key", "MEXC_API_KEY")
+                self.api_secret = self.api_secret or secret_value({}, "mexc_api_secret", "MEXC_API_SECRET")
+        except Exception:
+            pass
+
     async def _mexc_private(self, method: str, path: str, body=None, query: dict | None = None, base_url: str | None = None):
+        self._hydrate_api_keys_from_runtime()
         if not self.api_key or not self.api_secret:
             raise RuntimeError("MEXC API key/secret is missing")
         await self._mexc_private_rate_limit()

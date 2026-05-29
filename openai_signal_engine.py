@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from runtime_secrets import secret_value
+from runtime_secrets import secret_value, ensure_runtime_secrets_loaded, merge_secrets_into_settings
 import re
 from dataclasses import dataclass
 from typing import Any, Dict
@@ -61,6 +61,11 @@ def parse_bool_value(raw: Any, default: bool = False) -> bool:
 
 
 def openai_key(settings: dict) -> str:
+    try:
+        ensure_runtime_secrets_loaded(settings or {})
+        settings = merge_secrets_into_settings(settings or {})
+    except Exception:
+        settings = settings or {}
     key = str((settings or {}).get("openai_api_key") or "").strip()
     if key:
         return key

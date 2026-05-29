@@ -35,7 +35,7 @@ from chart_renderer import render_trade_setup_chart
 from ai_btc_autopilot import BTCVisionAutopilot
 from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
-from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env
+from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env, set_runtime_secret_cache, clear_runtime_secret_cache, runtime_secret_cache, ensure_runtime_secrets_loaded, merge_secrets_into_settings
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
@@ -809,11 +809,13 @@ async def sleep_until_next_scan(app, seconds: int | float) -> None:
         ev.clear()
 
 def _api_creds(settings: dict) -> tuple[str, str]:
-    # v75: Telegram/SQLite settings have priority, then Railway env, then
-    # a local backup file written by /api set. This prevents the bot from
-    # "losing" keys during runtime when settings reload empty/default values.
-    # For persistence across Railway redeploys, Railway Variables or a volume
-    # are still the safest source. Secrets are never printed unmasked.
+    # v77: one single credential source for every command/background sync.
+    # Always refresh from SQLite/runtime-cache/env/backup before returning.
+    try:
+        ensure_runtime_secrets_loaded(settings or {})
+        settings = merge_secrets_into_settings(settings or {})
+    except Exception:
+        settings = settings or {}
     api_key = secret_value(settings, "mexc_api_key", "MEXC_API_KEY")
     api_secret = secret_value(settings, "mexc_api_secret", "MEXC_API_SECRET")
     return api_key, api_secret
@@ -3256,7 +3258,8 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     started = time.perf_counter()
-    s = await storage.all_settings()
+    ensure_runtime_secrets_loaded()
+    s = merge_secrets_into_settings(await storage.all_settings())
     api_key, api_secret = _api_creds(s)
     if not (api_key and api_secret):
         await reply(update, "📊 BTC Status\n❌ MEXC API key/secret не настроены. Используй /api set KEY SECRET", reply_markup=MAIN_MENU)
@@ -4629,6 +4632,7 @@ async def openai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await storage.set("openai_api_key", key)
         os.environ["OPENAI_API_KEY"] = key
+        set_runtime_secret_cache({"openai_api_key": key})
         save_secret_backup({"openai_api_key": key})
         log_event("openai_key_persisted_v75", ok=True, sqlite=True, env_runtime=True, backup=True)
         await reply(update, "✅ OpenAI API key saved", reply_markup=MAIN_MENU)
@@ -4636,6 +4640,7 @@ async def openai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cmd == "clear":
         await storage.set("openai_api_key", "")
         os.environ.pop("OPENAI_API_KEY", None)
+        clear_runtime_secret_cache(["openai_api_key"])
         clear_secret_backup(["openai_api_key"])
         await reply(update, "🗑 OpenAI API key cleared", reply_markup=MAIN_MENU)
         return
@@ -4648,7 +4653,8 @@ async def openai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
-    s = await storage.all_settings()
+    ensure_runtime_secrets_loaded()
+    s = merge_secrets_into_settings(await storage.all_settings())
     if not context.args or context.args[0].lower() in {"status", "show"}:
         api_key, api_secret = _api_creds(s)
         source = "Telegram settings" if s.get("mexc_api_key") and s.get("mexc_api_secret") else "Railway/env fallback" if api_key and api_secret else "not configured"
@@ -4675,8 +4681,11 @@ async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await storage.set("mexc_api_secret", api_secret_new)
         os.environ["MEXC_API_KEY"] = api_key_new
         os.environ["MEXC_API_SECRET"] = api_secret_new
+        set_runtime_secret_cache({"mexc_api_key": api_key_new, "mexc_api_secret": api_secret_new})
         save_secret_backup({"mexc_api_key": api_key_new, "mexc_api_secret": api_secret_new})
-        log_event("api_keys_persisted_v75", ok=True, sqlite=True, env_runtime=True, backup=True)
+        verify_s = await storage.all_settings()
+        verify_key, verify_secret = _api_creds(verify_s)
+        log_event("api_keys_persisted_v76", ok=bool(verify_key and verify_secret), sqlite=True, env_runtime=True, runtime_cache=True, backup=True, key_mask=mask_secret(verify_key), secret_mask=mask_secret(verify_secret))
         cleared = 0
         try:
             cleared = await storage.clear_positions()
@@ -4691,6 +4700,7 @@ async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await storage.set("mexc_api_secret", "")
         os.environ.pop("MEXC_API_KEY", None)
         os.environ.pop("MEXC_API_SECRET", None)
+        clear_runtime_secret_cache(["mexc_api_key", "mexc_api_secret"])
         clear_secret_backup(["mexc_api_key", "mexc_api_secret"])
         await reset_exchange()
         await reply(update, "🗑 API keys cleared from bot storage", reply_markup=MAIN_MENU)
@@ -5571,6 +5581,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "clear":
             await storage.set("mexc_api_key", "")
             await storage.set("mexc_api_secret", "")
+            os.environ.pop("MEXC_API_KEY", None)
+            os.environ.pop("MEXC_API_SECRET", None)
+            clear_runtime_secret_cache(["mexc_api_key", "mexc_api_secret"])
+            clear_secret_backup(["mexc_api_key", "mexc_api_secret"])
             await reset_exchange()
             new_settings = await storage.all_settings()
             new_rev = int(new_settings.get("settings_revision", current_rev + 1))
@@ -5606,6 +5620,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = data[1] if len(data) > 1 else "status"
         if action == "clear":
             await storage.set("openai_api_key", "")
+            os.environ.pop("OPENAI_API_KEY", None)
+            clear_runtime_secret_cache(["openai_api_key"])
+            clear_secret_backup(["openai_api_key"])
             new_settings = await storage.all_settings()
             new_rev = int(new_settings.get("settings_revision", current_rev + 1))
             await _safe_edit_message_text(q.message, "🗑 OpenAI API key cleared", reply_markup=openai_menu(new_rev, new_settings))
@@ -7151,9 +7168,9 @@ async def on_startup(app):
     await storage.init()
     try:
         apply_secret_backup_to_env()
-        log_event("runtime_secrets_loaded_v75", ok=True)
+        log_event("runtime_secrets_loaded_v77", ok=True)
     except Exception as e:
-        log_event("runtime_secrets_load_failed_v75", ok=False, error=str(e)[:300])
+        log_event("runtime_secrets_load_failed_v77", ok=False, error=str(e)[:300])
 
     # V52: local positions are volatile cache only.  On deploy/restart wipe the
     # SQLite position cache so stale BTC AI TP/SL/order ids can never steer live
