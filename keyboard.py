@@ -11,7 +11,7 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["₿ BTC AI 4H автопилот", "📊 BTC Status"],
     ["🧽 Clean BTC Orders", "🧪 BTC Backtest 4H"],
     ["🧪 BTC Backtest 1H", "🧪 Round Levels"],
-    ["🧪 Strategy Lab", "🧪 Strategy Lab Extra"],
+    ["🧪 Strategy Lab", "🧪 Strategy Detail"],
     ["🔥 Aggressive Lab"],
     ["📊 BTC Status"],
     ["⚡ быстрый отскок"],

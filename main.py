@@ -33,7 +33,7 @@ from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
 from ai_btc_autopilot import BTCVisionAutopilot
-from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest
+from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
 
 logging.basicConfig(level=logging.INFO)
@@ -2964,7 +2964,7 @@ async def _strategy_lab_backtest_background(app, chat_id: int, progress_message_
     try:
         settings = await storage.all_settings()
         ex = await get_exchange(settings)
-        text, payload = await run_strategy_lab_backtest(ex, years=years, mode=mode, progress_cb=progress)
+        text, payload = await (run_strategy_detail_backtest(ex, years=years, progress_cb=progress) if str(mode).lower().startswith("detail") else run_strategy_lab_backtest(ex, years=years, mode=mode, progress_cb=progress))
         await progress("Report ready")
         try:
             await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=text[:3900], reply_markup=MAIN_MENU), timeout=8)
@@ -3030,24 +3030,21 @@ async def backtest_strategy_lab_extra_cmd(update: Update, context: ContextTypes.
         return
     try:
         years = 3.0
-        mode = "extra"
+        mode = "detail_extra"
         args = list(getattr(context, "args", []) or [])
         for a in args:
             aa = str(a).strip().lower()
-            if aa in ("full", "max", "15m"):
-                mode = "extra_full"
-            else:
-                try:
-                    years = max(0.5, min(5.0, float(aa)))
-                except Exception:
-                    pass
+            try:
+                years = max(0.5, min(5.0, float(aa)))
+            except Exception:
+                pass
         msg = await reply(
             update,
-            "🧪 STRATEGY LAB EXTRA — progress\n"
-            f"History requested: {years:g}y | mode={mode.upper()} | BTC/ETH\n"
-            "Families: VWAP, Bollinger, RSI, ATR, funding-proxy, EMA, Donchian, US-open, S/R, imbalance.\n"
+            "🧪 STRATEGY DETAIL — progress\n"
+            f"History requested: {years:g}y | mode=DETAIL | BTC/ETH\n"
+            "Подробно считаю только 3 режима: BTC 4H RSI divergence, BTC 1H RSI divergence, ETH 1H gap imbalance fill.\n"
             "Trading logic: НЕ изменяется, сделок не открываю.\n\n"
-            "Strategy Lab Extra started\n\n⏳ Это живое сообщение: этапы загрузки/расчёта будут обновляться здесь.",
+            "Strategy Detail started\n\n⏳ Это живое сообщение: этапы загрузки/расчёта будут обновляться здесь.",
             reply_markup=MAIN_MENU,
         )
         chat = update.effective_chat
@@ -5351,7 +5348,7 @@ def _button_mapping():
         ("🤖 AI BTC/ETH scalping", ai_scalping_toggle_cmd), ("AI BTC/ETH scalping", ai_scalping_toggle_cmd),
         ("₿ BTC AI 4H автопилот", btc_ai_autopilot_cmd), ("BTC AI 4H автопилот", btc_ai_autopilot_cmd),
         ("📊 BTC Status", status_btc_cmd), ("BTC Status", status_btc_cmd), ("/status_btc", status_btc_cmd),
-        ("🧪 BTC Backtest", backtest_btc_patterns_cmd), ("🧪 BTC Backtest 4H", backtest_btc_patterns_cmd), ("/backtest_btc_patterns", backtest_btc_patterns_cmd), ("🧪 BTC Backtest 1H", backtest_btc_patterns_1h_cmd), ("/backtest_btc_patterns_1h", backtest_btc_patterns_1h_cmd), ("🧪 Round Levels", backtest_round_levels_cmd), ("/backtest_round_levels", backtest_round_levels_cmd), ("🧪 Strategy Lab", backtest_strategy_lab_cmd), ("/backtest_strategy_lab", backtest_strategy_lab_cmd), ("🧪 Strategy Lab Extra", backtest_strategy_lab_extra_cmd), ("/backtest_strategy_lab_extra", backtest_strategy_lab_extra_cmd), ("🔥 Aggressive Lab", backtest_aggressive_lab_cmd), ("/backtest_aggressive_lab", backtest_aggressive_lab_cmd),
+        ("🧪 BTC Backtest", backtest_btc_patterns_cmd), ("🧪 BTC Backtest 4H", backtest_btc_patterns_cmd), ("/backtest_btc_patterns", backtest_btc_patterns_cmd), ("🧪 BTC Backtest 1H", backtest_btc_patterns_1h_cmd), ("/backtest_btc_patterns_1h", backtest_btc_patterns_1h_cmd), ("🧪 Round Levels", backtest_round_levels_cmd), ("/backtest_round_levels", backtest_round_levels_cmd), ("🧪 Strategy Lab", backtest_strategy_lab_cmd), ("/backtest_strategy_lab", backtest_strategy_lab_cmd), ("🧪 Strategy Detail", backtest_strategy_lab_extra_cmd), ("🧪 Strategy Lab Extra", backtest_strategy_lab_extra_cmd), ("/backtest_strategy_lab_extra", backtest_strategy_lab_extra_cmd), ("🔥 Aggressive Lab", backtest_aggressive_lab_cmd), ("/backtest_aggressive_lab", backtest_aggressive_lab_cmd),
         ("🧽 Clean BTC Orders", clean_btc_orders_cmd), ("Clean BTC Orders", clean_btc_orders_cmd), ("/clean_btc_orders", clean_btc_orders_cmd),
         ("⚡ быстрый отскок", quick_bounce_cmd), ("быстрый отскок", quick_bounce_cmd), ("Быстрый отскок", quick_bounce_cmd),
         ("🔻 импульсный слив", impulse_dump_cmd), ("импульсный слив", impulse_dump_cmd), ("Импульсный слив", impulse_dump_cmd),

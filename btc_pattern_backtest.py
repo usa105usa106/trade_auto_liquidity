@@ -907,6 +907,163 @@ def _round_level_scan(df: pd.DataFrame, symbol: str, timeframe: str, step: float
         "combined_avg_horizon_return_after_cost": float(np.mean(all_rets)) if all_rets else 0.0,
     }
 
+
+
+def _round_level_tp05_first_touch_scan(df: pd.DataFrame, symbol: str, timeframe: str, step: float, horizon_bars: int, cooldown_bars: int, target_pct: float = 0.005) -> dict:
+    """Round-level TP 0.5% first-touch test (read-only).
+
+    Uses the same round-level approach events as the reaction scan, but tests a
+    real trade question: after entering on the touch/probe candle close, what
+    happens first over the next 24h — TP +0.5% or SL?  Multiple SL variants are
+    tested. If both TP and SL are touched within the same candle, the result is
+    marked as SL first (conservative intrabar assumption).
+    """
+    if len(df) < max(300, cooldown_bars + horizon_bars + 20):
+        return {"ok": False, "symbol": symbol, "timeframe": timeframe, "error": f"not enough candles: {len(df)}"}
+
+    step = float(step)
+    band_pct = 0.0015
+    min_band_abs = step * 0.05
+    cost = 0.0006
+    sl_variants = [0.003, 0.005, 0.007, 0.010]
+    closes = df["close"].to_numpy(float)
+    highs = df["high"].to_numpy(float)
+    lows = df["low"].to_numpy(float)
+    last_hit: dict[tuple[str, int], int] = {}
+    events: list[dict] = []
+
+    for i in range(1, len(df) - horizon_bars - 1):
+        prev_close = float(closes[i - 1])
+        hi = float(highs[i])
+        lo = float(lows[i])
+        close = float(closes[i])
+        ts = int(df.iloc[i]["ts"])
+        if not all(math.isfinite(x) and x > 0 for x in (prev_close, hi, lo, close)):
+            continue
+        level_start = max(step, math.floor((lo - step) / step) * step)
+        level_end = math.ceil((hi + step) / step) * step
+        levels = np.arange(level_start, level_end + step * 0.5, step)
+        for level_f in levels:
+            level = float(level_f)
+            if level <= 0:
+                continue
+            band_abs = max(level * band_pct, min_band_abs)
+            zone_low = level - band_abs
+            zone_high = level + band_abs
+            level_key = int(round(level / step))
+            if prev_close < zone_low and hi >= zone_low and i - last_hit.get(("RES", level_key), -10**9) >= cooldown_bars:
+                events.append({"ts": ts, "i": i, "kind": "RESISTANCE_SHORT_TP05", "side": "SHORT", "level": level, "entry": close})
+                last_hit[("RES", level_key)] = i
+            if prev_close > zone_high and lo <= zone_high and i - last_hit.get(("SUP", level_key), -10**9) >= cooldown_bars:
+                events.append({"ts": ts, "i": i, "kind": "SUPPORT_LONG_TP05", "side": "LONG", "level": level, "entry": close})
+                last_hit[("SUP", level_key)] = i
+
+    def simulate_event(ev: dict, sl_pct: float) -> dict:
+        i = int(ev["i"])
+        entry = float(ev["entry"])
+        side = str(ev["side"])
+        if side == "LONG":
+            tp = entry * (1.0 + target_pct)
+            sl = entry * (1.0 - sl_pct)
+            for j in range(i + 1, min(len(df), i + 1 + horizon_bars)):
+                hit_sl = float(lows[j]) <= sl
+                hit_tp = float(highs[j]) >= tp
+                # conservative: if both inside same candle, assume SL first.
+                if hit_sl:
+                    return {"outcome": "SL", "ret": -sl_pct - cost, "bars": j - i}
+                if hit_tp:
+                    return {"outcome": "TP", "ret": target_pct - cost, "bars": j - i}
+            end_close = float(closes[min(len(df)-1, i + horizon_bars)])
+            return {"outcome": "TIME", "ret": (end_close - entry) / max(entry, 1e-9) - cost, "bars": horizon_bars}
+        else:
+            tp = entry * (1.0 - target_pct)
+            sl = entry * (1.0 + sl_pct)
+            for j in range(i + 1, min(len(df), i + 1 + horizon_bars)):
+                hit_sl = float(highs[j]) >= sl
+                hit_tp = float(lows[j]) <= tp
+                if hit_sl:
+                    return {"outcome": "SL", "ret": -sl_pct - cost, "bars": j - i}
+                if hit_tp:
+                    return {"outcome": "TP", "ret": target_pct - cost, "bars": j - i}
+            end_close = float(closes[min(len(df)-1, i + horizon_bars)])
+            return {"outcome": "TIME", "ret": (entry - end_close) / max(entry, 1e-9) - cost, "bars": horizon_bars}
+
+    def metrics_for(sl_pct: float, kind_filter: str | None = None) -> dict:
+        xs = [e for e in events if kind_filter is None or e.get("kind") == kind_filter]
+        if not xs:
+            return {"events": 0, "sl_pct": sl_pct}
+        sims = [simulate_event(e, sl_pct) for e in xs]
+        rets = [float(x["ret"]) for x in sims]
+        tp = sum(1 for x in sims if x["outcome"] == "TP")
+        sl = sum(1 for x in sims if x["outcome"] == "SL")
+        tm = sum(1 for x in sims if x["outcome"] == "TIME")
+        return {
+            "events": len(xs),
+            "sl_pct": float(sl_pct),
+            "tp_pct": float(target_pct),
+            "tp_first_rate": tp / len(xs),
+            "sl_first_rate": sl / len(xs),
+            "time_exit_rate": tm / len(xs),
+            "avg_return_after_cost": float(np.mean(rets)) if rets else 0.0,
+            "median_return_after_cost": float(np.median(rets)) if rets else 0.0,
+            "profit_factor": _profit_factor(rets),
+            "max_drawdown_sum_return": _max_dd_from_returns(rets),
+            "avg_bars_to_exit": float(np.mean([int(x.get("bars", 0)) for x in sims])) if sims else 0.0,
+        }
+
+    variants = []
+    for slp in sl_variants:
+        variants.append({
+            "sl_pct": slp,
+            "combined": metrics_for(slp),
+            "resistance_short": metrics_for(slp, "RESISTANCE_SHORT_TP05"),
+            "support_long": metrics_for(slp, "SUPPORT_LONG_TP05"),
+        })
+    best = None
+    scored = []
+    for v in variants:
+        c = v.get("combined") or {}
+        if int(c.get("events") or 0) <= 0:
+            continue
+        # PF first, then positive average return, then TP-first rate.
+        score = float(c.get("profit_factor") or 0) + max(0.0, float(c.get("avg_return_after_cost") or 0) * 100.0) + float(c.get("tp_first_rate") or 0) * 0.1
+        scored.append((score, v))
+    if scored:
+        best = sorted(scored, key=lambda x: x[0], reverse=True)[0][1]
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "step": step,
+        "band_pct": band_pct,
+        "target_pct": target_pct,
+        "horizon_bars": horizon_bars,
+        "cooldown_bars": cooldown_bars,
+        "candles": int(len(df)),
+        "events_total": len(events),
+        "sl_variants": variants,
+        "best_variant": best,
+        "note": "TP 0.5% first-touch; conservative intrabar assumption: if TP and SL hit in same candle, SL counts first",
+    }
+
+
+def _line_summary_round_tp05(res: dict) -> str:
+    if not res.get("ok"):
+        return f"{res.get('symbol')} {res.get('timeframe')}: error {res.get('error')}"
+    best = res.get("best_variant") or {}
+    c = best.get("combined") or {}
+    if not c:
+        return f"{res.get('symbol')} {str(res.get('timeframe')).upper()}: TP0.5 first-touch no events"
+    coverage = res.get('coverage_pct')
+    coverage_txt = f" coverage={_fmt_pct(coverage)}" if coverage is not None else ""
+    return (
+        f"{res.get('symbol')} {str(res.get('timeframe')).upper()}{coverage_txt}: "
+        f"best SL={_fmt_pct(c.get('sl_pct',0))} TP=0.50% events={c.get('events',0)} "
+        f"TP-first={_fmt_pct(c.get('tp_first_rate',0))} SL-first={_fmt_pct(c.get('sl_first_rate',0))} "
+        f"PF={float(c.get('profit_factor') or 0):.2f} avg={_fmt_pct(c.get('avg_return_after_cost',0))} "
+        f"DD={_fmt_pct(c.get('max_drawdown_sum_return',0))}"
+    )
+
 def _line_summary_round(res: dict) -> str:
     if not res.get("ok"):
         return f"{res.get('symbol')} {res.get('timeframe')}: error {res.get('error')}"
@@ -953,6 +1110,7 @@ async def run_round_level_backtest(exchange, years: float = 3.0, progress_cb=Non
     # Order chosen for clear progress in chat: BTC 1H, BTC 15m, ETH 1H, ETH 15m.
     timeframes = ["1h", "15m"]
     payload_results = []
+    payload_tp05_results = []
     await _progress("Round Levels started", years=years)
     for symbol in symbols:
         step = _round_step_for_symbol(symbol)
@@ -962,7 +1120,9 @@ async def run_round_level_backtest(exchange, years: float = 3.0, progress_cb=Non
                 candles = await fetch_ohlcv_history(exchange, symbol=symbol, timeframe=tf, years=years, limit_per_call=500)
                 await _progress(f"{symbol.split('_')[0]} {tf_label} loaded: {len(candles)} candles", symbol=symbol, timeframe=tf, candles=len(candles))
                 if len(candles) < 500:
-                    payload_results.append({"ok": False, "symbol": symbol, "timeframe": tf, "error": f"not enough candles fetched: {len(candles)}"})
+                    err_obj = {"ok": False, "symbol": symbol, "timeframe": tf, "error": f"not enough candles fetched: {len(candles)}"}
+                    payload_results.append(err_obj)
+                    payload_tp05_results.append(dict(err_obj))
                     await _progress(f"{symbol.split('_')[0]} {tf_label} skipped: not enough candles", symbol=symbol, timeframe=tf, candles=len(candles))
                     continue
                 df = _to_df(candles)
@@ -977,17 +1137,22 @@ async def run_round_level_backtest(exchange, years: float = 3.0, progress_cb=Non
                     cooldown_bars = 24
 
                 res = _round_level_scan(df, symbol=symbol, timeframe=tf, step=step, horizon_bars=horizon_bars, cooldown_bars=cooldown_bars, target_pct=0.005)
+                tp05 = _round_level_tp05_first_touch_scan(df, symbol=symbol, timeframe=tf, step=step, horizon_bars=horizon_bars, cooldown_bars=cooldown_bars, target_pct=0.005)
                 try:
                     expected = max(1, int(float(years) * 365.25 * 24 * 60 * 60 * 1000 / max(tf_ms, 1)))
-                    res["expected_candles_approx"] = expected
-                    res["coverage_pct"] = min(1.0, len(df) / expected)
-                    res["coverage_note"] = "OK" if len(df) >= expected * 0.80 else "PARTIAL_HISTORY"
+                    for obj in (res, tp05):
+                        obj["expected_candles_approx"] = expected
+                        obj["coverage_pct"] = min(1.0, len(df) / expected)
+                        obj["coverage_note"] = "OK" if len(df) >= expected * 0.80 else "PARTIAL_HISTORY"
                 except Exception:
                     pass
                 payload_results.append(res)
-                await _progress(f"{symbol.split('_')[0]} {tf_label} calculated: events={res.get('events_total',0)} coverage={_fmt_pct(res.get('coverage_pct',0))}", symbol=symbol, timeframe=tf, result_ok=bool(payload_results[-1].get("ok")), events=res.get('events_total',0), coverage=res.get('coverage_pct'))
+                payload_tp05_results.append(tp05)
+                await _progress(f"{symbol.split('_')[0]} {tf_label} calculated: events={res.get('events_total',0)} tp05_events={tp05.get('events_total',0)} coverage={_fmt_pct(res.get('coverage_pct',0))}", symbol=symbol, timeframe=tf, result_ok=bool(payload_results[-1].get("ok")), events=res.get('events_total',0), tp05_events=tp05.get('events_total',0), coverage=res.get('coverage_pct'))
             except Exception as e:
-                payload_results.append({"ok": False, "symbol": symbol, "timeframe": tf, "error": str(e)[:500]})
+                err_obj = {"ok": False, "symbol": symbol, "timeframe": tf, "error": str(e)[:500]}
+                payload_results.append(err_obj)
+                payload_tp05_results.append(dict(err_obj))
                 await _progress(f"{symbol.split('_')[0]} {tf_label} error: {str(e)[:160]}", symbol=symbol, timeframe=tf)
 
     payload = {
@@ -995,6 +1160,7 @@ async def run_round_level_backtest(exchange, years: float = 3.0, progress_cb=Non
         "years_requested": years,
         "runtime_sec": round(time.time() - started, 2),
         "results": payload_results,
+        "tp05_first_touch_results": payload_tp05_results,
         "notes": [
             "manual round-level backtest only; no trading logic changed",
             "BTC round step=500, ETH round step=50",
@@ -1021,7 +1187,15 @@ async def run_round_level_backtest(exchange, years: float = 3.0, progress_cb=Non
         lines.append("- " + _line_summary_round(r))
     lines += [
         "",
+        "3️⃣ TP 0.5% FIRST-TOUCH TEST",
+        "Идея: после входа от круглого уровня TP=0.5%; проверяем, что сработало первым за 24h — TP или SL. SL варианты: 0.3%, 0.5%, 0.7%, 1.0%. Если TP и SL внутри одной свечи — считаем SL первым, консервативно.",
+    ]
+    for r in payload_tp05_results:
+        lines.append("- " + _line_summary_round_tp05(r))
+    lines += [
+        "",
         "Как читать: corr/bounce≥0.5% = как часто был ход хотя бы 0.5%; avgCorr/avgBounce = средний лучший ход за 24h; avgBad = средний ход против; PF = грубый profit factor по закрытию через 24h.",
+        "TP 0.5 first-touch = уже ближе к реальной сделке: показывает, насколько часто тейк 0.5% срабатывал раньше стопа.",
         "Сырой JSON и ошибки: /log_full",
     ]
     return "\n".join(lines), payload
@@ -1444,6 +1618,273 @@ def _generate_strategy_returns(df_in: pd.DataFrame, symbol: str, timeframe: str,
         "short_signals": sum(1 for s in sides if s == "SHORT"),
         "score": float(score),
     }
+
+
+# ---------------- V72 Detailed strategy report for selected candidates only ----------------
+
+def _split_ts_70(df: pd.DataFrame) -> int:
+    try:
+        return int(df["ts"].iloc[int(len(df) * 0.70)])
+    except Exception:
+        return 0
+
+
+def _months_between_ms(a: int, b: int) -> float:
+    try:
+        if not a or not b or b <= a:
+            return 0.0
+        days = (int(b) - int(a)) / 1000.0 / 86400.0
+        return max(days / 30.4375, 0.0)
+    except Exception:
+        return 0.0
+
+
+def _max_loss_streak(rets: list[float]) -> int:
+    best = cur = 0
+    for r in rets or []:
+        if float(r) <= 0:
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+    return int(best)
+
+
+def _trade_subset_metrics(trades: list[dict]) -> dict:
+    rets = [float(t.get("ret", 0.0)) for t in (trades or []) if math.isfinite(float(t.get("ret", 0.0)))]
+    m = _strategy_metrics(rets)
+    m["loss_streak_max"] = _max_loss_streak(rets)
+    if trades:
+        ts0 = min(int(t.get("ts", 0)) for t in trades)
+        ts1 = max(int(t.get("ts", 0)) for t in trades)
+        months = _months_between_ms(ts0, ts1)
+        net = float(m.get("net_return_sum", 0.0))
+        m["period_months"] = months
+        m["monthly_simple"] = net / months if months > 0 else 0.0
+        m["monthly_compound"] = ((1.0 + net) ** (1.0 / months) - 1.0) if months > 0 and (1.0 + net) > 0 else 0.0
+    else:
+        m["period_months"] = 0.0
+        m["monthly_simple"] = 0.0
+        m["monthly_compound"] = 0.0
+    return m
+
+
+def _format_detail_metrics(m: dict) -> str:
+    return (
+        f"trades={int(m.get('trades',0))} WR={_pct_str(m.get('winrate',0))} "
+        f"PF={float(m.get('profit_factor',0)):.2f} net={_pct_str(m.get('net_return_sum',0))} "
+        f"avg={_pct_str(m.get('avg_return',0))} DD={_pct_str(m.get('max_drawdown',0))} "
+        f"M≈{_pct_str(m.get('monthly_compound',0))}/mo lossStreak={int(m.get('loss_streak_max',0))}"
+    )
+
+
+def _generate_selected_strategy_trades(df_in: pd.DataFrame, symbol: str, timeframe: str, family: str, params: dict, cost: float = 0.0006) -> list[dict]:
+    """Return detailed trades for the three selected V72 detail candidates.
+
+    Uses the same horizon-exit logic as Strategy Lab Extra so numbers are comparable
+    with the report the user already received.  Read-only backtest only.
+    """
+    df = _add_strategy_indicators(df_in)
+    c = df["close"].to_numpy(float); h = df["high"].to_numpy(float); l = df["low"].to_numpy(float); o = df["open"].to_numpy(float)
+    rsi14 = df["rsi14"].to_numpy(float)
+    atrp = df["atr_pct"].to_numpy(float)
+    body_abs = df["body_pct_abs"].to_numpy(float)
+    ts_arr = df["ts"].to_numpy(np.int64)
+    horizon = int(params.get("horizon", 6))
+    cooldown = int(params.get("cooldown", max(1, horizon // 2)))
+    look = int(params.get("lookback", 24))
+    trades: list[dict] = []
+    last_trade_i = -10**9
+    n = len(df)
+    for i in range(120, n - horizon - 1):
+        if i - last_trade_i < cooldown:
+            continue
+        side = None
+        reason = ""
+        fam = str(family)
+        try:
+            if fam == "rsi_divergence":
+                os = float(params.get("oversold", 38)); ob = float(params.get("overbought", 62))
+                if i - look < 2:
+                    continue
+                prev_low = np.nanmin(l[i-look:i]); prev_high = np.nanmax(h[i-look:i])
+                prev_rsi_low = np.nanmin(rsi14[i-look:i]); prev_rsi_high = np.nanmax(rsi14[i-look:i])
+                if l[i] < prev_low and rsi14[i] > prev_rsi_low and rsi14[i] <= os and c[i] > o[i]:
+                    side = "LONG"; reason = "bullish RSI divergence"
+                elif h[i] > prev_high and rsi14[i] < prev_rsi_high and rsi14[i] >= ob and c[i] < o[i]:
+                    side = "SHORT"; reason = "bearish RSI divergence"
+            elif fam == "gap_imbalance_fill":
+                mult = float(params.get("body_atr", 1.35))
+                if i < 3:
+                    continue
+                big_prev = body_abs[i-1] >= mult * max(float(atrp[i-1]), 0.001)
+                mid_prev = (float(o[i-1]) + float(c[i-1])) / 2.0
+                if big_prev and c[i-1] > o[i-1] and l[i] <= mid_prev and c[i] > mid_prev:
+                    side = "LONG"; reason = "bullish imbalance fill"
+                elif big_prev and c[i-1] < o[i-1] and h[i] >= mid_prev and c[i] < mid_prev:
+                    side = "SHORT"; reason = "bearish imbalance fill"
+        except Exception:
+            continue
+        if not side:
+            continue
+        entry = float(c[i]); exit_ = float(c[i + horizon])
+        ret = _trade_ret(side, entry, exit_, cost=cost)
+        trades.append({
+            "ts": int(ts_arr[i]),
+            "iso": datetime.fromtimestamp(int(ts_arr[i]) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "family": family,
+            "params": dict(params),
+            "side": side,
+            "entry": entry,
+            "exit": exit_,
+            "ret": float(ret),
+            "reason": reason,
+        })
+        last_trade_i = i
+    return trades
+
+
+def _detail_block(name: str, symbol: str, timeframe: str, family: str, params: dict, df: pd.DataFrame, trades: list[dict]) -> tuple[list[str], dict]:
+    split_ts = _split_ts_70(df)
+    train = [t for t in trades if int(t.get("ts", 0)) < split_ts]
+    test = [t for t in trades if int(t.get("ts", 0)) >= split_ts]
+    long_test = [t for t in test if t.get("side") == "LONG"]
+    short_test = [t for t in test if t.get("side") == "SHORT"]
+    now_ts = int(df["ts"].iloc[-1]) if len(df) else int(time.time()*1000)
+    recent_6m = [t for t in trades if int(t.get("ts", 0)) >= now_ts - int(182.5*86400*1000)]
+    recent_12m = [t for t in trades if int(t.get("ts", 0)) >= now_ts - int(365*86400*1000)]
+    m_all = _trade_subset_metrics(trades)
+    m_train = _trade_subset_metrics(train)
+    m_test = _trade_subset_metrics(test)
+    m_long = _trade_subset_metrics(long_test)
+    m_short = _trade_subset_metrics(short_test)
+    m_6m = _trade_subset_metrics(recent_6m)
+    m_12m = _trade_subset_metrics(recent_12m)
+    first_iso = datetime.fromtimestamp(int(df["ts"].iloc[0])/1000, tz=timezone.utc).strftime("%Y-%m-%d") if len(df) else "n/a"
+    last_iso = datetime.fromtimestamp(int(df["ts"].iloc[-1])/1000, tz=timezone.utc).strftime("%Y-%m-%d") if len(df) else "n/a"
+    test_months = float(m_test.get("period_months", 0.0))
+    test_net = float(m_test.get("net_return_sum", 0.0))
+    usd100_simple = 100.0 * (test_net / test_months) if test_months > 0 else 0.0
+    usd100_comp = 100.0 * float(m_test.get("monthly_compound", 0.0))
+    conclusion = "WEAK"
+    if float(m_test.get("profit_factor",0)) >= 1.5 and int(m_test.get("trades",0)) >= 40 and float(m_test.get("net_return_sum",0)) > 0:
+        conclusion = "DETAIL CANDIDATE"
+    if float(m_test.get("profit_factor",0)) >= 2.0 and int(m_test.get("trades",0)) >= 40 and abs(float(m_test.get("max_drawdown",0))) <= 0.15:
+        conclusion = "STRONG CANDIDATE"
+    lines = [
+        f"{name}",
+        f"{symbol} {str(timeframe).upper()} {family} {params}",
+        f"Data: candles={len(df)} | {first_iso}→{last_iso}",
+        f"ALL:   {_format_detail_metrics(m_all)}",
+        f"TRAIN: {_format_detail_metrics(m_train)}",
+        f"TEST:  {_format_detail_metrics(m_test)}",
+        f"TEST side split: LONG {_format_detail_metrics(m_long)} | SHORT {_format_detail_metrics(m_short)}",
+        f"Recent: 6M {_format_detail_metrics(m_6m)} | 12M {_format_detail_metrics(m_12m)}",
+        f"$100 estimate on TEST: ≈ ${usd100_comp:.2f}/mo compound or ${usd100_simple:.2f}/mo simple. Conclusion: {conclusion}",
+    ]
+    payload = {
+        "name": name,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "family": family,
+        "params": params,
+        "candles": len(df),
+        "from": first_iso,
+        "to": last_iso,
+        "all": m_all,
+        "train": m_train,
+        "test": m_test,
+        "test_long": m_long,
+        "test_short": m_short,
+        "recent_6m": m_6m,
+        "recent_12m": m_12m,
+        "test_usd100_monthly_simple": usd100_simple,
+        "test_usd100_monthly_compound": usd100_comp,
+        "conclusion": conclusion,
+        "sample_last_trades": trades[-8:],
+    }
+    return lines, payload
+
+
+async def run_strategy_detail_backtest(exchange, years: float = 3.0, progress_cb=None) -> tuple[str, dict]:
+    """Detailed read-only check for the three selected candidates only.
+
+    - BTC 4H RSI divergence
+    - BTC 1H RSI divergence
+    - ETH 1H gap imbalance fill
+    """
+    async def _progress(line: str, **extra):
+        try:
+            log_event("strategy_detail_progress", stage=str(line), **extra)
+        except Exception:
+            pass
+        if progress_cb is not None:
+            try:
+                await progress_cb(str(line))
+            except Exception as e:
+                log_event("strategy_detail_progress_cb_error", ok=False, error=str(e)[:300])
+
+    started = time.time()
+    jobs = [
+        ("1️⃣ BTC 4H RSI divergence", "BTC_USDT", "4h", "rsi_divergence", {"horizon": 6, "lookback": 6, "oversold": 38, "overbought": 62, "cooldown": 3}),
+        ("2️⃣ BTC 1H RSI divergence", "BTC_USDT", "1h", "rsi_divergence", {"horizon": 12, "lookback": 48, "oversold": 38, "overbought": 62, "cooldown": 6}),
+        ("3️⃣ ETH 1H gap imbalance fill", "ETH_USDT", "1h", "gap_imbalance_fill", {"horizon": 24, "body_atr": 1.35, "cooldown": 12}),
+    ]
+    blocks: list[str] = []
+    payload_results: list[dict] = []
+    errors: list[dict] = []
+    await _progress("Strategy Detail started", years=years)
+    for title, symbol, tf, family, params in jobs:
+        label = f"{symbol.split('_')[0]} {tf.upper()} {family}"
+        try:
+            await _progress(f"{label} loading candles")
+            candles = await fetch_ohlcv_history(exchange, symbol=symbol, timeframe=tf, years=years, limit_per_call=500)
+            await _progress(f"{label} loaded: {len(candles)} candles", symbol=symbol, timeframe=tf, candles=len(candles))
+            if len(candles) < 700:
+                errors.append({"symbol": symbol, "timeframe": tf, "error": f"not enough candles: {len(candles)}"})
+                continue
+            df = _to_df(candles)
+            tfms = _tf_ms(tf); now_ms = int(time.time() * 1000)
+            df = df[df["ts"] + tfms <= now_ms].reset_index(drop=True)
+            await _progress(f"{label} calculating detailed trades")
+            trades = _generate_selected_strategy_trades(df, symbol, tf, family, params)
+            lines, payload = _detail_block(title, symbol, tf, family, params, df, trades)
+            blocks.extend(lines + [""])
+            payload_results.append(payload)
+            await _progress(f"{label} calculated: trades={len(trades)}")
+        except Exception as e:
+            errors.append({"symbol": symbol, "timeframe": tf, "family": family, "error": str(e)[:500]})
+            await _progress(f"{label} error: {str(e)[:160]}")
+    payload = {
+        "ok": True,
+        "years_requested": years,
+        "mode": "detail_selected_only",
+        "runtime_sec": round(time.time() - started, 2),
+        "results": payload_results,
+        "errors": errors,
+        "notes": [
+            "manual Strategy Detail only; no trading logic changed",
+            "detailed report for exactly 3 candidates selected from Strategy Lab Extra",
+            "train/test split: first 70% train, last 30% test",
+            "returns include rough 0.06% round-trip cost placeholder",
+            "same horizon-exit logic as Strategy Lab Extra, not live trading integration",
+        ],
+    }
+    log_event("strategy_detail_backtest_result", **payload)
+    lines = [
+        "🧪 STRATEGY DETAIL REPORT — SELECTED ONLY",
+        f"History: {years:g}y | Trading logic: НЕ изменялась | OpenAI не вызывается",
+        "Detailed modes: BTC 4H RSI divergence, BTC 1H RSI divergence, ETH 1H gap imbalance fill.",
+        "Validation: train 70% / test 30%, side split, recent 6M/12M, monthly estimate from $100.",
+        "",
+        f"Runtime={payload['runtime_sec']}s | errors={len(errors)}",
+        "",
+    ] + blocks + [
+        "ИТОГ: это detail-backtest, не автоторговля. Подключать только после paper/live test. Сырой JSON: /log_full",
+    ]
+    return "\n".join(lines[:120]), payload
 
 
 def _strategy_param_grid(timeframe: str) -> list[tuple[str, dict]]:
