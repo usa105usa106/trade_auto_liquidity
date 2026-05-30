@@ -35,7 +35,7 @@ from chart_renderer import render_trade_setup_chart
 from ai_btc_autopilot import BTCVisionAutopilot
 from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
-from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env, set_runtime_secret_cache, clear_runtime_secret_cache, runtime_secret_cache, ensure_runtime_secrets_loaded, merge_secrets_into_settings
+from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env, set_runtime_secret_cache, clear_runtime_secret_cache, runtime_secret_cache, ensure_runtime_secrets_loaded, merge_secrets_into_settings, secret_source_report
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
@@ -809,16 +809,36 @@ async def sleep_until_next_scan(app, seconds: int | float) -> None:
         ev.clear()
 
 def _api_creds(settings: dict) -> tuple[str, str]:
-    # v77: one single credential source for every command/background sync.
-    # Always refresh from SQLite/runtime-cache/env/backup before returning.
+    # V79: one simple session source for every command/background sync.
+    # No backup-file search.  /api set writes SQLite + runtime env/cache; redeploy
+    # can require setting keys again unless Railway Variables are configured.
     try:
-        ensure_runtime_secrets_loaded(settings or {})
         settings = merge_secrets_into_settings(settings or {})
     except Exception:
         settings = settings or {}
     api_key = secret_value(settings, "mexc_api_key", "MEXC_API_KEY")
     api_secret = secret_value(settings, "mexc_api_secret", "MEXC_API_SECRET")
     return api_key, api_secret
+
+async def _ensure_secret_health(reason: str = "manual") -> dict:
+    """V79: lightweight non-mutating secret check.
+
+    Do not search backup files or heal from old caches.  This keeps credentials
+    deterministic: SQLite/current runtime/env only.
+    """
+    try:
+        raw = await storage.all_settings()
+    except Exception:
+        raw = {}
+    try:
+        merged = merge_secrets_into_settings(raw or {})
+        ensure_runtime_secrets_loaded(merged)
+        report = secret_source_report(merged)
+        log_event("secret_health_v79", ok=True, reason=reason, mexc_key=bool(_api_creds(merged)[0]), mexc_secret=bool(_api_creds(merged)[1]), openai=bool(str(merged.get("openai_api_key") or "").strip()), report=report)
+        return merged
+    except Exception as e:
+        log_event("secret_health_v79", ok=False, reason=reason, error=str(e)[:500])
+        return raw or {}
 
 
 def apply_mexc_runtime_env(settings: dict) -> None:
@@ -1214,7 +1234,14 @@ async def reset_market_runtime() -> None:
 
 async def get_exchange(settings: dict):
     global exchange_client
+    try:
+        ensure_runtime_secrets_loaded(settings or {})
+        settings = merge_secrets_into_settings(settings or {})
+    except Exception:
+        pass
     api_key, api_secret = _api_creds(settings)
+    if not (api_key and api_secret):
+        log_event("balance_api_missing_v79", ok=False, report=secret_source_report(settings or {}))
     proxy_enabled = bool(settings.get("proxy_enabled", False))
     proxy_url = str(settings.get("proxy_url", ""))
     desired_signature = (DEFAULT_EXCHANGE, proxy_url, proxy_enabled, api_key, bool(api_secret))
@@ -3258,10 +3285,10 @@ async def status_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     started = time.perf_counter()
-    ensure_runtime_secrets_loaded()
-    s = merge_secrets_into_settings(await storage.all_settings())
+    s = await _ensure_secret_health("status_btc")
     api_key, api_secret = _api_creds(s)
     if not (api_key and api_secret):
+        log_event("status_btc_api_missing_v79", ok=False, report=secret_source_report(s))
         await reply(update, "📊 BTC Status\n❌ MEXC API key/secret не настроены. Используй /api set KEY SECRET", reply_markup=MAIN_MENU)
         return
     try:
@@ -3737,7 +3764,14 @@ async def _direct_mexc_balance(settings: dict) -> tuple[dict, str]:
     or market loading are slow. We try futures private read hosts with a small
     per-request timeout and return either parsed USDT values or the last error.
     """
+    try:
+        ensure_runtime_secrets_loaded(settings or {})
+        settings = merge_secrets_into_settings(settings or {})
+    except Exception:
+        pass
     api_key, api_secret = _api_creds(settings)
+    if not (api_key and api_secret):
+        log_event("balance_api_missing_v79", ok=False, report=secret_source_report(settings or {}))
     proxy_enabled = bool(settings.get("proxy_enabled", False))
     proxy_url = str(settings.get("proxy_url", "") or "")
     ex = ExchangeClient(DEFAULT_EXCHANGE, proxy_url, proxy_enabled)
@@ -3775,7 +3809,7 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with lock:
-        s = await storage.all_settings()
+        s = await _ensure_secret_health("balance")
         proxy_enabled = bool(s.get("proxy_enabled", False))
         proxy_url = str(s.get("proxy_url", "") or "")
         started = time.perf_counter()
@@ -4634,7 +4668,7 @@ async def openai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.environ["OPENAI_API_KEY"] = key
         set_runtime_secret_cache({"openai_api_key": key})
         save_secret_backup({"openai_api_key": key})
-        log_event("openai_key_persisted_v75", ok=True, sqlite=True, env_runtime=True, backup=True)
+        log_event("openai_key_session_set_v79", ok=True, sqlite=True, runtime_env=True, backup=False)
         await reply(update, "✅ OpenAI API key saved", reply_markup=MAIN_MENU)
         return
     if cmd == "clear":
@@ -4653,8 +4687,7 @@ async def openai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
-    ensure_runtime_secrets_loaded()
-    s = merge_secrets_into_settings(await storage.all_settings())
+    s = await _ensure_secret_health("api_cmd")
     if not context.args or context.args[0].lower() in {"status", "show"}:
         api_key, api_secret = _api_creds(s)
         source = "Telegram settings" if s.get("mexc_api_key") and s.get("mexc_api_secret") else "Railway/env fallback" if api_key and api_secret else "not configured"
@@ -4685,7 +4718,7 @@ async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_secret_backup({"mexc_api_key": api_key_new, "mexc_api_secret": api_secret_new})
         verify_s = await storage.all_settings()
         verify_key, verify_secret = _api_creds(verify_s)
-        log_event("api_keys_persisted_v76", ok=bool(verify_key and verify_secret), sqlite=True, env_runtime=True, runtime_cache=True, backup=True, key_mask=mask_secret(verify_key), secret_mask=mask_secret(verify_secret))
+        log_event("api_keys_session_set_v79", ok=bool(verify_key and verify_secret), sqlite=True, runtime_env=True, runtime_cache=True, backup=False, key_mask=mask_secret(verify_key), secret_mask=mask_secret(verify_secret))
         cleared = 0
         try:
             cleared = await storage.clear_positions()
@@ -4693,7 +4726,42 @@ async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log_event("api_set_local_position_cache_clear_failed", ok=False, error=str(e)[:500])
         await reset_exchange()
-        await reply(update, f"✅ API saved\nKey: {mask_secret(context.args[1])}\nSecret: {mask_secret(context.args[2])}\nLocal position cache cleared: {cleared}\n\nТеперь можно /api test", reply_markup=MAIN_MENU)
+        # V79: immediately sync real MEXC state after the first /api set.
+        # This is read-only: it does not open/close positions. It warms the exchange
+        # client and BTC autopilot cache so position control starts from exchange truth.
+        sync_note = "sync: not run"
+        try:
+            sync_settings = merge_secrets_into_settings(await storage.all_settings())
+            ex = await get_exchange(sync_settings)
+            exec_engine = ExecutionEngine(storage, ex)
+            raw_positions = await asyncio.wait_for(ex.fetch_positions(), timeout=12)
+            positions = [p for p in (raw_positions or []) if exec_engine.exchange_position_qty(p) > 0]
+            btc_positions = []
+            for p in positions:
+                info = p.get("info") if isinstance(p.get("info"), dict) else {}
+                sym = str(p.get("symbol") or p.get("mexc_symbol") or info.get("symbol") or "").upper()
+                if "BTC" in sym:
+                    btc_positions.append(p)
+            btc_orders = []
+            try:
+                btc_orders = await asyncio.wait_for(ex.fetch_open_orders("BTC_USDT"), timeout=12) or []
+            except Exception as oe:
+                log_event("api_set_exchange_orders_sync_failed_v79", ok=False, error=str(oe)[:500])
+            autopilot = context.application.bot_data.get("btc_ai_autopilot") if context and context.application else None
+            if autopilot is not None:
+                try:
+                    autopilot._btc_exchange_position_cache = list(btc_positions)
+                    autopilot._btc_exchange_position_seen = bool(btc_positions)
+                    autopilot._last_position_sync_ts = 0.0
+                    autopilot._last_protection_sync_ts = 0.0
+                except Exception:
+                    pass
+            log_event("api_set_exchange_sync_v79", ok=True, positions=len(positions), btc_positions=len(btc_positions), btc_open_orders=len(btc_orders))
+            sync_note = f"Exchange sync: positions={len(positions)}, BTC positions={len(btc_positions)}, BTC orders={len(btc_orders)}"
+        except Exception as e:
+            log_event("api_set_exchange_sync_v79", ok=False, error=str(e)[:700])
+            sync_note = f"Exchange sync error: {str(e)[:160]}"
+        await reply(update, f"✅ API saved\nKey: {mask_secret(context.args[1])}\nSecret: {mask_secret(context.args[2])}\nLocal position cache cleared: {cleared}\n{sync_note}\n\nТеперь можно /api test", reply_markup=MAIN_MENU)
         return
     if cmd == "clear":
         await storage.set("mexc_api_key", "")
@@ -4828,7 +4896,7 @@ async def proxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reset_market_runtime()
         await reply(update, "🌐 Proxy URL saved\nUse /proxy on, then /proxy test.", reply_markup=MAIN_MENU)
     elif cmd == "test":
-        s = await storage.all_settings()
+        s = await _ensure_secret_health("balance")
         proxy_enabled = bool(s.get("proxy_enabled", False))
         proxy_url = str(s.get("proxy_url", "") or "")
         # fetch_public_ip uses aiohttp.ClientSession internally, reads PROXY_TEST_URL, and supports HTTP/SOCKS proxy paths.
@@ -7167,10 +7235,10 @@ async def trading_loop(app):
 async def on_startup(app):
     await storage.init()
     try:
-        apply_secret_backup_to_env()
-        log_event("runtime_secrets_loaded_v77", ok=True)
+        ensure_runtime_secrets_loaded(await storage.all_settings())
+        log_event("runtime_secrets_session_ready_v79", ok=True)
     except Exception as e:
-        log_event("runtime_secrets_load_failed_v77", ok=False, error=str(e)[:300])
+        log_event("runtime_secrets_session_ready_failed_v79", ok=False, error=str(e)[:300])
 
     # V52: local positions are volatile cache only.  On deploy/restart wipe the
     # SQLite position cache so stale BTC AI TP/SL/order ids can never steer live
