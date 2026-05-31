@@ -8,7 +8,8 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["💰 Balance", "🏓 Ping"],
     ["⚙️ Settings", "🔐 API"],
     ["🤖 AI BTC/ETH scalping"],
-    ["₿ BTC AI 4H автопилот", "📊 BTC Status"],
+    ["₿ BTC AI 4H автопилот", "♟ Game BTC AI"],
+    ["📊 BTC Status"],
     ["🧽 Clean BTC Orders", "🧪 BTC Backtest 4H"],
     ["🧪 BTC Backtest 1H", "🧪 Round Levels"],
     ["🧪 Strategy Lab", "🧪 Strategy Detail"],
@@ -22,6 +23,7 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["🗡 knife reversal"],
     ["🧠 multi strategy"],
     ["🚀 BOOST MODE", "🛑 STOP BOOST"],
+    ["🤖 ChatGPT Scan Mode", "❌ Exit ChatGPT Mode"],
     ["📊 BOOST STATUS", "📊 AI Stats"],
     ["⚙️ MEXC"],
 ], resize_keyboard=True)

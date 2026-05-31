@@ -29,6 +29,20 @@ class BTCAutopilotDecision:
     take_profit_2: float = 0.0
     take_profit_3: float = 0.0
     reason: str = ""
+    best_move: str = ""
+    game_plan: str = ""
+    market_maker_trap: str = ""
+    why_not_long: str = ""
+    why_not_short: str = ""
+    why_not_wait: str = ""
+    selected_move_break_score: float = 0.0
+    selected_move_trap_risk: float = 0.0
+    selected_move_net_score: float = 0.0
+    long_break_score: float = 0.0
+    short_break_score: float = 0.0
+    how_selected_move_breaks: str = ""
+    candidate_moves: Any = None
+    move_scores: Any = None
     raw: str = ""
     error: str = ""
 
@@ -575,9 +589,9 @@ class BTCVisionAutopilot:
             await self._notify(app, f"♻️ BTC AI: старая лимитка без активной сделки отменена. Готовлю новый 4H сигнал.")
         return n
 
-    async def cycle(self, app, force_live_test: bool = False):
+    async def cycle(self, app, force_live_test: bool = False, manual_once: bool = False):
         settings = await self.storage.all_settings()
-        if not force_live_test and not self._bool(settings, "btc_ai_autopilot_enabled", False):
+        if not (force_live_test or manual_once) and not self._bool(settings, "btc_ai_autopilot_enabled", False):
             return
         await self._hard_disable_other_modes(settings)
         if (not force_live_test) and await self._apply_stop_loss_pause_if_needed(app):
@@ -609,14 +623,14 @@ class BTCVisionAutopilot:
             return
 
         # IMPORTANT: AI always gets a clean chart with no entry/SL/TP markup.
-        ai_chart_path = await asyncio.to_thread(self.render_chart, symbol, candles, market_data)
+        ai_chart_path = await asyncio.to_thread(self.render_chart, symbol, candles, market_data, manual_once)
         temp_ai_msg = await self._send_temp_ai_chart(app, ai_chart_path, force_live_test=force_live_test)
         try:
             decision = await self.ask_ai(settings, ai_chart_path, market_data)
         finally:
             # Delete the temporary clean chart from Telegram after AI has answered.
             await self._delete_temp_message(app, temp_ai_msg)
-        self._log_chart_paths(ai_chart=ai_chart_path, mode="force_live_test" if force_live_test else "autopilot")
+        self._log_chart_paths(ai_chart=ai_chart_path, mode="force_live_test" if force_live_test else ("manual_game_btc_ai" if manual_once else "autopilot"))
 
         if decision.error:
             if not force_live_test:
@@ -638,6 +652,35 @@ class BTCVisionAutopilot:
             )
 
         prob = float(decision.probability or 0)
+        is_game_mode = str(settings.get("btc_ai_prompt_mode") or "").lower().strip() in {"game", "market_maker_chess", "chess"}
+        if is_game_mode and not force_live_test:
+            try:
+                best_move = str(getattr(decision, "best_move", "") or "").upper()
+                break_score = float(getattr(decision, "selected_move_break_score", 0) or 0)
+                trap_risk = float(getattr(decision, "selected_move_trap_risk", 0) or 0)
+                net_score = float(getattr(decision, "selected_move_net_score", 0) or 0)
+                block_reasons = []
+                if best_move in {"FULL_WAIT", "WAIT_FOR_LONG", "WAIT_FOR_SHORT"}:
+                    block_reasons.append(f"best_move={best_move}")
+                if decision.signal == "LONG" and best_move and not best_move.startswith("LONG"):
+                    block_reasons.append(f"LONG signal but best_move={best_move}")
+                if decision.signal == "SHORT" and best_move and not best_move.startswith("SHORT"):
+                    block_reasons.append(f"SHORT signal but best_move={best_move}")
+                if decision.signal in {"LONG", "SHORT"} and break_score > 55 and prob < 85:
+                    block_reasons.append(f"break_score {break_score:.0f}>55")
+                if decision.signal in {"LONG", "SHORT"} and trap_risk > 60 and prob < 85:
+                    block_reasons.append(f"trap_risk {trap_risk:.0f}>60")
+                if decision.signal in {"LONG", "SHORT"} and net_score < 15 and prob < 85:
+                    block_reasons.append(f"net_score {net_score:.0f}<15")
+                if block_reasons:
+                    original_game_signal = decision.signal
+                    decision.signal = "WAIT"
+                    decision.probability = min(prob, 64.0)
+                    decision.reason = (decision.reason + " | " if decision.reason else "") + "GAME HARD GATE WAIT: " + "; ".join(block_reasons)
+                    log_event("game_btc_ai_hard_gate_wait", ok=True, original_signal=original_game_signal, best_move=best_move, probability=prob, break_score=break_score, trap_risk=trap_risk, net_score=net_score, reasons=block_reasons)
+                    prob = float(decision.probability or 0)
+            except Exception as e:
+                log_event("game_btc_ai_hard_gate_error", ok=False, error=str(e)[:500], decision=decision.__dict__)
         reduced_mode_for_levels = (65.0 <= prob < 75.0) and (not force_live_test)
         forced_entry_for_levels = float(market_data.get("last_price") or 0) if (force_live_test or prob >= 85.0) else None
         plan_levels = self.prepare_levels(decision, market_data, forced_entry=forced_entry_for_levels, reduced_mode=reduced_mode_for_levels) if decision.signal in {"LONG", "SHORT"} else {}
@@ -1031,7 +1074,7 @@ class BTCVisionAutopilot:
         df["Hist"] = df.MACD - df.Signal
         return df.tail(tail).reset_index(drop=True)
 
-    def _draw_clean_btc_chart(self, df: pd.DataFrame, market_data: dict, levels: dict | None = None, decision: BTCAutopilotDecision | None = None, filename_prefix: str = "btc_ai_clean") -> str:
+    def _draw_clean_btc_chart(self, df: pd.DataFrame, market_data: dict, levels: dict | None = None, decision: BTCAutopilotDecision | None = None, filename_prefix: str = "btc_ai_clean", preserve_canvas: bool = False) -> str:
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
         from matplotlib.ticker import FuncFormatter
@@ -1238,13 +1281,18 @@ class BTCVisionAutopilot:
         plt.setp(av.get_xticklabels(), visible=False)
 
         out = Path("/tmp") / f"{filename_prefix}_{int(time.time())}.jpg"
-        fig.savefig(out, facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.08, dpi=100)
+        if preserve_canvas:
+            # Game BTC AI should send the full fixed canvas to OpenAI (1280x720 at dpi=100)
+            # with no auto-cropping, so log_full shows the real AI input size.
+            fig.savefig(out, facecolor=fig.get_facecolor(), dpi=100)
+        else:
+            fig.savefig(out, facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.08, dpi=100)
         plt.close(fig)
         return str(out)
 
-    def render_signal_chart(self, symbol: str, candles: list, market_data: dict, d: BTCAutopilotDecision, lv: dict) -> str:
+    def render_signal_chart(self, symbol: str, candles: list, market_data: dict, d: BTCAutopilotDecision, lv: dict, preserve_canvas: bool = False) -> str:
         df = self._prepare_chart_df(candles, tail=90)
-        return self._draw_clean_btc_chart(df, market_data, levels=lv, decision=d, filename_prefix="btc_ai_signal_clean")
+        return self._draw_clean_btc_chart(df, market_data, levels=lv, decision=d, filename_prefix="btc_ai_signal_clean", preserve_canvas=preserve_canvas)
 
 
     def _plan_order_ts(self, row: dict) -> float:
@@ -1855,9 +1903,9 @@ class BTCVisionAutopilot:
             return True
         return False
 
-    def render_chart(self, symbol: str, candles: list, market_data: dict) -> str:
+    def render_chart(self, symbol: str, candles: list, market_data: dict, preserve_canvas: bool = False) -> str:
         df = self._prepare_chart_df(candles, tail=90)
-        return self._draw_clean_btc_chart(df, market_data, levels=None, decision=None, filename_prefix="btc_ai_4h_clean")
+        return self._draw_clean_btc_chart(df, market_data, levels=None, decision=None, filename_prefix="btc_ai_4h_clean", preserve_canvas=preserve_canvas)
 
     async def ask_ai(self, settings: dict, chart_path: str, market_data: dict) -> BTCAutopilotDecision:
         key = openai_key(settings)
@@ -1868,7 +1916,92 @@ class BTCVisionAutopilot:
         chart_bytes = Path(chart_path).read_bytes()
         img64 = base64.b64encode(chart_bytes).decode()
         chart_size_bytes = len(chart_bytes)
-        prompt = """You are the dedicated BTC AI 4H autopilot risk engine. This prompt is ONLY for BTC_USDT 4H automated trading.
+        prompt_mode = str(settings.get("btc_ai_prompt_mode") or "classic").lower().strip()
+        if prompt_mode in {"game", "market_maker_chess", "chess"}:
+            prompt = """You are GAME BTC AI: a BTC_USDT 4H market-maker chess evaluator for MEXC futures.
+
+You are playing a chess-like trading game against the market maker/exchange liquidity engine. The market maker tries to trap obvious retail moves, sweep stops, fake breakouts, trigger liquidation cascades, and force late entries. Your task is to WIN THE CURRENT POSITIONING GAME, not to give a direct trend guess.
+
+You must think like a chess engine choosing the best move against an opponent:
+- Do not choose the obvious retail move just because price is moving in that direction.
+- Assume the market maker wants to exploit crowded stops and late entries.
+- Evaluate the board, candidate moves, traps, counter-moves, invalidations, and expected payoff.
+- The best move may be FULL_WAIT if every trade move is easy to trap.
+
+Execution venue: MEXC futures. Chart source: MEXC futures. Futures volume/funding/orderbook/liquidation proxy: MEXC. Binance data is SPOT confirmation only.
+
+CRITICAL CROSS-EXCHANGE RULE:
+Binance spot raw notional volume is normally much larger than MEXC futures volume. Do NOT compare raw Binance spot volume to raw MEXC futures volume. Use MEXC for executable futures structure and Binance spot only as directional confirmation by buy_ratio/delta_score.
+
+Return STRICT JSON only. Numeric prices only. No markdown. No prose outside JSON. Keep text fields short.
+
+CHESS PROCESS REQUIRED:
+1. Evaluate ALL candidate moves: LONG_LIMIT, LONG_MARKET, SHORT_LIMIT, SHORT_MARKET, WAIT_FOR_LONG, WAIT_FOR_SHORT, FULL_WAIT.
+2. For every candidate move, assign:
+   - score: quality of the move, 0-100.
+   - break_score: how strongly the idea can be broken by opposing evidence, 0-100.
+   - trap_risk: how likely this move is a market-maker trap, 0-100.
+   - net_score: score - break_score - 0.30*trap_risk.
+   - why_good: one short reason.
+   - how_it_breaks: one short invalidation/failure reason.
+3. Build the strongest LONG case and then try to destroy it.
+4. Build the strongest SHORT case and then try to destroy it.
+5. Compare the trade moves against FULL_WAIT. If the chosen trade move is not clearly better than WAIT, return WAIT.
+6. Pick the move with the best risk-adjusted net_score, not the most obvious direction.
+
+BREAKER RULES:
+- long_break_score = strongest argument against LONG.
+- short_break_score = strongest argument against SHORT.
+- If selected trade break_score > 55, return WAIT unless probability >=85, RR is exceptional, and invalidation is very clear.
+- If selected trade trap_risk > 60, return WAIT unless the move specifically exploits the trap after confirmation.
+- If score - break_score < 15 for the selected trade, return WAIT.
+- If FULL_WAIT score is within 10 points of the selected trade score, return WAIT.
+
+TRADING RULES:
+- Bot enters LIMIT at entry midpoint for probability 65-84.9; MARKET only for true A+ 85+.
+- Bot will NOT modify your TP levels. Bot may only widen SL if it is closer than 1% from executable entry. If required stop is above 2%, prefer WAIT.
+- 65-74.9: reduced setup, TP1 only, set TP2=0. 75-84.9: TP1+TP2. 85+: market entry with TP1+TP2.
+- LONG geometry: stop_loss < entry < TP1 <= TP2; reduced LONG: stop_loss < entry < TP1 and TP2=0.
+- SHORT geometry: TP2 <= TP1 < entry < stop_loss; reduced SHORT: TP1 < entry < stop_loss and TP2=0.
+
+JSON schema:
+{
+ "best_move":"LONG_LIMIT|LONG_MARKET|SHORT_LIMIT|SHORT_MARKET|WAIT_FOR_LONG|WAIT_FOR_SHORT|FULL_WAIT",
+ "signal":"LONG|SHORT|WAIT",
+ "probability":0,
+ "grade":"C|B|A|A+",
+ "entry_zone_low":0,
+ "entry_zone_high":0,
+ "stop_loss":0,
+ "take_profit_1":0,
+ "take_profit_2":0,
+ "take_profit_3":0,
+ "move_scores":{"LONG_LIMIT":0,"LONG_MARKET":0,"SHORT_LIMIT":0,"SHORT_MARKET":0,"WAIT_FOR_LONG":0,"WAIT_FOR_SHORT":0,"FULL_WAIT":0},
+ "long_break_score":0,
+ "short_break_score":0,
+ "selected_move_break_score":0,
+ "selected_move_trap_risk":0,
+ "selected_move_net_score":0,
+ "candidate_moves":[
+   {"move":"LONG_LIMIT","score":0,"break_score":0,"trap_risk":0,"net_score":0,"why_good":"short","how_it_breaks":"short"},
+   {"move":"LONG_MARKET","score":0,"break_score":0,"trap_risk":0,"net_score":0,"why_good":"short","how_it_breaks":"short"},
+   {"move":"SHORT_LIMIT","score":0,"break_score":0,"trap_risk":0,"net_score":0,"why_good":"short","how_it_breaks":"short"},
+   {"move":"SHORT_MARKET","score":0,"break_score":0,"trap_risk":0,"net_score":0,"why_good":"short","how_it_breaks":"short"},
+   {"move":"WAIT_FOR_LONG","score":0,"break_score":0,"trap_risk":0,"net_score":0,"why_good":"short","how_it_breaks":"short"},
+   {"move":"WAIT_FOR_SHORT","score":0,"break_score":0,"trap_risk":0,"net_score":0,"why_good":"short","how_it_breaks":"short"},
+   {"move":"FULL_WAIT","score":0,"break_score":0,"trap_risk":0,"net_score":0,"why_good":"short","how_it_breaks":"short"}
+ ],
+ "market_maker_trap":"short",
+ "game_plan":"short",
+ "how_selected_move_breaks":"short",
+ "why_not_long":"short",
+ "why_not_short":"short",
+ "why_not_wait":"short",
+ "reason":"short"
+}
+"""
+        else:
+            prompt = """You are the dedicated BTC AI 4H autopilot risk engine. This prompt is ONLY for BTC_USDT 4H automated trading.
 
 Execution venue: MEXC futures. Chart source: MEXC futures. Futures volume/funding/orderbook/liquidation proxy: MEXC. Binance data is SPOT confirmation only.
 
@@ -1908,7 +2041,7 @@ JSON schema: {"signal":"LONG|SHORT|WAIT","probability":0,"grade":"C|B|A|A+","ent
             chart_size_kb=round(chart_size_bytes/1024, 2),
             openai_image_detail="high",
         )
-        payload={"model":model,"response_format":{"type":"json_object"},"messages":[{"role":"user","content":[{"type":"text","text":prompt_with_data},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+img64,"detail":"high"}}]}],"max_completion_tokens":700}
+        payload={"model":model,"response_format":{"type":"json_object"},"messages":[{"role":"user","content":[{"type":"text","text":prompt_with_data},{"type":"image_url","image_url":{"url":"data:image/png;base64,"+img64,"detail":"high"}}]}],"max_completion_tokens":950 if prompt_mode in {"game", "market_maker_chess", "chess"} else 700}
         timeout=aiohttp.ClientTimeout(total=60)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(OPENAI_CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},json=payload) as r:
@@ -1917,7 +2050,7 @@ JSON schema: {"signal":"LONG|SHORT|WAIT","probability":0,"grade":"C|B|A|A+","ent
                     # Compatibility fallback for older Chat models that still expect max_tokens.
                     if "max_completion_tokens" in txt and "unsupported" in txt.lower():
                         payload.pop("max_completion_tokens", None)
-                        payload["max_tokens"] = 700
+                        payload["max_tokens"] = 950 if prompt_mode in {"game", "market_maker_chess", "chess"} else 700
                         async with session.post(OPENAI_CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},json=payload) as r2:
                             txt=await r2.text()
                             if r2.status>=300:
@@ -1941,8 +2074,34 @@ JSON schema: {"signal":"LONG|SHORT|WAIT","probability":0,"grade":"C|B|A|A+","ent
             )
             raw=response_json["choices"][0]["message"]["content"]
             data=json.loads(raw)
-            dec = BTCAutopilotDecision(signal=str(data.get("signal","WAIT")).upper(), probability=float(data.get("probability") or 0), grade=str(data.get("grade") or "C"), entry_zone_low=float(data.get("entry_zone_low") or 0), entry_zone_high=float(data.get("entry_zone_high") or 0), stop_loss=float(data.get("stop_loss") or 0), take_profit_1=float(data.get("take_profit_1") or 0), take_profit_2=float(data.get("take_profit_2") or 0), take_profit_3=float(data.get("take_profit_3") or 0), reason=str(data.get("reason") or "")[:600], raw=raw)
-            log_event("btc_ai_decision", model=model, decision=dec.__dict__, raw=raw, usage=usage, prompt_size_chars=prompt_size_chars, chart_size_kb=round(chart_size_bytes/1024,2))
+            dec = BTCAutopilotDecision(
+                signal=str(data.get("signal","WAIT")).upper(),
+                probability=float(data.get("probability") or 0),
+                grade=str(data.get("grade") or "C"),
+                entry_zone_low=float(data.get("entry_zone_low") or 0),
+                entry_zone_high=float(data.get("entry_zone_high") or 0),
+                stop_loss=float(data.get("stop_loss") or 0),
+                take_profit_1=float(data.get("take_profit_1") or 0),
+                take_profit_2=float(data.get("take_profit_2") or 0),
+                take_profit_3=float(data.get("take_profit_3") or 0),
+                reason=str(data.get("reason") or "")[:700],
+                best_move=str(data.get("best_move") or ""),
+                game_plan=str(data.get("game_plan") or "")[:700],
+                market_maker_trap=str(data.get("market_maker_trap") or "")[:500],
+                why_not_long=str(data.get("why_not_long") or "")[:400],
+                why_not_short=str(data.get("why_not_short") or "")[:400],
+                why_not_wait=str(data.get("why_not_wait") or "")[:400],
+                selected_move_break_score=float(data.get("selected_move_break_score") or data.get("break_score") or 0),
+                selected_move_trap_risk=float(data.get("selected_move_trap_risk") or data.get("trap_risk") or 0),
+                selected_move_net_score=float(data.get("selected_move_net_score") or 0),
+                long_break_score=float(data.get("long_break_score") or 0),
+                short_break_score=float(data.get("short_break_score") or 0),
+                how_selected_move_breaks=str(data.get("how_selected_move_breaks") or data.get("how_it_breaks") or "")[:500],
+                candidate_moves=data.get("candidate_moves") if isinstance(data.get("candidate_moves"), list) else None,
+                move_scores=data.get("move_scores") if isinstance(data.get("move_scores"), dict) else None,
+                raw=raw,
+            )
+            log_event("btc_ai_decision", model=model, prompt_mode=prompt_mode, decision=dec.__dict__, raw=raw, usage=usage, prompt_size_chars=prompt_size_chars, chart_size_kb=round(chart_size_bytes/1024,2))
             return dec
         except Exception as e:
             log_event("btc_ai_openai_parse_error", ok=False, error=str(e), raw=txt[:1200])
@@ -2041,7 +2200,28 @@ JSON schema: {"signal":"LONG|SHORT|WAIT","probability":0,"grade":"C|B|A|A+","ent
         reduced = bool(lv.get("reduced_mode")) or (65.0 <= float(d.probability or 0) < 75.0)
         tp_text = (f"TP: {tp1:.2f} (ИИ, закрыть 100%)") if reduced else (f"TP1: {tp1:.2f} (ИИ, 50%)\nTP2: {tp2:.2f} (ИИ, остаток)")
         stop_note = " · SL расширен ботом до мин. 1%" if bool(lv.get("stop_adjusted_by_bot")) else ""
+        game_line = ""
+        if getattr(d, "best_move", "") or getattr(d, "game_plan", ""):
+            try:
+                moves = getattr(d, "candidate_moves", None) or []
+                top_moves = []
+                if isinstance(moves, list):
+                    def _mv_score(m):
+                        try: return float((m or {}).get("net_score") or 0)
+                        except Exception: return 0.0
+                    for m in sorted([m for m in moves if isinstance(m, dict)], key=_mv_score, reverse=True)[:3]:
+                        top_moves.append(f"{str(m.get('move') or '')}:{float(m.get('score') or 0):.0f}/{float(m.get('break_score') or 0):.0f}/{float(m.get('trap_risk') or 0):.0f}/{float(m.get('net_score') or 0):.0f}")
+                top_moves_text = ", ".join(top_moves)[:180]
+            except Exception:
+                top_moves_text = ""
+            game_line = (f"♟ Game move: {getattr(d, 'best_move', '') or 'n/a'}\n"
+                         f"Break selected: {float(getattr(d, 'selected_move_break_score', 0) or 0):.0f}% | Trap: {float(getattr(d, 'selected_move_trap_risk', 0) or 0):.0f}% | Net: {float(getattr(d, 'selected_move_net_score', 0) or 0):.0f}\n"
+                         f"LONG break: {float(getattr(d, 'long_break_score', 0) or 0):.0f}% | SHORT break: {float(getattr(d, 'short_break_score', 0) or 0):.0f}%\n"
+                         f"Top moves score/break/trap/net: {top_moves_text}\n"
+                         f"MM trap: {(getattr(d, 'market_maker_trap', '') or '')[:120]}\n"
+                         f"Breaks if: {(getattr(d, 'how_selected_move_breaks', '') or '')[:120]}\n")
         return (f"✅ BTC AI 4H сигнал: {d.signal}\n"
+                f"{game_line}"
                 f"Проходимость ИИ: {float(d.probability or 0):.1f}%\n"
                 f"Вход: {entry_mid:.2f}\n"
                 f"Enter zone: {float(lv.get('entry_low') or d.entry_zone_low):.2f}-{float(lv.get('entry_high') or d.entry_zone_high):.2f}\n"

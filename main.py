@@ -33,6 +33,7 @@ from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
 from ai_btc_autopilot import BTCVisionAutopilot
+from chatgpt_mode import build_chatgpt_log, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log
 from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
 from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env, set_runtime_secret_cache, clear_runtime_secret_cache, runtime_secret_cache, ensure_runtime_secrets_loaded, merge_secrets_into_settings, secret_source_report
@@ -1553,6 +1554,89 @@ async def test_btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.application.create_task(_run_once())
 
 
+
+async def game_btc_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """One-shot BTC AI using market-maker chess prompt. Old BTC AI mode is untouched."""
+    global btc_ai_task, position_task
+    if not allowed(update): return
+    settings_before = await storage.all_settings()
+    old_prompt_mode = settings_before.get("btc_ai_prompt_mode")
+    old_live_test = settings_before.get("btc_ai_live_test_enabled")
+    # Same execution/risk defaults as BTC AI 4H, but no forced trade on WAIT.
+    hard_settings = {
+        "btc_ai_live_test_enabled": False,
+        "btc_ai_autopilot_enabled": False,
+        "btc_ai_prompt_mode": "market_maker_chess",
+        "btc_ai_symbol": "BTC_USDT",
+        "btc_ai_balance_share": 0.10,
+        "btc_ai_leverage": 10,
+        "btc_ai_min_trade_probability": 65,
+        "btc_ai_a_plus_probability": 85,
+        "btc_ai_limit_timeout_sec": 14400,
+        "btc_ai_pause_until": 0,
+        "limit_timeout_sec": 14400,
+        "live_trading": True,
+        "strategy_mode": "hybrid",
+        "max_open_positions": 1,
+        "openai_analysis_enabled": True,
+        "openai_show_decisions": True,
+        "boost_autopilot_active": False,
+        "boost_parallel_scan_enabled": False,
+        "quick_bounce_enabled": False,
+        "impulse_dump_enabled": False,
+        "orderflow_impulse_enabled": False,
+        "cascade_hunter_enabled": False,
+        "strongest_coin_enabled": False,
+        "liquidity_runner_enabled": False,
+        "auto_strategy_adaptation": False,
+        "regime_adaptation": False,
+        "spot_confirmation_enabled": False,
+        "session_filter_enabled": False,
+        "america_short_bias_enabled": False,
+        "mirror_mode": "off",
+        "trade_margin_pct": 0.10,
+        "margin_allocation_enabled": True,
+        "mexc_order_leverage": 10,
+        "scan_market_source": "mexc_binance",
+    }
+    for k, v in hard_settings.items():
+        await storage.set(k, v, bump_revision=False)
+    ex = await get_exchange(await storage.all_settings())
+    executor = ExecutionEngine(storage, ex)
+    autopilot = BTCVisionAutopilot(storage, ex, executor)
+    context.application.bot_data["btc_ai_autopilot"] = autopilot
+    if position_task is None or position_task.done():
+        globals()["position_task"] = context.application.create_task(position_management_loop(context.application))
+    if btc_ai_task is None or btc_ai_task.done():
+        btc_ai_task = context.application.create_task(autopilot.run_loop(context.application))
+
+    log_event("game_btc_ai_start", ok=True, version=VERSION, prompt_mode="market_maker_chess")
+    await reply(update,
+                "♟ GAME BTC AI запущен один раз.\n"
+                "Старый BTC AI 4H режим не включается и не меняется.\n"
+                "ИИ играет партию против маркетмейкера: сравнит LONG/SHORT/WAIT ходы и выберет лучший.\n"
+                "Сделка будет открыта только если Game AI даст tradable LONG/SHORT с порогом 65+. WAIT не форсируется.",
+                reply_markup=MAIN_MENU)
+
+    async def _run_once():
+        try:
+            await autopilot.cycle(context.application, force_live_test=False, manual_once=True)
+            log_event("game_btc_ai_finish", ok=True)
+        except Exception as e:
+            log_event("game_btc_ai_error", ok=False, error=str(e)[:1200])
+            await reply(update, f"❌ GAME BTC AI error: {str(e)[:700]}", reply_markup=MAIN_MENU)
+        finally:
+            # Restore old prompt mode so scheduled classic BTC AI is not touched.
+            try:
+                if old_prompt_mode is None:
+                    await storage.set("btc_ai_prompt_mode", "classic", bump_revision=False)
+                else:
+                    await storage.set("btc_ai_prompt_mode", old_prompt_mode, bump_revision=False)
+                await storage.set("btc_ai_live_test_enabled", bool(old_live_test), bump_revision=False)
+            except Exception as e:
+                log_event("game_btc_ai_restore_settings_error", ok=False, error=str(e)[:500])
+    context.application.create_task(_run_once())
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return
     await reply(update, f"""
@@ -1598,6 +1682,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /recovery - восстановить позиции MEXC после рестарта и проверить TP/SL
 /mexc_debug_state [SYMBOL] - raw debug MEXC positions/orders/symbol variants
 /test_btc - toggle LIVE BTC AI test: рисует график, отправляет ИИ, открывает TEST market сделку при любом ответе ИИ, пишет полный лог
+/game_btc_ai - one-shot Game BTC AI: ИИ играет против маркетмейкера, WAIT не форсируется
 
 Note: /positions checks MEXC exchange-first; /open_orders scans normal + plan + stop + TP/SL endpoints. If exchange TP/SL is missing after retries, new AI scalping entries are closed immediately.
 /proxy on|off|test|set URL
@@ -5416,6 +5501,123 @@ async def orderflow_impulse_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         reply_markup=MAIN_MENU,
     )
 
+
+async def chatgpt_scan_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """One-shot ChatGPT market scan mode.
+
+    Hard disables other entry modes, creates log.txt for ChatGPT, then waits for
+    setup.txt JSON uploaded back by the user.
+    """
+    global running, entries_enabled, trading_task, position_task
+    settings = await storage.all_settings()
+    chatgpt_log_event("mode_enter_requested")
+    await disable_other_modes(storage)
+    chatgpt_log_event("mode_other_entries_disabled")
+    entries_enabled = False
+    # Keep the execution/position loop alive. `running=False` stops both
+    # trading_loop and position_management_loop in this codebase, so ChatGPT
+    # mode must pause entries via entries_enabled=False, not kill running.
+    running = True
+    if position_task is None or position_task.done():
+        position_task = context.application.create_task(position_management_loop(context.application))
+    # Do not close existing positions; just stop background entry loops.
+    await reply(update, "🤖 ChatGPT Scan Mode ON\nОтключил остальные режимы входа. Запускаю один скан топ-200 и соберу log.txt...", reply_markup=MAIN_MENU)
+    try:
+        ns = await storage.all_settings()
+        apply_mexc_runtime_env({**ns, "mexc_order_leverage": "10", "mexc_order_open_type": "1"})
+        ex = await get_exchange(ns)
+        ws = await get_ws(ns)
+        chatgpt_log_event("mode_scan_call")
+        log_path = await build_chatgpt_log(ex, scanner, ns, ws_supervisor=ws, limit=200)
+        chat_id = update.effective_chat.id if update.effective_chat else first_admin_id()
+        with open(log_path, "rb") as f:
+            await context.application.bot.send_document(chat_id=chat_id, document=f, filename="log.txt", caption="✅ log.txt готов. Скинь его ChatGPT. Потом загрузи сюда setup.txt JSON.")
+        await storage.set("chatgpt_waiting_setup", True)
+        chatgpt_log_event("mode_waiting_setup", log_path=log_path)
+    except Exception as e:
+        chatgpt_log_event("mode_scan_failed", error=repr(e))
+        log.exception("chatgpt scan mode failed")
+        await reply(update, f"❌ ChatGPT scan failed: {str(e)[:900]}", reply_markup=MAIN_MENU)
+
+
+async def chatgpt_exit_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chatgpt_log_event("mode_exit_requested")
+    await storage.set("chatgpt_setup_mode", False)
+    await storage.set("chatgpt_waiting_setup", False)
+    chatgpt_log_event("mode_exit_done")
+    await reply(update, "❌ ChatGPT Mode OFF\nОжидание setup.txt отменено. Старые режимы автоматически не включал — включи нужный режим вручную.", reply_markup=MAIN_MENU)
+
+
+async def log_chatgpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    try:
+        path = chatgpt_runtime_log_path()
+        chatgpt_log_event("log_chatgpt_requested", user_id=getattr(update.effective_user, "id", ""))
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            chat_id = update.effective_chat.id if update.effective_chat else first_admin_id()
+            with open(path, "rb") as f:
+                await context.application.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename="chatgpt_mode_runtime.log",
+                    caption="📄 Подробный лог ChatGPT Mode. При ошибке скинь этот файл мне."
+                )
+        else:
+            await reply(update, "Лог ChatGPT Mode пока пустой.", reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"❌ Не смог отправить /log_chatgpt: {str(e)[:900]}\n\nПоследние строки:\n{tail_chatgpt_runtime_log(40)[:2500]}", reply_markup=MAIN_MENU)
+
+
+async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global running, position_task
+    if not allowed(update):
+        return
+    waiting = bool(await storage.get("chatgpt_waiting_setup", False))
+    if not waiting:
+        chatgpt_log_event("setup_file_ignored_not_waiting")
+        await reply(update, "Файл получил, но ChatGPT Mode не ждёт setup.txt. Нажми 🤖 ChatGPT Scan Mode сначала.", reply_markup=MAIN_MENU)
+        return
+    doc = update.message.document if update.message else None
+    name = str(getattr(doc, "file_name", "") or "")
+    if not doc or not name.lower().endswith(".txt"):
+        chatgpt_log_event("setup_file_rejected_extension", filename=name)
+        await reply(update, "Жду именно setup.txt в JSON-формате.", reply_markup=MAIN_MENU)
+        return
+    try:
+        chatgpt_log_event("setup_file_received", filename=name, file_size=getattr(doc, "file_size", ""))
+        tg_file = await context.bot.get_file(doc.file_id)
+        tmp_path = f"/tmp/{int(time.time())}_{name}"
+        await tg_file.download_to_drive(tmp_path)
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        setup = extract_setup_json(text)
+        settings = await storage.all_settings()
+        apply_mexc_runtime_env({**settings, "mexc_order_leverage": "10", "mexc_order_open_type": "1"})
+        ex = await get_exchange(settings)
+        running = True
+        if position_task is None or position_task.done():
+            position_task = context.application.create_task(position_management_loop(context.application))
+        result = await execute_setup(storage, ex, setup)
+        chatgpt_log_event("setup_file_processed", result=result)
+        # Keep monitoring active after setup execution, especially for LIMIT entries
+        # that start as pending and need fill detection before TP/SL is attached.
+        running = True
+        if position_task is None or position_task.done():
+            position_task = context.application.create_task(position_management_loop(context.application))
+        lines = ["✅ setup.txt обработан"]
+        if result.get("message") == "NO_TRADE":
+            lines.append("NO_TRADE: сделок нет.")
+        for row in result.get("opened", []):
+            status = "✅" if row.get("ok") else "❌"
+            lines.append(f"{status} {row.get('symbol')} {row.get('side','')} {row.get('order_type','')} entry={row.get('entry')} reason={row.get('reason','')}")
+        await storage.set("chatgpt_waiting_setup", False)
+        await reply(update, "\n".join(lines)[:3900], reply_markup=MAIN_MENU)
+    except Exception as e:
+        chatgpt_log_event("setup_file_processing_failed", error=repr(e))
+        log.exception("setup.txt processing failed")
+        await reply(update, f"❌ setup.txt error: {str(e)[:1200]}", reply_markup=MAIN_MENU)
+
 def _button_text_key(text: str) -> str:
     """Normalize Telegram reply-keyboard text.
 
@@ -5442,7 +5644,7 @@ def _button_mapping():
         ("🔐 API", api_cmd), ("API", api_cmd),
         ("📊 AI Stats", ai_stats_cmd), ("AI Stats", ai_stats_cmd),
         ("🤖 AI BTC/ETH scalping", ai_scalping_toggle_cmd), ("AI BTC/ETH scalping", ai_scalping_toggle_cmd),
-        ("₿ BTC AI 4H автопилот", btc_ai_autopilot_cmd), ("BTC AI 4H автопилот", btc_ai_autopilot_cmd),
+        ("₿ BTC AI 4H автопилот", btc_ai_autopilot_cmd), ("BTC AI 4H автопилот", btc_ai_autopilot_cmd), ("♟ Game BTC AI", game_btc_ai_cmd), ("Game BTC AI", game_btc_ai_cmd), ("/game_btc_ai", game_btc_ai_cmd),
         ("📊 BTC Status", status_btc_cmd), ("BTC Status", status_btc_cmd), ("/status_btc", status_btc_cmd),
         ("🧪 BTC Backtest", backtest_btc_patterns_cmd), ("🧪 BTC Backtest 4H", backtest_btc_patterns_cmd), ("/backtest_btc_patterns", backtest_btc_patterns_cmd), ("🧪 BTC Backtest 1H", backtest_btc_patterns_1h_cmd), ("/backtest_btc_patterns_1h", backtest_btc_patterns_1h_cmd), ("🧪 Round Levels", backtest_round_levels_cmd), ("/backtest_round_levels", backtest_round_levels_cmd), ("🧪 Strategy Lab", backtest_strategy_lab_cmd), ("/backtest_strategy_lab", backtest_strategy_lab_cmd), ("🧪 Strategy Detail", backtest_strategy_lab_extra_cmd), ("🧪 Strategy Lab Extra", backtest_strategy_lab_extra_cmd), ("/backtest_strategy_lab_extra", backtest_strategy_lab_extra_cmd), ("🔥 Aggressive Lab", backtest_aggressive_lab_cmd), ("/backtest_aggressive_lab", backtest_aggressive_lab_cmd),
         ("🧽 Clean BTC Orders", clean_btc_orders_cmd), ("Clean BTC Orders", clean_btc_orders_cmd), ("/clean_btc_orders", clean_btc_orders_cmd),
@@ -5455,6 +5657,9 @@ def _button_mapping():
         ("🧠 multi strategy", multi_strategy_cmd), ("multi strategy", multi_strategy_cmd), ("Multi strategy", multi_strategy_cmd),
         ("🚀 BOOST MODE", boost_start_cmd), ("BOOST MODE", boost_start_cmd),
         ("🛑 STOP BOOST", boost_stop_cmd), ("STOP BOOST", boost_stop_cmd),
+        ("🤖 ChatGPT Scan Mode", chatgpt_scan_mode_cmd), ("ChatGPT Scan Mode", chatgpt_scan_mode_cmd),
+        ("📄 Log ChatGPT", log_chatgpt_cmd), ("Log ChatGPT", log_chatgpt_cmd),
+        ("❌ Exit ChatGPT Mode", chatgpt_exit_mode_cmd), ("Exit ChatGPT Mode", chatgpt_exit_mode_cmd),
         ("📊 BOOST STATUS", boost_status_cmd), ("BOOST STATUS", boost_status_cmd),
         ("⚙️ MEXC", mexc_settings_cmd), ("⚙ MEXC", mexc_settings_cmd), ("MEXC", mexc_settings_cmd),
     ]
@@ -7289,10 +7494,14 @@ def build_app():
     app.add_handler(CommandHandler("log", _wrap_command(log_cmd, "/log")))
     app.add_handler(CommandHandler("log_full", _wrap_command(log_full_cmd, "/log_full")))
     app.add_handler(CommandHandler("test_btc", _wrap_command(test_btc_cmd, "/test_btc")))
+    app.add_handler(CommandHandler("game_btc_ai", _wrap_command(game_btc_ai_cmd, "/game_btc_ai")))
     app.add_handler(CommandHandler("run", _wrap_command(run_cmd, "/run")))
     app.add_handler(CommandHandler("boost_start", _wrap_command(boost_start_cmd, "/boost_start")))
     app.add_handler(CommandHandler("boost_stop", _wrap_command(boost_stop_cmd, "/boost_stop")))
     app.add_handler(CommandHandler("boost_status", _wrap_command(boost_status_cmd, "/boost_status")))
+    app.add_handler(CommandHandler("chatgpt_scan", _wrap_command(chatgpt_scan_mode_cmd, "/chatgpt_scan")))
+    app.add_handler(CommandHandler("chatgpt_exit", _wrap_command(chatgpt_exit_mode_cmd, "/chatgpt_exit")))
+    app.add_handler(CommandHandler("log_chatgpt", _wrap_command(log_chatgpt_cmd, "/log_chatgpt")))
     app.add_handler(CommandHandler("cascade_hunter", _wrap_command(cascade_hunter_cmd, "/cascade_hunter")))
     app.add_handler(CommandHandler("boost_rotation", _wrap_command(boost_rotation_cmd, "/boost_rotation")))
     app.add_handler(CommandHandler("boost_list", _wrap_command(boost_list_cmd, "/boost_list")))
@@ -7337,6 +7546,7 @@ def build_app():
     app.add_handler(CommandHandler("api", _wrap_command(api_cmd, "/api")))
     app.add_handler(CommandHandler("openai", _wrap_command(openai_cmd, "/openai")))
     app.add_handler(CallbackQueryHandler(_wrap_command(callback_router, "callback")))
+    app.add_handler(MessageHandler(filters.Document.ALL, document_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     return app
 

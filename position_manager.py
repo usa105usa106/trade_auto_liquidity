@@ -323,9 +323,39 @@ class PositionManager:
 
         # Timeout: cancel stale limit entry and free slot.
         _time_stop_sec, limit_timeout_sec, _breakeven_trigger_pct = await self._runtime_limits()
+        details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
+        try:
+            custom_minutes = int(float(details.get("cancel_if_not_filled_minutes") or 0))
+            if custom_minutes > 0:
+                limit_timeout_sec = custom_minutes * 60
+        except Exception:
+            pass
         if now - opened >= limit_timeout_sec:
             res = await self.execution_engine.cancel_entry(pos, live=True, reason="limit_timeout")
             return {"type": "limit_timeout", "symbol": symbol, "result": res}
+
+        # ChatGPT LIMIT safety: if price already reached TP1 before entry fill,
+        # the idea is stale; cancel the pending order. Optional stop-before-entry
+        # cancellation is also supported if setup.txt includes it.
+        try:
+            tps = details.get("chatgpt_take_profits") or []
+            tp1 = float((tps[0] or {}).get("price") or 0) if isinstance(tps, list) and tps else 0.0
+            sl = float(pos.get("stop_price") or 0)
+            side_u = str(pos.get("side") or "").upper()
+            cancel_tp1 = str(details.get("cancel_if_tp1_before_entry") or "").lower() in {"1", "true", "yes", "on"}
+            cancel_sl = str(details.get("cancel_if_stop_before_entry") or "").lower() in {"1", "true", "yes", "on"}
+            if (cancel_tp1 and tp1 > 0) or (cancel_sl and sl > 0):
+                ticker = await self.execution_engine.exchange_client.fetch_ticker(symbol)
+                cur = float(ticker.get("last") or ticker.get("close") or 0)
+                if cur > 0:
+                    if cancel_tp1 and tp1 > 0 and ((side_u == "LONG" and cur >= tp1) or (side_u == "SHORT" and cur <= tp1)):
+                        res = await self.execution_engine.cancel_entry(pos, live=True, reason="tp1_touched_before_entry")
+                        return {"type": "limit_stale_tp1_before_entry", "symbol": symbol, "result": res}
+                    if cancel_sl and sl > 0 and ((side_u == "LONG" and cur <= sl) or (side_u == "SHORT" and cur >= sl)):
+                        res = await self.execution_engine.cancel_entry(pos, live=True, reason="stop_touched_before_entry")
+                        return {"type": "limit_stale_stop_before_entry", "symbol": symbol, "result": res}
+        except Exception:
+            pass
 
         # Confirm the exact order state. Disappearance from open orders is not
         # enough: it may mean filled, canceled, rejected, or expired.

@@ -1365,6 +1365,49 @@ class ExecutionEngine:
                 except Exception as e:
                     out["sl_error"] = str(e)[:800]
                     log_event("error_boost_emergency_sl", symbol=symbol, side=side, qty=qty, stop_price=sl, attempt=i + 1, error=str(e), ok=False)
+            elif strategy_name_for_protection == "chatgpt_setup":
+                # ChatGPT setup mode supports 1-3 arbitrary take-profits from setup.txt.
+                # Each TP is placed as a reduce-only trigger-market close for its size_percent;
+                # SL protects 100% of the position.
+                details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
+                tps = details.get("chatgpt_take_profits") or []
+                tp_ids = []
+                try:
+                    if not isinstance(tps, list) or not tps:
+                        raise RuntimeError("missing chatgpt_take_profits")
+                    remaining_qty = qty
+                    for idx, tp_row in enumerate(tps, start=1):
+                        tp_price = float(tp_row.get("price") or 0)
+                        size_pct = float(tp_row.get("size_percent") or 0)
+                        if tp_price <= 0 or size_pct <= 0:
+                            continue
+                        tp_qty = qty * max(0.0, min(100.0, size_pct)) / 100.0
+                        if idx == len(tps):
+                            tp_qty = remaining_qty
+                        remaining_qty = max(0.0, remaining_qty - tp_qty)
+                        if tp_qty <= 0:
+                            continue
+                        log_event("chatgpt_tp_request", symbol=symbol, side=side, qty=tp_qty, trigger_price=tp_price, size_pct=size_pct, attempt=i + 1)
+                        order = await self._create_take_profit_market_order(symbol, side, tp_qty, tp_price)
+                        oid = order.get("id")
+                        out[f"tp{idx}_order_id"] = oid
+                        out[f"tp{idx}_raw"] = order
+                        tp_ids.append(str(oid or ""))
+                except Exception as e:
+                    out["tp_error"] = str(e)[:800]
+                    log_event("error_chatgpt_tp", symbol=symbol, side=side, qty=qty, tps=tps, attempt=i + 1, error=str(e), ok=False)
+                try:
+                    if sl > 0:
+                        log_event("chatgpt_sl_request", symbol=symbol, side=side, qty=qty, stop_price=sl, attempt=i + 1)
+                        order = await self._create_stop_market_order(symbol, side, qty, sl)
+                        out["sl_order_id"] = order.get("id")
+                        out["sl_raw"] = order
+                    else:
+                        out["sl_error"] = "missing stop_price"
+                except Exception as e:
+                    out["sl_error"] = str(e)[:800]
+                    log_event("error_chatgpt_sl", symbol=symbol, side=side, qty=qty, trigger_price=sl, attempt=i + 1, error=str(e), ok=False)
+
             elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin", "btc_ai_4h"}:
                 # Split TP mode: TP1 closes 50% at 1R, TP2 closes the remaining 50% at 2R.
                 # Do not use MEXC native by-position TP/SL here because it supports one TP only.
@@ -1495,6 +1538,16 @@ class ExecutionEngine:
                     out["protection_mode"] = "exchange_emergency_sl_only"
                     out["boost_unsafe_position"] = False
                     out["boost_defensive_mode"] = False
+                elif strategy_name_for_protection == "chatgpt_setup" and out.get("sl_order_id"):
+                    tp_keys = [k for k in out.keys() if k.startswith("tp") and k.endswith("_order_id")]
+                    out["tp_exists"] = bool(tp_keys)
+                    out["sl_exists"] = True
+                    out["take_profit_ok"] = bool(tp_keys)
+                    out["stop_loss_ok"] = True
+                    out["ok"] = bool(tp_keys)
+                    out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
+                    out["protection_mode"] = "chatgpt_multi_tp_planorders" if out["ok"] else "chatgpt_tp_missing"
+                    out["protection_note"] = f"ChatGPT setup: {len(tp_keys)} TP planorders + full SL requested"
                 elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin", "btc_ai_4h"} and out.get("tp1_order_id") and out.get("tp2_order_id") and out.get("sl_order_id"):
                     # V42 strict rule: returned planorder ids are NOT enough on MEXC.
                     # /status_btc is exchange-first, so protection is considered OK only
