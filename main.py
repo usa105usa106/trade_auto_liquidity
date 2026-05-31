@@ -822,25 +822,91 @@ def _api_creds(settings: dict) -> tuple[str, str]:
     return api_key, api_secret
 
 async def _ensure_secret_health(reason: str = "manual") -> dict:
-    """V79: lightweight non-mutating secret check.
+    """SQLite-first secret check.
 
-    Do not search backup files or heal from old caches.  This keeps credentials
-    deterministic: SQLite/current runtime/env only.
+    If keys are active in the current process but missing in SQLite, persist them
+    into SQLite once. No old backup/cache files are used.
     """
     try:
-        raw = await storage.all_settings()
+        raw = await _repair_sqlite_secrets_from_runtime(reason=reason)
     except Exception:
-        raw = {}
+        try:
+            raw = await storage.all_settings()
+        except Exception:
+            raw = {}
     try:
         merged = merge_secrets_into_settings(raw or {})
         ensure_runtime_secrets_loaded(merged)
         report = secret_source_report(merged)
-        log_event("secret_health_v7", ok=True, reason=reason, mexc_key=bool(_api_creds(merged)[0]), mexc_secret=bool(_api_creds(merged)[1]), openai=bool(str(merged.get("openai_api_key") or "").strip()), report=report)
+        log_event("secret_health_v11", ok=True, reason=reason, mexc_key=bool(_api_creds(merged)[0]), mexc_secret=bool(_api_creds(merged)[1]), openai=bool(str(merged.get("openai_api_key") or "").strip()), report=report)
         return merged
     except Exception as e:
-        log_event("secret_health_v7", ok=False, reason=reason, error=str(e)[:500])
+        log_event("secret_health_v11", ok=False, reason=reason, error=str(e)[:500])
         return raw or {}
 
+
+
+async def _repair_sqlite_secrets_from_runtime(reason: str = "manual") -> dict:
+    """Persist currently available runtime/env/exchange secrets into SQLite.
+
+    This is not an old backup/cache restore. It only saves keys that are already
+    active in the current process (after /api set, Railway env fallback, or an
+    already initialized ExchangeClient) so the next command/redeploy reads them
+    from SQLite deterministically.
+    """
+    repaired = {"mexc_key": False, "mexc_secret": False, "openai": False}
+    try:
+        current = await storage.all_settings()
+    except Exception:
+        current = {}
+
+    def clean(v):
+        return str(v or "").strip()
+
+    # First priority: explicit SQLite values already present.
+    db_mk = clean(current.get("mexc_api_key"))
+    db_ms = clean(current.get("mexc_api_secret"))
+    db_oa = clean(current.get("openai_api_key"))
+
+    # Runtime/process values. These are allowed only as a live source to write
+    # into SQLite; no file cache/backups are read.
+    env_mk = clean(os.getenv("MEXC_API_KEY", ""))
+    env_ms = clean(os.getenv("MEXC_API_SECRET", ""))
+    env_oa = clean(os.getenv("OPENAI_API_KEY", ""))
+
+    # If an exchange client is already initialized, it may still have the key in
+    # memory from a successful balance/API call. Save that into SQLite before a
+    # later reset loses it.
+    global exchange_client
+    ex_mk = clean(getattr(exchange_client, "api_key", "")) if exchange_client is not None else ""
+    ex_ms = clean(getattr(exchange_client, "api_secret", "")) if exchange_client is not None else ""
+
+    mk = db_mk or env_mk or ex_mk
+    ms = db_ms or env_ms or ex_ms
+    oa = db_oa or env_oa
+
+    try:
+        if mk and not db_mk:
+            await storage.set("mexc_api_key", mk, bump_revision=False)
+            os.environ["MEXC_API_KEY"] = mk
+            repaired["mexc_key"] = True
+        if ms and not db_ms:
+            await storage.set("mexc_api_secret", ms, bump_revision=False)
+            os.environ["MEXC_API_SECRET"] = ms
+            repaired["mexc_secret"] = True
+        if oa and not db_oa:
+            await storage.set("openai_api_key", oa, bump_revision=False)
+            os.environ["OPENAI_API_KEY"] = oa
+            repaired["openai"] = True
+        if any(repaired.values()):
+            log_event("sqlite_secret_repair_v11", ok=True, reason=reason, repaired=repaired)
+    except Exception as e:
+        log_event("sqlite_secret_repair_v11", ok=False, reason=reason, error=str(e)[:500])
+
+    try:
+        return await storage.all_settings()
+    except Exception:
+        return current or {}
 
 def apply_mexc_runtime_env(settings: dict) -> None:
     """Apply Telegram/DB MEXC order settings to this Railway process.
@@ -3856,9 +3922,13 @@ async def _direct_mexc_balance(settings: dict) -> tuple[dict, str]:
         pass
     api_key, api_secret = _api_creds(settings)
     if not (api_key and api_secret):
+        # One last SQLite repair attempt from current runtime/exchange env.
+        settings = await _repair_sqlite_secrets_from_runtime(reason="balance_missing")
+        api_key, api_secret = _api_creds(settings)
+    if not (api_key and api_secret):
         report = secret_source_report(settings or {})
-        log_event("balance_api_missing_v7", ok=False, report=report)
-        return {}, "MEXC API key/secret is missing before request; source_report=" + str(report)[:500]
+        log_event("balance_api_missing_v11", ok=False, report=report)
+        return {}, "MEXC API key/secret не сохранены в SQLite. Отправь один раз: /api set API_KEY API_SECRET. source=" + str(report)[:300]
     proxy_enabled = bool(settings.get("proxy_enabled", False))
     proxy_url = str(settings.get("proxy_url", "") or "")
     ex = ExchangeClient(DEFAULT_EXCHANGE, proxy_url, proxy_enabled)
@@ -4754,8 +4824,8 @@ async def openai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await storage.set("openai_api_key", key)
         os.environ["OPENAI_API_KEY"] = key
         set_runtime_secret_cache({"openai_api_key": key})
-        save_secret_backup({"openai_api_key": key})
-        log_event("openai_key_session_set_v79", ok=True, sqlite=True, runtime_env=True, backup=False)
+        # V11: SQLite is the persistent source. No backup/cache file write.
+        log_event("openai_key_sqlite_set_v11", ok=True, sqlite=True, runtime_env=True, backup=False)
         await reply(update, "✅ OpenAI API key saved", reply_markup=MAIN_MENU)
         return
     if cmd == "clear":
@@ -4802,10 +4872,14 @@ async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.environ["MEXC_API_KEY"] = api_key_new
         os.environ["MEXC_API_SECRET"] = api_secret_new
         set_runtime_secret_cache({"mexc_api_key": api_key_new, "mexc_api_secret": api_secret_new})
-        save_secret_backup({"mexc_api_key": api_key_new, "mexc_api_secret": api_secret_new})
+        # V11: SQLite is the persistent source. No backup/cache file write.
         verify_s = await storage.all_settings()
-        verify_key, verify_secret = _api_creds(verify_s)
-        log_event("api_keys_session_set_v7", ok=bool(verify_key and verify_secret), sqlite=True, runtime_env=True, runtime_cache=True, backup=False, key_mask=mask_secret(verify_key), secret_mask=mask_secret(verify_secret))
+        verify_key = str(await storage.get("mexc_api_key") or "").strip()
+        verify_secret = str(await storage.get("mexc_api_secret") or "").strip()
+        log_event("api_keys_sqlite_set_v11", ok=bool(verify_key and verify_secret), sqlite=True, runtime_env=True, backup=False, key_mask=mask_secret(verify_key), secret_mask=mask_secret(verify_secret))
+        if not (verify_key and verify_secret):
+            await reply(update, "❌ API не сохранился в SQLite. Сделки не запускаю. Повтори /api set API_KEY API_SECRET", reply_markup=MAIN_MENU)
+            return
         cleared = 0
         try:
             cleared = await storage.clear_positions()

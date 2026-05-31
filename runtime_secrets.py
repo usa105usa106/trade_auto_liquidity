@@ -9,7 +9,7 @@ SENSITIVE_SETTING_KEYS = {
     "openai_api_key": "OPENAI_API_KEY",
 }
 
-# V8 simple secret rule:
+# V11 simple secret rule:
 # 1) SQLite settings are the main source after /api set and /openai set.
 # 2) Railway/process ENV is only a fallback when SQLite is empty.
 # 3) No backup files, no old caches, no restart cache restore.
@@ -51,6 +51,7 @@ def load_secret_backup() -> Dict[str, str]:
 
 
 def save_secret_backup(values: Dict[str, Any]) -> None:
+    # V11: compatibility no-op. Telegram commands save directly to SQLite.
     set_runtime_secret_cache(values or {})
 
 
@@ -121,7 +122,7 @@ def secret_source_report(settings: Dict[str, Any] | None = None) -> Dict[str, An
     env_ms = bool(_clean(os.getenv("MEXC_API_SECRET", "")))
     env_oa = bool(_clean(os.getenv("OPENAI_API_KEY", "")))
     return {
-        "source_priority": "sqlite > env_fallback; backups_and_restart_cache_disabled",
+        "source_priority": "sqlite primary; env/runtime only repair fallback; no backup/cache files",
         "sqlite_mexc_key": sqlite_mk,
         "sqlite_mexc_secret": sqlite_ms,
         "sqlite_openai": sqlite_oa,
@@ -131,5 +132,5 @@ def secret_source_report(settings: Dict[str, Any] | None = None) -> Dict[str, An
         "active_mexc_key_source": "sqlite" if sqlite_mk else "env" if env_mk else "missing",
         "active_mexc_secret_source": "sqlite" if sqlite_ms else "env" if env_ms else "missing",
         "active_openai_source": "sqlite" if sqlite_oa else "env" if env_oa else "missing",
-        "backup_paths": "disabled_v8_no_cache",
+        "backup_paths": "disabled_v11_no_cache",
     }
