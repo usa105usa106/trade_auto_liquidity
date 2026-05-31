@@ -5504,42 +5504,64 @@ async def orderflow_impulse_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-async def chatgpt_scan_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """One-shot ChatGPT market scan mode.
-
-    Hard disables other entry modes, creates log.txt for ChatGPT, then waits for
-    setup.txt JSON uploaded back by the user.
-    """
-    global running, entries_enabled, trading_task, position_task
-    settings = await storage.all_settings()
-    chatgpt_log_event("mode_enter_requested")
-    await disable_other_modes(storage)
-    chatgpt_log_event("mode_other_entries_disabled")
-    entries_enabled = False
-    # Keep the execution/position loop alive. `running=False` stops both
-    # trading_loop and position_management_loop in this codebase, so ChatGPT
-    # mode must pause entries via entries_enabled=False, not kill running.
-    running = True
-    if position_task is None or position_task.done():
-        position_task = context.application.create_task(position_management_loop(context.application))
-    # Do not close existing positions; just stop background entry loops.
-    await reply(update, "🤖 ChatGPT Scan Mode ON\nОтключил остальные режимы входа. Запускаю один скан топ-200 и соберу log.txt...", reply_markup=MAIN_MENU)
+async def _chatgpt_scan_background_job(app, chat_id: int):
+    """Run the slow top-200 scan outside Telegram command timeout."""
     try:
         ns = await storage.all_settings()
         apply_mexc_runtime_env({**ns, "mexc_order_leverage": "10", "mexc_order_open_type": "1"})
         ex = await get_exchange(ns)
         ws = await get_ws(ns)
         chatgpt_log_event("mode_scan_call")
-        log_path = await build_chatgpt_log(ex, scanner, ns, ws_supervisor=ws, limit=200)
-        chat_id = update.effective_chat.id if update.effective_chat else first_admin_id()
+        scan_limit = int(os.getenv("CHATGPT_SCAN_LIMIT", "200") or 200)
+        log_path = await build_chatgpt_log(ex, scanner, ns, ws_supervisor=ws, limit=scan_limit)
         with open(log_path, "rb") as f:
-            await context.application.bot.send_document(chat_id=chat_id, document=f, filename="log.txt", caption="✅ log.txt готов. Скинь его ChatGPT. Потом загрузи сюда setup.txt JSON.")
+            await app.bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename="log.txt",
+                caption="✅ log.txt готов. Скинь его ChatGPT. Потом загрузи сюда setup.txt JSON.",
+            )
         await storage.set("chatgpt_waiting_setup", True)
         chatgpt_log_event("mode_waiting_setup", log_path=log_path)
     except Exception as e:
         chatgpt_log_event("mode_scan_failed", error=repr(e))
-        log.exception("chatgpt scan mode failed")
-        await reply(update, f"❌ ChatGPT scan failed: {str(e)[:900]}", reply_markup=MAIN_MENU)
+        log.exception("chatgpt scan background failed")
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=f"❌ ChatGPT scan failed: {str(e)[:900]}", reply_markup=MAIN_MENU)
+        except Exception:
+            pass
+    finally:
+        try:
+            app.bot_data["chatgpt_scan_running"] = False
+        except Exception:
+            pass
+
+
+async def chatgpt_scan_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """One-shot ChatGPT market scan mode.
+
+    Hard disables other entry modes and starts the slow top-200 scan in the
+    background, so the Telegram button command does not hit the 45s timeout.
+    """
+    global running, entries_enabled, trading_task, position_task
+    chatgpt_log_event("mode_enter_requested")
+    await disable_other_modes(storage)
+    chatgpt_log_event("mode_other_entries_disabled")
+    entries_enabled = False
+    running = True
+    if position_task is None or position_task.done():
+        position_task = context.application.create_task(position_management_loop(context.application))
+    chat_id = update.effective_chat.id if update.effective_chat else first_admin_id()
+    if context.application.bot_data.get("chatgpt_scan_running"):
+        await reply(update, "⏳ ChatGPT Scan уже идёт. Дождись log.txt или проверь /log_chatgpt.", reply_markup=MAIN_MENU)
+        return
+    context.application.bot_data["chatgpt_scan_running"] = True
+    context.application.create_task(_chatgpt_scan_background_job(context.application, chat_id))
+    await reply(
+        update,
+        "🤖 ChatGPT Scan Mode ON\nОтключил остальные режимы входа. Скан топ-200 запущен в фоне. Интерфейс не зависнет; когда log.txt будет готов, я пришлю файл сюда.",
+        reply_markup=MAIN_MENU,
+    )
 
 
 async def chatgpt_exit_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):

@@ -32,7 +32,7 @@ CHATGPT_MODE_KEYS = {
 # estimated deposit risk in % for one trade.
 CHATGPT_MIN_STOP_DISTANCE_PCT = 1.0
 CHATGPT_MAX_STOP_DISTANCE_PCT = 5.0
-CHATGPT_SETUP_VERSION = "1.1"
+CHATGPT_SETUP_VERSION = "1.2"
 
 # MEXC regional restrictions: tokenized stock/stock-index contracts can be
 # blocked in the user's region and must never be scanned or traded in
@@ -57,6 +57,39 @@ def filter_chatgpt_symbols(symbols: list[str]) -> tuple[list[str], list[str]]:
         else:
             kept.append(sym)
     return kept, blocked
+
+
+def mexc_native_symbol(sym: Any) -> str:
+    """Return clean MEXC futures symbol for logs/setup: BTC_USDT, ETH_USDT.
+
+    Scanner may receive ccxt symbols like BTC/USDT:USDT.  ChatGPT mode
+    intentionally writes only native MEXC contract ids to log.txt and setup.txt
+    to avoid symbol-format confusion in the trading module.
+    """
+    raw = str(sym or "").strip().upper()
+    if raw.endswith(":USDT"):
+        raw = raw[:-5]
+    raw = raw.replace("-", "_")
+    if "/" in raw:
+        base, quote = raw.split("/", 1)
+        quote = quote.split(":", 1)[0] or "USDT"
+        raw = f"{base}_{quote}"
+    elif raw.endswith("USDT") and "_" not in raw and len(raw) > 4:
+        raw = f"{raw[:-4]}_USDT"
+    raw = raw.replace("__", "_").strip("_ /:-")
+    return raw
+
+
+def mexc_native_symbols(symbols: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for sym in symbols or []:
+        native = mexc_native_symbol(sym)
+        if not native or native in seen:
+            continue
+        seen.add(native)
+        out.append(native)
+    return out
 
 
 CHATGPT_RUNTIME_LOG_PATH = Path(os.getenv("CHATGPT_RUNTIME_LOG_PATH", "/tmp/chatgpt_mode_runtime.log"))
@@ -138,6 +171,33 @@ def _fmt(v: Any, digits: int = 8) -> str:
         return f"{f:.{digits}f}".rstrip("0").rstrip(".")
     except Exception:
         return str(v)
+
+
+def _is_mexc_rate_limit_error(e: Exception) -> bool:
+    txt = repr(e).lower() + " " + str(e).lower()
+    return "requests are too frequent" in txt or "code\":510" in txt or "code 510" in txt
+
+
+async def _mexc_call(label: str, coro_factory, symbol: str = "", retries: int | None = None):
+    """Small throttle/retry wrapper for MEXC public API during ChatGPT scan."""
+    retries = int(os.getenv("CHATGPT_SCAN_RETRIES", "4") if retries is None else retries)
+    base_delay = float(os.getenv("CHATGPT_SCAN_REQUEST_DELAY_SEC", "0.22") or 0.22)
+    rate_sleep = float(os.getenv("CHATGPT_SCAN_RATE_LIMIT_SLEEP_SEC", "3.0") or 3.0)
+    last_exc = None
+    for attempt in range(retries + 1):
+        if base_delay > 0:
+            await asyncio.sleep(base_delay)
+        try:
+            return await coro_factory()
+        except Exception as e:
+            last_exc = e
+            if _is_mexc_rate_limit_error(e) and attempt < retries:
+                wait = rate_sleep * (attempt + 1)
+                chatgpt_log_event("scan_rate_limit_retry", label=label, symbol=symbol, attempt=attempt + 1, sleep_sec=wait, error=repr(e))
+                await asyncio.sleep(wait)
+                continue
+            raise
+    raise last_exc
 
 
 def _pct(a: float, b: float) -> float:
@@ -300,7 +360,7 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
     await scanner.refresh_symbols(exchange_client, scan_settings, ws_supervisor)
     raw_symbols = list(dict.fromkeys(getattr(scanner, "hot_symbols", []) or []))
     filtered_symbols, blocked_symbols = filter_chatgpt_symbols(raw_symbols)
-    symbols = filtered_symbols[:int(limit)]
+    symbols = mexc_native_symbols(filtered_symbols)[:int(limit)]
     chatgpt_log_event(
         "scan_symbols_loaded",
         raw_count=len(raw_symbols),
@@ -311,18 +371,19 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
     )
 
     async def one_symbol(sym: str) -> str:
-        if is_chatgpt_blocked_symbol(sym):
-            chatgpt_log_event("scan_symbol_blocked_stock", symbol=sym)
-            return f"SYMBOL: {sym}\nSKIPPED: REGION_BLOCKED_STOCK_CONTRACT"
+        native_sym = mexc_native_symbol(sym)
+        if is_chatgpt_blocked_symbol(native_sym):
+            chatgpt_log_event("scan_symbol_blocked_stock", symbol=native_sym)
+            return f"SYMBOL: {native_sym}\nSKIPPED: REGION_BLOCKED_STOCK_CONTRACT"
         try:
-            ticker, ob = await asyncio.gather(
-                exchange_client.fetch_ticker(sym),
-                exchange_client.fetch_order_book(sym, limit=20),
-            )
+            # MEXC returns code 510 if we hit public endpoints too fast.
+            # Keep calls sequential + throttled; command itself runs in background.
+            ticker = await _mexc_call("fetch_ticker", lambda: exchange_client.fetch_ticker(native_sym), symbol=native_sym)
+            ob = await _mexc_call("fetch_order_book", lambda: exchange_client.fetch_order_book(native_sym, limit=20), symbol=native_sym)
             price = _safe_float(ticker.get("last") or ticker.get("close"))
             tf_data = {}
             for tf in ("15m", "1h", "4h"):
-                candles = await exchange_client.fetch_ohlcv(sym, timeframe=tf, limit=120)
+                candles = await _mexc_call(f"fetch_ohlcv_{tf}", lambda tf=tf: exchange_client.fetch_ohlcv(native_sym, timeframe=tf, limit=120), symbol=native_sym)
                 closes = _closes(candles)
                 vols = _volumes(candles)
                 macd, sig, hist = _macd(closes)
@@ -342,7 +403,7 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
             if abs(pct24) <= 1.0:
                 pct24 *= 100.0
             lines = [
-                f"SYMBOL: {sym}",
+                f"SYMBOL: {native_sym}",
                 f"PRICE: {_fmt(price)} | 24H_CHANGE_PCT: {_fmt(pct24, 4)} | QUOTE_VOL: {_fmt(ticker.get('quoteVolume') or 0, 2)}",
                 f"ORDERBOOK: bid={obs['bid_pct']:.1f}% ask={obs['ask_pct']:.1f}% spread={obs['spread_pct']:.3f}% | big_bid={_fmt(obs['big_bid'][0])}/{_fmt(obs['big_bid'][1],2)} | big_ask={_fmt(obs['big_ask'][0])}/{_fmt(obs['big_ask'][1],2)}",
             ]
@@ -355,10 +416,12 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
             lines.append(f"SCORES: LONG={long_score}/100 SHORT={short_score}/100 NOTE={note}")
             return "\n".join(lines)
         except Exception as e:
-            chatgpt_log_event("scan_symbol_error", symbol=sym, error=repr(e))
-            return f"SYMBOL: {sym}\nERROR: {str(e)[:240]}"
+            chatgpt_log_event("scan_symbol_error", symbol=native_sym, error=repr(e))
+            return f"SYMBOL: {native_sym}\nERROR: {str(e)[:240]}"
 
-    sem = asyncio.Semaphore(int(os.getenv("CHATGPT_SCAN_CONCURRENCY", "4") or 4))
+    # Default to sequential scanning. It is slower, but MEXC often rate-limits
+    # aggressive parallel top-200 scans with code 510. User can raise via ENV.
+    sem = asyncio.Semaphore(int(os.getenv("CHATGPT_SCAN_CONCURRENCY", "1") or 1))
     async def guarded(sym):
         async with sem:
             return await one_symbol(sym)
@@ -367,11 +430,11 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
     btc = ""
     eth = ""
     try:
-        btc = await one_symbol("BTC/USDT:USDT")
+        btc = await one_symbol("BTC_USDT")
     except Exception:
         pass
     try:
-        eth = await one_symbol("ETH/USDT:USDT")
+        eth = await one_symbol("ETH_USDT")
     except Exception:
         pass
 
@@ -391,6 +454,7 @@ TASK FOR CHATGPT:
 1. Выбери максимум 3 лучшие сделки.
 2. Дай текстовый вердикт и ОБЯЗАТЕЛЬНО верни один блок setup.txt в JSON-формате.
 3. В setup.txt каждая сделка должна содержать: symbol, direction, order_type, entry или entry_reference, stop_loss, take_profits [{price,size_percent}], invalidation, comment, risk.stop_distance_percent.
+   SYMBOL всегда указывай в MEXC-native формате: BTC_USDT, ETH_USDT, BCH_USDT. Не используй BTC/USDT:USDT.
 4. Для LIMIT добавь cancel_if_not_filled_minutes и cancel_if_tp1_before_entry=true.
 5. Для MARKET добавь max_price_deviation_percent.
 6. Не указывай размер позиции в монетах: бот сам использует 10% депозита на каждую сделку, 10x leverage, isolated.
@@ -412,7 +476,7 @@ RISK RULES FOR CHATGPT:
 
 СТРОГИЙ ФОРМАТ setup.txt:
 {
-  "setup_version": "1.1",
+  "setup_version": "1.2",
   "mode": "AUTO_OPEN",
   "exchange": "MEXC_FUTURES",
   "margin_mode": "ISOLATED",
@@ -426,6 +490,7 @@ RISK RULES FOR CHATGPT:
     "max_stop_distance_percent": 5.0
   },
   "blocked_symbol_substrings": ["STOCK"],
+  "symbol_format": "MEXC_NATIVE_UNDERSCORE",
   "trades": []
 }
 """.strip()
@@ -480,7 +545,7 @@ def validate_setup(data: dict) -> list[dict]:
     chatgpt_log_event("setup_validate_start", setup_version=(data or {}).get("setup_version") if isinstance(data, dict) else None)
     if not isinstance(data, dict):
         raise ValueError("setup JSON must be an object")
-    if str(data.get("setup_version")) not in {"1.0", "1.1"}:
+    if str(data.get("setup_version")) not in {"1.0", "1.1", "1.2"}:
         raise ValueError("unsupported setup_version")
     trades = data.get("trades") or []
     if not isinstance(trades, list):
@@ -505,11 +570,7 @@ def validate_setup(data: dict) -> list[dict]:
         raw_symbol = str(t.get("symbol") or "").strip().upper()
         if is_chatgpt_blocked_symbol(raw_symbol):
             raise ValueError(f"TRADE_{i}: symbol {raw_symbol} is region-blocked because it contains STOCK")
-        symbol = raw_symbol.replace("_", "/")
-        if symbol.endswith("USDT") and "/" not in symbol:
-            symbol = symbol[:-4] + "/USDT:USDT"
-        elif symbol.endswith("/USDT"):
-            symbol = symbol + ":USDT"
+        symbol = mexc_native_symbol(raw_symbol)
         if is_chatgpt_blocked_symbol(symbol):
             raise ValueError(f"TRADE_{i}: symbol {symbol} is region-blocked because it contains STOCK")
         direction = str(t.get("direction") or "").upper()
