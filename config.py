@@ -9,7 +9,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = "0342 CHATGPT BLOCK STOCK V6"  # hard-coded; ignore stale Railway BOT_VERSION env
+VERSION = "0344 CHATGPT SQLITE SECRETS V8"  # hard-coded; ignore stale Railway BOT_VERSION env
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)

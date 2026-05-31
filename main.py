@@ -835,10 +835,10 @@ async def _ensure_secret_health(reason: str = "manual") -> dict:
         merged = merge_secrets_into_settings(raw or {})
         ensure_runtime_secrets_loaded(merged)
         report = secret_source_report(merged)
-        log_event("secret_health_v79", ok=True, reason=reason, mexc_key=bool(_api_creds(merged)[0]), mexc_secret=bool(_api_creds(merged)[1]), openai=bool(str(merged.get("openai_api_key") or "").strip()), report=report)
+        log_event("secret_health_v7", ok=True, reason=reason, mexc_key=bool(_api_creds(merged)[0]), mexc_secret=bool(_api_creds(merged)[1]), openai=bool(str(merged.get("openai_api_key") or "").strip()), report=report)
         return merged
     except Exception as e:
-        log_event("secret_health_v79", ok=False, reason=reason, error=str(e)[:500])
+        log_event("secret_health_v7", ok=False, reason=reason, error=str(e)[:500])
         return raw or {}
 
 
@@ -1242,7 +1242,7 @@ async def get_exchange(settings: dict):
         pass
     api_key, api_secret = _api_creds(settings)
     if not (api_key and api_secret):
-        log_event("balance_api_missing_v79", ok=False, report=secret_source_report(settings or {}))
+        log_event("exchange_api_missing_v7", ok=False, report=secret_source_report(settings or {}))
     proxy_enabled = bool(settings.get("proxy_enabled", False))
     proxy_url = str(settings.get("proxy_url", ""))
     desired_signature = (DEFAULT_EXCHANGE, proxy_url, proxy_enabled, api_key, bool(api_secret))
@@ -3856,7 +3856,9 @@ async def _direct_mexc_balance(settings: dict) -> tuple[dict, str]:
         pass
     api_key, api_secret = _api_creds(settings)
     if not (api_key and api_secret):
-        log_event("balance_api_missing_v79", ok=False, report=secret_source_report(settings or {}))
+        report = secret_source_report(settings or {})
+        log_event("balance_api_missing_v7", ok=False, report=report)
+        return {}, "MEXC API key/secret is missing before request; source_report=" + str(report)[:500]
     proxy_enabled = bool(settings.get("proxy_enabled", False))
     proxy_url = str(settings.get("proxy_url", "") or "")
     ex = ExchangeClient(DEFAULT_EXCHANGE, proxy_url, proxy_enabled)
@@ -4803,7 +4805,7 @@ async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_secret_backup({"mexc_api_key": api_key_new, "mexc_api_secret": api_secret_new})
         verify_s = await storage.all_settings()
         verify_key, verify_secret = _api_creds(verify_s)
-        log_event("api_keys_session_set_v79", ok=bool(verify_key and verify_secret), sqlite=True, runtime_env=True, runtime_cache=True, backup=False, key_mask=mask_secret(verify_key), secret_mask=mask_secret(verify_secret))
+        log_event("api_keys_session_set_v7", ok=bool(verify_key and verify_secret), sqlite=True, runtime_env=True, runtime_cache=True, backup=False, key_mask=mask_secret(verify_key), secret_mask=mask_secret(verify_secret))
         cleared = 0
         try:
             cleared = await storage.clear_positions()

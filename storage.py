@@ -402,26 +402,24 @@ class Storage:
             if await self.get(k) is None:
                 await self.set(k, v, bump_revision=False)
 
-        # v75: protect API keys from disappearing when SQLite/default settings are missing
-        # or Railway restarts with only env/backup available. This does not change
-        # trading logic; it only mirrors existing env/backup secrets into runtime settings.
+        # v8: simple secrets after restart.
+        # Main source is SQLite saved by /api set and /openai set.
+        # Railway/process ENV is only a fallback if SQLite is empty.
+        # No backup/cache restore is used, and ENV must not overwrite saved SQLite keys.
         try:
-            apply_secret_backup_to_env()
+            apply_secret_backup_to_env()  # no-op; kept for compatibility
             env_mexc_key = str(os.getenv("MEXC_API_KEY", "") or "").strip()
             env_mexc_secret = str(os.getenv("MEXC_API_SECRET", "") or "").strip()
             env_openai_key = str(os.getenv("OPENAI_API_KEY", "") or "").strip()
-            if env_mexc_key and not str(await self.get("mexc_api_key", "") or "").strip():
+            db_mexc_key = str(await self.get("mexc_api_key") or "").strip()
+            db_mexc_secret = str(await self.get("mexc_api_secret") or "").strip()
+            db_openai_key = str(await self.get("openai_api_key") or "").strip()
+            if env_mexc_key and not db_mexc_key:
                 await self.set("mexc_api_key", env_mexc_key, bump_revision=False)
-            if env_mexc_secret and not str(await self.get("mexc_api_secret", "") or "").strip():
+            if env_mexc_secret and not db_mexc_secret:
                 await self.set("mexc_api_secret", env_mexc_secret, bump_revision=False)
-            if env_openai_key and not str(await self.get("openai_api_key", "") or "").strip():
+            if env_openai_key and not db_openai_key:
                 await self.set("openai_api_key", env_openai_key, bump_revision=False)
-            if env_mexc_key or env_mexc_secret or env_openai_key:
-                save_secret_backup({
-                    "mexc_api_key": env_mexc_key,
-                    "mexc_api_secret": env_mexc_secret,
-                    "openai_api_key": env_openai_key,
-                })
         except Exception:
             pass
 
