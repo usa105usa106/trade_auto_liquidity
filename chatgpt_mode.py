@@ -848,6 +848,266 @@ async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
 
     return cancelled
 
+
+
+def _chatgpt_order_symbol(o: dict) -> str:
+    info = o.get("info") if isinstance(o.get("info"), dict) else {}
+    return mexc_native_symbol(o.get("symbol") or info.get("symbol") or info.get("contract") or "")
+
+
+def _chatgpt_order_id(o: dict) -> str:
+    info = o.get("info") if isinstance(o.get("info"), dict) else {}
+    return str(o.get("id") or info.get("orderId") or info.get("id") or info.get("planOrderId") or "").split(":", 1)[0].strip()
+
+
+def _chatgpt_is_entry_order(o: dict, known_order_ids: set[str] | None = None) -> bool:
+    """True only for ChatGPT entry LIMIT orders, never TP/SL/reduce-only.
+
+    This is intentionally exchange-first: it reads the live order row and only
+    uses known_order_ids after a live exchange snapshot has already been fetched.
+    """
+    known_order_ids = known_order_ids or set()
+    info = o.get("info") if isinstance(o.get("info"), dict) else {}
+    ext = str(info.get("externalOid") or info.get("clientOrderId") or o.get("clientOrderId") or "")
+    oid = _chatgpt_order_id(o)
+    reduce_only = str(o.get("reduceOnly") or info.get("reduceOnly") or "").lower() in {"1", "true", "yes"}
+    prot = str(info.get("_protection_kind") or "").lower()
+    src = str(info.get("_source_endpoint") or "").lower()
+    if reduce_only or prot in {"tp", "sl"} or "stoporder" in src or "planorder" in src:
+        return False
+    return ext.startswith("bot_entry_") or (oid and oid in known_order_ids)
+
+
+def _chatgpt_exchange_position_qty(row: dict) -> float:
+    for key in ("contracts", "amount", "positionAmt"):
+        try:
+            v = row.get(key)
+            if v not in (None, ""):
+                q = abs(float(v))
+                if q > 0:
+                    return q
+        except Exception:
+            pass
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
+    for key in ("holdVol", "vol", "positionVol", "positionAmt", "amount", "contracts"):
+        try:
+            v = info.get(key)
+            if v not in (None, ""):
+                q = abs(float(v))
+                if q > 0:
+                    return q
+        except Exception:
+            pass
+    return 0.0
+
+
+def _chatgpt_exchange_position_symbol(row: dict) -> str:
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
+    return mexc_native_symbol(row.get("symbol") or row.get("mexc_symbol") or info.get("symbol") or info.get("contract") or "")
+
+
+def _chatgpt_exchange_position_side(row: dict) -> str:
+    side = str(row.get("side") or "").lower()
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
+    raw = str(info.get("positionType") or info.get("holdSide") or info.get("side") or side).lower()
+    if side in {"short", "sell"} or raw in {"2", "short", "sell"} or "short" in raw:
+        return "SHORT"
+    return "LONG"
+
+
+def _chatgpt_exchange_position_entry(row: dict) -> float:
+    for key in ("entryPrice", "entry_price", "average"):
+        try:
+            v = row.get(key)
+            if v not in (None, ""):
+                f = float(v)
+                if f > 0:
+                    return f
+        except Exception:
+            pass
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
+    for key in ("holdAvgPrice", "openAvgPrice", "entryPrice", "avgPrice"):
+        try:
+            v = info.get(key)
+            if v not in (None, ""):
+                f = float(v)
+                if f > 0:
+                    return f
+        except Exception:
+            pass
+    return 0.0
+
+
+def _chatgpt_exchange_position_opened_at(row: dict) -> float:
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
+    for key in ("createTime", "openTime", "updateTime"):
+        try:
+            v = info.get(key)
+            if v not in (None, ""):
+                ts = float(v)
+                return ts / 1000.0 if ts > 10_000_000_000 else ts
+        except Exception:
+            pass
+    return time.time()
+
+
+def _chatgpt_exchange_position_to_local(row: dict) -> dict | None:
+    sym = _chatgpt_exchange_position_symbol(row)
+    qty = _chatgpt_exchange_position_qty(row)
+    if not sym or qty <= 0:
+        return None
+    entry = _chatgpt_exchange_position_entry(row)
+    return {
+        "symbol": sym,
+        "side": _chatgpt_exchange_position_side(row),
+        "status": "open",
+        "entry_price": entry,
+        "qty": qty,
+        "stop_price": 0.0,
+        "take_price": 0.0,
+        "strategy": "chatgpt_setup",
+        "order_id": str((row.get("info") or {}).get("positionId") or row.get("id") or ""),
+        "opened_at": _chatgpt_exchange_position_opened_at(row),
+        "chatgpt_exchange_reconciled": True,
+        "exchange_source_of_truth": True,
+        "raw_exchange_position": row,
+    }
+
+
+async def _fetch_exchange_chatgpt_snapshot(exchange_client, known_order_ids: set[str] | None = None) -> dict:
+    """Fetch live MEXC state before setup handling.
+
+    No local position cache is read here. This is the hard source of truth after
+    redeploy/restart and prevents stale SQLite rows from duplicating slots.
+    """
+    known_order_ids = known_order_ids or set()
+    chatgpt_log_event("exchange_first_snapshot_start")
+    positions: list[dict] = []
+    orders: list[dict] = []
+    try:
+        raw_positions = await exchange_client.fetch_positions()
+        for row in raw_positions or []:
+            rec = _chatgpt_exchange_position_to_local(row)
+            if rec:
+                positions.append(rec)
+        chatgpt_log_event("exchange_first_positions_loaded", count=len(positions), symbols=[p.get("symbol") for p in positions])
+    except Exception as e:
+        chatgpt_log_event("exchange_first_positions_error", error=str(e))
+        raise
+    try:
+        raw_orders = await exchange_client.fetch_open_orders()
+        for o in raw_orders or []:
+            if _chatgpt_is_entry_order(o, known_order_ids):
+                orders.append(o)
+        chatgpt_log_event("exchange_first_pending_loaded", count=len(orders), symbols=[_chatgpt_order_symbol(o) for o in orders])
+    except Exception as e:
+        chatgpt_log_event("exchange_first_pending_error", error=str(e))
+        raise
+    return {"positions": positions, "pending_orders": orders}
+
+
+async def _reconcile_chatgpt_state_from_exchange(storage, exchange_client) -> dict:
+    """Rebuild ChatGPT local cache from live exchange state.
+
+    Important invariant for setup imports:
+    - before this function completes, setup code must not use local cache;
+    - after this function completes, local cache may be used because stale
+      ChatGPT rows have been removed and live exchange rows have been written.
+    """
+    # The only local read before the exchange snapshot is order IDs to help
+    # identify old bot_entry rows on exchanges that omit externalOid in wrappers.
+    # Counts and slot decisions never use this pre-sync cache.
+    known_order_ids: set[str] = set()
+    try:
+        for pos in await storage.positions():
+            if str(pos.get("strategy") or "").lower() == "chatgpt_setup":
+                oid = str(pos.get("order_id") or "").split(":", 1)[0].strip()
+                if oid:
+                    known_order_ids.add(oid)
+    except Exception as e:
+        chatgpt_log_event("exchange_first_known_ids_cache_error", error=str(e))
+    snapshot = await _fetch_exchange_chatgpt_snapshot(exchange_client, known_order_ids)
+
+    live_symbols = {p.get("symbol") for p in snapshot.get("positions", []) if p.get("symbol")}
+    live_order_ids = {_chatgpt_order_id(o) for o in snapshot.get("pending_orders", []) if _chatgpt_order_id(o)}
+
+    # Now the exchange snapshot is in hand; it is safe to clean stale local
+    # ChatGPT rows and rebuild cache from live rows.
+    removed = []
+    try:
+        for pos in await storage.positions():
+            if str(pos.get("strategy") or "").lower() != "chatgpt_setup":
+                continue
+            sym = mexc_native_symbol(pos.get("symbol"))
+            oid = str(pos.get("order_id") or "").split(":", 1)[0].strip()
+            status = str(pos.get("status") or "").lower()
+            if status == "pending":
+                keep = bool(oid and oid in live_order_ids)
+            else:
+                keep = bool(sym and sym in live_symbols)
+            if not keep and sym:
+                await storage.remove_position(sym)
+                removed.append({"symbol": sym, "order_id": oid, "status": status})
+    except Exception as e:
+        chatgpt_log_event("exchange_first_cleanup_error", error=str(e))
+
+    upserted_positions = []
+    for rec in snapshot.get("positions", []) or []:
+        try:
+            await storage.upsert_position(rec)
+            upserted_positions.append(rec.get("symbol"))
+        except Exception as e:
+            chatgpt_log_event("exchange_first_upsert_position_error", symbol=rec.get("symbol"), error=str(e))
+
+    upserted_pending = []
+    for o in snapshot.get("pending_orders", []) or []:
+        oid = _chatgpt_order_id(o)
+        sym = _chatgpt_order_symbol(o)
+        if not sym or not oid:
+            continue
+        info = o.get("info") if isinstance(o.get("info"), dict) else {}
+        side_raw = str(o.get("side") or info.get("side") or "").lower()
+        side = "SHORT" if side_raw in {"3", "sell", "short"} else "LONG"
+        rec = {
+            "symbol": sym,
+            "side": side,
+            "status": "pending",
+            "order_type": "limit",
+            "entry_price": _safe_float(o.get("price") or info.get("price")),
+            "qty": _safe_float(o.get("amount") or info.get("vol")),
+            "stop_price": 0.0,
+            "take_price": 0.0,
+            "strategy": "chatgpt_setup",
+            "order_id": oid,
+            "opened_at": time.time(),
+            "chatgpt_exchange_reconciled": True,
+            "exchange_source_of_truth": True,
+            "raw_exchange_order": o,
+        }
+        try:
+            await storage.upsert_position(rec)
+            upserted_pending.append(sym)
+        except Exception as e:
+            chatgpt_log_event("exchange_first_upsert_pending_error", symbol=sym, order_id=oid, error=str(e))
+
+    result = {
+        "ok": True,
+        "positions": snapshot.get("positions", []),
+        "pending_orders": snapshot.get("pending_orders", []),
+        "removed_stale": removed,
+        "upserted_positions": upserted_positions,
+        "upserted_pending": upserted_pending,
+    }
+    chatgpt_log_event(
+        "exchange_first_reconcile_done",
+        positions=len(result["positions"]),
+        pending=len(result["pending_orders"]),
+        removed=len(removed),
+        upserted_positions=upserted_positions,
+        upserted_pending=upserted_pending,
+    )
+    return result
+
 async def _count_open_chatgpt_positions(storage) -> tuple[int, list[dict]]:
     """Count real active ChatGPT positions only.
 
@@ -1002,13 +1262,19 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
     if not trades:
         chatgpt_log_event("setup_execute_no_trade")
         return {"ok": True, "opened": [], "message": "NO_TRADE"}
+    # V28 hard rule: after redeploy/restart, never trust local SQLite/cache for
+    # ChatGPT slots until a live exchange-first reconciliation has completed.
+    # This prevents stale local rows from duplicating slots and prevents missing
+    # live positions (for example SKYAI) from being counted as 0/6.
+    exec_engine = ExecutionEngine(storage, exchange_client)
+    reconcile = await _reconcile_chatgpt_state_from_exchange(storage, exchange_client)
+
     bal = await exchange_client.fetch_balance()
     equity = _balance_total_usdt(bal)
     if equity <= 0:
         equity = float(os.getenv("DEFAULT_EQUITY_USDT", "100") or 100)
     margin_pct = float(setup.get("default_margin_percent_per_trade") or 10) / 100.0
     leverage = int(float(setup.get("default_leverage") or 10))
-    exec_engine = ExecutionEngine(storage, exchange_client)
     opened = []
     live = True
     cancelled_pending = await _cancel_all_old_pending_limits(storage, exec_engine)
@@ -1019,7 +1285,11 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         # Hard safety gate: never place new setup limits while an old ChatGPT
         # entry limit is still open or its cancellation was not verified.
         chatgpt_log_event("setup_abort_old_pending_cancel_failed", failed=cancel_failed[:20], count=len(cancel_failed))
-        return {"ok": False, "opened": [], "message": "OLD_PENDING_CANCEL_FAILED", "failed_cancelled_pending": cancel_failed}
+        return {"ok": False, "opened": [], "message": "OLD_PENDING_CANCEL_FAILED", "failed_cancelled_pending": cancel_failed, "reconcile": reconcile}
+
+    # Re-sync after cancellation. From here local cache may be used because it is
+    # rebuilt from real-time exchange state, not from stale pre-deploy data.
+    reconcile_after_cancel = await _reconcile_chatgpt_state_from_exchange(storage, exchange_client)
 
     open_slots, open_positions = await _count_open_chatgpt_positions(storage)
 
@@ -1040,6 +1310,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
                 "rotation": rotation_result,
                 "open_positions": open_slots,
                 "max_open_positions": CHATGPT_MAX_OPEN_POSITIONS,
+                "reconcile": reconcile_after_cancel,
             }
         limits_to_place = 1
         # Re-count after successful close so duplicate-symbol filtering below sees
@@ -1078,6 +1349,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
             "open_positions": open_slots,
             "max_open_positions": CHATGPT_MAX_OPEN_POSITIONS,
             "skipped_open_symbol": skipped_open_symbol,
+            "reconcile": reconcile_after_cancel,
         }
     if len(trades) > limits_to_place:
         skipped = trades[limits_to_place:]
@@ -1166,4 +1438,5 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         "max_open_positions": CHATGPT_MAX_OPEN_POSITIONS,
         "max_pending_limits": CHATGPT_MAX_PENDING_LIMITS,
         "limits_to_place": limits_to_place,
+        "reconcile": reconcile_after_cancel,
     }

@@ -5733,6 +5733,13 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if msg:
             lines.append(f"status={msg}")
 
+        rec = result.get("reconcile") if isinstance(result.get("reconcile"), dict) else {}
+        if rec:
+            try:
+                lines.append(f"🔄 Биржа синхронизирована: позиций {len(rec.get('positions') or [])}, pending-лимиток {len(rec.get('pending_orders') or [])}; stale cache очищен {len(rec.get('removed_stale') or [])}.")
+            except Exception:
+                lines.append("🔄 Биржа синхронизирована, кеш проверен.")
+
         cancelled_n = result.get("cancelled_pending_count")
         if cancelled_n is not None:
             lines.append(f"🧹 Старые pending-лимитки ChatGPT Mode сняты: {cancelled_n}")
