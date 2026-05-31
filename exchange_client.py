@@ -1991,6 +1991,20 @@ class ExchangeClient:
     async def mexc_place_take_profit_market(self, symbol: str, close_side: str, amount: float, trigger_price: float, client_order_id: str = "", leverage: int | None = None) -> dict:
         return await self.mexc_place_trigger_market(symbol, close_side, amount, trigger_price, kind="tp", client_order_id=client_order_id, leverage=leverage)
 
+
+    async def mexc_cancel_plan_order(self, symbol: str, order_id: str) -> dict:
+        """Cancel one active MEXC futures planorder by order id.
+
+        Used by ChatGPT mode when TP1 is filled: old full-size SL is canceled
+        before a new breakeven SL for the remaining position is placed.
+        """
+        oid = str(order_id or "").strip()
+        if not oid:
+            return {"ok": False, "reason": "missing_order_id"}
+        msym = self._mexc_symbol(symbol)
+        out = await self._mexc_private("POST", "/api/v1/private/planorder/cancel", body=[{"symbol": msym, "orderId": oid}])
+        return {"ok": True, "id": oid, "symbol": msym, "info": out}
+
     async def mexc_debug_state(self, symbol: str | None = None) -> dict:
         """Compact raw diagnostics for MEXC state without exposing credentials."""
         endpoints = [

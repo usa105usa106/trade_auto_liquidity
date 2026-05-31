@@ -23,7 +23,9 @@ CHATGPT_MODE_KEYS = {
     "boost_parallel_scan_enabled": False,
     "ai_scalping_enabled": False,
     "btc_ai_autopilot_enabled": False,
-    "live_trading": False,
+    # ChatGPT Mode disables other ENTRY strategies, but live trading must stay ON
+    # because setup.txt is meant to place real MEXC orders.
+    "live_trading": True,
 }
 
 # Simple mandatory stop-risk corridor for ChatGPT-generated setup.txt.
@@ -32,7 +34,9 @@ CHATGPT_MODE_KEYS = {
 # estimated deposit risk in % for one trade.
 CHATGPT_MIN_STOP_DISTANCE_PCT = 1.0
 CHATGPT_MAX_STOP_DISTANCE_PCT = 5.0
-CHATGPT_SETUP_VERSION = "1.2"
+CHATGPT_SETUP_VERSION = "1.4"
+CHATGPT_MAX_ACTIVE_TRADES = 3
+CHATGPT_MAX_TOTAL_SLOTS = 3  # open ChatGPT positions + new pending limits must not exceed this
 
 # MEXC regional restrictions: tokenized stock/stock-index contracts can be
 # blocked in the user's region and must never be scanned or traded in
@@ -440,25 +444,55 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
 
     task = """
 TASK FOR CHATGPT:
-Ты получил log.txt от Telegram-бота со сканом топ-200 монет.
+Ты получил log.txt от Telegram-бота со сканом топ-200 монет MEXC Futures.
 
-ЭТАП 1:
+ОБЩИЙ ПРОЦЕСС:
+1. Бот собирает данные по MEXC Futures API.
+2. Пользователь отправляет этот log.txt в ChatGPT.
+3. ChatGPT сначала выбирает 10 монет-кандидатов.
+4. Пользователь присылает только 10 скриншотов 4H по этим 10 монетам.
+5. ChatGPT по 4H оставляет 5 лучших монет.
+6. Пользователь присылает ещё 10 скриншотов: 15m и 1H по этим 5 монетам.
+7. Только после этого ChatGPT выбирает максимум 3 лучшие сделки и возвращает текстовый вердикт + готовый setup.txt файлом/блоком JSON.
+8. По умолчанию максимум 3 сделки; не расширяй setup.txt до 5/10 без отдельной просьбы пользователя.
+9. Важно: у бота есть 3 общих ChatGPT-слота: реальные открытые ChatGPT-позиции + новые pending LIMIT-ордера вместе не должны превышать 3.
+
+ЭТАП 1 ПОСЛЕ log.txt:
 1. Проанализируй общий рынок BTC/ETH и все монеты из лога.
-2. Отбери 5–10 лучших кандидатов.
+2. Отбери ровно 10 лучших кандидатов, если достойных меньше — напиши меньше и объясни почему.
 3. Раздели их на LONG / SHORT / WAIT / NO TRADE.
-4. Скажи пользователю, какие скриншоты нужны по каждой выбранной монете: обычно 15m / 1H / 4H, 1D только если нужен среднесрок.
-5. НЕ рассматривай монеты/контракты, где в названии есть STOCK: они заблокированы по региону и торговать их нельзя.
-6. На этом этапе НЕ давай финальные сделки без скриншотов.
+4. Попроси у пользователя ТОЛЬКО 4H-скриншоты по этим 10 монетам.
+5. НЕ проси сразу 15m и 1H.
+6. НЕ давай финальные сделки и НЕ создавай setup.txt на этом этапе.
+7. НЕ рассматривай монеты/контракты, где в названии есть STOCK: они заблокированы по региону и торговать их нельзя.
 
-ЭТАП 2 ПОСЛЕ СКРИНШОТОВ:
+ЭТАП 2 ПОСЛЕ 10 СКРИНШОТОВ 4H:
+1. Проанализируй 4H-структуру выбранных 10 монет.
+2. Оставь 5 лучших монет.
+3. Попроси у пользователя только 15m и 1H скриншоты по этим 5 монетам.
+4. НЕ создавай setup.txt до получения 15m и 1H по этим 5 монетам.
+
+ЭТАП 3 ПОСЛЕ ДОПОЛНИТЕЛЬНЫХ 10 СКРИНШОТОВ 15m/1H:
 1. Выбери максимум 3 лучшие сделки.
-2. Дай текстовый вердикт и ОБЯЗАТЕЛЬНО верни один блок setup.txt в JSON-формате.
-3. В setup.txt каждая сделка должна содержать: symbol, direction, order_type, entry или entry_reference, stop_loss, take_profits [{price,size_percent}], invalidation, comment, risk.stop_distance_percent.
-   SYMBOL всегда указывай в MEXC-native формате: BTC_USDT, ETH_USDT, BCH_USDT. Не используй BTC/USDT:USDT.
-4. Для LIMIT добавь cancel_if_not_filled_minutes и cancel_if_tp1_before_entry=true.
-5. Для MARKET добавь max_price_deviation_percent.
-6. Не указывай размер позиции в монетах: бот сам использует 10% депозита на каждую сделку, 10x leverage, isolated.
-7. Если хороших сделок нет, верни trades: [] и verdict: NO_TRADE.
+2. Дай короткий текстовый вердикт.
+3. ОБЯЗАТЕЛЬНО верни готовый setup.txt в JSON-формате так, чтобы пользователь мог сразу скачать файл и отправить его боту.
+4. Название файла может быть setup.txt, setup-1.txt, setup-2.txt и так далее — бот принимает любые .txt с корректным JSON setup.
+5. В setup.txt каждая сделка должна содержать: symbol, direction, order_type, entry или entry_reference, stop_loss, take_profits [{price,size_percent}], invalidation, comment, risk.stop_distance_percent. Для третьего тейка используй size_percent="REMAINDER", а не 30.
+6. Для ChatGPT Mode запрещены trailing/scalp exits и paper_fill: LIMIT-сделка считается открытой только после реального fill на MEXC.
+7. SYMBOL всегда указывай в MEXC-native формате: BTC_USDT, ETH_USDT, BCH_USDT. Не используй BTC/USDT:USDT.
+8. Для LIMIT добавь cancel_if_not_filled_minutes и cancel_if_tp1_before_entry=true.
+9. Для MARKET добавь max_price_deviation_percent.
+10. Не указывай размер позиции в монетах: бот сам использует 10% депозита на каждую сделку, 10x leverage, isolated.
+11. Если хороших сделок нет, верни trades: [] и verdict: NO_TRADE.
+12. В setup.txt всегда ставь max_active_trades=3.
+13. Если часть старых ChatGPT-сделок уже стала реальными позициями, новые лимитки ставятся только на свободные слоты.
+
+SCREENSHOT RULES FOR CHATGPT:
+1. После log.txt проси только 4H по 10 монетам.
+2. После 4H отбери 5 монет.
+3. По 5 монетам проси только 15m и 1H.
+4. Итого максимум 20 скриншотов: 10 скринов 4H + 10 скринов 15m/1H.
+5. Не проси 30 скриншотов сразу.
 
 BLOCKED SYMBOL RULES FOR CHATGPT:
 1. Любой symbol, где есть substring STOCK, запрещён: MSFTSTOCK_USDT, STXSTOCKUSDT и любые аналоги.
@@ -474,9 +508,28 @@ RISK RULES FOR CHATGPT:
 6. В setup.txt обязательно укажи risk.stop_distance_percent и risk.estimated_deposit_risk_percent.
 7. Бот по умолчанию использует 10% депозита на сделку, 10x leverage, isolated; при таком режиме stop_distance_percent примерно равен риску по депозиту в процентах.
 
+TRADE MANAGEMENT RULES FOR CHATGPT MODE:
+1. trailing_enabled=false.
+2. scalp_exit_enabled=false.
+3. paper_fill_enabled=false.
+4. breakeven_after_tp1_only=true.
+5. LIMIT сначала PENDING_LIMIT, SL/TP ставятся только после реального fill на MEXC.
+6. После исполнения TP1 бот должен перенести STOP_LOSS по остатку позиции в безубыток: breakeven_price=ENTRY.
+7. В take_profits используй схему: TP1=35%, TP2=35%, TP3=size_percent="REMAINDER". Третий тейк закрывает весь остаток позиции после округлений MEXC.
+
+NEW SETUP REPLACEMENT RULES:
+1. При загрузке нового setup.txt бот отменяет все старые pending LIMIT-ордера ChatGPT Mode, которые ещё не исполнены.
+2. Открытые позиции бот не трогает.
+3. После отмены старых pending-лимиток бот считает реальные открытые ChatGPT-позиции.
+4. Свободные слоты = 3 - количество открытых ChatGPT-позиций.
+5. Бот ставит из нового setup.txt только столько новых лимиток, сколько есть свободных слотов.
+6. Если уже открыто 3 ChatGPT-позиции, новые лимитки не ставятся.
+7. Открытые позиции бот не трогает.
+8. По умолчанию максимум 3 сделки и максимум 3 общих ChatGPT-слота.
+
 СТРОГИЙ ФОРМАТ setup.txt:
 {
-  "setup_version": "1.2",
+  "setup_version": "1.4",
   "mode": "AUTO_OPEN",
   "exchange": "MEXC_FUTURES",
   "margin_mode": "ISOLATED",
@@ -488,6 +541,13 @@ RISK RULES FOR CHATGPT:
   "risk_rules": {
     "min_stop_distance_percent": 1.0,
     "max_stop_distance_percent": 5.0
+  },
+  "trade_management": {
+    "trailing_enabled": false,
+    "scalp_exit_enabled": false,
+    "paper_fill_enabled": false,
+    "breakeven_after_tp1_only": true,
+    "breakeven_price": "ENTRY"
   },
   "blocked_symbol_substrings": ["STOCK"],
   "symbol_format": "MEXC_NATIVE_UNDERSCORE",
@@ -545,13 +605,14 @@ def validate_setup(data: dict) -> list[dict]:
     chatgpt_log_event("setup_validate_start", setup_version=(data or {}).get("setup_version") if isinstance(data, dict) else None)
     if not isinstance(data, dict):
         raise ValueError("setup JSON must be an object")
-    if str(data.get("setup_version")) not in {"1.0", "1.1", "1.2"}:
+    if str(data.get("setup_version")) not in {"1.0", "1.1", "1.2", "1.3", "1.4"}:
         raise ValueError("unsupported setup_version")
     trades = data.get("trades") or []
     if not isinstance(trades, list):
         raise ValueError("trades must be a list")
-    if len(trades) > int(data.get("max_active_trades") or 3):
-        raise ValueError("too many trades")
+    max_trades = CHATGPT_MAX_ACTIVE_TRADES
+    if len(trades) > max_trades:
+        raise ValueError(f"too many trades: max {max_trades} for ChatGPT Mode")
     valid_until = str(data.get("valid_until_utc") or "").replace("UTC", "").strip()
     if valid_until:
         try:
@@ -595,14 +656,38 @@ def validate_setup(data: dict) -> list[dict]:
         tps = t.get("take_profits") or []
         if not tps:
             raise ValueError(f"TRADE_{i}: take_profits required")
-        total = sum(_safe_float(x.get("size_percent")) for x in tps if isinstance(x, dict))
-        if abs(total - 100.0) > 0.5:
-            raise ValueError(f"TRADE_{i}: TP sizes must sum to 100")
+        if not isinstance(tps, list):
+            raise ValueError(f"TRADE_{i}: take_profits must be a list")
+
+        has_remainder = False
+        numeric_total = 0.0
+        for idx, x in enumerate(tps):
+            if not isinstance(x, dict):
+                raise ValueError(f"TRADE_{i}: invalid TP row")
+            raw_size = x.get("size_percent")
+            if isinstance(raw_size, str) and raw_size.strip().upper() == "REMAINDER":
+                if idx != len(tps) - 1:
+                    raise ValueError(f"TRADE_{i}: REMAINDER is allowed only on the last TP")
+                has_remainder = True
+            else:
+                numeric_total += _safe_float(raw_size)
+
+        if has_remainder:
+            if numeric_total <= 0 or numeric_total >= 100.0:
+                raise ValueError(f"TRADE_{i}: numeric TP sizes before REMAINDER must be >0 and <100")
+        else:
+            if abs(numeric_total - 100.0) > 0.5:
+                raise ValueError(f"TRADE_{i}: TP sizes must sum to 100 or last TP must be REMAINDER")
+
         clean_tps = []
-        for tp in tps:
+        for idx, tp in enumerate(tps):
             p = _safe_float(tp.get("price") if isinstance(tp, dict) else 0)
-            s = _safe_float(tp.get("size_percent") if isinstance(tp, dict) else 0)
-            if p <= 0 or s <= 0:
+            raw_size = tp.get("size_percent") if isinstance(tp, dict) else 0
+            if isinstance(raw_size, str) and raw_size.strip().upper() == "REMAINDER":
+                s: float | str = "REMAINDER"
+            else:
+                s = _safe_float(raw_size)
+            if p <= 0 or (s != "REMAINDER" and float(s) <= 0):
                 raise ValueError(f"TRADE_{i}: invalid TP")
             if direction == "LONG" and p <= entry:
                 raise ValueError(f"TRADE_{i}: LONG TP must be above entry")
@@ -620,6 +705,65 @@ def validate_setup(data: dict) -> list[dict]:
     chatgpt_log_event("setup_validate_ok", trades=len(out))
     return out
 
+
+async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
+    """Cancel all old ChatGPT pending LIMITs before applying a new setup.
+
+    New setup.txt is treated as the fresh source of truth for pending entries.
+    Only unfilled ChatGPT setup LIMIT entries are cancelled. Real open positions
+    are never touched.
+    """
+    cancelled = []
+    try:
+        positions = await storage.positions()
+    except Exception as e:
+        chatgpt_log_event("cancel_old_pending_load_error", error=str(e))
+        return cancelled
+
+    for pos in positions or []:
+        sym = str(pos.get("symbol") or "").upper()
+        strategy = str(pos.get("strategy") or "").lower()
+        status = str(pos.get("status") or "").lower()
+        order_type = str(pos.get("order_type") or "").lower()
+        if strategy != "chatgpt_setup" or status != "pending" or order_type != "limit":
+            if strategy == "chatgpt_setup":
+                chatgpt_log_event("cancel_old_pending_skip", symbol=sym, status=status, strategy=strategy, order_type=order_type)
+            continue
+        try:
+            chatgpt_log_event("cancel_old_pending_start", symbol=sym, order_id=pos.get("order_id"), old_entry=pos.get("entry_price"))
+            res = await exec_engine.cancel_entry(pos, live=True, reason="chatgpt_new_setup_cancel_old_pending")
+            chatgpt_log_event("cancel_old_pending_done", symbol=sym, order_id=pos.get("order_id"), result=res)
+            cancelled.append({"symbol": sym, "order_id": pos.get("order_id"), "ok": True, "result": res})
+        except Exception as e:
+            chatgpt_log_event("cancel_old_pending_error", symbol=sym, order_id=pos.get("order_id"), error=str(e))
+            cancelled.append({"symbol": sym, "order_id": pos.get("order_id"), "ok": False, "error": str(e)})
+    return cancelled
+
+async def _count_open_chatgpt_slots(storage) -> tuple[int, list[dict]]:
+    """Count real active ChatGPT positions after old pending limits are cancelled.
+
+    Pending LIMIT entries are not counted here because execute_setup cancels old
+    pending ChatGPT limits before calling this helper. We count only open/closing
+    positions so a fresh setup can fill remaining free slots up to 3 total.
+    """
+    active: list[dict] = []
+    try:
+        positions = await storage.positions()
+    except Exception as e:
+        chatgpt_log_event("slot_count_load_error", error=str(e))
+        return 0, active
+
+    for pos in positions or []:
+        strategy = str(pos.get("strategy") or "").lower()
+        status = str(pos.get("status") or "open").lower()
+        if strategy != "chatgpt_setup":
+            continue
+        if status in {"open", "closing"}:
+            active.append(pos)
+        elif status == "pending":
+            chatgpt_log_event("slot_count_pending_ignored_after_cancel", symbol=pos.get("symbol"), order_id=pos.get("order_id"), status=status)
+    chatgpt_log_event("slot_count_open_positions", count=len(active), symbols=[p.get("symbol") for p in active])
+    return len(active), active
 
 def _balance_total_usdt(balance: dict) -> float:
     for key in ("USDT", "usdt"):
@@ -650,7 +794,36 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
     exec_engine = ExecutionEngine(storage, exchange_client)
     opened = []
     live = True
-    chatgpt_log_event("setup_execute_balance", equity=equity, margin_pct=margin_pct, leverage=leverage, trades=len(trades))
+    cancelled_pending = await _cancel_all_old_pending_limits(storage, exec_engine)
+    if cancelled_pending:
+        chatgpt_log_event("setup_cancelled_old_pending_limits", items=cancelled_pending)
+
+    open_slots, open_positions = await _count_open_chatgpt_slots(storage)
+    free_slots = max(0, CHATGPT_MAX_TOTAL_SLOTS - open_slots)
+    requested_trades = len(trades)
+    if free_slots <= 0:
+        chatgpt_log_event(
+            "setup_no_free_slots",
+            max_total_slots=CHATGPT_MAX_TOTAL_SLOTS,
+            open_slots=open_slots,
+            open_symbols=[p.get("symbol") for p in open_positions],
+            requested_trades=requested_trades,
+        )
+        return {"ok": True, "opened": [], "message": "NO_FREE_CHATGPT_SLOTS", "open_slots": open_slots, "max_total_slots": CHATGPT_MAX_TOTAL_SLOTS}
+    if len(trades) > free_slots:
+        skipped = trades[free_slots:]
+        trades = trades[:free_slots]
+        chatgpt_log_event(
+            "setup_trades_trimmed_to_free_slots",
+            max_total_slots=CHATGPT_MAX_TOTAL_SLOTS,
+            open_slots=open_slots,
+            free_slots=free_slots,
+            requested_trades=requested_trades,
+            accepted_trades=len(trades),
+            skipped_symbols=[t.get("symbol") for t in skipped],
+        )
+
+    chatgpt_log_event("setup_execute_balance", equity=equity, margin_pct=margin_pct, leverage=leverage, trades=len(trades), requested_trades=requested_trades, cancelled_pending=len(cancelled_pending), open_slots=open_slots, free_slots=free_slots, max_active_trades=CHATGPT_MAX_ACTIVE_TRADES, max_total_slots=CHATGPT_MAX_TOTAL_SLOTS)
     for t in trades:
         entry = float(t["entry"])
         notional = equity * margin_pct * leverage
@@ -669,7 +842,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
             risk_pct=0.0,
             confidence=float(t.get("confidence") or 0),
             strategy="chatgpt_setup",
-            max_open_positions=int(setup.get("max_active_trades") or 3),
+            max_open_positions=CHATGPT_MAX_ACTIVE_TRADES,
             planned_notional_usdt=notional,
             expected_margin_usdt=equity * margin_pct,
             max_margin_per_position_usdt=equity * margin_pct,
@@ -683,6 +856,13 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
                 "cancel_if_stop_before_entry": _truthy(t.get("cancel_if_stop_before_entry", False)),
                 "max_price_deviation_percent": float(t.get("max_price_deviation_percent") or 0),
                 "risk": t.get("risk") or {},
+                "trade_management": {
+                    "trailing_enabled": False,
+                    "scalp_exit_enabled": False,
+                    "paper_fill_enabled": False,
+                    "breakeven_after_tp1_only": True,
+                    "breakeven_price": "ENTRY",
+                },
             },
         )
         # Market stale-price guard.

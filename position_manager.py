@@ -1,6 +1,7 @@
 import time
 import os
 from debug_log import log_event
+from chatgpt_runtime_logger import chatgpt_log_event
 from scalp_exit_engine import ScalpExitPolicy
 from protection_engine import ProtectionEngine
 
@@ -307,18 +308,170 @@ class PositionManager:
             return 0.0
         return (price-entry)/entry*100 if str(pos.get("side")).upper()=="LONG" else (entry-price)/entry*100
 
+
+
+    def _position_symbol_matches(self, row: dict, symbol: str) -> bool:
+        try:
+            return bool(self.execution_engine._position_symbol_matches(row, symbol))
+        except Exception:
+            row_symbol = str(row.get("symbol") or row.get("mexc_symbol") or "")
+            return row_symbol.replace(":USDT", "").replace("/", "_").upper() == str(symbol or "").replace("/", "_").upper()
+
+    def _exchange_row_contracts(self, row: dict) -> float:
+        try:
+            return float(self.execution_engine._exchange_row_contracts(row))
+        except Exception:
+            info = row.get("info", {}) if isinstance(row.get("info"), dict) else {}
+            for key in ("contracts", "qty", "amount", "size"):
+                try:
+                    v = row.get(key)
+                    if v not in (None, ""):
+                        return abs(float(v))
+                except Exception:
+                    pass
+            for key in ("holdVol", "vol", "positionAmt"):
+                try:
+                    v = info.get(key)
+                    if v not in (None, ""):
+                        return abs(float(v))
+                except Exception:
+                    pass
+            return 0.0
+
+    async def _find_exchange_position_row(self, symbol: str) -> dict | None:
+        try:
+            if hasattr(self.execution_engine, "_find_exchange_position_row"):
+                row = await self.execution_engine._find_exchange_position_row(symbol)
+                if row:
+                    return row
+        except Exception:
+            pass
+        try:
+            rows = await self.execution_engine.exchange_client.fetch_positions([symbol])
+        except Exception:
+            rows = []
+        for row in rows or []:
+            if self._position_symbol_matches(row, symbol) and self._exchange_row_contracts(row) > 0:
+                return row
+        return None
+
+    async def _chatgpt_move_sl_to_be_after_tp1(self, pos: dict, live: bool) -> dict | None:
+        """For ChatGPT setup positions: after TP1 partially closes on MEXC,
+        cancel the old full-size SL and place a new SL at entry for the remaining position.
+        No trailing/scalp logic is used.
+        """
+        if not live:
+            return None
+        if str(pos.get("strategy") or "").lower() != "chatgpt_setup":
+            return None
+        if pos.get("chatgpt_tp1_breakeven_done") or pos.get("breakeven_moved"):
+            return None
+        details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
+        mgmt = details.get("trade_management") if isinstance(details.get("trade_management"), dict) else {}
+        if not self._truthy(mgmt.get("breakeven_after_tp1_only", pos.get("breakeven_after_tp1_only", True)), True):
+            return None
+        tps = details.get("chatgpt_take_profits") or []
+        if not isinstance(tps, list) or not tps:
+            return None
+        try:
+            tp1_size_pct = float((tps[0] or {}).get("size_percent") or 0)
+        except Exception:
+            tp1_size_pct = 0.0
+        if tp1_size_pct <= 0:
+            return None
+        symbol = pos.get("symbol")
+        entry = float(pos.get("entry_price") or 0)
+        side = str(pos.get("side") or "").upper()
+        if not symbol or entry <= 0 or side not in {"LONG", "SHORT"}:
+            return None
+
+        row = await self._find_exchange_position_row(symbol)
+        if not row:
+            chatgpt_log_event("tp1_be_check_no_exchange_position", symbol=symbol)
+            return None
+        cur_qty = self._exchange_row_contracts(row)
+        chatgpt_log_event("tp1_be_check", symbol=symbol, current_qty=cur_qty, local_qty=pos.get("qty"), original_qty=pos.get("chatgpt_original_qty"), entry=entry)
+        if cur_qty <= 0:
+            return None
+        orig_qty = float(pos.get("chatgpt_original_qty") or pos.get("qty") or 0)
+        if orig_qty <= 0:
+            orig_qty = cur_qty
+            pos["chatgpt_original_qty"] = cur_qty
+            await self.storage.upsert_position(pos)
+            chatgpt_log_event("tp1_be_original_qty_initialized", symbol=symbol, original_qty=cur_qty)
+            return None
+        # Detect TP1 by real exchange size reduction. Use 75% of expected TP1
+        # so rounding/contract-size differences do not block BE forever.
+        expected_reduction = orig_qty * min(max(tp1_size_pct, 0.0), 100.0) / 100.0
+        actual_reduction = orig_qty - cur_qty
+        if expected_reduction <= 0 or actual_reduction < expected_reduction * 0.75:
+            chatgpt_log_event("tp1_be_not_yet", symbol=symbol, original_qty=orig_qty, current_qty=cur_qty, expected_reduction=expected_reduction, actual_reduction=actual_reduction)
+            return None
+
+        chatgpt_log_event("tp1_hit_detected", symbol=symbol, original_qty=orig_qty, current_qty=cur_qty, expected_reduction=expected_reduction, actual_reduction=actual_reduction)
+        old_sl_id = str(pos.get("sl_order_id") or "")
+        if old_sl_id:
+            try:
+                if hasattr(self.execution_engine.exchange_client, "mexc_cancel_plan_order"):
+                    cancel_res = await self.execution_engine.exchange_client.mexc_cancel_plan_order(symbol, old_sl_id)
+                else:
+                    cancel_res = await self.execution_engine.exchange_client.cancel_order(old_sl_id, symbol)
+                log_event("chatgpt_tp1_cancel_old_sl", symbol=symbol, old_sl_order_id=old_sl_id, result=cancel_res, ok=True)
+                chatgpt_log_event("breakeven_cancel_old_sl_ok", symbol=symbol, old_sl_order_id=old_sl_id, result=cancel_res)
+            except Exception as e:
+                # Do not place a duplicate SL if old full-size SL could not be canceled.
+                pos["chatgpt_tp1_be_cancel_sl_error"] = str(e)[:240]
+                pos["updated_at"] = time.time()
+                await self.storage.upsert_position(pos)
+                log_event("chatgpt_tp1_cancel_old_sl_error", symbol=symbol, old_sl_order_id=old_sl_id, error=str(e), ok=False)
+                chatgpt_log_event("breakeven_cancel_old_sl_error", symbol=symbol, old_sl_order_id=old_sl_id, error=str(e))
+                return {"type": "chatgpt_tp1_be_wait_cancel_sl", "symbol": symbol, "error": str(e)[:160]}
+        try:
+            chatgpt_log_event("breakeven_new_sl_start", symbol=symbol, qty=cur_qty, stop_price=entry)
+            order = await self.execution_engine._create_stop_market_order(symbol, side, cur_qty, entry)
+        except Exception as e:
+            pos["chatgpt_tp1_be_new_sl_error"] = str(e)[:240]
+            pos["updated_at"] = time.time()
+            await self.storage.upsert_position(pos)
+            log_event("chatgpt_tp1_new_be_sl_error", symbol=symbol, qty=cur_qty, entry=entry, error=str(e), ok=False)
+            chatgpt_log_event("breakeven_new_sl_error", symbol=symbol, qty=cur_qty, entry=entry, error=str(e))
+            return {"type": "chatgpt_tp1_be_wait_new_sl", "symbol": symbol, "error": str(e)[:160]}
+        pos["qty"] = cur_qty
+        pos["stop_price"] = entry
+        pos["sl_order_id"] = order.get("id")
+        pos["sl_raw"] = order
+        pos["breakeven_moved"] = True
+        pos["chatgpt_tp1_breakeven_done"] = True
+        pos["chatgpt_tp1_be_qty"] = cur_qty
+        pos["chatgpt_tp1_be_price"] = entry
+        pos["updated_at"] = time.time()
+        pos["protection_checked_at"] = time.time()
+        await self.storage.upsert_position(pos)
+        log_event("chatgpt_tp1_breakeven_moved", symbol=symbol, qty=cur_qty, stop_price=entry, old_sl_order_id=old_sl_id, new_sl_order_id=order.get("id"), ok=True)
+        chatgpt_log_event("breakeven_move_ok", symbol=symbol, qty=cur_qty, stop_price=entry, old_sl_order_id=old_sl_id, new_sl_order_id=order.get("id"), order=order)
+        return {"type": "chatgpt_tp1_breakeven", "symbol": symbol, "stop_price": entry, "qty": cur_qty}
+
     async def _manage_pending(self, pos: dict, live: bool) -> dict | None:
         now = time.time()
         opened = float(pos.get("opened_at") or now)
         symbol = pos["symbol"]
+        strategy = str(pos.get("strategy") or "").lower()
+        is_chatgpt_setup = strategy == "chatgpt_setup"
+        # ChatGPT setup mode places REAL MEXC limit orders even when the global
+        # live_trading toggle was turned off to disable other strategies.  Never
+        # simulate these as paper fills.  Keep them PENDING until MEXC confirms
+        # the order is filled or a real exchange position exists.
+        if is_chatgpt_setup:
+            live = True
+            chatgpt_log_event("pending_limit_check", symbol=symbol, status=pos.get("status"), order_id=pos.get("order_id"), opened_at=pos.get("opened_at"), entry=pos.get("entry_price"), stop=pos.get("stop_price"), take=pos.get("take_price"))
         if not live:
-            # Paper limit orders are simulated as filled on the next management
-            # tick; no private exchange endpoint is needed, but the pending
-            # lifecycle is still visible in storage after placement.
+            # Paper mode simulation is allowed only for non-ChatGPT strategies.
             pos["status"] = "open"
             pos["updated_at"] = now
             pos = self.execution_engine._decorate_position_metrics(pos)
             await self.storage.upsert_position(pos)
+            if is_chatgpt_setup:
+                chatgpt_log_event("ERROR_chatgpt_paper_fill_attempt_blocked", symbol=symbol)
             return {"type": "paper_limit_filled", "symbol": symbol}
 
         # Timeout: cancel stale limit entry and free slot.
@@ -331,7 +484,11 @@ class PositionManager:
         except Exception:
             pass
         if now - opened >= limit_timeout_sec:
+            if is_chatgpt_setup:
+                chatgpt_log_event("pending_limit_timeout_cancel_start", symbol=symbol, age_sec=round(now-opened, 2), timeout_sec=limit_timeout_sec, order_id=pos.get("order_id"))
             res = await self.execution_engine.cancel_entry(pos, live=True, reason="limit_timeout")
+            if is_chatgpt_setup:
+                chatgpt_log_event("pending_limit_timeout_cancel_done", symbol=symbol, result=res)
             return {"type": "limit_timeout", "symbol": symbol, "result": res}
 
         # ChatGPT LIMIT safety: if price already reached TP1 before entry fill,
@@ -349,10 +506,18 @@ class PositionManager:
                 cur = float(ticker.get("last") or ticker.get("close") or 0)
                 if cur > 0:
                     if cancel_tp1 and tp1 > 0 and ((side_u == "LONG" and cur >= tp1) or (side_u == "SHORT" and cur <= tp1)):
+                        if is_chatgpt_setup:
+                            chatgpt_log_event("pending_limit_stale_tp1_before_entry", symbol=symbol, current_price=cur, tp1=tp1, order_id=pos.get("order_id"))
                         res = await self.execution_engine.cancel_entry(pos, live=True, reason="tp1_touched_before_entry")
+                        if is_chatgpt_setup:
+                            chatgpt_log_event("pending_limit_stale_tp1_cancel_done", symbol=symbol, result=res)
                         return {"type": "limit_stale_tp1_before_entry", "symbol": symbol, "result": res}
                     if cancel_sl and sl > 0 and ((side_u == "LONG" and cur <= sl) or (side_u == "SHORT" and cur >= sl)):
+                        if is_chatgpt_setup:
+                            chatgpt_log_event("pending_limit_stale_stop_before_entry", symbol=symbol, current_price=cur, stop=sl, order_id=pos.get("order_id"))
                         res = await self.execution_engine.cancel_entry(pos, live=True, reason="stop_touched_before_entry")
+                        if is_chatgpt_setup:
+                            chatgpt_log_event("pending_limit_stale_stop_cancel_done", symbol=symbol, result=res)
                         return {"type": "limit_stale_stop_before_entry", "symbol": symbol, "result": res}
         except Exception:
             pass
@@ -361,19 +526,33 @@ class PositionManager:
         # enough: it may mean filled, canceled, rejected, or expired.
         oid = str(pos.get("order_id") or "")
         if not oid:
+            if is_chatgpt_setup:
+                chatgpt_log_event("pending_limit_sync_warning", symbol=symbol, error="missing order_id")
             return {"type": "pending_sync_warning", "symbol": symbol, "error": "missing order_id"}
         try:
+            if is_chatgpt_setup:
+                chatgpt_log_event("pending_limit_fetch_order_start", symbol=symbol, order_id=oid)
             order = await self.execution_engine.exchange_client.fetch_order(oid, symbol)
             status = str(order.get("status") or "").lower()
             filled = float(order.get("filled") or 0)
             amount = float(order.get("amount") or pos.get("qty") or 0)
             avg = float(order.get("average") or order.get("price") or pos.get("entry_price") or 0)
+            if is_chatgpt_setup:
+                chatgpt_log_event("pending_limit_fetch_order_result", symbol=symbol, order_id=oid, status=status, filled=filled, amount=amount, average=avg, raw=order)
             if status in {"closed", "filled"} or (amount > 0 and filled >= amount * 0.999):
                 pos["status"] = "open"
                 pos["entry_price"] = avg or pos.get("entry_price")
+                if filled > 0:
+                    pos["qty"] = filled
+                    pos.setdefault("chatgpt_original_qty", filled)
                 pos["updated_at"] = now
                 pos = self.execution_engine._decorate_position_metrics(pos)
+                if is_chatgpt_setup:
+                    chatgpt_log_event("limit_filled_confirmed", symbol=symbol, order_id=oid, filled=filled, amount=amount, entry_price=pos.get("entry_price"), qty=pos.get("qty"))
+                    chatgpt_log_event("sl_tp_place_start", symbol=symbol, qty=pos.get("qty"), stop=pos.get("stop_price"), take=pos.get("take_price"), tps=details.get("chatgpt_take_profits"))
                 protection = await self.execution_engine.place_protection_orders(pos, live=True)
+                if is_chatgpt_setup:
+                    chatgpt_log_event("sl_tp_place_result", symbol=symbol, ok=bool(protection.get("ok")), protection=protection)
                 pos.update(protection)
                 await self.storage.upsert_position(pos)
                 if not protection.get("ok"):
@@ -390,14 +569,22 @@ class PositionManager:
                     # to reattach exchange protection.
                     pos["auto_close_on_protection_failed_ignored"] = True
                     await self.storage.upsert_position(pos)
+                    if is_chatgpt_setup:
+                        chatgpt_log_event("sl_tp_protection_failed_local_monitoring", symbol=symbol, protection=protection)
                     return {"type": "protection_local", "symbol": symbol, "protection": protection}
+                if is_chatgpt_setup:
+                    chatgpt_log_event("limit_position_open_ready", symbol=symbol, status="open", protection_mode=protection.get("protection_mode"), sl_order_id=protection.get("sl_order_id"), tp1_order_id=protection.get("tp1_order_id"), tp2_order_id=protection.get("tp2_order_id"), tp3_order_id=protection.get("tp3_order_id"))
                 return {"type": "limit_filled", "symbol": symbol}
             if status in {"canceled", "cancelled", "rejected", "expired"}:
+                if is_chatgpt_setup:
+                    chatgpt_log_event("pending_limit_terminal_status", symbol=symbol, order_id=oid, status=status, order=order)
                 await self.storage.remove_position(symbol)
                 await self.storage.set_lock(symbol, 30, f"limit_{status}")
                 return {"type": f"limit_{status}", "symbol": symbol}
         except Exception as e:
             # On sync error keep pending but don't duplicate entries; occupied slot remains used.
+            if is_chatgpt_setup:
+                chatgpt_log_event("pending_limit_sync_error", symbol=symbol, order_id=oid, error=str(e))
             return {"type": "pending_sync_warning", "symbol": symbol, "error": str(e)}
         return None
 
@@ -414,6 +601,11 @@ class PositionManager:
             if status not in {"open"}:
                 continue
             symbol=pos["symbol"]
+            strategy = str(pos.get("strategy") or "").lower()
+            is_chatgpt_setup = strategy == "chatgpt_setup"
+            if is_chatgpt_setup:
+                # ChatGPT setup positions must stay live-managed even if old entry modes are paused.
+                live = True
             if await self._is_terminal_closed(symbol):
                 # Ignore stale post-close callbacks such as breakeven moved after
                 # SL/TP/time-stop. CLOSED is terminal.
@@ -425,6 +617,18 @@ class PositionManager:
             wd = await self._protection_watchdog(pos, live)
             if wd:
                 events.append(wd)
+            if is_chatgpt_setup:
+                be_ev = await self._chatgpt_move_sl_to_be_after_tp1(pos, True)
+                if be_ev:
+                    events.append(be_ev)
+                    # reload local fields after BE update
+                    try:
+                        for _p in await self.storage.positions():
+                            if str(_p.get("symbol") or "") == str(symbol):
+                                pos = _p
+                                break
+                    except Exception:
+                        pass
             try:
                 price=await price_provider(symbol)
             except Exception as e:
@@ -433,7 +637,6 @@ class PositionManager:
             if not price:
                 continue
             side=str(pos.get("side")).upper(); stop=float(pos.get("stop_price") or 0); take=float(pos.get("take_price") or 0); entry=float(pos.get("entry_price") or 0); opened=float(pos.get("opened_at") or now); pnl=self.pnl_pct(pos, price)
-            strategy = str(pos.get("strategy") or "").lower()
             is_liquidity_retest = strategy == "liquidity_retest"
             is_ai_scalping = strategy == "ai_scalping"
             is_boost_scalping = strategy == "boost_scalping"
@@ -452,9 +655,13 @@ class PositionManager:
             # before the price reaches the calculated dump target.
             impulse_manage_only_tpsl = str(await self._setting("impulse_dump_manage_only_tpsl", os.getenv("IMPULSE_DUMP_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
             orderflow_manage_only_tpsl = str(await self._setting("orderflow_impulse_manage_only_tpsl", os.getenv("ORDERFLOW_IMPULSE_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
-            manage_only_tpsl = (is_ai_scalping and ai_manage_only_tpsl) or (is_boost_scalping and boost_manage_only_tpsl) or (is_impulse_dump and impulse_manage_only_tpsl) or ((is_orderflow_impulse or is_cascade_hunter or is_strongest_coin) and orderflow_manage_only_tpsl) or is_knife_reversal
+            # ChatGPT setup mode is managed ONLY by explicit SL and TP orders
+            # from setup.txt.  Do not apply generic scalp breakeven, trailing,
+            # smart time-stop, or local fake-profit exits.
+            manage_only_tpsl = (is_ai_scalping and ai_manage_only_tpsl) or (is_boost_scalping and boost_manage_only_tpsl) or (is_impulse_dump and impulse_manage_only_tpsl) or ((is_orderflow_impulse or is_cascade_hunter or is_strongest_coin) and orderflow_manage_only_tpsl) or is_knife_reversal or is_chatgpt_setup
             policy = await self._refresh_scalp_policy()
-            policy.update_best_pnl(pos, pnl)
+            if not is_chatgpt_setup:
+                policy.update_best_pnl(pos, pnl)
             if manage_only_tpsl:
                 move_be, new_stop = False, 0.0
             elif is_liquidity_retest:

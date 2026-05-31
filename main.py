@@ -5593,7 +5593,7 @@ async def _chatgpt_scan_background_job(app, chat_id: int):
                 chat_id=chat_id,
                 document=f,
                 filename="log.txt",
-                caption="✅ log.txt готов. Скинь его ChatGPT. Потом загрузи сюда setup.txt JSON.",
+                caption="✅ log.txt готов. Скинь его ChatGPT. После финального анализа загрузи сюда setup.txt / setup-1.txt / любой .txt с JSON setup.",
             )
         await storage.set("chatgpt_waiting_setup", True)
         chatgpt_log_event("mode_waiting_setup", log_path=log_path)
@@ -5680,7 +5680,7 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = str(getattr(doc, "file_name", "") or "")
     if not doc or not name.lower().endswith(".txt"):
         chatgpt_log_event("setup_file_rejected_extension", filename=name)
-        await reply(update, "Жду именно setup.txt в JSON-формате.", reply_markup=MAIN_MENU)
+        await reply(update, "Жду setup.txt / setup-1.txt / любой .txt с JSON setup.", reply_markup=MAIN_MENU)
         return
     try:
         chatgpt_log_event("setup_file_received", filename=name, file_size=getattr(doc, "file_size", ""))

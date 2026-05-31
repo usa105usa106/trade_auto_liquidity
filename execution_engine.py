@@ -3,6 +3,7 @@ import asyncio
 import os
 from models import TradePlan
 from debug_log import log_event
+from chatgpt_runtime_logger import chatgpt_log_event
 
 class ExecutionEngine:
     """
@@ -541,7 +542,11 @@ class ExecutionEngine:
             attached_tpsl_requested = bool(params.get("takeProfitPrice") or params.get("stopLossPrice"))
             attached_tpsl_failed = False
             try:
+                if str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup":
+                    chatgpt_log_event("entry_order_send_start", symbol=plan.symbol, side=plan.side, order_type=order_type, qty=plan.qty, price=price, leverage=getattr(plan, "leverage", None), params=params)
                 order = await self._create_order_retry(plan.symbol, order_type, side, plan.qty, price, params, attempts=2)
+                if str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup":
+                    chatgpt_log_event("entry_order_send_ok", symbol=plan.symbol, order_id=order.get("id"), status=order.get("status"), filled=order.get("filled"), average=order.get("average"), order=order)
             except Exception as e:
                 msg = str(e)
                 # MEXC sometimes rejects opening orders with attached TP/SL as
@@ -557,12 +562,20 @@ class ExecutionEngine:
                         "takeProfitOrderPrice", "stopLossOrderPrice",
                         "takeProfitReverse", "stopLossReverse",
                     }}
+                    if str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup":
+                        chatgpt_log_event("entry_order_retry_without_attached_tpsl", symbol=plan.symbol, reason=msg, clean_params=clean_params)
                     order = await self._create_order_retry(plan.symbol, order_type, side, plan.qty, price, clean_params, attempts=2)
                     params = clean_params
+                    if str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup":
+                        chatgpt_log_event("entry_order_retry_ok", symbol=plan.symbol, order_id=order.get("id"), order=order)
                 elif self._is_mexc_opening_restricted_error(e):
+                    if str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup":
+                        chatgpt_log_event("entry_order_restricted_error", symbol=plan.symbol, error=str(e))
                     await self.storage.set_lock(plan.symbol, int(os.getenv("MEXC_RESTRICTED_SYMBOL_LOCK_SEC", "86400")), "mexc_opening_restricted_8950")
                     return {"ok": False, "reason": "mexc opening restricted / reduce-only symbol (code 8950)"}
                 else:
+                    if str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup":
+                        chatgpt_log_event("entry_order_send_error", symbol=plan.symbol, error=str(e), params=params)
                     raise
 
             # For market orders, sync the real exchange position immediately.
@@ -570,6 +583,15 @@ class ExecutionEngine:
             # but the raw order response does not include a filled quantity/price.
             pos = plan.__dict__.copy()
             pos["status"] = "pending" if order_type == "limit" else "open"
+            if str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup":
+                chatgpt_log_event("position_record_create", symbol=plan.symbol, status=("pending" if order_type == "limit" else "open"), order_type=order_type, order_id=order.get("id"), qty=plan.qty, entry=plan.entry_price, stop=plan.stop_price, take=plan.take_price)
+                pos["paper"] = False
+                pos["pending_order_live"] = order_type == "limit"
+                pos["trailing_enabled"] = False
+                pos["scalp_exit_enabled"] = False
+                pos["paper_fill_enabled"] = False
+                pos["breakeven_after_tp1_only"] = True
+                pos["management_mode"] = "chatgpt_tp_sl_only"
             if attached_tpsl_failed:
                 pos["entry_attached_tpsl_error"] = "MEXC 5003 stop-limit price error; entry retried without attached TP/SL"
             pos["initial_stop_price"] = plan.stop_price
@@ -697,7 +719,7 @@ class ExecutionEngine:
                             and not bool(pos.get("liquidation_stop_mode"))
                             and float(pos.get("take_price") or 0) > 0
                             and float(pos.get("stop_price") or 0) > 0
-                            and str(pos.get("strategy") or "").lower() not in {"cascade_hunter", "strongest_coin", "btc_ai_4h"}
+                            and str(pos.get("strategy") or "").lower() not in {"cascade_hunter", "strongest_coin", "btc_ai_4h", "chatgpt_setup"}
                             and not (str(pos.get("strategy") or "").lower() == "boost_scalping" and self._truthy(await self._setting("boost_emergency_sl_only", os.getenv("BOOST_EMERGENCY_SL_ONLY", "true")), True))
                         ):
                             try:
@@ -793,7 +815,7 @@ class ExecutionEngine:
                         await self.storage.upsert_position(pos)
                     # legacy regression marker: elif strategy_name == "quick_bounce"
                     # legacy regression marker: exchange SL/TP failed; quick_bounce remains open under virtual TP/SL monitor
-                    elif strategy_name in {"quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter", "strongest_coin"}:
+                    elif strategy_name in {"quick_bounce", "impulse_dump", "orderflow_impulse", "knife_reversal", "cascade_hunter", "strongest_coin", "chatgpt_setup"}:
                         # v0231: Quick Bounce must try real exchange SL/TP first, but if
                         # MEXC rejects/does not confirm them, DO NOT panic-close the entry.
                         # Keep the position open and let PositionManager enforce virtual
@@ -1373,22 +1395,35 @@ class ExecutionEngine:
                 tps = details.get("chatgpt_take_profits") or []
                 tp_ids = []
                 try:
+                    chatgpt_log_event("chatgpt_protection_tp_batch_start", symbol=symbol, side=side, qty=qty, tps=tps)
                     if not isinstance(tps, list) or not tps:
                         raise RuntimeError("missing chatgpt_take_profits")
                     remaining_qty = qty
                     for idx, tp_row in enumerate(tps, start=1):
                         tp_price = float(tp_row.get("price") or 0)
-                        size_pct = float(tp_row.get("size_percent") or 0)
-                        if tp_price <= 0 or size_pct <= 0:
-                            continue
-                        tp_qty = qty * max(0.0, min(100.0, size_pct)) / 100.0
-                        if idx == len(tps):
+                        raw_size = tp_row.get("size_percent")
+                        is_remainder = isinstance(raw_size, str) and raw_size.strip().upper() == "REMAINDER"
+                        if is_remainder:
+                            size_pct = "REMAINDER"
                             tp_qty = remaining_qty
+                        else:
+                            size_pct_float = float(raw_size or 0)
+                            if size_pct_float <= 0:
+                                continue
+                            size_pct = size_pct_float
+                            tp_qty = qty * max(0.0, min(100.0, size_pct_float)) / 100.0
+                            # Safety: the final TP always closes whatever remains, even if setup used a number.
+                            if idx == len(tps):
+                                tp_qty = remaining_qty
+                        if tp_price <= 0:
+                            continue
                         remaining_qty = max(0.0, remaining_qty - tp_qty)
                         if tp_qty <= 0:
                             continue
                         log_event("chatgpt_tp_request", symbol=symbol, side=side, qty=tp_qty, trigger_price=tp_price, size_pct=size_pct, attempt=i + 1)
+                        chatgpt_log_event("chatgpt_tp_place_start", symbol=symbol, tp_index=idx, side=side, qty=tp_qty, trigger_price=tp_price, size_pct=size_pct, remaining_qty_before=remaining_qty + tp_qty)
                         order = await self._create_take_profit_market_order(symbol, side, tp_qty, tp_price)
+                        chatgpt_log_event("chatgpt_tp_place_ok", symbol=symbol, tp_index=idx, order_id=order.get("id"), order=order)
                         oid = order.get("id")
                         out[f"tp{idx}_order_id"] = oid
                         out[f"tp{idx}_raw"] = order
@@ -1396,10 +1431,13 @@ class ExecutionEngine:
                 except Exception as e:
                     out["tp_error"] = str(e)[:800]
                     log_event("error_chatgpt_tp", symbol=symbol, side=side, qty=qty, tps=tps, attempt=i + 1, error=str(e), ok=False)
+                    chatgpt_log_event("chatgpt_tp_place_error", symbol=symbol, side=side, qty=qty, tps=tps, error=str(e))
                 try:
                     if sl > 0:
                         log_event("chatgpt_sl_request", symbol=symbol, side=side, qty=qty, stop_price=sl, attempt=i + 1)
+                        chatgpt_log_event("chatgpt_sl_place_start", symbol=symbol, side=side, qty=qty, stop_price=sl)
                         order = await self._create_stop_market_order(symbol, side, qty, sl)
+                        chatgpt_log_event("chatgpt_sl_place_ok", symbol=symbol, order_id=order.get("id"), order=order)
                         out["sl_order_id"] = order.get("id")
                         out["sl_raw"] = order
                     else:
@@ -1407,6 +1445,7 @@ class ExecutionEngine:
                 except Exception as e:
                     out["sl_error"] = str(e)[:800]
                     log_event("error_chatgpt_sl", symbol=symbol, side=side, qty=qty, trigger_price=sl, attempt=i + 1, error=str(e), ok=False)
+                    chatgpt_log_event("chatgpt_sl_place_error", symbol=symbol, side=side, qty=qty, stop_price=sl, error=str(e))
 
             elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin", "btc_ai_4h"}:
                 # Split TP mode: TP1 closes 50% at 1R, TP2 closes the remaining 50% at 2R.
@@ -1548,6 +1587,7 @@ class ExecutionEngine:
                     out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
                     out["protection_mode"] = "chatgpt_multi_tp_planorders" if out["ok"] else "chatgpt_tp_missing"
                     out["protection_note"] = f"ChatGPT setup: {len(tp_keys)} TP planorders + full SL requested"
+                    chatgpt_log_event("chatgpt_protection_summary", symbol=symbol, ok=out.get("ok"), tp_count=len(tp_keys), tp_keys=tp_keys, sl_order_id=out.get("sl_order_id"), protection_status=out.get("protection_status"), protection_mode=out.get("protection_mode"))
                 elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin", "btc_ai_4h"} and out.get("tp1_order_id") and out.get("tp2_order_id") and out.get("sl_order_id"):
                     # V42 strict rule: returned planorder ids are NOT enough on MEXC.
                     # /status_btc is exchange-first, so protection is considered OK only
