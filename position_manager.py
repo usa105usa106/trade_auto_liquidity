@@ -307,11 +307,16 @@ class PositionManager:
             await self.storage.upsert_position(pos)
 
             if strategy_name == "chatgpt_setup" and not protected:
-                try:
-                    from chatgpt_runtime_logger import chatgpt_log_event
-                    chatgpt_log_event("chatgpt_protection_missing_silent_monitor", symbol=pos.get("symbol"), signature=sig, status=state.get("protection_status"), sl=state.get("stop_loss_ok", state.get("sl_exists")), tp=state.get("take_profit_ok", state.get("tp_exists")))
-                except Exception:
-                    pass
+                # ChatGPT Mode has one live monitor card. Missing exchange TP/SL
+                # must NOT create repeated Telegram messages or noisy /log_chatgpt
+                # rows every watchdog tick. Log it only when the protection state
+                # actually changes; the live monitor card still updates normally.
+                if prev_sig != sig:
+                    try:
+                        from chatgpt_runtime_logger import chatgpt_log_event
+                        chatgpt_log_event("chatgpt_protection_missing_silent_monitor", symbol=pos.get("symbol"), signature=sig, status=state.get("protection_status"), sl=state.get("stop_loss_ok", state.get("sl_exists")), tp=state.get("take_profit_ok", state.get("tp_exists")))
+                    except Exception:
+                        pass
                 return None
 
             if state.get("reattach_attempted") or not protected or (strategy_name == "chatgpt_setup" and protected and prev_sig and prev_sig != sig):

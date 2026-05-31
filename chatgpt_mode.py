@@ -658,7 +658,7 @@ NEW SETUP REPLACEMENT RULES:
 
 СТРОГИЙ ФОРМАТ setup.txt:
 {
-  "setup_version": "2.0",
+  "setup_version": "2.2",
   "mode": "AUTO_OPEN",
   "exchange": "MEXC_FUTURES",
   "margin_mode": "ISOLATED",
@@ -734,7 +734,7 @@ def validate_setup(data: dict) -> list[dict]:
     chatgpt_log_event("setup_validate_start", setup_version=(data or {}).get("setup_version") if isinstance(data, dict) else None)
     if not isinstance(data, dict):
         raise ValueError("setup JSON must be an object")
-    if str(data.get("setup_version")) not in {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "2.0"}:
+    if str(data.get("setup_version")) not in {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "2.0", "2.1", "2.2"}:
         raise ValueError("unsupported setup_version")
     trades = data.get("trades") or []
     if not isinstance(trades, list):
@@ -884,10 +884,10 @@ async def _cancel_all_old_pending_limits(storage, exec_engine, setup_symbols: se
                 res = await exec_engine.cancel_entry(pos, live=True, reason="chatgpt_new_setup_cancel_old_pending")
                 ok = bool((res or {}).get("ok"))
                 chatgpt_log_event("cancel_old_pending_local_done", symbol=sym, order_id=oid, ok=ok, result=res)
-                cancelled.append({"source": "local", "symbol": sym, "order_id": oid, "ok": ok, "result": res})
+                cancelled.append({"source": "local", "symbol": sym, "order_id": oid, "ok": ok, "reason": "entry", "result": res})
             except Exception as e:
                 chatgpt_log_event("cancel_old_pending_local_error", symbol=sym, order_id=oid, error=str(e))
-                cancelled.append({"source": "local", "symbol": sym, "order_id": oid, "ok": False, "error": str(e)})
+                cancelled.append({"source": "local", "symbol": sym, "order_id": oid, "ok": False, "reason": "entry", "error": str(e)})
         elif strategy == "chatgpt_setup":
             chatgpt_log_event("cancel_old_pending_skip", symbol=sym, status=status, strategy=strategy, order_type=order_type)
 
@@ -922,6 +922,7 @@ async def _cancel_all_old_pending_limits(storage, exec_engine, setup_symbols: se
         return ext.startswith("bot_entry_") or (oid and oid in local_pending_ids) or is_normal_open_order_endpoint
 
     exchange_cancelled_ids: set[str] = set()
+    cancel_candidates: list[tuple[dict, str, str, str]] = []
     for o in orders or []:
         sym = _order_symbol(o)
         oid = _order_id(o)
@@ -932,29 +933,49 @@ async def _cancel_all_old_pending_limits(storage, exec_engine, setup_symbols: se
         # for a moment, the bot can delete its real SL/TP. Entry limits are still always removed.
         is_orphan = bool(sym and sym in setup_symbols and sym not in live_symbols)
         should_cancel = bool(is_entry or is_orphan)
-        chatgpt_log_event(
-            "cancel_old_pending_exchange_order_seen",
-            symbol=sym,
-            order_id=oid,
-            source=info.get("_source_endpoint"),
-            kind=info.get("_protection_kind"),
-            is_entry=is_entry,
-            is_orphan=is_orphan,
-            should_cancel=should_cancel,
-        )
-        if not should_cancel:
+        # Do not spam runtime logs with every untouched order. Log only actions.
+        if should_cancel:
+            chatgpt_log_event(
+                "cancel_old_pending_exchange_order_seen",
+                symbol=sym,
+                order_id=oid,
+                source=info.get("_source_endpoint"),
+                kind=info.get("_protection_kind"),
+                is_entry=is_entry,
+                is_orphan=is_orphan,
+                should_cancel=should_cancel,
+            )
+        if not should_cancel or not sym or not oid or oid in exchange_cancelled_ids:
             continue
-        if not sym or not oid or oid in exchange_cancelled_ids:
-            continue
+        exchange_cancelled_ids.add(oid)
+        cancel_candidates.append((o, sym, oid, "entry" if is_entry else "orphan"))
+
+    async def _cancel_one_exchange_order(item: tuple[dict, str, str, str]) -> dict:
+        _o, sym, oid, reason = item
         try:
-            chatgpt_log_event("cancel_old_pending_exchange_order_cancel_start", symbol=sym, order_id=oid, reason=("entry" if is_entry else "orphan"))
+            chatgpt_log_event("cancel_old_pending_exchange_order_cancel_start", symbol=sym, order_id=oid, reason=reason)
             res = await exec_engine.exchange_client.cancel_order(oid, sym)
-            exchange_cancelled_ids.add(oid)
             chatgpt_log_event("cancel_old_pending_exchange_order_cancel_ok", symbol=sym, order_id=oid, result=res)
-            cancelled.append({"source": "exchange", "symbol": sym, "order_id": oid, "ok": True, "reason": ("entry" if is_entry else "orphan"), "result": res})
+            return {"source": "exchange", "symbol": sym, "order_id": oid, "ok": True, "reason": reason, "result": res}
         except Exception as e:
             chatgpt_log_event("cancel_old_pending_exchange_order_cancel_error", symbol=sym, order_id=oid, error=str(e))
-            cancelled.append({"source": "exchange", "symbol": sym, "order_id": oid, "ok": False, "reason": ("entry" if is_entry else "orphan"), "error": str(e)})
+            return {"source": "exchange", "symbol": sym, "order_id": oid, "ok": False, "reason": reason, "error": str(e)}
+
+    if cancel_candidates:
+        # MEXC can rate-limit, so keep it parallel but bounded. This prevents a
+        # 6-order stale TP/SL cleanup from taking ~30 seconds sequentially.
+        sem = asyncio.Semaphore(int(os.getenv("CHATGPT_CANCEL_CONCURRENCY", "3") or 3))
+
+        async def _bounded_cancel(item):
+            async with sem:
+                return await _cancel_one_exchange_order(item)
+
+        results = await asyncio.gather(*[_bounded_cancel(x) for x in cancel_candidates], return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                cancelled.append({"source": "exchange", "ok": False, "error": str(r)})
+            else:
+                cancelled.append(r)
 
     # 3) Verify after cancel.
     try:
@@ -1460,6 +1481,54 @@ def _chatgpt_group_protection(positions: list[dict], all_orders: list[dict]) -> 
     return protected, emergency
 
 
+
+
+def _chatgpt_cleanup_summary(items: list[dict] | None) -> dict:
+    """Summarize setup cleanup in user-facing terms.
+
+    entry = normal pending entry LIMIT orders.
+    orphan = old conditional/plan orders for setup symbols that have no live
+    position anymore.  These are garbage TP/SL leftovers, not real лимитки.
+    """
+    summary = {
+        "entry_found": 0,
+        "entry_cancelled": 0,
+        "entry_left": 0,
+        "orphan_found": 0,
+        "orphan_cancelled": 0,
+        "orphan_left": 0,
+        "other_failed": 0,
+    }
+    seen: set[tuple[str, str, str]] = set()
+    for x in items or []:
+        reason = str(x.get("reason") or "entry").lower()
+        if reason not in {"entry", "orphan"}:
+            reason = "entry" if str(x.get("source") or "").lower() in {"local", "exchange"} else "other"
+        key = (reason, str(x.get("symbol") or ""), str(x.get("order_id") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        ok = bool(x.get("ok"))
+        if reason == "orphan":
+            summary["orphan_found"] += 1
+            if ok:
+                summary["orphan_cancelled"] += 1
+            else:
+                summary["orphan_left"] += 1
+        elif reason == "entry":
+            summary["entry_found"] += 1
+            if ok:
+                summary["entry_cancelled"] += 1
+            else:
+                summary["entry_left"] += 1
+        else:
+            if not ok:
+                summary["other_failed"] += 1
+    summary["total_found"] = summary["entry_found"] + summary["orphan_found"]
+    summary["total_cancelled"] = summary["entry_cancelled"] + summary["orphan_cancelled"]
+    summary["total_left"] = summary["entry_left"] + summary["orphan_left"] + summary["other_failed"]
+    return summary
+
 async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dict | None = None) -> str:
     """Build one exchange-source-of-truth monitor card for Telegram.
 
@@ -1490,6 +1559,7 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
     skipped = [x for x in opened if not x.get("ok")]
     requested = res.get("requested_trades", res.get("limits_to_place", "-"))
     cancelled = res.get("cancelled_pending_count", 0) if setup_result is not None else 0
+    cleanup = res.get("cleanup_summary") or {"entry_found": cancelled, "entry_cancelled": cancelled, "entry_left": 0, "orphan_found": 0, "orphan_cancelled": 0, "orphan_left": 0}
     setup_status = "setup-файл обработан" if setup_result is not None and bool(res.get("ok", True)) else ("setup-файл НЕ исполнен" if setup_result is not None else "ожидаю setup-файл")
     setup_time = str(res.get("setup_installed_at") or res.get("setup_received_at") or "-")
     lines = [
@@ -1513,7 +1583,9 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
     if setup_result is not None:
         lines += [
             "",
-            f"🧹 снято старых лимиток: {cancelled}",
+            "🧹 очистка перед setup:",
+            f"• entry-лимитки: найдено {cleanup.get('entry_found', 0)}, снято {cleanup.get('entry_cancelled', cancelled)}, осталось {cleanup.get('entry_left', 0)}",
+            f"• старые условные ордера без позиции: найдено {cleanup.get('orphan_found', 0)}, снято {cleanup.get('orphan_cancelled', 0)}, осталось {cleanup.get('orphan_left', 0)}",
             f"📄 найдено в новом setup: {requested}/{CHATGPT_MAX_PENDING_LIMITS}",
             f"✅ поставлено новых лимиток: {placed}",
             f"❌ пропущено: {len(skipped)}",
@@ -1557,14 +1629,16 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
     opened = []
     live = True
     cancelled_pending = await _cancel_all_old_pending_limits(storage, exec_engine, {str(t.get("symbol") or "") for t in trades})
+    cleanup_summary = _chatgpt_cleanup_summary(cancelled_pending)
     if cancelled_pending:
         chatgpt_log_event("setup_cancelled_old_pending_limits", items=cancelled_pending)
+    chatgpt_log_event("setup_cleanup_summary", **cleanup_summary)
     cancel_failed = [x for x in (cancelled_pending or []) if not bool(x.get("ok"))]
     if cancel_failed:
         # Hard safety gate: never place new setup limits while an old ChatGPT
         # entry limit is still open or its cancellation was not verified.
         chatgpt_log_event("setup_abort_old_pending_cancel_failed", failed=cancel_failed[:20], count=len(cancel_failed))
-        return {"ok": False, "opened": [], "message": "OLD_PENDING_CANCEL_FAILED", "failed_cancelled_pending": cancel_failed, "reconcile": reconcile}
+        return {"ok": False, "opened": [], "message": "OLD_PENDING_CANCEL_FAILED", "failed_cancelled_pending": cancel_failed, "cleanup_summary": cleanup_summary, "reconcile": reconcile}
 
     # Re-sync after cancellation. From here local cache may be used because it is
     # rebuilt from real-time exchange state, not from stale pre-deploy data.
@@ -1630,6 +1704,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
             "skipped_open_symbol": skipped_open_symbol,
             "reconcile": reconcile_after_cancel,
             "requested_trades": requested_trades,
+            "cleanup_summary": cleanup_summary,
         }
     if len(trades) > limits_to_place:
         skipped = trades[limits_to_place:]
@@ -1788,6 +1863,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         "opened": opened,
         "rotation": rotation_result,
         "cancelled_pending_count": len([x for x in (cancelled_pending or []) if bool(x.get("ok"))]),
+        "cleanup_summary": cleanup_summary,
         "open_positions": open_slots,
         "max_open_positions": CHATGPT_MAX_OPEN_POSITIONS,
         "max_pending_limits": CHATGPT_MAX_PENDING_LIMITS,
