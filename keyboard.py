@@ -23,7 +23,8 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["🗡 knife reversal"],
     ["🧠 multi strategy"],
     ["🚀 BOOST MODE", "🛑 STOP BOOST"],
-    ["🤖 ChatGPT Scan Mode", "❌ Exit ChatGPT Mode"],
+    ["🤖 ChatGPT Scan Mode", "📥 Принять setup"],
+    ["📄 Log ChatGPT", "❌ Exit ChatGPT Mode"],
     ["📊 BOOST STATUS", "📊 AI Stats"],
     ["⚙️ MEXC"],
 ], resize_keyboard=True)

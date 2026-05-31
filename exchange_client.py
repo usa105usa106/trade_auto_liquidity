@@ -679,6 +679,24 @@ class ExchangeClient:
         return await self.exchange.create_order(norm, type_, side, amount, price, params)
 
     async def cancel_order(self, order_id, symbol):
+        # v23: MEXC normal entry LIMIT orders created by native fallback must be
+        # cancelled through the native futures endpoint first.  Relying only on
+        # ccxt cancel_order could leave old ChatGPT pending limits alive after
+        # redeploy/setup replacement.
+        if self.exchange_id == "mexc":
+            native_error = None
+            try:
+                msym = self._mexc_symbol(symbol)
+                oid = str(order_id or "").split(":", 1)[0].strip()
+                if not oid:
+                    raise ValueError("empty order_id")
+                return await self._mexc_private("POST", "/api/v1/private/order/cancel", body={"symbol": msym, "orderId": oid})
+            except Exception as e:
+                native_error = e
+                try:
+                    return await self.exchange.cancel_order(order_id, self.normalize_symbol(symbol))
+                except Exception as ccxt_error:
+                    raise RuntimeError(f"MEXC cancel_order failed: native={native_error}; ccxt={ccxt_error}")
         return await self.exchange.cancel_order(order_id, self.normalize_symbol(symbol))
 
     async def cancel_all_orders(self, symbol=None):

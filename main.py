@@ -5593,7 +5593,7 @@ async def _chatgpt_scan_background_job(app, chat_id: int):
                 chat_id=chat_id,
                 document=f,
                 filename="log.txt",
-                caption="✅ log.txt готов. Скинь его ChatGPT. После финального анализа загрузи сюда setup.txt / setup-1.txt / любой .txt с JSON setup.",
+                caption="✅ log.txt готов. Скинь его ChatGPT. После финального анализа загрузи сюда setup-HHMM_DDMM.txt / setup-1.txt / любой .txt с JSON setup.",
             )
         await storage.set("chatgpt_waiting_setup", True)
         chatgpt_log_event("mode_waiting_setup", log_path=log_path)
@@ -5609,6 +5609,29 @@ async def _chatgpt_scan_background_job(app, chat_id: int):
             app.bot_data["chatgpt_scan_running"] = False
         except Exception:
             pass
+
+
+
+async def chatgpt_accept_setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enter ChatGPT setup import mode without starting a new market scan."""
+    global running, entries_enabled, position_task
+    if not allowed(update):
+        return
+    chatgpt_log_event("mode_accept_setup_requested")
+    await disable_other_modes(storage)
+    chatgpt_log_event("mode_other_entries_disabled", source="accept_setup")
+    entries_enabled = False
+    running = True
+    if position_task is None or position_task.done():
+        position_task = context.application.create_task(position_management_loop(context.application))
+    await storage.set("chatgpt_waiting_setup", True)
+    await storage.set("chatgpt_setup_mode", True)
+    chatgpt_log_event("mode_waiting_setup_manual")
+    await reply(
+        update,
+        "📥 Приём setup включён\nСкан НЕ запускаю. Пришли setup-HHMM_DDMM.txt / setup-1.txt / любой .txt с корректным JSON setup. Старые режимы входа отключены, сопровождение позиций остаётся включённым.",
+        reply_markup=MAIN_MENU,
+    )
 
 
 async def chatgpt_scan_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5674,13 +5697,13 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     waiting = bool(await storage.get("chatgpt_waiting_setup", False))
     if not waiting:
         chatgpt_log_event("setup_file_ignored_not_waiting")
-        await reply(update, "Файл получил, но ChatGPT Mode не ждёт setup.txt. Нажми 🤖 ChatGPT Scan Mode сначала.", reply_markup=MAIN_MENU)
+        await reply(update, "Файл получил, но ChatGPT Mode не ждёт setup. Нажми 📥 Принять setup или 🤖 ChatGPT Scan Mode сначала.", reply_markup=MAIN_MENU)
         return
     doc = update.message.document if update.message else None
     name = str(getattr(doc, "file_name", "") or "")
     if not doc or not name.lower().endswith(".txt"):
         chatgpt_log_event("setup_file_rejected_extension", filename=name)
-        await reply(update, "Жду setup.txt / setup-1.txt / любой .txt с JSON setup.", reply_markup=MAIN_MENU)
+        await reply(update, "Жду setup-HHMM_DDMM.txt / setup-1.txt / любой .txt с JSON setup.", reply_markup=MAIN_MENU)
         return
     try:
         chatgpt_log_event("setup_file_received", filename=name, file_size=getattr(doc, "file_size", ""))
@@ -5756,6 +5779,7 @@ def _button_mapping():
         ("🚀 BOOST MODE", boost_start_cmd), ("BOOST MODE", boost_start_cmd),
         ("🛑 STOP BOOST", boost_stop_cmd), ("STOP BOOST", boost_stop_cmd),
         ("🤖 ChatGPT Scan Mode", chatgpt_scan_mode_cmd), ("ChatGPT Scan Mode", chatgpt_scan_mode_cmd),
+        ("📥 Принять setup", chatgpt_accept_setup_cmd), ("Принять setup", chatgpt_accept_setup_cmd), ("Accept setup", chatgpt_accept_setup_cmd), ("/import_setup", chatgpt_accept_setup_cmd),
         ("📄 Log ChatGPT", log_chatgpt_cmd), ("Log ChatGPT", log_chatgpt_cmd),
         ("❌ Exit ChatGPT Mode", chatgpt_exit_mode_cmd), ("Exit ChatGPT Mode", chatgpt_exit_mode_cmd),
         ("📊 BOOST STATUS", boost_status_cmd), ("BOOST STATUS", boost_status_cmd),
@@ -7598,6 +7622,7 @@ def build_app():
     app.add_handler(CommandHandler("boost_stop", _wrap_command(boost_stop_cmd, "/boost_stop")))
     app.add_handler(CommandHandler("boost_status", _wrap_command(boost_status_cmd, "/boost_status")))
     app.add_handler(CommandHandler("chatgpt_scan", _wrap_command(chatgpt_scan_mode_cmd, "/chatgpt_scan")))
+    app.add_handler(CommandHandler("import_setup", _wrap_command(chatgpt_accept_setup_cmd, "/import_setup")))
     app.add_handler(CommandHandler("chatgpt_exit", _wrap_command(chatgpt_exit_mode_cmd, "/chatgpt_exit")))
     app.add_handler(CommandHandler("log_chatgpt", _wrap_command(log_chatgpt_cmd, "/log_chatgpt")))
     app.add_handler(CommandHandler("cascade_hunter", _wrap_command(cascade_hunter_cmd, "/cascade_hunter")))

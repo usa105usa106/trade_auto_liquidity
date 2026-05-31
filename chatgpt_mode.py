@@ -184,9 +184,9 @@ def _is_mexc_rate_limit_error(e: Exception) -> bool:
 
 async def _mexc_call(label: str, coro_factory, symbol: str = "", retries: int | None = None):
     """Small throttle/retry wrapper for MEXC public API during ChatGPT scan."""
-    retries = int(os.getenv("CHATGPT_SCAN_RETRIES", "4") if retries is None else retries)
-    base_delay = float(os.getenv("CHATGPT_SCAN_REQUEST_DELAY_SEC", "0.22") or 0.22)
-    rate_sleep = float(os.getenv("CHATGPT_SCAN_RATE_LIMIT_SLEEP_SEC", "3.0") or 3.0)
+    retries = int(os.getenv("CHATGPT_SCAN_RETRIES", "2") if retries is None else retries)
+    base_delay = float(os.getenv("CHATGPT_SCAN_REQUEST_DELAY_SEC", "0.12") or 0.12)
+    rate_sleep = float(os.getenv("CHATGPT_SCAN_RATE_LIMIT_SLEEP_SEC", "2.0") or 2.0)
     last_exc = None
     for attempt in range(retries + 1):
         if base_delay > 0:
@@ -351,7 +351,9 @@ async def disable_other_modes(storage) -> None:
 
 async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200) -> str:
     """Run one top-N scan and write a ChatGPT-ready log.txt."""
-    chatgpt_log_event("scan_start", limit=limit)
+    scan_started_at = time.time()
+    workers = int(os.getenv("CHATGPT_SCAN_CONCURRENCY", "3") or 3)
+    chatgpt_log_event("scan_start", limit=limit, workers=workers, retries=os.getenv("CHATGPT_SCAN_RETRIES", "2"))
     work = Path(os.getenv("CHATGPT_LOG_DIR", "/tmp"))
     work.mkdir(parents=True, exist_ok=True)
     path = work / f"chatgpt_market_log_{int(time.time())}.txt"
@@ -423,13 +425,24 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
             chatgpt_log_event("scan_symbol_error", symbol=native_sym, error=repr(e))
             return f"SYMBOL: {native_sym}\nERROR: {str(e)[:240]}"
 
-    # Default to sequential scanning. It is slower, but MEXC often rate-limits
-    # aggressive parallel top-200 scans with code 510. User can raise via ENV.
-    sem = asyncio.Semaphore(int(os.getenv("CHATGPT_SCAN_CONCURRENCY", "1") or 1))
+    # v22: keep the same scan depth, but use three cautious workers by default.
+    # This should reduce a ~9 minute scan toward ~3-5 minutes without removing
+    # funding/orderbook/candles/RSI/MACD data. MEXC code=510 is still handled
+    # inside _mexc_call with retry/backoff.
+    sem = asyncio.Semaphore(workers)
     async def guarded(sym):
         async with sem:
             return await one_symbol(sym)
     blocks = await asyncio.gather(*(guarded(s) for s in symbols), return_exceptions=True)
+    ok_blocks = 0
+    err_blocks = 0
+    for b in blocks:
+        txt = str(b)
+        if isinstance(b, Exception) or "\nERROR:" in txt:
+            err_blocks += 1
+        else:
+            ok_blocks += 1
+    chatgpt_log_event("scan_workers_done", workers=workers, symbols=len(symbols), ok=ok_blocks, errors=err_blocks, elapsed_sec=round(time.time() - scan_started_at, 2))
 
     btc = ""
     eth = ""
@@ -455,7 +468,7 @@ TASK FOR CHATGPT:
 6. Пользователь присылает ещё 10 скриншотов: 15m и 1H по этим 5 монетам.
 7. Только после этого ChatGPT выбирает максимум 3 лучшие сделки и возвращает текстовый вердикт + готовый setup.txt файлом/блоком JSON.
 8. По умолчанию максимум 3 сделки; не расширяй setup.txt до 5/10 без отдельной просьбы пользователя.
-9. Важно: у бота есть 3 общих ChatGPT-слота: реальные открытые ChatGPT-позиции + новые pending LIMIT-ордера вместе не должны превышать 3.
+9. Важно: у бота есть 3 общих ChatGPT-слота: реальные открытые ChatGPT-позиции + новые pending LIMIT-ордера вместе не должны превышать 3. Pending LIMIT проверяются не чаще одного раза в 10 секунд, чтобы не долбить MEXC.
 
 ЭТАП 1 ПОСЛЕ log.txt:
 1. Проанализируй общий рынок BTC/ETH и все монеты из лога.
@@ -475,8 +488,8 @@ TASK FOR CHATGPT:
 ЭТАП 3 ПОСЛЕ ДОПОЛНИТЕЛЬНЫХ 10 СКРИНШОТОВ 15m/1H:
 1. Выбери максимум 3 лучшие сделки.
 2. Дай короткий текстовый вердикт.
-3. ОБЯЗАТЕЛЬНО верни готовый setup.txt в JSON-формате так, чтобы пользователь мог сразу скачать файл и отправить его боту.
-4. Название файла может быть setup.txt, setup-1.txt, setup-2.txt и так далее — бот принимает любые .txt с корректным JSON setup.
+3. ОБЯЗАТЕЛЬНО верни готовый setup-файл в JSON-формате так, чтобы пользователь мог сразу скачать файл и отправить его боту.
+4. Файл создавай с уникальным именем: setup-HHMM_DDMM.txt, например setup-1445_3105.txt. Не используй одно и то же setup.txt, чтобы Telegram не путал старые файлы. Бот принимает setup.txt, setup-1.txt, setup-2.txt, setup-HHMM_DDMM.txt и любые .txt с корректным JSON setup.
 5. В setup.txt каждая сделка должна содержать: symbol, direction, order_type, entry или entry_reference, stop_loss, take_profits [{price,size_percent}], invalidation, comment, risk.stop_distance_percent. Для третьего тейка используй size_percent="REMAINDER", а не 30.
 6. Для ChatGPT Mode запрещены trailing/scalp exits и paper_fill: LIMIT-сделка считается открытой только после реального fill на MEXC.
 7. SYMBOL всегда указывай в MEXC-native формате: BTC_USDT, ETH_USDT, BCH_USDT. Не используй BTC/USDT:USDT.
@@ -486,6 +499,11 @@ TASK FOR CHATGPT:
 11. Если хороших сделок нет, верни trades: [] и verdict: NO_TRADE.
 12. В setup.txt всегда ставь max_active_trades=3.
 13. Если часть старых ChatGPT-сделок уже стала реальными позициями, новые лимитки ставятся только на свободные слоты.
+
+SETUP FILE NAMING RULE FOR CHATGPT:
+1. Финальный файл всегда прикладывай как setup-HHMM_DDMM.txt, где HHMM — текущее время, DDMM — сегодняшняя дата.
+2. Пример: setup-1445_3105.txt.
+3. В ответе дай именно файл для скачивания, не только JSON-блок.
 
 SCREENSHOT RULES FOR CHATGPT:
 1. После log.txt проси только 4H по 10 монетам.
@@ -709,34 +727,104 @@ def validate_setup(data: dict) -> list[dict]:
 async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
     """Cancel all old ChatGPT pending LIMITs before applying a new setup.
 
-    New setup.txt is treated as the fresh source of truth for pending entries.
-    Only unfilled ChatGPT setup LIMIT entries are cancelled. Real open positions
-    are never touched.
+    v22 hardens cancellation. We cancel both:
+    - local DB pending ChatGPT LIMIT entries;
+    - exchange-only open entry orders created by ChatGPT mode (externalOid/client id starts with bot_entry_)
+      even if the local DB missed them after redeploy/restart.
+
+    Real open positions are never touched.
     """
-    cancelled = []
+    cancelled: list[dict] = []
+    local_pending_ids: set[str] = set()
+
+    # 1) Cancel local pending rows first.
     try:
         positions = await storage.positions()
     except Exception as e:
         chatgpt_log_event("cancel_old_pending_load_error", error=str(e))
-        return cancelled
+        positions = []
 
     for pos in positions or []:
         sym = str(pos.get("symbol") or "").upper()
         strategy = str(pos.get("strategy") or "").lower()
         status = str(pos.get("status") or "").lower()
         order_type = str(pos.get("order_type") or "").lower()
-        if strategy != "chatgpt_setup" or status != "pending" or order_type != "limit":
-            if strategy == "chatgpt_setup":
-                chatgpt_log_event("cancel_old_pending_skip", symbol=sym, status=status, strategy=strategy, order_type=order_type)
+        if strategy == "chatgpt_setup" and status == "pending" and order_type == "limit":
+            oid = str(pos.get("order_id") or "").strip()
+            if oid:
+                local_pending_ids.add(oid)
+            try:
+                chatgpt_log_event("cancel_old_pending_local_start", symbol=sym, order_id=oid, old_entry=pos.get("entry_price"))
+                res = await exec_engine.cancel_entry(pos, live=True, reason="chatgpt_new_setup_cancel_old_pending")
+                chatgpt_log_event("cancel_old_pending_local_done", symbol=sym, order_id=oid, result=res)
+                cancelled.append({"source": "local", "symbol": sym, "order_id": oid, "ok": True, "result": res})
+            except Exception as e:
+                chatgpt_log_event("cancel_old_pending_local_error", symbol=sym, order_id=oid, error=str(e))
+                cancelled.append({"source": "local", "symbol": sym, "order_id": oid, "ok": False, "error": str(e)})
+        elif strategy == "chatgpt_setup":
+            chatgpt_log_event("cancel_old_pending_skip", symbol=sym, status=status, strategy=strategy, order_type=order_type)
+
+    # 2) Cancel exchange-only ChatGPT entry orders. These can survive redeploy or
+    # local state mismatch. Do not cancel TP/SL/reduce-only orders.
+    try:
+        chatgpt_log_event("cancel_old_pending_exchange_fetch_start")
+        orders = await exec_engine.exchange_client.fetch_open_orders()
+        chatgpt_log_event("cancel_old_pending_exchange_found", count=len(orders or []))
+    except Exception as e:
+        chatgpt_log_event("cancel_old_pending_exchange_fetch_error", error=str(e))
+        orders = []
+
+    def _order_symbol(o: dict) -> str:
+        info = o.get("info") if isinstance(o.get("info"), dict) else {}
+        return mexc_native_symbol(o.get("symbol") or info.get("symbol") or info.get("contract") or "")
+
+    def _order_id(o: dict) -> str:
+        info = o.get("info") if isinstance(o.get("info"), dict) else {}
+        return str(o.get("id") or info.get("orderId") or info.get("id") or info.get("planOrderId") or "").strip()
+
+    def _is_chatgpt_entry_order(o: dict) -> bool:
+        info = o.get("info") if isinstance(o.get("info"), dict) else {}
+        ext = str(info.get("externalOid") or info.get("clientOrderId") or o.get("clientOrderId") or "")
+        oid = _order_id(o)
+        reduce_only = str(o.get("reduceOnly") or info.get("reduceOnly") or "").lower() in {"1", "true", "yes"}
+        prot = str(info.get("_protection_kind") or "").lower()
+        if reduce_only or prot in {"tp", "sl"}:
+            return False
+        return ext.startswith("bot_entry_") or (oid and oid in local_pending_ids)
+
+    exchange_cancelled_ids: set[str] = set()
+    for o in orders or []:
+        if not _is_chatgpt_entry_order(o):
+            continue
+        sym = _order_symbol(o)
+        oid = _order_id(o)
+        if not sym or not oid or oid in exchange_cancelled_ids:
             continue
         try:
-            chatgpt_log_event("cancel_old_pending_start", symbol=sym, order_id=pos.get("order_id"), old_entry=pos.get("entry_price"))
-            res = await exec_engine.cancel_entry(pos, live=True, reason="chatgpt_new_setup_cancel_old_pending")
-            chatgpt_log_event("cancel_old_pending_done", symbol=sym, order_id=pos.get("order_id"), result=res)
-            cancelled.append({"symbol": sym, "order_id": pos.get("order_id"), "ok": True, "result": res})
+            chatgpt_log_event("cancel_old_pending_exchange_order_cancel_start", symbol=sym, order_id=oid)
+            res = await exec_engine.exchange_client.cancel_order(oid, sym)
+            exchange_cancelled_ids.add(oid)
+            chatgpt_log_event("cancel_old_pending_exchange_order_cancel_ok", symbol=sym, order_id=oid, result=res)
+            cancelled.append({"source": "exchange", "symbol": sym, "order_id": oid, "ok": True, "result": res})
         except Exception as e:
-            chatgpt_log_event("cancel_old_pending_error", symbol=sym, order_id=pos.get("order_id"), error=str(e))
-            cancelled.append({"symbol": sym, "order_id": pos.get("order_id"), "ok": False, "error": str(e)})
+            chatgpt_log_event("cancel_old_pending_exchange_order_cancel_error", symbol=sym, order_id=oid, error=str(e))
+            cancelled.append({"source": "exchange", "symbol": sym, "order_id": oid, "ok": False, "error": str(e)})
+
+    # 3) Verify after cancel.
+    try:
+        await asyncio.sleep(float(os.getenv("CHATGPT_CANCEL_VERIFY_DELAY_SEC", "0.8") or 0.8))
+        verify = await exec_engine.exchange_client.fetch_open_orders()
+        leftovers = []
+        for o in verify or []:
+            if _is_chatgpt_entry_order(o):
+                leftovers.append({"symbol": _order_symbol(o), "order_id": _order_id(o)})
+        if leftovers:
+            chatgpt_log_event("cancel_old_pending_verify_still_exists_error", leftovers=leftovers[:20], count=len(leftovers))
+        else:
+            chatgpt_log_event("cancel_old_pending_verify_after_cancel_ok")
+    except Exception as e:
+        chatgpt_log_event("cancel_old_pending_verify_after_cancel_error", error=str(e))
+
     return cancelled
 
 async def _count_open_chatgpt_slots(storage) -> tuple[int, list[dict]]:

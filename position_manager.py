@@ -463,7 +463,26 @@ class PositionManager:
         # the order is filled or a real exchange position exists.
         if is_chatgpt_setup:
             live = True
-            chatgpt_log_event("pending_limit_check", symbol=symbol, status=pos.get("status"), order_id=pos.get("order_id"), opened_at=pos.get("opened_at"), entry=pos.get("entry_price"), stop=pos.get("stop_price"), take=pos.get("take_price"))
+            # v23: pending ChatGPT LIMITs were being polled every execution loop
+            # tick (~0.25s), which spammed /log_chatgpt and could hit MEXC rate
+            # limits. Check each pending order only once per configurable interval.
+            try:
+                check_interval = float(os.getenv("CHATGPT_PENDING_CHECK_INTERVAL_SEC", "10") or 10)
+            except Exception:
+                check_interval = 10.0
+            try:
+                last_check = float(pos.get("chatgpt_pending_last_check_at") or 0)
+            except Exception:
+                last_check = 0.0
+            if last_check > 0 and now - last_check < max(1.0, check_interval):
+                return None
+            pos["chatgpt_pending_last_check_at"] = now
+            pos["updated_at"] = now
+            try:
+                await self.storage.upsert_position(pos)
+            except Exception:
+                pass
+            chatgpt_log_event("pending_limit_check", symbol=symbol, status=pos.get("status"), order_id=pos.get("order_id"), opened_at=pos.get("opened_at"), entry=pos.get("entry_price"), stop=pos.get("stop_price"), take=pos.get("take_price"), check_interval_sec=check_interval)
         if not live:
             # Paper mode simulation is allowed only for non-ChatGPT strategies.
             pos["status"] = "open"
