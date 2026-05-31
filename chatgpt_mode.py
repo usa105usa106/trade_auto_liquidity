@@ -34,7 +34,7 @@ CHATGPT_MODE_KEYS = {
 # estimated deposit risk in % for one trade.
 CHATGPT_MIN_STOP_DISTANCE_PCT = 1.0
 CHATGPT_MAX_STOP_DISTANCE_PCT = 5.0
-CHATGPT_SETUP_VERSION = "1.8"
+CHATGPT_SETUP_VERSION = "1.9"
 # ChatGPT Mode separates pending LIMIT slots from real open position slots.
 # Old pending LIMITs are always cancelled when a new setup is imported.
 # Up to 3 fresh pending limits can be placed, while up to 6 real ChatGPT
@@ -237,6 +237,79 @@ def _pct(a: float, b: float) -> float:
 
 def _stop_distance_pct(entry: float, stop: float) -> float:
     return abs(float(entry) - float(stop)) / float(entry) * 100.0 if entry else 0.0
+
+
+
+
+async def _fetch_chatgpt_current_price(exchange_client, symbol: str) -> float:
+    """Return the best available current price for a setup safety gate.
+
+    For stale LIMIT setups, the dangerous case is a fast move through the
+    planned stop before the bot places the entry order.  We prefer mark/index
+    prices when MEXC exposes them, then last/close/bid/ask.  Any failure is
+    surfaced to the caller so the setup row can be skipped safely instead of
+    placing a blind order.
+    """
+    ticker = await exchange_client.fetch_ticker(symbol)
+    info = ticker.get("info") if isinstance(ticker, dict) else {}
+    candidates = []
+    if isinstance(ticker, dict):
+        candidates += [
+            ticker.get("mark"),
+            ticker.get("markPrice"),
+            ticker.get("last"),
+            ticker.get("close"),
+            ticker.get("bid"),
+            ticker.get("ask"),
+        ]
+    if isinstance(info, dict):
+        candidates += [
+            info.get("markPrice"),
+            info.get("fairPrice"),
+            info.get("indexPrice"),
+            info.get("lastPrice"),
+            info.get("last"),
+            info.get("close"),
+            info.get("bid1"),
+            info.get("ask1"),
+        ]
+    for raw in candidates:
+        price = _safe_float(raw)
+        if price > 0:
+            return price
+    raise ValueError("ticker has no usable current price")
+
+
+def _chatgpt_stop_breached(direction: str, current_price: float, stop_price: float) -> bool:
+    """True when market already moved beyond the setup SL.
+
+    LONG is invalid if current <= stop.  SHORT is invalid if current >= stop.
+    In this state placing the old LIMIT is unsafe because the setup risk model
+    is already broken before entry.
+    """
+    d = str(direction or "").upper()
+    if d == "LONG":
+        return current_price <= stop_price
+    if d == "SHORT":
+        return current_price >= stop_price
+    return False
+
+
+def _chatgpt_tp1_already_touched(direction: str, current_price: float, tp1_price: float) -> bool:
+    """True when the market already reached TP1 before entry placement.
+
+    LONG is stale if current >= TP1.  SHORT is stale if current <= TP1.
+    If TP1 has already been touched, risk/reward is no longer the setup that
+    ChatGPT approved, so the LIMIT must be skipped for safety.
+    """
+    d = str(direction or "").upper()
+    if tp1_price <= 0:
+        return False
+    if d == "LONG":
+        return current_price >= tp1_price
+    if d == "SHORT":
+        return current_price <= tp1_price
+    return False
 
 
 def _closes(candles: list) -> list[float]:
@@ -585,7 +658,7 @@ NEW SETUP REPLACEMENT RULES:
 
 СТРОГИЙ ФОРМАТ setup.txt:
 {
-  "setup_version": "1.8",
+  "setup_version": "2.0",
   "mode": "AUTO_OPEN",
   "exchange": "MEXC_FUTURES",
   "margin_mode": "ISOLATED",
@@ -661,7 +734,7 @@ def validate_setup(data: dict) -> list[dict]:
     chatgpt_log_event("setup_validate_start", setup_version=(data or {}).get("setup_version") if isinstance(data, dict) else None)
     if not isinstance(data, dict):
         raise ValueError("setup JSON must be an object")
-    if str(data.get("setup_version")) not in {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8"}:
+    if str(data.get("setup_version")) not in {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "2.0"}:
         raise ValueError("unsupported setup_version")
     trades = data.get("trades") or []
     if not isinstance(trades, list):
@@ -762,7 +835,7 @@ def validate_setup(data: dict) -> list[dict]:
     return out
 
 
-async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
+async def _cancel_all_old_pending_limits(storage, exec_engine, setup_symbols: set[str] | None = None) -> list[dict]:
     """Cancel all stale ChatGPT orders before applying a new setup.
 
     Hard rule for V30:
@@ -778,6 +851,7 @@ async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
     """
     cancelled: list[dict] = []
     local_pending_ids: set[str] = set()
+    setup_symbols = {mexc_native_symbol(s) for s in (setup_symbols or set()) if mexc_native_symbol(s)}
 
     # 1) Read cache only after exchange-first reconcile has already rebuilt it.
     # It is used here only to identify order IDs and real open symbols, never to
@@ -853,7 +927,10 @@ async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
         oid = _order_id(o)
         info = o.get("info") if isinstance(o.get("info"), dict) else {}
         is_entry = _is_chatgpt_entry_order(o)
-        is_orphan = bool(sym and sym not in live_symbols)
+        # Only remove orphan planorders for symbols that are being reused by the NEW setup.
+        # Global orphan cleanup is dangerous: if exchange position sync misses a live position
+        # for a moment, the bot can delete its real SL/TP. Entry limits are still always removed.
+        is_orphan = bool(sym and sym in setup_symbols and sym not in live_symbols)
         should_cancel = bool(is_entry or is_orphan)
         chatgpt_log_event(
             "cancel_old_pending_exchange_order_seen",
@@ -886,7 +963,16 @@ async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
         leftovers = []
         for o in verify or []:
             sym = _order_symbol(o)
-            if _is_chatgpt_entry_order(o) or (sym and sym not in live_symbols):
+            # V39: verify only what we were allowed to cancel.
+            # Old V38 logic treated ANY plan/open order for a non-live symbol as a
+            # leftover, including unrelated symbols outside the new setup. That could
+            # abort setup after a successful cleanup and could also make the bot look
+            # inconsistent: cancel logic was setup-scoped, verify logic was global.
+            # Entry orders are still checked globally; orphan planorders are checked
+            # only for symbols from the new setup and only when no real position is
+            # live for that symbol.
+            is_setup_scoped_orphan = bool(sym and sym in setup_symbols and sym not in live_symbols)
+            if _is_chatgpt_entry_order(o) or is_setup_scoped_orphan:
                 leftovers.append({"symbol": sym, "order_id": _order_id(o)})
         if leftovers:
             chatgpt_log_event("cancel_old_pending_verify_still_exists_error", leftovers=leftovers[:20], count=len(leftovers))
@@ -1470,7 +1556,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
     leverage = int(float(setup.get("default_leverage") or 10))
     opened = []
     live = True
-    cancelled_pending = await _cancel_all_old_pending_limits(storage, exec_engine)
+    cancelled_pending = await _cancel_all_old_pending_limits(storage, exec_engine, {str(t.get("symbol") or "") for t in trades})
     if cancelled_pending:
         chatgpt_log_event("setup_cancelled_old_pending_limits", items=cancelled_pending)
     cancel_failed = [x for x in (cancelled_pending or []) if not bool(x.get("ok"))]
@@ -1607,6 +1693,50 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         plan = _build_plan(t)
         entry = float(plan.entry_price)
         final_tp = float(plan.take_price)
+        stop_price = float(plan.stop_price)
+        tp_rows = plan.signal_details.get("chatgpt_take_profits") or []
+        tp1_price = _safe_float((tp_rows[0] or {}).get("price") if tp_rows else 0)
+        # V38 hard safety gate: before entry placement, reject stale setups if
+        # either the setup SL has already been crossed OR TP1 has already been
+        # reached.  In both cases the original risk/reward is broken before the
+        # limit order even exists.
+        try:
+            cur = await _fetch_chatgpt_current_price(exchange_client, plan.symbol)
+            if _chatgpt_stop_breached(plan.side, cur, stop_price):
+                side_word = "ниже" if str(plan.side).upper() == "LONG" else "выше"
+                reason = f"цена уже {side_word} стопа: current={_fmt(cur)}, stop={_fmt(stop_price)}; лимитка не выставлена в целях безопасности"
+                chatgpt_log_event(
+                    "setup_trade_rejected_stop_already_breached",
+                    symbol=plan.symbol,
+                    side=plan.side,
+                    order_type=plan.order_type,
+                    current_price=cur,
+                    entry=entry,
+                    stop=stop_price,
+                    tp1=tp1_price,
+                    reason=reason,
+                )
+                return {"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": False, "reason": reason, "safety_stop_breached": True, "current_price": cur, "stop": stop_price, "tp1": tp1_price}
+            if _chatgpt_tp1_already_touched(plan.side, cur, tp1_price):
+                side_word = "выше TP1" if str(plan.side).upper() == "LONG" else "ниже TP1"
+                reason = f"цена уже {side_word}: current={_fmt(cur)}, tp1={_fmt(tp1_price)}; лимитка не выставлена в целях безопасности"
+                chatgpt_log_event(
+                    "setup_trade_rejected_tp1_already_touched",
+                    symbol=plan.symbol,
+                    side=plan.side,
+                    order_type=plan.order_type,
+                    current_price=cur,
+                    entry=entry,
+                    stop=stop_price,
+                    tp1=tp1_price,
+                    reason=reason,
+                )
+                return {"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": False, "reason": reason, "safety_tp1_touched": True, "current_price": cur, "stop": stop_price, "tp1": tp1_price}
+        except Exception as e:
+            reason = f"не смог проверить текущую цену перед входом: {e}; лимитка не выставлена в целях безопасности"
+            chatgpt_log_event("setup_trade_rejected_price_safety_check_failed", symbol=plan.symbol, side=plan.side, entry=entry, stop=stop_price, tp1=tp1_price, error=str(e))
+            return {"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": False, "reason": reason, "price_safety_check_failed": True}
+
         # Market stale-price guard. LIMIT entries are already handled by expiry/TP-before-entry rules.
         if plan.order_type == "market":
             max_dev = float(plan.signal_details.get("max_price_deviation_percent") or 0.7)

@@ -619,7 +619,17 @@ class PositionManager:
                     return {"type": "chatgpt_limit_filled_local_protection", "symbol": symbol, "entry_price": pos.get("entry_price"), "stop_price": pos.get("stop_price"), "take_price": pos.get("take_price"), "protection": protection}
                 if is_chatgpt_setup:
                     chatgpt_log_event("limit_position_open_ready", symbol=symbol, status="open", protection_mode=protection.get("protection_mode"), sl_order_id=protection.get("sl_order_id"), tp1_order_id=protection.get("tp1_order_id"), tp2_order_id=protection.get("tp2_order_id"), tp3_order_id=protection.get("tp3_order_id"))
-                    return {"type": "chatgpt_limit_filled_protected", "symbol": symbol, "entry_price": pos.get("entry_price"), "stop_price": pos.get("stop_price"), "take_price": pos.get("take_price"), "tp_orders": [protection.get("tp1_order_id"), protection.get("tp2_order_id"), protection.get("tp3_order_id")]}
+                    return {
+                        "type": "chatgpt_limit_filled_protected",
+                        "symbol": symbol,
+                        "entry_price": pos.get("entry_price"),
+                        "stop_price": pos.get("stop_price"),
+                        "take_price": pos.get("take_price"),
+                        "tp_levels": details.get("chatgpt_take_profits") or [],
+                        "tp_orders": [protection.get("tp1_order_id"), protection.get("tp2_order_id"), protection.get("tp3_order_id")],
+                        "sl_order_id": protection.get("sl_order_id"),
+                        "protection_note": protection.get("protection_note"),
+                    }
                 return {"type": "limit_filled", "symbol": symbol}
             if status in {"canceled", "cancelled", "rejected", "expired"}:
                 if is_chatgpt_setup:

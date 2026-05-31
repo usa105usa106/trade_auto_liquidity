@@ -1155,14 +1155,30 @@ def format_position_event(ev: dict) -> str:
     # v0134 improved protection notifications
 
     if typ == "chatgpt_limit_filled_protected":
+        tp_levels = ev.get("tp_levels") if isinstance(ev.get("tp_levels"), list) else []
+        tp_orders = ev.get("tp_orders") if isinstance(ev.get("tp_orders"), list) else []
+        tp_lines = []
+        for idx, tp in enumerate(tp_levels, start=1):
+            if not isinstance(tp, dict):
+                continue
+            price = tp.get("price")
+            size = tp.get("size_percent")
+            oid = tp_orders[idx - 1] if idx - 1 < len(tp_orders) else None
+            suffix = f" ({size})" if size not in (None, "") else ""
+            oid_suffix = f" ✅" if oid else ""
+            tp_lines.append(f"TP{idx}: {price}{suffix}{oid_suffix}")
+        if not tp_lines:
+            tp_lines = [f"TP final: {ev.get('take_price')}"]
         return "\n".join([
             "📌 Лимитка исполнена",
             f"{symbol}",
             f"Entry: {ev.get('entry_price')}",
             "",
             "✅ Позиция под полной защитой",
-            f"SL: {ev.get('stop_price')}",
-            f"TP final: {ev.get('take_price')}",
+            f"SL: {ev.get('stop_price')} ✅",
+            *tp_lines,
+            "",
+            "SL один на всю позицию; TP разбиты на 3 части.",
         ])
 
     if typ == "chatgpt_limit_filled_local_protection":
