@@ -555,7 +555,7 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
     except Exception:
         pass
 
-    task = 'ЗАДАЧА ДЛЯ CHATGPT MODE:\n\nТы анализируешь торговый log.txt для выбора сделок на MEXC Futures.\n\nВАЖНО:\nНе проси сразу 15m / 1H / 4H по всем монетам.\nНе проси 20–30 скриншотов сразу.\nСкриншоты браузером бот пока НЕ делает.\nСначала нужен только 4H.\n\nПОРЯДОК РАБОТЫ:\n\n1. Проанализируй весь log.txt.\n   Используй все метрики скана: 15m / 1H / 4H, объём, ликвидность,\n   RSI, MACD, MA7/MA25/MA99, orderbook, движение, силу/слабость,\n   риск перегрева и общий фон BTC/ETH.\n\n2. Выбери 10 лучших инструментов-кандидатов для ручной проверки по графикам.\n\n3. Сначала попроси у пользователя только 10 скриншотов 4H:\n   по одному 4H-графику на каждый выбранный инструмент.\n\n4. После получения 4H-графиков оставь 5 лучших кандидатов\n   и попроси по ним графики на 1H:\n   по одному 1H-графику на каждый из 5 кандидатов.\n\n5. По графикам 1H выбери 3 лучшие монеты для setup.\n\n6. 15m проси только если точка входа по 1H неясная,\n   максимум по 1–2 монетам.\n   15m нужен только для уточнения входа, а не для отбора всех кандидатов.\n\n7. После финального выбора верни готовый setup-файл для бота.\n   Файл должен быть приложен именно файлом, а не только текстом в чате.\n   Имя файла строго:\n   setup-HHMM_DDMM.txt\n   Пример:\n   setup-0059_0106.txt\n\n8. Внутри setup-файла обязательно:\n   setup_version: "1.6"\n   mode: "AUTO_OPEN"\n   exchange: "MEXC_FUTURES"\n   margin_mode: "ISOLATED"\n   default_margin_percent_per_trade: 10\n   default_leverage: 10\n   verdict: "TRADE" или "NO_TRADE"\n   trades: максимум 3 сделки.\n\n9. По каждой сделке обязательно указать:\n   symbol\n   direction: LONG или SHORT\n   order_type: LIMIT\n   entry\n   stop_loss\n   take_profits:\n     TP1: 35%\n     TP2: 35%\n     TP3: REMAINDER\n   cancel_if_not_filled_minutes: 120\n   cancel_if_tp1_before_entry: true\n   invalidation\n   comment\n   risk.stop_distance_percent\n   risk.estimated_deposit_risk_percent\n\n10. ВАЖНО ПО STOP_LOSS:\n\n   ChatGPT сам рассчитывает entry, stop_loss и take_profits.\n   Сделки выставляются лимитными ордерами, не рыночными.\n\n   Stop_loss должен быть структурным и находиться в диапазоне:\n   минимум 1% от entry,\n   максимум 5% от entry.\n\n   Если структурный стоп получается меньше 1%, не используй микростоп.\n   Расширь stop_loss до логичного уровня, чтобы расстояние было не меньше 1%.\n\n   Если структурный стоп получается больше 5%, не давай эту сделку в setup.\n\n   Take_profits НЕ пересчитываются от округлённого или расширенного stop_loss.\n   TP1 / TP2 / TP3 выбираются по графику, уровням, ликвидности и структуре рынка.\n\n   Схема фиксации:\n   TP1: 35%\n   TP2: 35%\n   TP3: REMAINDER\n\n   После TP1 бот переносит stop_loss в breakeven.\n   Trailing: OFF.\n   Scalp exit: OFF.\n\n11. Старые версии setup не использовать.\n   Бот принимает только setup_version "1.6".\n   Не использовать setup_version "1.4", "1.5", "2.3" и любые другие версии.\n\n12. Если нет 3 качественных сделок, не выдумывай.\n   Лучше дай 1–2 сделки или verdict: "NO_TRADE".'.strip()
+    task = 'ЗАДАЧА ДЛЯ CHATGPT MODE:\n\nТы анализируешь торговый log.txt для выбора сделок на MEXC Futures.\n\nВАЖНО:\nНе проси сразу 15m / 1H / 4H по всем монетам.\nНе проси 20–30 скриншотов сразу.\nСкриншоты браузером бот пока НЕ делает.\nСначала нужен только 4H.\n\nЗАПРЕЩЁННЫЕ ИНСТРУМЕНТЫ:\nНе рассматривай и не добавляй в setup любые инструменты, где в символе есть STOCK.\nПримеры: MSFTSTOCK_USDT, DELLSTOCK_USDT, IBMSTOCK_USDT, SPCXSTOCK_USDT.\nТакие инструменты регионально блокируются и не могут быть открыты ботом.\n\nПОРЯДОК РАБОТЫ:\n\n1. Проанализируй весь log.txt.\n   Используй все метрики скана: 15m / 1H / 4H, объём, ликвидность,\n   RSI, MACD, MA7/MA25/MA99, orderbook, движение, силу/слабость,\n   риск перегрева и общий фон BTC/ETH.\n   Символы со STOCK не рассматривать.\n\n2. Выбери 10 лучших инструментов-кандидатов для ручной проверки по графикам.\n   В эти 10 инструментов нельзя включать символы со STOCK.\n\n3. Сначала попроси у пользователя только 10 скриншотов 4H:\n   по одному 4H-графику на каждый выбранный инструмент.\n\n4. После получения 4H-графиков оставь 5 лучших кандидатов\n   и попроси по ним графики на 1H:\n   по одному 1H-графику на каждый из 5 кандидатов.\n\n5. По графикам 1H выбери 3 лучшие монеты для setup.\n\n6. 15m проси только если точка входа по 1H неясная,\n   максимум по 1–2 монетам.\n   15m нужен только для уточнения входа, а не для отбора всех кандидатов.\n\n7. После финального выбора ОБЯЗАТЕЛЬНО верни готовый setup как прикреплённый .txt файл.\n   Не пиши setup просто текстом в сообщении.\n   Не пиши setup в Markdown.\n   Не пиши setup в ```json блоке.\n   Нужно именно создать и приложить файл.\n\n   Имя файла строго:\n   setup-HHMM_DDMM.txt\n\n   Пример имени:\n   setup-0059_0106.txt\n\n8. Внутри setup-файла должен быть ЧИСТЫЙ JSON object.\n   Файл должен начинаться с { и заканчиваться }.\n   Не используй Markdown, не используй ```json, не используй поясняющий текст до или после JSON.\n   В файле не должно быть строк вида setup_version: 1.6 вне JSON.\n\n   Обязательные поля верхнего уровня:\n   "setup_version": "1.6"\n   "mode": "AUTO_OPEN"\n   "exchange": "MEXC_FUTURES"\n   "margin_mode": "ISOLATED"\n   "default_margin_percent_per_trade": 10\n   "default_leverage": 10\n   "verdict": "TRADE" или "NO_TRADE"\n   "blocked_symbol_substrings": ["STOCK"]\n   "symbol_format": "MEXC_NATIVE_UNDERSCORE"\n   "trades": максимум 3 сделки.\n\n   Минимальный пример структуры файла:\n   {\n     "setup_version": "1.6",\n     "mode": "AUTO_OPEN",\n     "exchange": "MEXC_FUTURES",\n     "margin_mode": "ISOLATED",\n     "default_margin_percent_per_trade": 10,\n     "default_leverage": 10,\n     "verdict": "TRADE",\n     "blocked_symbol_substrings": ["STOCK"],\n     "symbol_format": "MEXC_NATIVE_UNDERSCORE",\n     "trades": []\n   }\n\n9. По каждой сделке обязательно указать:\n   symbol\n   direction: LONG или SHORT\n   order_type: LIMIT\n   entry\n   stop_loss\n   take_profits:\n     TP1: 35%\n     TP2: 35%\n     TP3: REMAINDER\n   cancel_if_not_filled_minutes: 120\n   cancel_if_tp1_before_entry: true\n   invalidation\n   comment\n   risk.stop_distance_percent\n   risk.estimated_deposit_risk_percent\n\n10. ВАЖНО ПО STOP_LOSS:\n\n   ChatGPT сам рассчитывает entry, stop_loss и take_profits.\n   Сделки выставляются лимитными ордерами, не рыночными.\n\n   Stop_loss должен быть структурным и находиться в диапазоне:\n   минимум 1% от entry,\n   максимум 5% от entry.\n\n   Если структурный стоп получается меньше 1%, не используй микростоп.\n   Расширь stop_loss до логичного уровня, чтобы расстояние было не меньше 1%.\n\n   Если структурный стоп получается больше 5%, не давай эту сделку в setup.\n\n   Take_profits НЕ пересчитываются от округлённого или расширенного stop_loss.\n   TP1 / TP2 / TP3 выбираются по графику, уровням, ликвидности и структуре рынка.\n\n   Схема фиксации:\n   TP1: 35%\n   TP2: 35%\n   TP3: REMAINDER\n\n   После TP1 бот переносит stop_loss в breakeven.\n   Trailing: OFF.\n   Scalp exit: OFF.\n\n11. Старые версии setup не использовать.\n   Бот принимает только setup_version "1.6".\n   Не использовать setup_version "1.4", "1.5", "2.3" и любые другие версии.\n\n12. Если нет 3 качественных сделок, не выдумывай.\n   Лучше дай 1–2 сделки или verdict: "NO_TRADE".\n'.strip()
 
     header = [
         "CHATGPT MARKET SCAN LOG",
@@ -580,28 +580,75 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
         else:
             body.append(str(b))
     text = "\n".join(header + ["\n---\n".join(body), "", "=== TASK ===", task, ""])
-    path.write_text(text, encoding="utf-8")
-    chatgpt_log_event("scan_log_created", path=str(path), symbols=len(symbols), bytes=len(text.encode("utf-8")))
+    path.write_text(text, encoding="utf-8-sig")
+    chatgpt_log_event("scan_log_created", path=str(path), symbols=len(symbols), bytes=len(text.encode("utf-8-sig")))
     return str(path)
 
 
 def extract_setup_json(text: str) -> dict:
     chatgpt_log_event("setup_extract_start", text_bytes=len(str(text or "").encode("utf-8", errors="ignore")))
-    raw = str(text or "").strip()
+    raw = str(text or "").replace("\ufeff", "").strip()
+
+    # Allow the historical wrapper used in some ChatGPT answers, but still
+    # require the payload itself to be a JSON object.
     if "===== setup.txt =====" in raw:
         raw = raw.split("===== setup.txt =====", 1)[1].split("===== end setup.txt =====", 1)[0].strip()
+
+    # Robustly unwrap common markdown fences if a model accidentally added them.
     if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.lower().startswith("json"):
-            raw = raw[4:].strip()
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError("setup.txt must contain JSON object")
-    data = json.loads(raw[start:end + 1])
+        lines = raw.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+        if raw.lower().startswith("json\n"):
+            raw = raw.split("\n", 1)[1].strip()
+
+    # Primary path: pure JSON file.
+    if raw.startswith("{") and raw.endswith("}"):
+        data = json.loads(raw)
+    else:
+        # Fallback: extract the first balanced top-level JSON object from text.
+        # This handles accidental captions around JSON without accepting YAML/
+        # key=value pseudo-setup formats.
+        start = raw.find("{")
+        if start < 0:
+            raise ValueError(
+                "setup.txt должен содержать чистый JSON object: файл начинается с { и заканчивается }. "
+                "Сейчас в файле не найден символ {"
+            )
+        depth = 0
+        in_str = False
+        esc = False
+        end = -1
+        for i in range(start, len(raw)):
+            ch = raw[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end < start:
+            raise ValueError("setup.txt содержит незакрытый JSON object: не найден корректный закрывающий }")
+        data = json.loads(raw[start:end + 1])
+
+    if not isinstance(data, dict):
+        raise ValueError("setup JSON must be an object")
     chatgpt_log_event("setup_extract_ok", setup_version=data.get("setup_version"), trades_count=len(data.get("trades") or []), verdict=data.get("verdict"))
     return data
-
 
 def validate_setup(data: dict) -> list[dict]:
     chatgpt_log_event("setup_validate_start", setup_version=(data or {}).get("setup_version") if isinstance(data, dict) else None)

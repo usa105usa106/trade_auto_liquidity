@@ -5798,14 +5798,17 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_path = f"/tmp/{int(time.time())}_{safe_name}"
         await tg_file.download_to_drive(tmp_path)
         chatgpt_log_event("setup_file_downloaded", filename=name, path=tmp_path)
-        with open(tmp_path, "r", encoding="utf-8") as f:
+        with open(tmp_path, "r", encoding="utf-8-sig") as f:
             text = f.read()
 
         try:
             setup = extract_setup_json(text)
         except Exception as e:
             chatgpt_log_event("setup_extract_error", filename=name, error=str(e))
-            await reply(update, f"❌ setup-файл отклонён\nПричина: JSON setup не найден или повреждён: {str(e)[:700]}", reply_markup=MAIN_MENU)
+            await reply(update, "❌ setup-файл отклонён\n"
+                              f"Причина: JSON setup не найден или повреждён: {str(e)[:700]}\n\n"
+                              "Файл setup должен быть чистым JSON object: начинаться с { и заканчиваться }.\n"
+                              "Без Markdown, без поясняющего текста, без строк вида setup_version: 1.6 вне JSON.", reply_markup=MAIN_MENU)
             return
 
         setup_version = str(setup.get("setup_version") or "").strip()
