@@ -5726,12 +5726,45 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         running = True
         if position_task is None or position_task.done():
             position_task = context.application.create_task(position_management_loop(context.application))
-        lines = ["✅ setup.txt обработан"]
-        if result.get("message") == "NO_TRADE":
+        ok_result = bool(result.get("ok", True))
+        lines = ["✅ setup-файл обработан" if ok_result else "❌ setup-файл НЕ исполнен"]
+
+        msg = str(result.get("message") or "")
+        if msg:
+            lines.append(f"status={msg}")
+
+        cancelled_n = result.get("cancelled_pending_count")
+        if cancelled_n is not None:
+            lines.append(f"🧹 Старые pending-лимитки ChatGPT Mode сняты: {cancelled_n}")
+
+        rotation = result.get("rotation")
+        if isinstance(rotation, dict):
+            if rotation.get("rotated"):
+                pnl_txt = ""
+                try:
+                    pnl_txt = f" pnl={float(rotation.get('pnl_pct') or 0):.2f}%"
+                except Exception:
+                    pass
+                lines.append(f"🔁 Ротация: закрыта худшая позиция {rotation.get('symbol')}{pnl_txt}; разрешена 1 новая лимитка.")
+            elif msg == "ROTATION_FAILED":
+                lines.append(f"⚠️ Ротация не выполнена: {rotation.get('reason') or rotation}")
+            else:
+                lines.append("🔁 Ротация: не требовалась.")
+
+        if msg == "NO_TRADE":
             lines.append("NO_TRADE: сделок нет.")
+        if msg == "OLD_PENDING_CANCEL_FAILED":
+            lines.append("Старые лимитки не снялись, новые НЕ ставил. Скинь /log_chatgpt.")
+        if msg == "NO_LIMIT_CAPACITY":
+            lines.append("Нет свободной вместимости под новые лимитки.")
+
+        if result.get("open_positions") is not None:
+            lines.append(f"📊 ChatGPT позиции: {result.get('open_positions')}/{result.get('max_open_positions')}; лимитки за setup: до {result.get('max_pending_limits')}")
+
         for row in result.get("opened", []):
             status = "✅" if row.get("ok") else "❌"
-            lines.append(f"{status} {row.get('symbol')} {row.get('side','')} {row.get('order_type','')} entry={row.get('entry')} reason={row.get('reason','')}")
+            reason = row.get("reason") or (row.get("result") or {}).get("reason") or ""
+            lines.append(f"{status} {row.get('symbol')} {row.get('side','')} {row.get('order_type','')} entry={row.get('entry')} reason={reason}")
         await storage.set("chatgpt_waiting_setup", False)
         await reply(update, "\n".join(lines)[:3900], reply_markup=MAIN_MENU)
     except Exception as e:

@@ -34,9 +34,16 @@ CHATGPT_MODE_KEYS = {
 # estimated deposit risk in % for one trade.
 CHATGPT_MIN_STOP_DISTANCE_PCT = 1.0
 CHATGPT_MAX_STOP_DISTANCE_PCT = 5.0
-CHATGPT_SETUP_VERSION = "1.5"
-CHATGPT_MAX_ACTIVE_TRADES = 3
-CHATGPT_MAX_TOTAL_SLOTS = 3  # open ChatGPT positions + new pending limits must not exceed this
+CHATGPT_SETUP_VERSION = "1.6"
+# ChatGPT Mode separates pending LIMIT slots from real open position slots.
+# Old pending LIMITs are always cancelled when a new setup is imported.
+# Up to 3 fresh pending limits can be placed, while up to 6 real ChatGPT
+# positions may be open after previous limits have filled.
+CHATGPT_MAX_PENDING_LIMITS = 3
+CHATGPT_MAX_OPEN_POSITIONS = 6
+# Backward-compatible names used in logs/older code paths.
+CHATGPT_MAX_ACTIVE_TRADES = CHATGPT_MAX_PENDING_LIMITS
+CHATGPT_MAX_TOTAL_SLOTS = CHATGPT_MAX_OPEN_POSITIONS
 
 # MEXC regional restrictions: tokenized stock/stock-index contracts can be
 # blocked in the user's region and must never be scanned or traded in
@@ -459,34 +466,36 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
 TASK FOR CHATGPT:
 Ты получил log.txt от Telegram-бота со сканом топ-200 монет MEXC Futures.
 
-ОБЩИЙ ПРОЦЕСС:
+ОБЩИЙ ПРОЦЕСС SCREENSHOT WORKFLOW V2:
 1. Бот собирает данные по MEXC Futures API.
 2. Пользователь отправляет этот log.txt в ChatGPT.
 3. ChatGPT сначала выбирает 10 монет-кандидатов.
 4. Пользователь присылает только 10 скриншотов 4H по этим 10 монетам.
 5. ChatGPT по 4H оставляет 5 лучших монет.
-6. Пользователь присылает ещё 10 скриншотов: 15m и 1H по этим 5 монетам.
-7. Только после этого ChatGPT выбирает максимум 3 лучшие сделки и возвращает текстовый вердикт + готовый setup.txt файлом/блоком JSON.
-8. По умолчанию максимум 3 сделки; не расширяй setup.txt до 5/10 без отдельной просьбы пользователя.
-9. Важно: у бота есть 3 общих ChatGPT-слота: реальные открытые ChatGPT-позиции + новые pending LIMIT-ордера вместе не должны превышать 3. Pending LIMIT проверяются не чаще одного раза в 10 секунд, чтобы не долбить MEXC.
+6. Пользователь присылает только 5 скриншотов 1H по этим 5 монетам.
+7. После 4H+1H ChatGPT выбирает максимум 3 лучшие сделки и возвращает текстовый вердикт + готовый setup-файл.
+8. 15m НЕ является обязательным этапом. Проси 15m только точечно по 1–2 монетам, если без него нельзя безопасно определить вход.
+9. По умолчанию максимум 3 сделки; не расширяй setup.txt до 5/10 без отдельной просьбы пользователя.
+10. Важно: у бота отдельные слоты: до 3 pending LIMIT-ордеров ChatGPT Mode и до 6 реальных открытых ChatGPT-позиций. При новом setup старые pending LIMIT всегда снимаются, открытые позиции не трогаются, кроме ротации 6/6.
 
 ЭТАП 1 ПОСЛЕ log.txt:
 1. Проанализируй общий рынок BTC/ETH и все монеты из лога.
 2. Отбери ровно 10 лучших кандидатов, если достойных меньше — напиши меньше и объясни почему.
 3. Раздели их на LONG / SHORT / WAIT / NO TRADE.
 4. Попроси у пользователя ТОЛЬКО 4H-скриншоты по этим 10 монетам.
-5. НЕ проси сразу 15m и 1H.
+5. НЕ проси сразу 1H и 15m.
 6. НЕ давай финальные сделки и НЕ создавай setup.txt на этом этапе.
 7. НЕ рассматривай монеты/контракты, где в названии есть STOCK: они заблокированы по региону и торговать их нельзя.
 
 ЭТАП 2 ПОСЛЕ 10 СКРИНШОТОВ 4H:
 1. Проанализируй 4H-структуру выбранных 10 монет.
 2. Оставь 5 лучших монет.
-3. Попроси у пользователя только 15m и 1H скриншоты по этим 5 монетам.
-4. НЕ создавай setup.txt до получения 15m и 1H по этим 5 монетам.
+3. Попроси у пользователя только 1H скриншоты по этим 5 монетам.
+4. НЕ создавай setup-файл до получения 1H по этим 5 монетам.
+5. 15m проси только дополнительно по 1–2 спорным монетам, если 4H+1H недостаточно для входа.
 
-ЭТАП 3 ПОСЛЕ ДОПОЛНИТЕЛЬНЫХ 10 СКРИНШОТОВ 15m/1H:
-1. Выбери максимум 3 лучшие сделки.
+ЭТАП 3 ПОСЛЕ ДОПОЛНИТЕЛЬНЫХ 5 СКРИНШОТОВ 1H:
+1. Выбери максимум 3 лучшие сделки по 4H+1H. Если вход по одной из них спорный, сначала попроси 15m только по этой монете и не создавай setup до уточнения.
 2. Дай короткий текстовый вердикт.
 3. ОБЯЗАТЕЛЬНО верни готовый setup-файл в JSON-формате так, чтобы пользователь мог сразу скачать файл и отправить его боту.
 4. Файл создавай с уникальным именем: setup-HHMM_DDMM.txt, например setup-1445_3105.txt. Не используй одно и то же setup.txt, чтобы Telegram не путал старые файлы. Бот принимает setup.txt, setup-1.txt, setup-2.txt, setup-HHMM_DDMM.txt и любые .txt с корректным JSON setup.
@@ -497,8 +506,15 @@ TASK FOR CHATGPT:
 9. Для MARKET добавь max_price_deviation_percent.
 10. Не указывай размер позиции в монетах: бот сам использует 10% депозита на каждую сделку, 10x leverage, isolated.
 11. Если хороших сделок нет, верни trades: [] и verdict: NO_TRADE.
-12. В setup.txt всегда ставь max_active_trades=3.
-13. Если часть старых ChatGPT-сделок уже стала реальными позициями, новые лимитки ставятся только на свободные слоты.
+12. В setup.txt всегда ставь max_active_trades=3 для новых лимиток.
+13. Бот может держать до 6 открытых ChatGPT-позиций. Если при новом setup уже открыто 6/6, бот может закрыть максимум 1 худшую позицию без TP1 и поставить максимум 1 новую лимитку. Если открыто 5/6 — никого не закрывает и ставит максимум 1 лимитку; 4/6 — максимум 2; 0–3/6 — максимум 3.
+
+ROTATION RULES FOR BOT:
+1. Ротация включается только при загрузке нового setup-файла и только если уже открыто 6/6 ChatGPT-позиций.
+2. Бот закрывает максимум 1 худшую позицию: TP1 ещё не достигнут, PnL самый плохой, при равенстве — самая старая.
+3. Если все позиции уже после TP1 / в безубытке, бот никого не закрывает и новый setup не исполняет.
+4. Если закрытие худшей позиции не удалось, новые лимитки не ставятся.
+5. Бот обязан написать в Telegram, была ли ротация, какие старые лимитки сняты и какие новые лимитки поставлены/отклонены.
 
 SETUP FILE NAMING RULE FOR CHATGPT:
 1. Финальный файл всегда прикладывай как setup-HHMM_DDMM.txt, где HHMM — текущее время, DDMM — сегодняшняя дата.
@@ -508,9 +524,10 @@ SETUP FILE NAMING RULE FOR CHATGPT:
 SCREENSHOT RULES FOR CHATGPT:
 1. После log.txt проси только 4H по 10 монетам.
 2. После 4H отбери 5 монет.
-3. По 5 монетам проси только 15m и 1H.
-4. Итого максимум 20 скриншотов: 10 скринов 4H + 10 скринов 15m/1H.
-5. Не проси 30 скриншотов сразу.
+3. По 5 монетам проси только 1H.
+4. Итого стандартно максимум 15 скриншотов: 10 скринов 4H + 5 скринов 1H.
+5. 15m проси только опционально по 1–2 спорным монетам для точного входа.
+6. Не проси 20–30 скриншотов сразу.
 
 BLOCKED SYMBOL RULES FOR CHATGPT:
 1. Любой symbol, где есть substring STOCK, запрещён: MSFTSTOCK_USDT, STXSTOCKUSDT и любые аналоги.
@@ -539,15 +556,16 @@ NEW SETUP REPLACEMENT RULES:
 1. При загрузке нового setup.txt бот отменяет все старые pending LIMIT-ордера ChatGPT Mode, которые ещё не исполнены.
 2. Открытые позиции бот не трогает.
 3. После отмены старых pending-лимиток бот считает реальные открытые ChatGPT-позиции.
-4. Свободные слоты = 3 - количество открытых ChatGPT-позиций.
-5. Бот ставит из нового setup.txt только столько новых лимиток, сколько есть свободных слотов.
-6. Если уже открыто 3 ChatGPT-позиции, новые лимитки не ставятся.
-7. Открытые позиции бот не трогает.
-8. По умолчанию максимум 3 сделки и максимум 3 общих ChatGPT-слота.
+4. У бота отдельные лимиты: до 3 pending LIMIT и до 6 открытых ChatGPT-позиций.
+5. Бот может поставить до 3 новых лимиток, но не больше свободной вместимости до 6 открытых позиций.
+6. Если уже открыто 6/6 позиций, бот может сделать ротацию: закрыть максимум 1 худшую позицию без TP1 и поставить максимум 1 новую лимитку.
+7. Если открыто 5/6 — никого не закрывает и ставит максимум 1 лимитку; 4/6 — максимум 2; 0–3/6 — максимум 3.
+8. Открытые позиции бот не трогает, кроме строгой ротации 6/6.
+9. По умолчанию максимум 3 новые лимитки из одного setup.
 
 СТРОГИЙ ФОРМАТ setup.txt:
 {
-  "setup_version": "1.4",
+  "setup_version": "1.6",
   "mode": "AUTO_OPEN",
   "exchange": "MEXC_FUTURES",
   "margin_mode": "ISOLATED",
@@ -623,7 +641,7 @@ def validate_setup(data: dict) -> list[dict]:
     chatgpt_log_event("setup_validate_start", setup_version=(data or {}).get("setup_version") if isinstance(data, dict) else None)
     if not isinstance(data, dict):
         raise ValueError("setup JSON must be an object")
-    if str(data.get("setup_version")) not in {"1.0", "1.1", "1.2", "1.3", "1.4"}:
+    if str(data.get("setup_version")) not in {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"}:
         raise ValueError("unsupported setup_version")
     trades = data.get("trades") or []
     if not isinstance(trades, list):
@@ -830,12 +848,12 @@ async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
 
     return cancelled
 
-async def _count_open_chatgpt_slots(storage) -> tuple[int, list[dict]]:
-    """Count real active ChatGPT positions after old pending limits are cancelled.
+async def _count_open_chatgpt_positions(storage) -> tuple[int, list[dict]]:
+    """Count real active ChatGPT positions only.
 
-    Pending LIMIT entries are not counted here because execute_setup cancels old
-    pending ChatGPT limits before calling this helper. We count only open/closing
-    positions so a fresh setup can fill remaining free slots up to 3 total.
+    Pending LIMITs are not counted as position slots. They are cancelled before
+    each new setup import and are governed separately by
+    CHATGPT_MAX_PENDING_LIMITS.
     """
     active: list[dict] = []
     try:
@@ -855,6 +873,114 @@ async def _count_open_chatgpt_slots(storage) -> tuple[int, list[dict]]:
             chatgpt_log_event("slot_count_pending_ignored_after_cancel", symbol=pos.get("symbol"), order_id=pos.get("order_id"), status=status)
     chatgpt_log_event("slot_count_open_positions", count=len(active), symbols=[p.get("symbol") for p in active])
     return len(active), active
+
+
+def _chatgpt_tp1_reached(pos: dict) -> bool:
+    """Best-effort TP1 marker for rotation safety.
+
+    If TP1 has already been reached and the stop was moved to breakeven, the
+    position is protected and should not be rotated out automatically.
+    """
+    for key in (
+        "chatgpt_tp1_breakeven_done",
+        "breakeven_moved",
+        "tp1_hit",
+        "partial_taken",
+        "partial_take_done",
+    ):
+        if _truthy(pos.get(key), False):
+            return True
+    return False
+
+
+def _chatgpt_position_pnl_pct_from_price(pos: dict, price: float) -> float:
+    try:
+        entry = float(pos.get("entry_price") or 0)
+        if entry <= 0 or price <= 0:
+            return 0.0
+        side = str(pos.get("side") or "").upper()
+        if side == "LONG":
+            return (price - entry) / entry * 100.0
+        return (entry - price) / entry * 100.0
+    except Exception:
+        return 0.0
+
+
+async def _select_worst_chatgpt_rotation_position(open_positions: list[dict], exchange_client) -> dict | None:
+    """Select at most one worst ChatGPT position for rotation.
+
+    Candidates: TP1 not reached. Rank by worst PnL first, oldest as tie-break.
+    """
+    candidates: list[dict] = []
+    for pos in open_positions or []:
+        if _chatgpt_tp1_reached(pos):
+            chatgpt_log_event("rotation_candidate_skip_tp1_reached", symbol=pos.get("symbol"), opened_at=pos.get("opened_at"))
+            continue
+        sym = str(pos.get("symbol") or "")
+        price = 0.0
+        try:
+            ticker = await exchange_client.fetch_ticker(sym)
+            price = _safe_float(ticker.get("last") or ticker.get("close") or ticker.get("bid") or ticker.get("ask"))
+        except Exception as e:
+            chatgpt_log_event("rotation_candidate_price_error", symbol=sym, error=str(e))
+        pnl = _chatgpt_position_pnl_pct_from_price(pos, price)
+        try:
+            opened = float(pos.get("opened_at") or 0)
+        except Exception:
+            opened = 0.0
+        row = dict(pos)
+        row["_rotation_current_price"] = price
+        row["_rotation_pnl_pct"] = pnl
+        row["_rotation_opened_at"] = opened
+        candidates.append(row)
+
+    chatgpt_log_event(
+        "rotation_candidates_found",
+        count=len(candidates),
+        candidates=[{
+            "symbol": c.get("symbol"),
+            "pnl_pct": round(float(c.get("_rotation_pnl_pct") or 0), 4),
+            "opened_at": c.get("opened_at"),
+        } for c in candidates[:20]],
+    )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (float(c.get("_rotation_pnl_pct") or 0), float(c.get("_rotation_opened_at") or 0)))
+    worst = candidates[0]
+    chatgpt_log_event(
+        "rotation_worst_selected",
+        symbol=worst.get("symbol"),
+        pnl_pct=round(float(worst.get("_rotation_pnl_pct") or 0), 4),
+        opened_at=worst.get("opened_at"),
+        current_price=worst.get("_rotation_current_price"),
+    )
+    return worst
+
+
+async def _rotate_one_chatgpt_position(storage, exec_engine: ExecutionEngine, open_positions: list[dict]) -> dict:
+    """Close exactly one worst ChatGPT position when 6/6 positions are full.
+
+    Rotation is allowed only on a new setup import and only when all 6 open
+    position slots are occupied. If closing fails, no new setup limit is placed.
+    """
+    chatgpt_log_event("rotation_check_start", open_positions=len(open_positions), max_open_positions=CHATGPT_MAX_OPEN_POSITIONS)
+    worst = await _select_worst_chatgpt_rotation_position(open_positions, exec_engine.exchange_client)
+    if not worst:
+        chatgpt_log_event("rotation_no_candidate", reason="all_positions_after_tp1_or_no_candidates")
+        return {"ok": False, "rotated": False, "reason": "no_rotation_candidate"}
+    try:
+        chatgpt_log_event("rotation_close_start", symbol=worst.get("symbol"), pnl_pct=worst.get("_rotation_pnl_pct"), opened_at=worst.get("opened_at"))
+        res = await exec_engine.close_position(worst, reason="chatgpt_rotation_new_setup", live=True)
+        ok = bool((res or {}).get("ok"))
+        if ok:
+            chatgpt_log_event("rotation_close_ok", symbol=worst.get("symbol"), result=res)
+            return {"ok": True, "rotated": True, "symbol": worst.get("symbol"), "pnl_pct": worst.get("_rotation_pnl_pct"), "result": res}
+        chatgpt_log_event("rotation_close_error", symbol=worst.get("symbol"), result=res)
+        return {"ok": False, "rotated": False, "symbol": worst.get("symbol"), "reason": "close_failed", "result": res}
+    except Exception as e:
+        chatgpt_log_event("rotation_close_error", symbol=worst.get("symbol"), error=str(e))
+        return {"ok": False, "rotated": False, "symbol": worst.get("symbol"), "reason": f"close_exception: {e}"}
+
 
 def _balance_total_usdt(balance: dict) -> float:
     for key in ("USDT", "usdt"):
@@ -895,32 +1021,80 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         chatgpt_log_event("setup_abort_old_pending_cancel_failed", failed=cancel_failed[:20], count=len(cancel_failed))
         return {"ok": False, "opened": [], "message": "OLD_PENDING_CANCEL_FAILED", "failed_cancelled_pending": cancel_failed}
 
-    open_slots, open_positions = await _count_open_chatgpt_slots(storage)
-    free_slots = max(0, CHATGPT_MAX_TOTAL_SLOTS - open_slots)
+    open_slots, open_positions = await _count_open_chatgpt_positions(storage)
+
+    rotation_result: dict | None = None
+    limits_to_place = min(CHATGPT_MAX_PENDING_LIMITS, len(trades))
+
+    if open_slots >= CHATGPT_MAX_OPEN_POSITIONS:
+        # Full book: rotate exactly one worst ChatGPT position and then allow
+        # exactly one new pending limit from the setup. Never rotate more than
+        # one position per setup file.
+        rotation_result = await _rotate_one_chatgpt_position(storage, exec_engine, open_positions)
+        if not rotation_result.get("ok"):
+            chatgpt_log_event("setup_abort_rotation_failed", rotation=rotation_result)
+            return {
+                "ok": False,
+                "opened": [],
+                "message": "ROTATION_FAILED",
+                "rotation": rotation_result,
+                "open_positions": open_slots,
+                "max_open_positions": CHATGPT_MAX_OPEN_POSITIONS,
+            }
+        limits_to_place = 1
+        # Re-count after successful close so duplicate-symbol filtering below sees
+        # the updated local state.
+        open_slots, open_positions = await _count_open_chatgpt_positions(storage)
+    else:
+        free_position_capacity = max(0, CHATGPT_MAX_OPEN_POSITIONS - open_slots)
+        limits_to_place = min(CHATGPT_MAX_PENDING_LIMITS, free_position_capacity, len(trades))
+
+    open_symbols = {mexc_native_symbol(p.get("symbol")) for p in (open_positions or []) if p.get("symbol")}
+    filtered_trades = []
+    skipped_open_symbol = []
+    for t in trades:
+        sym = mexc_native_symbol(t.get("symbol"))
+        if sym in open_symbols:
+            skipped_open_symbol.append(sym)
+            chatgpt_log_event("setup_trade_skipped_existing_position", symbol=sym)
+            continue
+        filtered_trades.append(t)
+    trades = filtered_trades
+
     requested_trades = len(trades)
-    if free_slots <= 0:
+    if limits_to_place <= 0:
         chatgpt_log_event(
-            "setup_no_free_slots",
-            max_total_slots=CHATGPT_MAX_TOTAL_SLOTS,
-            open_slots=open_slots,
-            open_symbols=[p.get("symbol") for p in open_positions],
-            requested_trades=requested_trades,
+            "setup_no_limit_capacity",
+            max_open_positions=CHATGPT_MAX_OPEN_POSITIONS,
+            max_pending_limits=CHATGPT_MAX_PENDING_LIMITS,
+            open_positions=open_slots,
+            skipped_open_symbol=skipped_open_symbol,
         )
-        return {"ok": True, "opened": [], "message": "NO_FREE_CHATGPT_SLOTS", "open_slots": open_slots, "max_total_slots": CHATGPT_MAX_TOTAL_SLOTS}
-    if len(trades) > free_slots:
-        skipped = trades[free_slots:]
-        trades = trades[:free_slots]
+        return {
+            "ok": True,
+            "opened": [],
+            "message": "NO_LIMIT_CAPACITY",
+            "rotation": rotation_result,
+            "open_positions": open_slots,
+            "max_open_positions": CHATGPT_MAX_OPEN_POSITIONS,
+            "skipped_open_symbol": skipped_open_symbol,
+        }
+    if len(trades) > limits_to_place:
+        skipped = trades[limits_to_place:]
+        trades = trades[:limits_to_place]
         chatgpt_log_event(
-            "setup_trades_trimmed_to_free_slots",
-            max_total_slots=CHATGPT_MAX_TOTAL_SLOTS,
-            open_slots=open_slots,
-            free_slots=free_slots,
+            "setup_trades_trimmed_to_limit_capacity",
+            max_open_positions=CHATGPT_MAX_OPEN_POSITIONS,
+            max_pending_limits=CHATGPT_MAX_PENDING_LIMITS,
+            open_positions=open_slots,
+            limits_to_place=limits_to_place,
             requested_trades=requested_trades,
             accepted_trades=len(trades),
             skipped_symbols=[t.get("symbol") for t in skipped],
+            skipped_open_symbol=skipped_open_symbol,
         )
 
-    chatgpt_log_event("setup_execute_balance", equity=equity, margin_pct=margin_pct, leverage=leverage, trades=len(trades), requested_trades=requested_trades, cancelled_pending=len(cancelled_pending), open_slots=open_slots, free_slots=free_slots, max_active_trades=CHATGPT_MAX_ACTIVE_TRADES, max_total_slots=CHATGPT_MAX_TOTAL_SLOTS)
+    chatgpt_log_event("setup_execute_balance", equity=equity, margin_pct=margin_pct, leverage=leverage, trades=len(trades), requested_trades=requested_trades, cancelled_pending=len(cancelled_pending), open_positions=open_slots, limits_to_place=limits_to_place, max_pending_limits=CHATGPT_MAX_PENDING_LIMITS, max_open_positions=CHATGPT_MAX_OPEN_POSITIONS, rotation=rotation_result)
     for t in trades:
         entry = float(t["entry"])
         notional = equity * margin_pct * leverage
@@ -939,7 +1113,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
             risk_pct=0.0,
             confidence=float(t.get("confidence") or 0),
             strategy="chatgpt_setup",
-            max_open_positions=CHATGPT_MAX_ACTIVE_TRADES,
+            max_open_positions=CHATGPT_MAX_OPEN_POSITIONS,
             planned_notional_usdt=notional,
             expected_margin_usdt=equity * margin_pct,
             max_margin_per_position_usdt=equity * margin_pct,
@@ -982,5 +1156,14 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         res = await exec_engine.place_entry(plan, live=live)
         chatgpt_log_event("setup_trade_place_result", symbol=plan.symbol, ok=bool(res.get("ok")), result=res)
         opened.append({"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": bool(res.get("ok")), "result": res})
-    chatgpt_log_event("setup_execute_done", opened=opened)
-    return {"ok": True, "opened": opened}
+    chatgpt_log_event("setup_execute_done", opened=opened, rotation=rotation_result)
+    return {
+        "ok": True,
+        "opened": opened,
+        "rotation": rotation_result,
+        "cancelled_pending_count": len([x for x in (cancelled_pending or []) if bool(x.get("ok"))]),
+        "open_positions": open_slots,
+        "max_open_positions": CHATGPT_MAX_OPEN_POSITIONS,
+        "max_pending_limits": CHATGPT_MAX_PENDING_LIMITS,
+        "limits_to_place": limits_to_place,
+    }

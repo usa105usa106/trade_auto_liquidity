@@ -93,13 +93,13 @@ class ExecutionEngine:
         positions = await self.storage.positions()
         return len([p for p in positions if p.get("status") in {"open", "pending", "closing"}])
 
-    async def can_enter(self, symbol: str, max_open_positions: int, live: bool) -> tuple[bool, str]:
+    async def can_enter(self, symbol: str, max_open_positions: int, live: bool, ignore_slot_caps: bool = False) -> tuple[bool, str]:
         locked, reason = await self.storage.is_locked(symbol)
         if locked:
             return False, f"symbol locked: {reason}"
         if symbol in await self.storage.position_symbols():
             return False, "position already open/pending"
-        if await self.occupied_slots() >= int(max_open_positions):
+        if (not ignore_slot_caps) and await self.occupied_slots() >= int(max_open_positions):
             return False, "max positions reached"
         if live:
             # fail-safe: if exchange order/position check fails, block live entry.
@@ -118,7 +118,7 @@ class ExecutionEngine:
                         row_sym = str(row.get("symbol") or row.get("mexc_symbol") or "").replace("/", "_").replace(":USDT", "").upper()
                         if row_sym and row_sym == requested:
                             return False, f"exchange position already open: {row_sym}"
-                if exchange_open >= int(max_open_positions):
+                if (not ignore_slot_caps) and exchange_open >= int(max_open_positions):
                     return False, f"max exchange positions reached ({exchange_open}/{int(max_open_positions)})"
             except Exception as e:
                 return False, f"cannot verify exchange positions: {e}"
@@ -481,7 +481,22 @@ class ExecutionEngine:
 
     async def place_entry(self, plan: TradePlan, live: bool):
         async with self._lock_for(plan.symbol):
-            ok, reason = await self.can_enter(plan.symbol, int(getattr(plan, "max_open_positions", 999)), live=live)
+            is_chatgpt_setup = str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup"
+            # ChatGPT Mode owns its own slot accounting in chatgpt_mode.execute_setup:
+            # it cancels old pending limits, counts ChatGPT open/closing positions,
+            # trims setup trades to free slots, and verifies same-symbol exchange
+            # conflicts.  The generic ExecutionEngine global cap counts every
+            # exchange position from all modes and caused valid accepted setups to
+            # fail with "max exchange positions reached (3/3)" even when ChatGPT
+            # slots were free.  For chatgpt_setup we bypass only the global slot
+            # caps; same-symbol local position, same-symbol exchange position, and
+            # same-symbol open-order guards remain active.
+            ok, reason = await self.can_enter(
+                plan.symbol,
+                int(getattr(plan, "max_open_positions", 999)),
+                live=live,
+                ignore_slot_caps=is_chatgpt_setup,
+            )
             if not ok:
                 return {"ok": False, "reason": reason}
 
