@@ -34,7 +34,7 @@ CHATGPT_MODE_KEYS = {
 # estimated deposit risk in % for one trade.
 CHATGPT_MIN_STOP_DISTANCE_PCT = 1.0
 CHATGPT_MAX_STOP_DISTANCE_PCT = 5.0
-CHATGPT_SETUP_VERSION = "1.6"
+CHATGPT_SETUP_VERSION = "1.7"
 # ChatGPT Mode separates pending LIMIT slots from real open position slots.
 # Old pending LIMITs are always cancelled when a new setup is imported.
 # Up to 3 fresh pending limits can be placed, while up to 6 real ChatGPT
@@ -44,6 +44,8 @@ CHATGPT_MAX_OPEN_POSITIONS = 6
 # Backward-compatible names used in logs/older code paths.
 CHATGPT_MAX_ACTIVE_TRADES = CHATGPT_MAX_PENDING_LIMITS
 CHATGPT_MAX_TOTAL_SLOTS = CHATGPT_MAX_OPEN_POSITIONS
+CHATGPT_LIMIT_TTL_MINUTES = 120
+CHATGPT_MONITOR_INTERVAL_SEC = 30
 
 # MEXC regional restrictions: tokenized stock/stock-index contracts can be
 # blocked in the user's region and must never be scanned or traded in
@@ -807,9 +809,11 @@ async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
         oid = _order_id(o)
         reduce_only = str(o.get("reduceOnly") or info.get("reduceOnly") or "").lower() in {"1", "true", "yes"}
         prot = str(info.get("_protection_kind") or "").lower()
-        if reduce_only or prot in {"tp", "sl"}:
+        src = str(info.get("_source_endpoint") or "").lower()
+        if reduce_only or prot in {"tp", "sl"} or "stoporder" in src or "planorder" in src:
             return False
-        return ext.startswith("bot_entry_") or (oid and oid in local_pending_ids)
+        is_normal_open_order_endpoint = "order/list/open_orders" in src or src == ""
+        return ext.startswith("bot_entry_") or (oid and oid in local_pending_ids) or is_normal_open_order_endpoint
 
     exchange_cancelled_ids: set[str] = set()
     for o in orders or []:
@@ -875,7 +879,11 @@ def _chatgpt_is_entry_order(o: dict, known_order_ids: set[str] | None = None) ->
     src = str(info.get("_source_endpoint") or "").lower()
     if reduce_only or prot in {"tp", "sl"} or "stoporder" in src or "planorder" in src:
         return False
-    return ext.startswith("bot_entry_") or (oid and oid in known_order_ids)
+    # Exchange-source-of-truth mode: any active normal open-order row is an entry
+    # candidate.  This intentionally catches old ChatGPT orders after redeploy
+    # even when MEXC/ccxt did not return externalOid/clientOrderId.
+    is_normal_open_order_endpoint = "order/list/open_orders" in src or src == ""
+    return ext.startswith("bot_entry_") or (oid and oid in known_order_ids) or is_normal_open_order_endpoint
 
 
 def _chatgpt_exchange_position_qty(row: dict) -> float:
@@ -1256,6 +1264,122 @@ def _balance_total_usdt(balance: dict) -> float:
         return 0.0
 
 
+
+
+def _chatgpt_protection_kind(o: dict) -> str:
+    info = o.get("info") if isinstance(o.get("info"), dict) else {}
+    kind = str(info.get("_protection_kind") or "").lower()
+    typ = str(o.get("type") or info.get("orderType") or info.get("type") or "").lower()
+    src = str(info.get("_source_endpoint") or "").lower()
+    txt = " ".join(str(info.get(k) or "").lower() for k in ("externalOid", "clientOrderId", "side", "orderType", "triggerType"))
+    if kind in {"tp", "sl"}:
+        return kind
+    if "takeprofit" in txt or "take_profit" in txt or "tp" == typ or "tp" in typ:
+        return "tp"
+    if "stoploss" in txt or "stop_loss" in txt or "sl" == typ or "sl" in typ:
+        return "sl"
+    # MEXC plan/stop endpoints use side=2/4 for closing triggers in some modes.
+    # If the parser expanded stoporder/open_orders rows, _protection_kind is already set.
+    if "planorder" in src or "stoporder" in src:
+        side = str(info.get("side") or o.get("side") or "")
+        if side in {"2", "4"}:
+            return "sl"
+    return ""
+
+
+def _chatgpt_group_protection(positions: list[dict], all_orders: list[dict]) -> tuple[list[str], list[str]]:
+    protected, emergency = [], []
+    by_symbol: dict[str, set[str]] = {}
+    for o in all_orders or []:
+        sym = _chatgpt_order_symbol(o)
+        if not sym:
+            continue
+        kind = _chatgpt_protection_kind(o)
+        if kind:
+            by_symbol.setdefault(sym, set()).add(kind)
+    for p in positions or []:
+        sym = mexc_native_symbol(p.get("symbol"))
+        kinds = by_symbol.get(sym, set())
+        if "sl" in kinds and "tp" in kinds:
+            protected.append(sym)
+        else:
+            missing = []
+            if "sl" not in kinds:
+                missing.append("SL")
+            if "tp" not in kinds:
+                missing.append("TP")
+            emergency.append(f"{sym} — {'/'.join(missing)} missing")
+    return protected, emergency
+
+
+async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dict | None = None) -> str:
+    """Build one exchange-source-of-truth monitor card for Telegram.
+
+    Counts and protection state are fetched from MEXC every time. Local cache is
+    not used as source of truth; it is only echoed through setup_result when
+    available for reporting how many new setup rows were requested/placed.
+    """
+    known: set[str] = set()
+    try:
+        for pos in await storage.positions():
+            if str(pos.get("strategy") or "").lower() == "chatgpt_setup":
+                oid = str(pos.get("order_id") or "").split(":", 1)[0].strip()
+                if oid:
+                    known.add(oid)
+    except Exception:
+        pass
+    snap = await _fetch_exchange_chatgpt_snapshot(exchange_client, known)
+    positions = snap.get("positions") or []
+    pending = snap.get("pending_orders") or []
+    try:
+        all_orders = await exchange_client.fetch_open_orders()
+    except Exception:
+        all_orders = []
+    protected, emergency = _chatgpt_group_protection(positions, all_orders)
+    res = setup_result or {}
+    opened = res.get("opened") if isinstance(res.get("opened"), list) else []
+    placed = len([x for x in opened if x.get("ok")])
+    skipped = [x for x in opened if not x.get("ok")]
+    lines = [
+        "🤖 ChatGPT Mode Monitor",
+        "",
+        "🔄 Синхронизация с биржей выполнена",
+        f"📊 Открытые позиции: {len(positions)}/{CHATGPT_MAX_OPEN_POSITIONS}",
+        f"📌 Лимитные entry-ордера: {len(pending)}/{CHATGPT_MAX_PENDING_LIMITS}",
+        "",
+        "🛡 Полная защита:",
+    ]
+    if protected:
+        lines += [f"• {x} — SL + TP" for x in protected]
+    else:
+        lines.append("• нет подтверждённых")
+    lines += ["", "🚨 Аварийные позиции:"]
+    if emergency:
+        lines += [f"• {x}" for x in emergency]
+    else:
+        lines.append("• нет")
+    if setup_result is not None:
+        lines += [
+            "",
+            "📄 Последний setup:",
+            f"• найдено лимиток: {res.get('requested_trades', res.get('limits_to_place', '-'))}",
+            f"• поставлено: {placed}",
+            f"• пропущено: {len(skipped)}",
+        ]
+        for row in skipped[:6]:
+            reason = row.get("reason") or (row.get("result") or {}).get("reason") or "unknown"
+            lines.append(f"  - {row.get('symbol')}: {reason}")
+        if res.get("message"):
+            lines.append(f"• status: {res.get('message')}")
+    lines += [
+        "",
+        f"⏳ Лимитки живут: {CHATGPT_LIMIT_TTL_MINUTES} минут",
+        "🔁 Сопровождение включено",
+        f"⏱ Проверка каждые {CHATGPT_MONITOR_INTERVAL_SEC} сек",
+        f"🕒 {_now_utc()}",
+    ]
+    return "\n".join(lines)[:3900]
+
 async def execute_setup(storage, exchange_client, setup: dict) -> dict:
     chatgpt_log_event("setup_execute_start")
     trades = validate_setup(setup)
@@ -1350,6 +1474,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
             "max_open_positions": CHATGPT_MAX_OPEN_POSITIONS,
             "skipped_open_symbol": skipped_open_symbol,
             "reconcile": reconcile_after_cancel,
+            "requested_trades": requested_trades,
         }
     if len(trades) > limits_to_place:
         skipped = trades[limits_to_place:]
@@ -1394,7 +1519,8 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
                 "chatgpt_take_profits": tps,
                 "invalidation": str(t.get("invalidation") or ""),
                 "comment": str(t.get("comment") or ""),
-                "cancel_if_not_filled_minutes": int(float(t.get("cancel_if_not_filled_minutes") or 0)),
+                # v29: ChatGPT entry LIMITs live 120 minutes regardless of old setup files.
+                "cancel_if_not_filled_minutes": CHATGPT_LIMIT_TTL_MINUTES,
                 "cancel_if_tp1_before_entry": _truthy(t.get("cancel_if_tp1_before_entry", False)),
                 "cancel_if_stop_before_entry": _truthy(t.get("cancel_if_stop_before_entry", False)),
                 "max_price_deviation_percent": float(t.get("max_price_deviation_percent") or 0),
@@ -1438,5 +1564,6 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         "max_open_positions": CHATGPT_MAX_OPEN_POSITIONS,
         "max_pending_limits": CHATGPT_MAX_PENDING_LIMITS,
         "limits_to_place": limits_to_place,
+        "requested_trades": requested_trades,
         "reconcile": reconcile_after_cancel,
     }

@@ -33,7 +33,7 @@ from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
 from ai_btc_autopilot import BTCVisionAutopilot
-from chatgpt_mode import build_chatgpt_log, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log
+from chatgpt_mode import build_chatgpt_log, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log, build_chatgpt_monitor_text, CHATGPT_MONITOR_INTERVAL_SEC
 from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
 from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env, set_runtime_secret_cache, clear_runtime_secret_cache, runtime_secret_cache, ensure_runtime_secrets_loaded, merge_secrets_into_settings, secret_source_report
@@ -1153,6 +1153,60 @@ def format_position_event(ev: dict) -> str:
     label = reason_map.get(str(typ), str(typ))
 
     # v0134 improved protection notifications
+
+    if typ == "chatgpt_limit_filled_protected":
+        return "\n".join([
+            "📌 Лимитка исполнена",
+            f"{symbol}",
+            f"Entry: {ev.get('entry_price')}",
+            "",
+            "✅ Позиция под полной защитой",
+            f"SL: {ev.get('stop_price')}",
+            f"TP final: {ev.get('take_price')}",
+        ])
+
+    if typ == "chatgpt_limit_filled_local_protection":
+        return "\n".join([
+            "📌 Лимитка исполнена",
+            f"{symbol}",
+            f"Entry: {ev.get('entry_price')}",
+            "",
+            "🚨 LOCAL PROTECTION MODE",
+            "Биржевая SL/TP защита не подтверждена.",
+            "Бот сопровождает позицию локально и будет пытаться восстановить защиту.",
+        ])
+
+    if typ == "chatgpt_tp1_breakeven":
+        return "\n".join([
+            "🎯 TP1 достигнут",
+            f"{symbol}",
+            "Часть позиции закрыта.",
+            f"Стоп перенесён в Б/У: {ev.get('stop_price')}",
+        ])
+
+    if typ == "chatgpt_24h_profit_closed":
+        try:
+            pnl_s = f"{float(ev.get('pnl_pct') or 0):+.2f}%"
+        except Exception:
+            pnl_s = "плюс"
+        return "\n".join([
+            "⏰ Позиция старше 24 часов закрыта в плюсе",
+            f"{symbol}",
+            f"PnL: {pnl_s}",
+        ])
+
+    if typ == "chatgpt_24h_negative_hold":
+        try:
+            pnl_s = f"{float(ev.get('pnl_pct') or 0):+.2f}%"
+        except Exception:
+            pnl_s = "минус"
+        return "\n".join([
+            "⏰ Позиция старше 24 часов, но в минусе",
+            f"{symbol}",
+            f"PnL: {pnl_s}",
+            "Действие: не закрываю.",
+        ])
+
     if typ == "boost_monitor_only_no_exchange_protection":
         try:
             pp = float(ev.get("pnl_pct") or 0)
@@ -5773,7 +5827,12 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reason = row.get("reason") or (row.get("result") or {}).get("reason") or ""
             lines.append(f"{status} {row.get('symbol')} {row.get('side','')} {row.get('order_type','')} entry={row.get('entry')} reason={reason}")
         await storage.set("chatgpt_waiting_setup", False)
+        # Send concise setup result, then create/update one live exchange monitor card.
         await reply(update, "\n".join(lines)[:3900], reply_markup=MAIN_MENU)
+        try:
+            await update_chatgpt_monitor_message(context.application, ex=ex, setup_result=result)
+        except Exception as e:
+            chatgpt_log_event("chatgpt_monitor_after_setup_error", error=str(e))
     except Exception as e:
         chatgpt_log_event("setup_file_processing_failed", error=repr(e))
         log.exception("setup.txt processing failed")
@@ -6277,6 +6336,18 @@ async def emit_position_events(app, events: list[dict]) -> None:
         else:
             app.create_task(notify_admin(app, text, key="position_event"))
 
+
+async def update_chatgpt_monitor_message(app, ex=None, setup_result: dict | None = None) -> None:
+    """Refresh one live ChatGPT monitor message from exchange state."""
+    try:
+        settings = await storage.all_settings()
+        exchange = ex or await get_exchange(settings)
+        text = await build_chatgpt_monitor_text(storage, exchange, setup_result=setup_result)
+        await notify_admin_bottom_replace(app, text, key="chatgpt_mode_monitor", min_interval_sec=0)
+        chatgpt_log_event("chatgpt_monitor_message_updated")
+    except Exception as e:
+        chatgpt_log_event("chatgpt_monitor_message_update_error", error=str(e))
+
 async def position_management_loop(app):
     """Fast execution/exit loop independent from Telegram and signal scanning.
 
@@ -6297,6 +6368,13 @@ async def position_management_loop(app):
                 pos_manager = PositionManager(storage, exec_engine)
                 events = await pos_manager.manage(lambda symbol: get_last_price(ex, symbol), live)
                 await emit_position_events(app, events)
+                try:
+                    last_mon = float(app.bot_data.get("chatgpt_monitor_last_update", 0) or 0)
+                    if time.time() - last_mon >= float(CHATGPT_MONITOR_INTERVAL_SEC):
+                        app.bot_data["chatgpt_monitor_last_update"] = time.time()
+                        app.create_task(update_chatgpt_monitor_message(app, ex=ex))
+                except Exception as e:
+                    chatgpt_log_event("chatgpt_monitor_loop_schedule_error", error=str(e))
                 interval = float(settings.get("execution_loop_interval_sec", interval_default) or interval_default)
                 await asyncio.sleep(max(0.05, min(interval, 2.0)))
             except asyncio.CancelledError:

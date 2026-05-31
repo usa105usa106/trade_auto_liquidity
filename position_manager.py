@@ -568,6 +568,7 @@ class PositionManager:
                 pos = self.execution_engine._decorate_position_metrics(pos)
                 if is_chatgpt_setup:
                     chatgpt_log_event("limit_filled_confirmed", symbol=symbol, order_id=oid, filled=filled, amount=amount, entry_price=pos.get("entry_price"), qty=pos.get("qty"))
+                    events_note = "limit filled"
                     chatgpt_log_event("sl_tp_place_start", symbol=symbol, qty=pos.get("qty"), stop=pos.get("stop_price"), take=pos.get("take_price"), tps=details.get("chatgpt_take_profits"))
                 protection = await self.execution_engine.place_protection_orders(pos, live=True)
                 if is_chatgpt_setup:
@@ -590,9 +591,10 @@ class PositionManager:
                     await self.storage.upsert_position(pos)
                     if is_chatgpt_setup:
                         chatgpt_log_event("sl_tp_protection_failed_local_monitoring", symbol=symbol, protection=protection)
-                    return {"type": "protection_local", "symbol": symbol, "protection": protection}
+                    return {"type": "chatgpt_limit_filled_local_protection", "symbol": symbol, "entry_price": pos.get("entry_price"), "stop_price": pos.get("stop_price"), "take_price": pos.get("take_price"), "protection": protection}
                 if is_chatgpt_setup:
                     chatgpt_log_event("limit_position_open_ready", symbol=symbol, status="open", protection_mode=protection.get("protection_mode"), sl_order_id=protection.get("sl_order_id"), tp1_order_id=protection.get("tp1_order_id"), tp2_order_id=protection.get("tp2_order_id"), tp3_order_id=protection.get("tp3_order_id"))
+                    return {"type": "chatgpt_limit_filled_protected", "symbol": symbol, "entry_price": pos.get("entry_price"), "stop_price": pos.get("stop_price"), "take_price": pos.get("take_price"), "tp_orders": [protection.get("tp1_order_id"), protection.get("tp2_order_id"), protection.get("tp3_order_id")]}
                 return {"type": "limit_filled", "symbol": symbol}
             if status in {"canceled", "cancelled", "rejected", "expired"}:
                 if is_chatgpt_setup:
@@ -656,6 +658,23 @@ class PositionManager:
             if not price:
                 continue
             side=str(pos.get("side")).upper(); stop=float(pos.get("stop_price") or 0); take=float(pos.get("take_price") or 0); entry=float(pos.get("entry_price") or 0); opened=float(pos.get("opened_at") or now); pnl=self.pnl_pct(pos, price)
+            if is_chatgpt_setup and now - opened >= 86400 and not pos.get("chatgpt_24h_checked_done"):
+                # v29: after 24h, close only if in profit; leave losing positions untouched.
+                if pnl > 0:
+                    chatgpt_log_event("chatgpt_24h_profit_close_start", symbol=symbol, pnl_pct=pnl, opened_at=opened)
+                    res = await self.execution_engine.close_exchange_position(pos, reason="chatgpt_24h_profit_close")
+                    pos["chatgpt_24h_checked_done"] = True
+                    pos["updated_at"] = now
+                    await self.storage.upsert_position(pos)
+                    chatgpt_log_event("chatgpt_24h_profit_close_done", symbol=symbol, pnl_pct=pnl, result=res)
+                    events.append({"type": "chatgpt_24h_profit_closed", "symbol": symbol, "pnl_pct": pnl, "result": res})
+                    continue
+                else:
+                    pos["chatgpt_24h_checked_done"] = True
+                    pos["updated_at"] = now
+                    await self.storage.upsert_position(pos)
+                    chatgpt_log_event("chatgpt_24h_negative_hold", symbol=symbol, pnl_pct=pnl, opened_at=opened)
+                    events.append({"type": "chatgpt_24h_negative_hold", "symbol": symbol, "pnl_pct": pnl})
             is_liquidity_retest = strategy == "liquidity_retest"
             is_ai_scalping = strategy == "ai_scalping"
             is_boost_scalping = strategy == "boost_scalping"
