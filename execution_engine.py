@@ -93,7 +93,7 @@ class ExecutionEngine:
         positions = await self.storage.positions()
         return len([p for p in positions if p.get("status") in {"open", "pending", "closing"}])
 
-    async def can_enter(self, symbol: str, max_open_positions: int, live: bool, ignore_slot_caps: bool = False) -> tuple[bool, str]:
+    async def can_enter(self, symbol: str, max_open_positions: int, live: bool, ignore_slot_caps: bool = False, ignore_open_order_guard: bool = False) -> tuple[bool, str]:
         locked, reason = await self.storage.is_locked(symbol)
         if locked:
             return False, f"symbol locked: {reason}"
@@ -122,13 +122,94 @@ class ExecutionEngine:
                     return False, f"max exchange positions reached ({exchange_open}/{int(max_open_positions)})"
             except Exception as e:
                 return False, f"cannot verify exchange positions: {e}"
-            try:
-                orders = await self.exchange_client.fetch_open_orders(symbol)
-                if orders:
-                    return False, "open order exists on exchange"
-            except Exception as e:
-                return False, f"cannot verify open orders: {e}"
+            if not ignore_open_order_guard:
+                try:
+                    orders = await self.exchange_client.fetch_open_orders(symbol)
+                    entry_orders = [o for o in (orders or []) if self._is_exchange_entry_order(o)]
+                    if entry_orders:
+                        return False, "open entry order exists on exchange"
+                    if orders:
+                        chatgpt_log_event(
+                            "can_enter_ignored_protection_orders",
+                            symbol=symbol,
+                            total=len(orders or []),
+                            entry=len(entry_orders),
+                        )
+                except Exception as e:
+                    return False, f"cannot verify open orders: {e}"
         return True, "ok"
+
+    def _is_exchange_entry_order(self, order: dict) -> bool:
+        """True for normal opening entry orders, False for TP/SL/plan/reduce-only.
+
+        MEXC fetch_open_orders() intentionally returns normal orders plus
+        plan/stop TP-SL rows.  The generic old guard treated any row as a
+        blocking open order; that made ChatGPT setup skip TON/HBAR while the
+        only rows could be protection/orphan plan orders.
+        """
+        if not isinstance(order, dict):
+            return False
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        src = str(info.get("_source_endpoint") or "").lower()
+        kind = str(info.get("_protection_kind") or "").lower()
+        typ = str(order.get("type") or info.get("orderType") or info.get("category") or "").lower()
+        reduce_only = str(order.get("reduceOnly") or info.get("reduceOnly") or info.get("reduce_only") or "").lower() in {"1", "true", "yes", "on"}
+        side_raw = str(order.get("side") or info.get("side") or "").lower()
+        if reduce_only or kind in {"tp", "sl"}:
+            return False
+        if "stoporder" in src or "planorder" in src or "tpsl" in typ or typ.startswith("tpsl_"):
+            return False
+        # MEXC normal entry orders come from /order/list/open_orders and use
+        # side 1=open long or 3=open short (ccxt: buy/sell for normal limit).
+        if "order/list/open_orders" in src or src == "":
+            return side_raw in {"1", "3", "buy", "sell", "long", "short", ""}
+        return False
+
+    def _exchange_order_id(self, order: dict) -> str:
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        return str(order.get("id") or info.get("orderId") or info.get("id") or info.get("planOrderId") or info.get("stopOrderId") or "").split(":", 1)[0].strip()
+
+    async def cancel_same_symbol_stale_orders(self, symbol: str, *, reason: str = "chatgpt_same_symbol_stale_order") -> dict:
+        """Cancel live open orders for a setup symbol before retrying entry.
+
+        Used only after exchange-first sync has already confirmed that this
+        symbol is not an open position. Therefore all same-symbol open orders
+        are stale blockers: old entry limits or orphan TP/SL/plan orders.
+        """
+        out = {"ok": True, "symbol": symbol, "found": 0, "cancelled": 0, "failed": 0, "items": []}
+        try:
+            orders = await self.exchange_client.fetch_open_orders(symbol)
+        except Exception as e:
+            out.update({"ok": False, "error": f"fetch_open_orders failed: {e}"})
+            chatgpt_log_event("same_symbol_cancel_fetch_error", symbol=symbol, error=str(e), reason=reason)
+            return out
+        out["found"] = len(orders or [])
+        for o in orders or []:
+            oid = self._exchange_order_id(o)
+            if not oid:
+                continue
+            try:
+                info = o.get("info") if isinstance(o.get("info"), dict) else {}
+                chatgpt_log_event("same_symbol_cancel_start", symbol=symbol, order_id=oid, source=info.get("_source_endpoint"), kind=info.get("_protection_kind"), order=o, reason=reason)
+                res = await self.exchange_client.cancel_order(oid, symbol)
+                out["cancelled"] += 1
+                out["items"].append({"order_id": oid, "ok": True, "result": res})
+                chatgpt_log_event("same_symbol_cancel_ok", symbol=symbol, order_id=oid, result=res)
+            except Exception as e:
+                out["failed"] += 1
+                out["items"].append({"order_id": oid, "ok": False, "error": str(e)})
+                chatgpt_log_event("same_symbol_cancel_error", symbol=symbol, order_id=oid, error=str(e))
+        await asyncio.sleep(float(os.getenv("CHATGPT_CANCEL_VERIFY_DELAY_SEC", "0.8") or 0.8))
+        try:
+            left = await self.exchange_client.fetch_open_orders(symbol)
+            out["leftovers"] = len(left or [])
+            if left:
+                out["ok"] = False
+                chatgpt_log_event("same_symbol_cancel_leftovers", symbol=symbol, count=len(left or []), orders=left)
+        except Exception as e:
+            out["ok"] = False
+            out["verify_error"] = str(e)
+        return out
 
 
     def _is_mexc_opening_restricted_error(self, exc: Exception) -> bool:
@@ -1410,9 +1491,14 @@ class ExecutionEngine:
                 tps = details.get("chatgpt_take_profits") or []
                 tp_ids = []
                 try:
-                    chatgpt_log_event("chatgpt_protection_tp_batch_start", symbol=symbol, side=side, qty=qty, tps=tps)
+                    chatgpt_log_event("chatgpt_protection_batch_start", symbol=symbol, side=side, qty=qty, stop_price=sl, tps=tps)
                     if not isinstance(tps, list) or not tps:
                         raise RuntimeError("missing chatgpt_take_profits")
+
+                    # V34 SPEED FIX: compute TP quantities first, then send
+                    # TP1/TP2/TP3 and SL concurrently.  MEXC still verifies the
+                    # returned planorder ids below, so speed does not replace safety.
+                    tp_jobs = []
                     remaining_qty = qty
                     for idx, tp_row in enumerate(tps, start=1):
                         tp_price = float(tp_row.get("price") or 0)
@@ -1427,40 +1513,62 @@ class ExecutionEngine:
                                 continue
                             size_pct = size_pct_float
                             tp_qty = qty * max(0.0, min(100.0, size_pct_float)) / 100.0
-                            # Safety: the final TP always closes whatever remains, even if setup used a number.
                             if idx == len(tps):
                                 tp_qty = remaining_qty
                         if tp_price <= 0:
                             continue
+                        remaining_before = remaining_qty
                         remaining_qty = max(0.0, remaining_qty - tp_qty)
                         if tp_qty <= 0:
                             continue
+                        tp_jobs.append((idx, tp_price, tp_qty, size_pct, remaining_before))
+
+                    async def _place_one_tp(job):
+                        idx, tp_price, tp_qty, size_pct, remaining_before = job
                         log_event("chatgpt_tp_request", symbol=symbol, side=side, qty=tp_qty, trigger_price=tp_price, size_pct=size_pct, attempt=i + 1)
-                        chatgpt_log_event("chatgpt_tp_place_start", symbol=symbol, tp_index=idx, side=side, qty=tp_qty, trigger_price=tp_price, size_pct=size_pct, remaining_qty_before=remaining_qty + tp_qty)
+                        chatgpt_log_event("chatgpt_tp_place_start", symbol=symbol, tp_index=idx, side=side, qty=tp_qty, trigger_price=tp_price, size_pct=size_pct, remaining_qty_before=remaining_before)
                         order = await self._create_take_profit_market_order(symbol, side, tp_qty, tp_price)
                         chatgpt_log_event("chatgpt_tp_place_ok", symbol=symbol, tp_index=idx, order_id=order.get("id"), order=order)
-                        oid = order.get("id")
-                        out[f"tp{idx}_order_id"] = oid
-                        out[f"tp{idx}_raw"] = order
-                        tp_ids.append(str(oid or ""))
-                except Exception as e:
-                    out["tp_error"] = str(e)[:800]
-                    log_event("error_chatgpt_tp", symbol=symbol, side=side, qty=qty, tps=tps, attempt=i + 1, error=str(e), ok=False)
-                    chatgpt_log_event("chatgpt_tp_place_error", symbol=symbol, side=side, qty=qty, tps=tps, error=str(e))
-                try:
-                    if sl > 0:
+                        return idx, order
+
+                    async def _place_sl():
+                        if sl <= 0:
+                            raise RuntimeError("missing stop_price")
                         log_event("chatgpt_sl_request", symbol=symbol, side=side, qty=qty, stop_price=sl, attempt=i + 1)
                         chatgpt_log_event("chatgpt_sl_place_start", symbol=symbol, side=side, qty=qty, stop_price=sl)
                         order = await self._create_stop_market_order(symbol, side, qty, sl)
                         chatgpt_log_event("chatgpt_sl_place_ok", symbol=symbol, order_id=order.get("id"), order=order)
-                        out["sl_order_id"] = order.get("id")
-                        out["sl_raw"] = order
-                    else:
-                        out["sl_error"] = "missing stop_price"
+                        return order
+
+                    tasks = [asyncio.create_task(_place_one_tp(job)) for job in tp_jobs]
+                    sl_task = asyncio.create_task(_place_sl())
+                    results = await asyncio.gather(*tasks, sl_task, return_exceptions=True)
+
+                    for r in results[:len(tasks)]:
+                        if isinstance(r, Exception):
+                            out["tp_error"] = (str(out.get("tp_error") or "") + "; " + str(r))[:800].strip("; ")
+                            chatgpt_log_event("chatgpt_tp_place_error", symbol=symbol, side=side, qty=qty, tps=tps, error=str(r))
+                            continue
+                        idx, order = r
+                        oid = order.get("id")
+                        out[f"tp{idx}_order_id"] = oid
+                        out[f"tp{idx}_raw"] = order
+                        tp_ids.append(str(oid or ""))
+
+                    sl_result = results[-1] if results else None
+                    if isinstance(sl_result, Exception):
+                        out["sl_error"] = str(sl_result)[:800]
+                        log_event("error_chatgpt_sl", symbol=symbol, side=side, qty=qty, trigger_price=sl, attempt=i + 1, error=str(sl_result), ok=False)
+                        chatgpt_log_event("chatgpt_sl_place_error", symbol=symbol, side=side, qty=qty, stop_price=sl, error=str(sl_result))
+                    elif sl_result:
+                        out["sl_order_id"] = sl_result.get("id")
+                        out["sl_raw"] = sl_result
+
+                    chatgpt_log_event("chatgpt_protection_batch_done", symbol=symbol, tp_ids=tp_ids, sl_order_id=out.get("sl_order_id"), tp_error=out.get("tp_error"), sl_error=out.get("sl_error"))
                 except Exception as e:
-                    out["sl_error"] = str(e)[:800]
-                    log_event("error_chatgpt_sl", symbol=symbol, side=side, qty=qty, trigger_price=sl, attempt=i + 1, error=str(e), ok=False)
-                    chatgpt_log_event("chatgpt_sl_place_error", symbol=symbol, side=side, qty=qty, stop_price=sl, error=str(e))
+                    out["tp_error"] = str(e)[:800]
+                    log_event("error_chatgpt_tp", symbol=symbol, side=side, qty=qty, tps=tps, attempt=i + 1, error=str(e), ok=False)
+                    chatgpt_log_event("chatgpt_protection_batch_error", symbol=symbol, side=side, qty=qty, tps=tps, stop_price=sl, error=str(e))
 
             elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin", "btc_ai_4h"}:
                 # Split TP mode: TP1 closes 50% at 1R, TP2 closes the remaining 50% at 2R.
@@ -1593,16 +1701,69 @@ class ExecutionEngine:
                     out["boost_unsafe_position"] = False
                     out["boost_defensive_mode"] = False
                 elif strategy_name_for_protection == "chatgpt_setup" and out.get("sl_order_id"):
-                    tp_keys = [k for k in out.keys() if k.startswith("tp") and k.endswith("_order_id")]
-                    out["tp_exists"] = bool(tp_keys)
-                    out["sl_exists"] = True
-                    out["take_profit_ok"] = bool(tp_keys)
-                    out["stop_loss_ok"] = True
-                    out["ok"] = bool(tp_keys)
+                    # V32 STRICT: returned MEXC ids are not enough.  ChatGPT mode
+                    # must verify that SL and every TP planorder is visible on the
+                    # exchange after the position is live.  Otherwise the monitor
+                    # shows a false protected state while there is no exchange SL/TP.
+                    tp_keys = sorted([k for k in out.keys() if k.startswith("tp") and k.endswith("_order_id")])
+                    tp_ids = [str(out.get(k) or "") for k in tp_keys if str(out.get(k) or "").strip()]
+                    sl_id = str(out.get("sl_order_id") or "")
+                    verified_tp_ids: list[str] = []
+                    missing_tp_ids: list[str] = []
+                    sl_verified = False
+                    verify_error = ""
+                    mexc_exchange = str(getattr(self.exchange_client, "exchange_id", "") or "").lower() == "mexc"
+                    verifier_available = hasattr(self.exchange_client, "mexc_find_active_plan_order")
+                    if mexc_exchange and verifier_available:
+                        try:
+                            # V34 SPEED FIX: verify TP ids and SL id concurrently.
+                            # This keeps strict exchange verification but avoids one
+                            # blocking API round-trip per planorder.
+                            verify_tasks = [asyncio.create_task(self.exchange_client.mexc_find_active_plan_order(symbol, order_id=oid)) for oid in tp_ids]
+                            sl_task = asyncio.create_task(self.exchange_client.mexc_find_active_plan_order(symbol, order_id=sl_id)) if sl_id else None
+                            verify_results = await asyncio.gather(*verify_tasks, return_exceptions=True) if verify_tasks else []
+                            for oid, row in zip(tp_ids, verify_results):
+                                if isinstance(row, Exception):
+                                    missing_tp_ids.append(oid)
+                                    verify_error = (verify_error + f"; tp {oid}: {row}")[:500]
+                                elif row:
+                                    verified_tp_ids.append(oid)
+                                else:
+                                    missing_tp_ids.append(oid)
+                            if sl_task:
+                                sl_row = await sl_task
+                                sl_verified = bool(sl_row)
+                        except Exception as e:
+                            verify_error = str(e)[:500]
+                    else:
+                        # Non-MEXC/unit adapters cannot expose the native planorder book.
+                        # Keep old id-based behavior there only.
+                        verified_tp_ids = tp_ids[:]
+                        sl_verified = bool(sl_id)
+                    out["chatgpt_tp_ids"] = tp_ids
+                    out["chatgpt_verified_tp_ids"] = verified_tp_ids
+                    out["chatgpt_missing_tp_ids"] = missing_tp_ids
+                    out["chatgpt_sl_plan_verified"] = bool(sl_verified)
+                    if verify_error:
+                        out["chatgpt_plan_verify_error"] = verify_error
+                    out["tp_exists"] = bool(tp_ids) and len(verified_tp_ids) == len(tp_ids)
+                    out["sl_exists"] = bool(sl_verified)
+                    out["take_profit_ok"] = out["tp_exists"]
+                    out["stop_loss_ok"] = out["sl_exists"]
+                    out["ok"] = bool(out["tp_exists"] and out["sl_exists"])
                     out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
-                    out["protection_mode"] = "chatgpt_multi_tp_planorders" if out["ok"] else "chatgpt_tp_missing"
-                    out["protection_note"] = f"ChatGPT setup: {len(tp_keys)} TP planorders + full SL requested"
-                    chatgpt_log_event("chatgpt_protection_summary", symbol=symbol, ok=out.get("ok"), tp_count=len(tp_keys), tp_keys=tp_keys, sl_order_id=out.get("sl_order_id"), protection_status=out.get("protection_status"), protection_mode=out.get("protection_mode"))
+                    out["protection_mode"] = "chatgpt_multi_tp_planorders_verified" if out["ok"] else "chatgpt_planorders_not_visible"
+                    out["protection_note"] = (
+                        f"ChatGPT setup: {len(verified_tp_ids)}/{len(tp_ids)} TP planorders verified + SL verified={bool(sl_verified)}"
+                    )
+                    chatgpt_log_event(
+                        "chatgpt_protection_summary",
+                        symbol=symbol, ok=out.get("ok"), tp_count=len(tp_keys), tp_ids=tp_ids,
+                        verified_tp_ids=verified_tp_ids, missing_tp_ids=missing_tp_ids,
+                        sl_order_id=out.get("sl_order_id"), sl_verified=bool(sl_verified),
+                        verify_error=verify_error, protection_status=out.get("protection_status"),
+                        protection_mode=out.get("protection_mode"),
+                    )
                 elif strategy_name_for_protection in {"cascade_hunter", "strongest_coin", "btc_ai_4h"} and out.get("tp1_order_id") and out.get("tp2_order_id") and out.get("sl_order_id"):
                     # V42 strict rule: returned planorder ids are NOT enough on MEXC.
                     # /status_btc is exchange-first, so protection is considered OK only

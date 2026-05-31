@@ -288,9 +288,34 @@ class PositionManager:
                     pos["boost_unsafe_position"] = False
                     pos["boost_defensive_mode"] = False
                 pos.pop("protection_warning", None)
+
+            # v31: ChatGPT Mode has one live monitor card. Do not spam Telegram
+            # with repeated LOCAL PROTECTION MODE / SL: MISSING / TP: MISSING
+            # messages every watchdog pass. The missing-protection state stays in
+            # SQLite and in /log_chatgpt, and the monitor card shows the current
+            # emergency list. Send a separate Telegram event only on a real state
+            # change to protected, or for non-ChatGPT strategies.
+            strategy_name = str(pos.get("strategy") or "").lower()
+            prev_sig = str(pos.get("protection_notify_signature") or "")
+            sig = "|".join([
+                str(state.get("protection_status") or ""),
+                str(bool(state.get("stop_loss_ok", state.get("sl_exists", False)))),
+                str(bool(state.get("take_profit_ok", state.get("tp_exists", False)))),
+                str(state.get("protection_mode") or ""),
+            ])
+            pos["protection_notify_signature"] = sig
             await self.storage.upsert_position(pos)
-            if state.get("reattach_attempted") or not protected:
-                return {"type": "protection_watchdog", "symbol": pos.get("symbol"), **state}
+
+            if strategy_name == "chatgpt_setup" and not protected:
+                try:
+                    from chatgpt_runtime_logger import chatgpt_log_event
+                    chatgpt_log_event("chatgpt_protection_missing_silent_monitor", symbol=pos.get("symbol"), signature=sig, status=state.get("protection_status"), sl=state.get("stop_loss_ok", state.get("sl_exists")), tp=state.get("take_profit_ok", state.get("tp_exists")))
+                except Exception:
+                    pass
+                return None
+
+            if state.get("reattach_attempted") or not protected or (strategy_name == "chatgpt_setup" and protected and prev_sig and prev_sig != sig):
+                return {"type": "protection_watchdog", "symbol": pos.get("symbol"), "strategy": strategy_name, **state}
         except Exception as e:
             pos["protection_warning"] = f"protection watchdog error: {str(e)[:180]}"
             pos["protection_checked_at"] = now

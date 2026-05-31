@@ -5780,58 +5780,23 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         running = True
         if position_task is None or position_task.done():
             position_task = context.application.create_task(position_management_loop(context.application))
-        ok_result = bool(result.get("ok", True))
-        lines = ["✅ setup-файл обработан" if ok_result else "❌ setup-файл НЕ исполнен"]
-
-        msg = str(result.get("message") or "")
-        if msg:
-            lines.append(f"status={msg}")
-
-        rec = result.get("reconcile") if isinstance(result.get("reconcile"), dict) else {}
-        if rec:
-            try:
-                lines.append(f"🔄 Биржа синхронизирована: позиций {len(rec.get('positions') or [])}, pending-лимиток {len(rec.get('pending_orders') or [])}; stale cache очищен {len(rec.get('removed_stale') or [])}.")
-            except Exception:
-                lines.append("🔄 Биржа синхронизирована, кеш проверен.")
-
-        cancelled_n = result.get("cancelled_pending_count")
-        if cancelled_n is not None:
-            lines.append(f"🧹 Старые pending-лимитки ChatGPT Mode сняты: {cancelled_n}")
-
-        rotation = result.get("rotation")
-        if isinstance(rotation, dict):
-            if rotation.get("rotated"):
-                pnl_txt = ""
-                try:
-                    pnl_txt = f" pnl={float(rotation.get('pnl_pct') or 0):.2f}%"
-                except Exception:
-                    pass
-                lines.append(f"🔁 Ротация: закрыта худшая позиция {rotation.get('symbol')}{pnl_txt}; разрешена 1 новая лимитка.")
-            elif msg == "ROTATION_FAILED":
-                lines.append(f"⚠️ Ротация не выполнена: {rotation.get('reason') or rotation}")
-            else:
-                lines.append("🔁 Ротация: не требовалась.")
-
-        if msg == "NO_TRADE":
-            lines.append("NO_TRADE: сделок нет.")
-        if msg == "OLD_PENDING_CANCEL_FAILED":
-            lines.append("Старые лимитки не снялись, новые НЕ ставил. Скинь /log_chatgpt.")
-        if msg == "NO_LIMIT_CAPACITY":
-            lines.append("Нет свободной вместимости под новые лимитки.")
-
-        if result.get("open_positions") is not None:
-            lines.append(f"📊 ChatGPT позиции: {result.get('open_positions')}/{result.get('max_open_positions')}; лимитки за setup: до {result.get('max_pending_limits')}")
-
-        for row in result.get("opened", []):
-            status = "✅" if row.get("ok") else "❌"
-            reason = row.get("reason") or (row.get("result") or {}).get("reason") or ""
-            lines.append(f"{status} {row.get('symbol')} {row.get('side','')} {row.get('order_type','')} entry={row.get('entry')} reason={reason}")
+        # V33: one live master status message only. Do not send a separate
+        # "setup-файл обработан" summary and then a second monitor card: that
+        # duplicates the same state and clutters Telegram. All setup result
+        # details are merged into ChatGPT Mode Monitor, which is delete/replace
+        # updated by notify_admin_bottom_replace under one stable key.
+        try:
+            from chatgpt_mode import _now_chatgpt_display_short
+            result["setup_installed_at"] = _now_chatgpt_display_short()
+        except Exception:
+            result["setup_installed_at"] = datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M МСК")
         await storage.set("chatgpt_waiting_setup", False)
-        # Send concise setup result, then create/update one live exchange monitor card.
-        await reply(update, "\n".join(lines)[:3900], reply_markup=MAIN_MENU)
         try:
             await update_chatgpt_monitor_message(context.application, ex=ex, setup_result=result)
         except Exception as e:
+            chatgpt_log_event("chatgpt_monitor_after_setup_error", error=str(e))
+            await reply(update, f"❌ setup обработан, но monitor не обновился: {str(e)[:900]}", reply_markup=MAIN_MENU)
+    except Exception as e:
             chatgpt_log_event("chatgpt_monitor_after_setup_error", error=str(e))
     except Exception as e:
         chatgpt_log_event("setup_file_processing_failed", error=repr(e))
@@ -6331,6 +6296,13 @@ async def emit_position_events(app, events: list[dict]) -> None:
             continue
         text = format_position_event(ev)
         if ev_type == "protection_watchdog":
+            # v33: ChatGPT Mode protection state is displayed in the single live
+            # monitor card. Do not send separate repeated LOCAL PROTECTION MODE
+            # cards for missing SL/TP; they spam the chat.
+            is_chatgpt = str(ev.get("strategy") or "").lower() == "chatgpt_setup"
+            is_missing = str(ev.get("protection_status") or "").upper() not in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP", "EMERGENCY SL ONLY"}
+            if is_chatgpt and is_missing:
+                continue
             symbol_key = str(ev.get("symbol") or "position").replace("/", "_").replace(":", "_")
             app.create_task(notify_admin_bottom_replace(app, text, key=f"position_watchdog_{symbol_key}"))
         else:

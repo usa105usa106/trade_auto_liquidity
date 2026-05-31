@@ -34,7 +34,7 @@ CHATGPT_MODE_KEYS = {
 # estimated deposit risk in % for one trade.
 CHATGPT_MIN_STOP_DISTANCE_PCT = 1.0
 CHATGPT_MAX_STOP_DISTANCE_PCT = 5.0
-CHATGPT_SETUP_VERSION = "1.7"
+CHATGPT_SETUP_VERSION = "1.8"
 # ChatGPT Mode separates pending LIMIT slots from real open position slots.
 # Old pending LIMITs are always cancelled when a new setup is imported.
 # Up to 3 fresh pending limits can be placed, while up to 6 real ChatGPT
@@ -157,6 +157,24 @@ def tail_chatgpt_runtime_log(max_lines: int = 80) -> str:
 
 def _now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _chatgpt_display_tz() -> timezone:
+    # Telegram users read ChatGPT Mode status in local MSK time.
+    # Keep runtime logs in UTC, but never show UTC in the live monitor card.
+    try:
+        hours = int(os.getenv("CHATGPT_DISPLAY_TZ_OFFSET_HOURS", "3"))
+    except Exception:
+        hours = 3
+    return timezone(timedelta(hours=hours))
+
+
+def _now_chatgpt_display() -> str:
+    return datetime.now(_chatgpt_display_tz()).strftime("%Y-%m-%d %H:%M:%S МСК")
+
+
+def _now_chatgpt_display_short() -> str:
+    return datetime.now(_chatgpt_display_tz()).strftime("%H:%M МСК")
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -567,7 +585,7 @@ NEW SETUP REPLACEMENT RULES:
 
 СТРОГИЙ ФОРМАТ setup.txt:
 {
-  "setup_version": "1.6",
+  "setup_version": "1.8",
   "mode": "AUTO_OPEN",
   "exchange": "MEXC_FUTURES",
   "margin_mode": "ISOLATED",
@@ -643,7 +661,7 @@ def validate_setup(data: dict) -> list[dict]:
     chatgpt_log_event("setup_validate_start", setup_version=(data or {}).get("setup_version") if isinstance(data, dict) else None)
     if not isinstance(data, dict):
         raise ValueError("setup JSON must be an object")
-    if str(data.get("setup_version")) not in {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6"}:
+    if str(data.get("setup_version")) not in {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8"}:
         raise ValueError("unsupported setup_version")
     trades = data.get("trades") or []
     if not isinstance(trades, list):
@@ -745,24 +763,38 @@ def validate_setup(data: dict) -> list[dict]:
 
 
 async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
-    """Cancel all old ChatGPT pending LIMITs before applying a new setup.
+    """Cancel all stale ChatGPT orders before applying a new setup.
 
-    v22 hardens cancellation. We cancel both:
-    - local DB pending ChatGPT LIMIT entries;
-    - exchange-only open entry orders created by ChatGPT mode (externalOid/client id starts with bot_entry_)
-      even if the local DB missed them after redeploy/restart.
+    Hard rule for V30:
+    - real open positions are never touched;
+    - TP/SL of real open positions are never touched;
+    - all old pending entry orders are cancelled;
+    - orphan TP/SL/plan orders whose symbol has no real open ChatGPT position
+      are treated as garbage and cancelled too.
 
-    Real open positions are never touched.
+    This fixes the case where global sync reported pending=0, but MEXC later
+    rejected TON/HBAR with "open order exists on exchange" because orphan
+    plan/stop orders were still live for those symbols.
     """
     cancelled: list[dict] = []
     local_pending_ids: set[str] = set()
 
-    # 1) Cancel local pending rows first.
+    # 1) Read cache only after exchange-first reconcile has already rebuilt it.
+    # It is used here only to identify order IDs and real open symbols, never to
+    # make pre-sync slot decisions.
     try:
         positions = await storage.positions()
     except Exception as e:
         chatgpt_log_event("cancel_old_pending_load_error", error=str(e))
         positions = []
+
+    live_symbols: set[str] = set()
+    for pos in positions or []:
+        if str(pos.get("strategy") or "").lower() == "chatgpt_setup" and str(pos.get("status") or "").lower() in {"open", "closing"}:
+            sym_live = mexc_native_symbol(pos.get("symbol"))
+            if sym_live:
+                live_symbols.add(sym_live)
+    chatgpt_log_event("cancel_old_pending_live_symbols", symbols=sorted(live_symbols), count=len(live_symbols))
 
     for pos in positions or []:
         sym = str(pos.get("symbol") or "").upper()
@@ -817,21 +849,35 @@ async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
 
     exchange_cancelled_ids: set[str] = set()
     for o in orders or []:
-        if not _is_chatgpt_entry_order(o):
-            continue
         sym = _order_symbol(o)
         oid = _order_id(o)
+        info = o.get("info") if isinstance(o.get("info"), dict) else {}
+        is_entry = _is_chatgpt_entry_order(o)
+        is_orphan = bool(sym and sym not in live_symbols)
+        should_cancel = bool(is_entry or is_orphan)
+        chatgpt_log_event(
+            "cancel_old_pending_exchange_order_seen",
+            symbol=sym,
+            order_id=oid,
+            source=info.get("_source_endpoint"),
+            kind=info.get("_protection_kind"),
+            is_entry=is_entry,
+            is_orphan=is_orphan,
+            should_cancel=should_cancel,
+        )
+        if not should_cancel:
+            continue
         if not sym or not oid or oid in exchange_cancelled_ids:
             continue
         try:
-            chatgpt_log_event("cancel_old_pending_exchange_order_cancel_start", symbol=sym, order_id=oid)
+            chatgpt_log_event("cancel_old_pending_exchange_order_cancel_start", symbol=sym, order_id=oid, reason=("entry" if is_entry else "orphan"))
             res = await exec_engine.exchange_client.cancel_order(oid, sym)
             exchange_cancelled_ids.add(oid)
             chatgpt_log_event("cancel_old_pending_exchange_order_cancel_ok", symbol=sym, order_id=oid, result=res)
-            cancelled.append({"source": "exchange", "symbol": sym, "order_id": oid, "ok": True, "result": res})
+            cancelled.append({"source": "exchange", "symbol": sym, "order_id": oid, "ok": True, "reason": ("entry" if is_entry else "orphan"), "result": res})
         except Exception as e:
             chatgpt_log_event("cancel_old_pending_exchange_order_cancel_error", symbol=sym, order_id=oid, error=str(e))
-            cancelled.append({"source": "exchange", "symbol": sym, "order_id": oid, "ok": False, "error": str(e)})
+            cancelled.append({"source": "exchange", "symbol": sym, "order_id": oid, "ok": False, "reason": ("entry" if is_entry else "orphan"), "error": str(e)})
 
     # 3) Verify after cancel.
     try:
@@ -839,8 +885,9 @@ async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
         verify = await exec_engine.exchange_client.fetch_open_orders()
         leftovers = []
         for o in verify or []:
-            if _is_chatgpt_entry_order(o):
-                leftovers.append({"symbol": _order_symbol(o), "order_id": _order_id(o)})
+            sym = _order_symbol(o)
+            if _is_chatgpt_entry_order(o) or (sym and sym not in live_symbols):
+                leftovers.append({"symbol": sym, "order_id": _order_id(o)})
         if leftovers:
             chatgpt_log_event("cancel_old_pending_verify_still_exists_error", leftovers=leftovers[:20], count=len(leftovers))
             for item in leftovers:
@@ -1271,19 +1318,34 @@ def _chatgpt_protection_kind(o: dict) -> str:
     kind = str(info.get("_protection_kind") or "").lower()
     typ = str(o.get("type") or info.get("orderType") or info.get("type") or "").lower()
     src = str(info.get("_source_endpoint") or "").lower()
-    txt = " ".join(str(info.get(k) or "").lower() for k in ("externalOid", "clientOrderId", "side", "orderType", "triggerType"))
+    txt = " ".join(str(info.get(k) or "").lower() for k in ("externalOid", "clientOrderId", "side", "orderType", "triggerType", "type"))
     if kind in {"tp", "sl"}:
         return kind
-    if "takeprofit" in txt or "take_profit" in txt or "tp" == typ or "tp" in typ:
+    # V32: ChatGPT protection is placed through MEXC planorder/place with
+    # externalOid bot_tp_* / bot_sl_*. MEXC list endpoints often return orderType=5
+    # for both TP and SL, so side/orderType alone cannot classify them. The bot
+    # must read the explicit externalOid marker first, otherwise real TP orders are
+    # shown as missing and the monitor enters false LOCAL PROTECTION MODE.
+    if "bot_tp" in txt or "chatgpt_tp" in txt or "takeprofit" in txt or "take_profit" in txt or "tp" == typ or "tp" in typ:
         return "tp"
-    if "stoploss" in txt or "stop_loss" in txt or "sl" == typ or "sl" in typ:
+    if "bot_sl" in txt or "chatgpt_sl" in txt or "stoploss" in txt or "stop_loss" in txt or "sl" == typ or "sl" in typ:
         return "sl"
-    # MEXC plan/stop endpoints use side=2/4 for closing triggers in some modes.
-    # If the parser expanded stoporder/open_orders rows, _protection_kind is already set.
+    # If no bot marker survived in the MEXC row, use the plan trigger direction
+    # as a best-effort classifier: side=4 closes LONG, triggerType=1 is TP
+    # (price >= trigger), triggerType=2 is SL. side=2 closes SHORT, inverse.
     if "planorder" in src or "stoporder" in src:
         side = str(info.get("side") or o.get("side") or "")
-        if side in {"2", "4"}:
-            return "sl"
+        trig = str(info.get("triggerType") or info.get("trigger_type") or "")
+        if side == "4":
+            if trig == "1":
+                return "tp"
+            if trig == "2":
+                return "sl"
+        if side == "2":
+            if trig == "2":
+                return "tp"
+            if trig == "1":
+                return "sl"
     return ""
 
 
@@ -1340,20 +1402,24 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
     opened = res.get("opened") if isinstance(res.get("opened"), list) else []
     placed = len([x for x in opened if x.get("ok")])
     skipped = [x for x in opened if not x.get("ok")]
+    requested = res.get("requested_trades", res.get("limits_to_place", "-"))
+    cancelled = res.get("cancelled_pending_count", 0) if setup_result is not None else 0
+    setup_status = "setup-файл обработан" if setup_result is not None and bool(res.get("ok", True)) else ("setup-файл НЕ исполнен" if setup_result is not None else "ожидаю setup-файл")
+    setup_time = str(res.get("setup_installed_at") or res.get("setup_received_at") or "-")
     lines = [
         "🤖 ChatGPT Mode Monitor",
+        f"✅ {setup_status}" if setup_result is not None and bool(res.get("ok", True)) else f"❌ {setup_status}" if setup_result is not None else f"📥 {setup_status}",
+        "🔄 биржа синхронизирована",
+        f"📊 открытые позиции: {len(positions)}/{CHATGPT_MAX_OPEN_POSITIONS}",
+        f"📌 pending лимитки: {len(pending)}/{CHATGPT_MAX_PENDING_LIMITS}",
         "",
-        "🔄 Синхронизация с биржей выполнена",
-        f"📊 Открытые позиции: {len(positions)}/{CHATGPT_MAX_OPEN_POSITIONS}",
-        f"📌 Лимитные entry-ордера: {len(pending)}/{CHATGPT_MAX_PENDING_LIMITS}",
-        "",
-        "🛡 Полная защита:",
+        "🛡 полная защита:",
     ]
     if protected:
         lines += [f"• {x} — SL + TP" for x in protected]
     else:
         lines.append("• нет подтверждённых")
-    lines += ["", "🚨 Аварийные позиции:"]
+    lines += ["", "🚨 аварийные позиции:"]
     if emergency:
         lines += [f"• {x}" for x in emergency]
     else:
@@ -1361,22 +1427,25 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
     if setup_result is not None:
         lines += [
             "",
-            "📄 Последний setup:",
-            f"• найдено лимиток: {res.get('requested_trades', res.get('limits_to_place', '-'))}",
-            f"• поставлено: {placed}",
-            f"• пропущено: {len(skipped)}",
+            f"🧹 снято старых лимиток: {cancelled}",
+            f"📄 найдено в новом setup: {requested}/{CHATGPT_MAX_PENDING_LIMITS}",
+            f"✅ поставлено новых лимиток: {placed}",
+            f"❌ пропущено: {len(skipped)}",
         ]
-        for row in skipped[:6]:
-            reason = row.get("reason") or (row.get("result") or {}).get("reason") or "unknown"
-            lines.append(f"  - {row.get('symbol')}: {reason}")
+        if skipped:
+            for row in skipped[:6]:
+                reason = row.get("reason") or (row.get("result") or {}).get("reason") or "unknown"
+                lines.append(f"• {row.get('symbol')}: {reason}")
+        else:
+            lines.append("• нет")
         if res.get("message"):
-            lines.append(f"• status: {res.get('message')}")
+            lines.append(f"status: {res.get('message')}")
     lines += [
         "",
-        f"⏳ Лимитки живут: {CHATGPT_LIMIT_TTL_MINUTES} минут",
-        "🔁 Сопровождение включено",
-        f"⏱ Проверка каждые {CHATGPT_MONITOR_INTERVAL_SEC} сек",
-        f"🕒 {_now_utc()}",
+        "🔁 сопровождение включено",
+        f"⏳ лимитки живут {CHATGPT_LIMIT_TTL_MINUTES} мин, установка: {setup_time}",
+        f"⏱ проверка каждые {CHATGPT_MONITOR_INTERVAL_SEC} сек",
+        f"🕒 последнее обновление: {_now_chatgpt_display()}",
     ]
     return "\n".join(lines)[:3900]
 
@@ -1492,14 +1561,14 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         )
 
     chatgpt_log_event("setup_execute_balance", equity=equity, margin_pct=margin_pct, leverage=leverage, trades=len(trades), requested_trades=requested_trades, cancelled_pending=len(cancelled_pending), open_positions=open_slots, limits_to_place=limits_to_place, max_pending_limits=CHATGPT_MAX_PENDING_LIMITS, max_open_positions=CHATGPT_MAX_OPEN_POSITIONS, rotation=rotation_result)
-    for t in trades:
+
+    def _build_plan(t: dict) -> TradePlan:
         entry = float(t["entry"])
         notional = equity * margin_pct * leverage
         qty = notional / entry
         tps = t["take_profits"]
-        # take_price is the farthest/final TP; protection branch reads all TPs from signal_details.
         final_tp = float(tps[-1]["price"])
-        plan = TradePlan(
+        return TradePlan(
             symbol=t["symbol"],
             side=t["direction"],
             order_type=str(t["order_type"]).lower(),
@@ -1519,7 +1588,6 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
                 "chatgpt_take_profits": tps,
                 "invalidation": str(t.get("invalidation") or ""),
                 "comment": str(t.get("comment") or ""),
-                # v29: ChatGPT entry LIMITs live 120 minutes regardless of old setup files.
                 "cancel_if_not_filled_minutes": CHATGPT_LIMIT_TTL_MINUTES,
                 "cancel_if_tp1_before_entry": _truthy(t.get("cancel_if_tp1_before_entry", False)),
                 "cancel_if_stop_before_entry": _truthy(t.get("cancel_if_stop_before_entry", False)),
@@ -1534,7 +1602,12 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
                 },
             },
         )
-        # Market stale-price guard.
+
+    async def _place_one_setup_trade(t: dict) -> dict:
+        plan = _build_plan(t)
+        entry = float(plan.entry_price)
+        final_tp = float(plan.take_price)
+        # Market stale-price guard. LIMIT entries are already handled by expiry/TP-before-entry rules.
         if plan.order_type == "market":
             max_dev = float(plan.signal_details.get("max_price_deviation_percent") or 0.7)
             try:
@@ -1543,17 +1616,42 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
                 if cur > 0 and abs(cur - entry) / entry * 100.0 > max_dev:
                     reason = f"market price deviation > {max_dev}%"
                     chatgpt_log_event("setup_trade_rejected", symbol=plan.symbol, reason=reason, current_price=cur, entry=entry)
-                    opened.append({"symbol": plan.symbol, "ok": False, "reason": reason})
-                    continue
+                    return {"symbol": plan.symbol, "ok": False, "reason": reason}
             except Exception as e:
                 reason = f"ticker check failed: {e}"
                 chatgpt_log_event("setup_trade_rejected", symbol=plan.symbol, reason=reason)
-                opened.append({"symbol": plan.symbol, "ok": False, "reason": reason})
-                continue
-        chatgpt_log_event("setup_trade_place_start", symbol=plan.symbol, side=plan.side, order_type=plan.order_type, entry=entry, qty=qty, stop=plan.stop_price, final_tp=final_tp)
+                return {"symbol": plan.symbol, "ok": False, "reason": reason}
+
+        chatgpt_log_event("setup_trade_place_start", symbol=plan.symbol, side=plan.side, order_type=plan.order_type, entry=entry, qty=plan.qty, stop=plan.stop_price, final_tp=final_tp)
         res = await exec_engine.place_entry(plan, live=live)
-        chatgpt_log_event("setup_trade_place_result", symbol=plan.symbol, ok=bool(res.get("ok")), result=res)
-        opened.append({"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": bool(res.get("ok")), "result": res})
+        reason_text = str((res or {}).get("reason") or "").lower()
+        if (not bool((res or {}).get("ok"))) and "open" in reason_text and "order" in reason_text and "exchange" in reason_text:
+            chatgpt_log_event("setup_trade_open_order_conflict_retry_start", symbol=plan.symbol, first_result=res)
+            cleanup = await exec_engine.cancel_same_symbol_stale_orders(plan.symbol, reason="chatgpt_setup_retry_open_order_exists")
+            if cleanup.get("ok"):
+                res2 = await exec_engine.place_entry(plan, live=live)
+                chatgpt_log_event("setup_trade_open_order_conflict_retry_result", symbol=plan.symbol, cleanup=cleanup, retry_result=res2)
+                res = res2
+            else:
+                chatgpt_log_event("setup_trade_open_order_conflict_cleanup_failed", symbol=plan.symbol, cleanup=cleanup)
+                res = {"ok": False, "reason": "open order exists on exchange; same-symbol cleanup failed", "cleanup": cleanup, "first_result": res}
+        chatgpt_log_event("setup_trade_place_result", symbol=plan.symbol, ok=bool((res or {}).get("ok")), result=res)
+        return {"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": bool((res or {}).get("ok")), "result": res}
+
+    # V34 SPEED FIX: place up to three setup LIMITs concurrently after one
+    # exchange-first sync/cleanup pass.  Per-symbol locks in ExecutionEngine
+    # still prevent duplicates; this removes the old one-by-one delay.
+    if trades:
+        chatgpt_log_event("setup_trade_place_batch_start", trades=len(trades), symbols=[t.get("symbol") for t in trades])
+        batch_results = await asyncio.gather(*[_place_one_setup_trade(t) for t in trades], return_exceptions=True)
+        for t, r in zip(trades, batch_results):
+            if isinstance(r, Exception):
+                sym = str(t.get("symbol") or "")
+                chatgpt_log_event("setup_trade_place_exception", symbol=sym, error=str(r))
+                opened.append({"symbol": sym, "ok": False, "reason": str(r)})
+            else:
+                opened.append(r)
+        chatgpt_log_event("setup_trade_place_batch_done", opened=opened)
     chatgpt_log_event("setup_execute_done", opened=opened, rotation=rotation_result)
     return {
         "ok": True,
