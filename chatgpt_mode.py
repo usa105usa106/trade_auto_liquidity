@@ -555,134 +555,7 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
     except Exception:
         pass
 
-    task = """
-TASK FOR CHATGPT:
-Ты получил log.txt от Telegram-бота со сканом топ-200 монет MEXC Futures.
-
-ОБЩИЙ ПРОЦЕСС SCREENSHOT WORKFLOW V2:
-1. Бот собирает данные по MEXC Futures API.
-2. Пользователь отправляет этот log.txt в ChatGPT.
-3. ChatGPT сначала выбирает 10 монет-кандидатов.
-4. Пользователь присылает только 10 скриншотов 4H по этим 10 монетам.
-5. ChatGPT по 4H оставляет 5 лучших монет.
-6. Пользователь присылает только 5 скриншотов 1H по этим 5 монетам.
-7. После 4H+1H ChatGPT выбирает максимум 3 лучшие сделки и возвращает текстовый вердикт + готовый setup-файл.
-8. 15m НЕ является обязательным этапом. Проси 15m только точечно по 1–2 монетам, если без него нельзя безопасно определить вход.
-9. По умолчанию максимум 3 сделки; не расширяй setup.txt до 5/10 без отдельной просьбы пользователя.
-10. Важно: у бота отдельные слоты: до 3 pending LIMIT-ордеров ChatGPT Mode и до 6 реальных открытых ChatGPT-позиций. При новом setup старые pending LIMIT всегда снимаются, открытые позиции не трогаются, кроме ротации 6/6.
-
-ЭТАП 1 ПОСЛЕ log.txt:
-1. Проанализируй общий рынок BTC/ETH и все монеты из лога.
-2. Отбери ровно 10 лучших кандидатов, если достойных меньше — напиши меньше и объясни почему.
-3. Раздели их на LONG / SHORT / WAIT / NO TRADE.
-4. Попроси у пользователя ТОЛЬКО 4H-скриншоты по этим 10 монетам.
-5. НЕ проси сразу 1H и 15m.
-6. НЕ давай финальные сделки и НЕ создавай setup.txt на этом этапе.
-7. НЕ рассматривай монеты/контракты, где в названии есть STOCK: они заблокированы по региону и торговать их нельзя.
-
-ЭТАП 2 ПОСЛЕ 10 СКРИНШОТОВ 4H:
-1. Проанализируй 4H-структуру выбранных 10 монет.
-2. Оставь 5 лучших монет.
-3. Попроси у пользователя только 1H скриншоты по этим 5 монетам.
-4. НЕ создавай setup-файл до получения 1H по этим 5 монетам.
-5. 15m проси только дополнительно по 1–2 спорным монетам, если 4H+1H недостаточно для входа.
-
-ЭТАП 3 ПОСЛЕ ДОПОЛНИТЕЛЬНЫХ 5 СКРИНШОТОВ 1H:
-1. Выбери максимум 3 лучшие сделки по 4H+1H. Если вход по одной из них спорный, сначала попроси 15m только по этой монете и не создавай setup до уточнения.
-2. Дай короткий текстовый вердикт.
-3. ОБЯЗАТЕЛЬНО верни готовый setup-файл в JSON-формате так, чтобы пользователь мог сразу скачать файл и отправить его боту.
-4. Файл создавай с уникальным именем: setup-HHMM_DDMM.txt, например setup-1445_3105.txt. Не используй одно и то же setup.txt, чтобы Telegram не путал старые файлы. Бот принимает setup.txt, setup-1.txt, setup-2.txt, setup-HHMM_DDMM.txt и любые .txt с корректным JSON setup.
-5. В setup.txt каждая сделка должна содержать: symbol, direction, order_type, entry или entry_reference, stop_loss, take_profits [{price,size_percent}], invalidation, comment, risk.stop_distance_percent. Для третьего тейка используй size_percent="REMAINDER", а не 30.
-6. Для ChatGPT Mode запрещены trailing/scalp exits и paper_fill: LIMIT-сделка считается открытой только после реального fill на MEXC.
-7. SYMBOL всегда указывай в MEXC-native формате: BTC_USDT, ETH_USDT, BCH_USDT. Не используй BTC/USDT:USDT.
-8. Для LIMIT добавь cancel_if_not_filled_minutes и cancel_if_tp1_before_entry=true.
-9. Для MARKET добавь max_price_deviation_percent.
-10. Не указывай размер позиции в монетах: бот сам использует 10% депозита на каждую сделку, 10x leverage, isolated.
-11. Если хороших сделок нет, верни trades: [] и verdict: NO_TRADE.
-12. В setup.txt всегда ставь max_active_trades=3 для новых лимиток.
-13. Бот может держать до 6 открытых ChatGPT-позиций. Если при новом setup уже открыто 6/6, бот может закрыть максимум 1 худшую позицию без TP1 и поставить максимум 1 новую лимитку. Если открыто 5/6 — никого не закрывает и ставит максимум 1 лимитку; 4/6 — максимум 2; 0–3/6 — максимум 3.
-
-ROTATION RULES FOR BOT:
-1. Ротация включается только при загрузке нового setup-файла и только если уже открыто 6/6 ChatGPT-позиций.
-2. Бот закрывает максимум 1 худшую позицию: TP1 ещё не достигнут, PnL самый плохой, при равенстве — самая старая.
-3. Если все позиции уже после TP1 / в безубытке, бот никого не закрывает и новый setup не исполняет.
-4. Если закрытие худшей позиции не удалось, новые лимитки не ставятся.
-5. Бот обязан написать в Telegram, была ли ротация, какие старые лимитки сняты и какие новые лимитки поставлены/отклонены.
-
-SETUP FILE NAMING RULE FOR CHATGPT:
-1. Финальный файл всегда прикладывай как setup-HHMM_DDMM.txt, где HHMM — текущее время, DDMM — сегодняшняя дата.
-2. Пример: setup-1445_3105.txt.
-3. В ответе дай именно файл для скачивания, не только JSON-блок.
-
-SCREENSHOT RULES FOR CHATGPT:
-1. После log.txt проси только 4H по 10 монетам.
-2. После 4H отбери 5 монет.
-3. По 5 монетам проси только 1H.
-4. Итого стандартно максимум 15 скриншотов: 10 скринов 4H + 5 скринов 1H.
-5. 15m проси только опционально по 1–2 спорным монетам для точного входа.
-6. Не проси 20–30 скриншотов сразу.
-
-BLOCKED SYMBOL RULES FOR CHATGPT:
-1. Любой symbol, где есть substring STOCK, запрещён: MSFTSTOCK_USDT, STXSTOCKUSDT и любые аналоги.
-2. Такие монеты не выбирай в кандидаты, не запрашивай по ним скриншоты и не добавляй в setup.txt.
-3. Если они попали в лог ошибочно — игнорируй их как NO_TRADE / REGION_BLOCKED.
-
-RISK RULES FOR CHATGPT:
-1. Все стопы рассчитывает ChatGPT.
-2. Стоп должен быть структурным: за поддержкой для LONG или за сопротивлением для SHORT.
-3. Расстояние от ENTRY до STOP_LOSS должно быть от 1% до 5%.
-4. Если нормальный структурный стоп получается меньше 1% — расширь стоп минимум до 1%.
-5. Если нормальный структурный стоп получается больше 5% — не давай такую сделку, пометь NO_TRADE.
-6. В setup.txt обязательно укажи risk.stop_distance_percent и risk.estimated_deposit_risk_percent.
-7. Бот по умолчанию использует 10% депозита на сделку, 10x leverage, isolated; при таком режиме stop_distance_percent примерно равен риску по депозиту в процентах.
-
-TRADE MANAGEMENT RULES FOR CHATGPT MODE:
-1. trailing_enabled=false.
-2. scalp_exit_enabled=false.
-3. paper_fill_enabled=false.
-4. breakeven_after_tp1_only=true.
-5. LIMIT сначала PENDING_LIMIT, SL/TP ставятся только после реального fill на MEXC.
-6. После исполнения TP1 бот должен перенести STOP_LOSS по остатку позиции в безубыток: breakeven_price=ENTRY.
-7. В take_profits используй схему: TP1=35%, TP2=35%, TP3=size_percent="REMAINDER". Третий тейк закрывает весь остаток позиции после округлений MEXC.
-
-NEW SETUP REPLACEMENT RULES:
-1. При загрузке нового setup.txt бот отменяет все старые pending LIMIT-ордера ChatGPT Mode, которые ещё не исполнены.
-2. Открытые позиции бот не трогает.
-3. После отмены старых pending-лимиток бот считает реальные открытые ChatGPT-позиции.
-4. У бота отдельные лимиты: до 3 pending LIMIT и до 6 открытых ChatGPT-позиций.
-5. Бот может поставить до 3 новых лимиток, но не больше свободной вместимости до 6 открытых позиций.
-6. Если уже открыто 6/6 позиций, бот может сделать ротацию: закрыть максимум 1 худшую позицию без TP1 и поставить максимум 1 новую лимитку.
-7. Если открыто 5/6 — никого не закрывает и ставит максимум 1 лимитку; 4/6 — максимум 2; 0–3/6 — максимум 3.
-8. Открытые позиции бот не трогает, кроме строгой ротации 6/6.
-9. По умолчанию максимум 3 новые лимитки из одного setup.
-
-СТРОГИЙ ФОРМАТ setup.txt:
-{
-  "setup_version": "1.6",
-  "mode": "AUTO_OPEN",
-  "exchange": "MEXC_FUTURES",
-  "margin_mode": "ISOLATED",
-  "default_margin_percent_per_trade": 10,
-  "default_leverage": 10,
-  "max_active_trades": 3,
-  "valid_until_utc": "YYYY-MM-DD HH:MM:SS",
-  "verdict": "...",
-  "risk_rules": {
-    "min_stop_distance_percent": 1.0,
-    "max_stop_distance_percent": 5.0
-  },
-  "trade_management": {
-    "trailing_enabled": false,
-    "scalp_exit_enabled": false,
-    "paper_fill_enabled": false,
-    "breakeven_after_tp1_only": true,
-    "breakeven_price": "ENTRY"
-  },
-  "blocked_symbol_substrings": ["STOCK"],
-  "symbol_format": "MEXC_NATIVE_UNDERSCORE",
-  "trades": []
-}
-""".strip()
+    task = 'ЗАДАЧА ДЛЯ CHATGPT MODE:\n\nТы анализируешь торговый log.txt для выбора сделок на MEXC Futures.\n\nВАЖНО:\nНе проси сразу 15m / 1H / 4H по всем монетам.\nНе проси 20–30 скриншотов сразу.\nСкриншоты браузером бот пока НЕ делает.\nСначала нужен только 4H.\n\nПОРЯДОК РАБОТЫ:\n\n1. Проанализируй весь log.txt.\n   Используй все метрики скана: 15m / 1H / 4H, объём, ликвидность,\n   RSI, MACD, MA7/MA25/MA99, orderbook, движение, силу/слабость,\n   риск перегрева и общий фон BTC/ETH.\n\n2. Выбери 10 лучших инструментов-кандидатов для ручной проверки по графикам.\n\n3. Сначала попроси у пользователя только 10 скриншотов 4H:\n   по одному 4H-графику на каждый выбранный инструмент.\n\n4. После получения 4H-графиков оставь 5 лучших кандидатов\n   и попроси по ним графики на 1H:\n   по одному 1H-графику на каждый из 5 кандидатов.\n\n5. По графикам 1H выбери 3 лучшие монеты для setup.\n\n6. 15m проси только если точка входа по 1H неясная,\n   максимум по 1–2 монетам.\n   15m нужен только для уточнения входа, а не для отбора всех кандидатов.\n\n7. После финального выбора верни готовый setup-файл для бота.\n   Файл должен быть приложен именно файлом, а не только текстом в чате.\n   Имя файла строго:\n   setup-HHMM_DDMM.txt\n   Пример:\n   setup-0059_0106.txt\n\n8. Внутри setup-файла обязательно:\n   setup_version: "1.6"\n   mode: "AUTO_OPEN"\n   exchange: "MEXC_FUTURES"\n   margin_mode: "ISOLATED"\n   default_margin_percent_per_trade: 10\n   default_leverage: 10\n   verdict: "TRADE" или "NO_TRADE"\n   trades: максимум 3 сделки.\n\n9. По каждой сделке обязательно указать:\n   symbol\n   direction: LONG или SHORT\n   order_type: LIMIT\n   entry\n   stop_loss\n   take_profits:\n     TP1: 35%\n     TP2: 35%\n     TP3: REMAINDER\n   cancel_if_not_filled_minutes: 120\n   cancel_if_tp1_before_entry: true\n   invalidation\n   comment\n   risk.stop_distance_percent\n   risk.estimated_deposit_risk_percent\n\n10. ВАЖНО ПО STOP_LOSS:\n\n   ChatGPT сам рассчитывает entry, stop_loss и take_profits.\n   Сделки выставляются лимитными ордерами, не рыночными.\n\n   Stop_loss должен быть структурным и находиться в диапазоне:\n   минимум 1% от entry,\n   максимум 5% от entry.\n\n   Если структурный стоп получается меньше 1%, не используй микростоп.\n   Расширь stop_loss до логичного уровня, чтобы расстояние было не меньше 1%.\n\n   Если структурный стоп получается больше 5%, не давай эту сделку в setup.\n\n   Take_profits НЕ пересчитываются от округлённого или расширенного stop_loss.\n   TP1 / TP2 / TP3 выбираются по графику, уровням, ликвидности и структуре рынка.\n\n   Схема фиксации:\n   TP1: 35%\n   TP2: 35%\n   TP3: REMAINDER\n\n   После TP1 бот переносит stop_loss в breakeven.\n   Trailing: OFF.\n   Scalp exit: OFF.\n\n11. Старые версии setup не использовать.\n   Бот принимает только setup_version "1.6".\n   Не использовать setup_version "1.4", "1.5", "2.3" и любые другие версии.\n\n12. Если нет 3 качественных сделок, не выдумывай.\n   Лучше дай 1–2 сделки или verdict: "NO_TRADE".'.strip()
 
     header = [
         "CHATGPT MARKET SCAN LOG",
@@ -743,9 +616,12 @@ def validate_setup(data: dict) -> list[dict]:
     trades = data.get("trades") or []
     if not isinstance(trades, list):
         raise ValueError("trades must be a list")
+    data["_requested_trades_total"] = len(trades)
     max_trades = CHATGPT_MAX_ACTIVE_TRADES
     if len(trades) > max_trades:
         raise ValueError(f"too many trades: max {max_trades} for ChatGPT Mode")
+    duplicate_skipped: list[dict] = []
+    seen_setup_symbols: set[str] = set()
     valid_until = str(data.get("valid_until_utc") or "").replace("UTC", "").strip()
     if valid_until:
         try:
@@ -767,6 +643,12 @@ def validate_setup(data: dict) -> list[dict]:
         symbol = mexc_native_symbol(raw_symbol)
         if is_chatgpt_blocked_symbol(symbol):
             raise ValueError(f"TRADE_{i}: symbol {symbol} is region-blocked because it contains STOCK")
+        if symbol in seen_setup_symbols:
+            reason = f"дубль в setup-файле: {symbol}; повторная сделка пропущена"
+            duplicate_skipped.append({"symbol": symbol, "ok": False, "reason": reason, "skipped_duplicate_in_setup": True})
+            chatgpt_log_event("setup_trade_skipped_duplicate_in_setup", index=i, symbol=symbol, reason=reason)
+            continue
+        seen_setup_symbols.add(symbol)
         direction = str(t.get("direction") or "").upper()
         order_type = str(t.get("order_type") or "").upper()
         if direction not in {"LONG", "SHORT"}:
@@ -835,7 +717,8 @@ def validate_setup(data: dict) -> list[dict]:
         ct.update({"symbol": symbol, "direction": direction, "order_type": order_type, "entry": entry, "stop_loss": stop, "take_profits": clean_tps, "risk": risk})
         chatgpt_log_event("setup_trade_validated", index=i, symbol=symbol, direction=direction, order_type=order_type, entry=entry, stop_loss=stop, stop_distance_pct=round(stop_dist, 4), tps=len(clean_tps))
         out.append(ct)
-    chatgpt_log_event("setup_validate_ok", trades=len(out))
+    data["_duplicate_skipped"] = duplicate_skipped
+    chatgpt_log_event("setup_validate_ok", trades=len(out), duplicates=len(duplicate_skipped))
     return out
 
 
@@ -1691,11 +1574,11 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         free_position_capacity = max(0, CHATGPT_MAX_OPEN_POSITIONS - open_slots)
         limits_to_place = min(CHATGPT_MAX_PENDING_LIMITS, free_position_capacity, len(trades))
 
-    original_requested_trades = len(trades)
+    original_requested_trades = int(setup.get("_requested_trades_total") or len(trades))
     open_symbols = {mexc_native_symbol(p.get("symbol")) for p in (open_positions or []) if p.get("symbol")}
     filtered_trades = []
     skipped_open_symbol = []
-    preplace_skipped: list[dict] = []
+    preplace_skipped: list[dict] = list(setup.get("_duplicate_skipped") or [])
     for t in trades:
         sym = mexc_native_symbol(t.get("symbol"))
         if sym in open_symbols:

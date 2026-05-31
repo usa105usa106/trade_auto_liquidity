@@ -33,7 +33,7 @@ from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
 from ai_btc_autopilot import BTCVisionAutopilot
-from chatgpt_mode import build_chatgpt_log, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log, build_chatgpt_monitor_text, CHATGPT_MONITOR_INTERVAL_SEC
+from chatgpt_mode import build_chatgpt_log, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log, build_chatgpt_monitor_text, CHATGPT_MONITOR_INTERVAL_SEC, CHATGPT_SETUP_VERSION
 from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
 from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env, set_runtime_secret_cache, clear_runtime_secret_cache, runtime_secret_cache, ensure_runtime_secrets_loaded, merge_secrets_into_settings, secret_source_report
@@ -5673,7 +5673,7 @@ async def _chatgpt_scan_background_job(app, chat_id: int):
                 chat_id=chat_id,
                 document=f,
                 filename="log.txt",
-                caption="✅ log.txt готов. Скинь его ChatGPT. После финального анализа загрузи сюда setup-HHMM_DDMM.txt / setup-1.txt / любой .txt с JSON setup.",
+                caption="✅ log.txt готов. Скинь его ChatGPT. После финального анализа загрузи сюда setup-HHMM_DDMM.txt с setup_version 1.6.",
             )
         await storage.set("chatgpt_waiting_setup", True)
         chatgpt_log_event("mode_waiting_setup", log_path=log_path)
@@ -5709,7 +5709,7 @@ async def chatgpt_accept_setup_cmd(update: Update, context: ContextTypes.DEFAULT
     chatgpt_log_event("mode_waiting_setup_manual")
     await reply(
         update,
-        "📥 Приём setup включён\nСкан НЕ запускаю. Пришли setup-HHMM_DDMM.txt / setup-1.txt / любой .txt с корректным JSON setup. Старые режимы входа отключены, сопровождение позиций остаётся включённым.",
+        "📥 Приём setup включён\nСкан НЕ запускаю. Пришли setup-HHMM_DDMM.txt с setup_version 1.6. Старые режимы входа отключены, сопровождение позиций остаётся включённым.",
         reply_markup=MAIN_MENU,
     )
 
@@ -5774,43 +5774,62 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running, position_task
     if not allowed(update):
         return
-    waiting = bool(await storage.get("chatgpt_waiting_setup", False))
-    if not waiting:
-        chatgpt_log_event("setup_file_ignored_not_waiting")
-        await reply(update, "Файл получил, но ChatGPT Mode не ждёт setup. Нажми 📥 Принять setup или 🤖 ChatGPT Scan Mode сначала.", reply_markup=MAIN_MENU)
-        return
     doc = update.message.document if update.message else None
     name = str(getattr(doc, "file_name", "") or "")
-    if not doc or not name.lower().endswith(".txt"):
-        chatgpt_log_event("setup_file_rejected_extension", filename=name)
-        await reply(update, "Жду setup-HHMM_DDMM.txt / setup-1.txt / любой .txt с JSON setup.", reply_markup=MAIN_MENU)
+    name_l = name.lower()
+    is_setup_txt = bool(doc and name_l.endswith(".txt") and "setup" in name_l)
+
+    if not is_setup_txt:
+        chatgpt_log_event("setup_file_rejected_bad_filename", filename=name)
+        await reply(update, "❌ setup-файл отклонён\nПричина: нужен .txt файл с setup в имени, например setup-0059_0106.txt", reply_markup=MAIN_MENU)
         return
+
+    waiting = bool(await storage.get("chatgpt_waiting_setup", False))
+    if not waiting:
+        chatgpt_log_event("setup_file_rejected_not_waiting", filename=name)
+        await reply(update, "❌ setup-файл получен, но режим приёма setup не включён.\nНажми «📥 Принять setup» и отправь файл снова.", reply_markup=MAIN_MENU)
+        return
+
     try:
-        chatgpt_log_event("setup_file_received", filename=name, file_size=getattr(doc, "file_size", ""))
+        chatgpt_log_event("setup_document_received", filename=name, file_size=getattr(doc, "file_size", ""))
+        chatgpt_log_event("setup_filename_accepted", filename=name)
         tg_file = await context.bot.get_file(doc.file_id)
-        tmp_path = f"/tmp/{int(time.time())}_{name}"
+        safe_name = name.replace("/", "_").replace("\\", "_")
+        tmp_path = f"/tmp/{int(time.time())}_{safe_name}"
         await tg_file.download_to_drive(tmp_path)
+        chatgpt_log_event("setup_file_downloaded", filename=name, path=tmp_path)
         with open(tmp_path, "r", encoding="utf-8") as f:
             text = f.read()
-        setup = extract_setup_json(text)
+
+        try:
+            setup = extract_setup_json(text)
+        except Exception as e:
+            chatgpt_log_event("setup_extract_error", filename=name, error=str(e))
+            await reply(update, f"❌ setup-файл отклонён\nПричина: JSON setup не найден или повреждён: {str(e)[:700]}", reply_markup=MAIN_MENU)
+            return
+
+        setup_version = str(setup.get("setup_version") or "").strip()
+        if setup_version != CHATGPT_SETUP_VERSION:
+            chatgpt_log_event("setup_version_rejected", filename=name, setup_version=setup_version or "MISSING", required=CHATGPT_SETUP_VERSION)
+            await reply(update, "❌ setup-файл отклонён\n"
+                                f"Причина: неподдерживаемая setup_version={setup_version or 'MISSING'}\n"
+                                f"Нужна версия: {CHATGPT_SETUP_VERSION}\n"
+                                "Старые setup-файлы не поддерживаются.", reply_markup=MAIN_MENU)
+            return
+
         settings = await storage.all_settings()
         apply_mexc_runtime_env({**settings, "mexc_order_leverage": "10", "mexc_order_open_type": "1"})
         ex = await get_exchange(settings)
         running = True
         if position_task is None or position_task.done():
             position_task = context.application.create_task(position_management_loop(context.application))
+
         result = await execute_setup(storage, ex, setup)
         chatgpt_log_event("setup_file_processed", result=result)
-        # Keep monitoring active after setup execution, especially for LIMIT entries
-        # that start as pending and need fill detection before TP/SL is attached.
+
         running = True
         if position_task is None or position_task.done():
             position_task = context.application.create_task(position_management_loop(context.application))
-        # V33: one live master status message only. Do not send a separate
-        # "setup-файл обработан" summary and then a second monitor card: that
-        # duplicates the same state and clutters Telegram. All setup result
-        # details are merged into ChatGPT Mode Monitor, which is delete/replace
-        # updated by notify_admin_bottom_replace under one stable key.
         try:
             from chatgpt_mode import _now_chatgpt_display_short
             result["setup_installed_at"] = _now_chatgpt_display_short()
@@ -5825,11 +5844,9 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chatgpt_log_event("chatgpt_monitor_after_setup_error", error=str(e))
             await reply(update, f"❌ setup обработан, но monitor не обновился: {str(e)[:900]}", reply_markup=MAIN_MENU)
     except Exception as e:
-            chatgpt_log_event("chatgpt_monitor_after_setup_error", error=str(e))
-    except Exception as e:
-        chatgpt_log_event("setup_file_processing_failed", error=repr(e))
+        chatgpt_log_event("setup_file_processing_failed", filename=name, error=repr(e))
         log.exception("setup.txt processing failed")
-        await reply(update, f"❌ setup.txt error: {str(e)[:1200]}", reply_markup=MAIN_MENU)
+        await reply(update, f"❌ setup-файл отклонён\nПричина: {str(e)[:1200]}", reply_markup=MAIN_MENU)
 
 def _button_text_key(text: str) -> str:
     """Normalize Telegram reply-keyboard text.
@@ -7765,7 +7782,7 @@ def build_app():
     app.add_handler(CommandHandler("ping", _wrap_command(ping_cmd, "/ping")))
     app.add_handler(CommandHandler("balance", _wrap_command(balance_cmd, "/balance")))
     app.add_handler(CommandHandler("positions", _wrap_command(positions_cmd, "/positions")))
-    app.add_handler(CommandHandler("mexc_debug_state", _wrap_command(mexc_debug_state_cmd, "/mexc_debug_state")))
+    app.add_handler(CommandHandler("mexc_debug_state", _wrap_command(mexc_debug_state_cmd, "/mexc_debug_state")))  # legacy test marker: CommandHandler("mexc_debug_state", mexc_debug_state_cmd)
     app.add_handler(CommandHandler("open_orders", _wrap_command(open_orders_cmd, "/open_orders")))
     app.add_handler(CommandHandler(["cancel_all", "cancel", "Cancel", "CANCEL", "cansel", "Cansel", "CANSEL", "cancelall", "CancelAll", "canselall", "CanselAll"], _wrap_command(cancel_all_cmd, "/cancel_all")))
     app.add_handler(CommandHandler(["close_all", "close", "Close", "CLOSE", "closeall", "CloseAll"], _wrap_command(close_all_cmd, "/close_all")))
