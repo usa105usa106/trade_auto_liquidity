@@ -136,6 +136,11 @@ async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", 
 
     msg_key = f"bottom_msg_id_{key}"
     old_msg_id = app.bot_data.get(msg_key)
+    if not old_msg_id:
+        try:
+            old_msg_id = await storage.get(msg_key, None)
+        except Exception:
+            old_msg_id = None
     if old_msg_id:
         try:
             await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id)), timeout=4)
@@ -144,7 +149,12 @@ async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", 
             log.debug("telegram bottom status delete skipped: %s", e)
     try:
         msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=str(text)[:3900]), timeout=6)
-        app.bot_data[msg_key] = getattr(msg, "message_id", None)
+        new_id = getattr(msg, "message_id", None)
+        app.bot_data[msg_key] = new_id
+        try:
+            await storage.set(msg_key, new_id, bump_revision=False)
+        except Exception:
+            pass
     except Exception as e:
         log.warning("telegram bottom status failed: %s", e)
 
@@ -5806,6 +5816,8 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result["setup_installed_at"] = _now_chatgpt_display_short()
         except Exception:
             result["setup_installed_at"] = datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M МСК")
+        result["_monitor_persist"] = True
+        await storage.set("chatgpt_last_setup_result", result)
         await storage.set("chatgpt_waiting_setup", False)
         try:
             await update_chatgpt_monitor_message(context.application, ex=ex, setup_result=result)

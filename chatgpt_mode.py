@@ -34,7 +34,7 @@ CHATGPT_MODE_KEYS = {
 # estimated deposit risk in % for one trade.
 CHATGPT_MIN_STOP_DISTANCE_PCT = 1.0
 CHATGPT_MAX_STOP_DISTANCE_PCT = 5.0
-CHATGPT_SETUP_VERSION = "1.9"
+CHATGPT_SETUP_VERSION = "1.6"
 # ChatGPT Mode separates pending LIMIT slots from real open position slots.
 # Old pending LIMITs are always cancelled when a new setup is imported.
 # Up to 3 fresh pending limits can be placed, while up to 6 real ChatGPT
@@ -658,7 +658,7 @@ NEW SETUP REPLACEMENT RULES:
 
 СТРОГИЙ ФОРМАТ setup.txt:
 {
-  "setup_version": "2.2",
+  "setup_version": "1.6",
   "mode": "AUTO_OPEN",
   "exchange": "MEXC_FUTURES",
   "margin_mode": "ISOLATED",
@@ -734,8 +734,12 @@ def validate_setup(data: dict) -> list[dict]:
     chatgpt_log_event("setup_validate_start", setup_version=(data or {}).get("setup_version") if isinstance(data, dict) else None)
     if not isinstance(data, dict):
         raise ValueError("setup JSON must be an object")
-    if str(data.get("setup_version")) not in {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "2.0", "2.1", "2.2"}:
-        raise ValueError("unsupported setup_version")
+    setup_version = str(data.get("setup_version") or "").strip()
+    if setup_version != CHATGPT_SETUP_VERSION:
+        raise ValueError(
+            f"неподдерживаемая версия setup_version={setup_version or 'MISSING'}. "
+            f"Нужна версия: {CHATGPT_SETUP_VERSION}. Старые setup-файлы не поддерживаются, чтобы не ломать ChatGPT Mode."
+        )
     trades = data.get("trades") or []
     if not isinstance(trades, list):
         raise ValueError("trades must be a list")
@@ -1533,9 +1537,23 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
     """Build one exchange-source-of-truth monitor card for Telegram.
 
     Counts and protection state are fetched from MEXC every time. Local cache is
-    not used as source of truth; it is only echoed through setup_result when
-    available for reporting how many new setup rows were requested/placed.
+    not used as source of truth for positions/orders. The last setup execution
+    result is persisted only for the user-facing monitor summary, so periodic
+    refreshes do not revert to "ожидаю setup-файл" and do not lose the cleanup /
+    skipped reasons after the file has already been processed.
     """
+    if setup_result is None:
+        try:
+            waiting_for_new_setup = bool(await storage.get("chatgpt_waiting_setup", False))
+        except Exception:
+            waiting_for_new_setup = False
+        if not waiting_for_new_setup:
+            try:
+                saved = await storage.get("chatgpt_last_setup_result", None)
+                if isinstance(saved, dict) and saved.get("_monitor_persist"):
+                    setup_result = saved
+            except Exception:
+                setup_result = None
     known: set[str] = set()
     try:
         for pos in await storage.positions():
@@ -1586,7 +1604,7 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
             "🧹 очистка перед setup:",
             f"• entry-лимитки: найдено {cleanup.get('entry_found', 0)}, снято {cleanup.get('entry_cancelled', cancelled)}, осталось {cleanup.get('entry_left', 0)}",
             f"• старые условные ордера без позиции: найдено {cleanup.get('orphan_found', 0)}, снято {cleanup.get('orphan_cancelled', 0)}, осталось {cleanup.get('orphan_left', 0)}",
-            f"📄 найдено в новом setup: {requested}/{CHATGPT_MAX_PENDING_LIMITS}",
+            f"📄 к установке из setup: {requested}/{CHATGPT_MAX_PENDING_LIMITS}",
             f"✅ поставлено новых лимиток: {placed}",
             f"❌ пропущено: {len(skipped)}",
         ]
@@ -1673,19 +1691,23 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         free_position_capacity = max(0, CHATGPT_MAX_OPEN_POSITIONS - open_slots)
         limits_to_place = min(CHATGPT_MAX_PENDING_LIMITS, free_position_capacity, len(trades))
 
+    original_requested_trades = len(trades)
     open_symbols = {mexc_native_symbol(p.get("symbol")) for p in (open_positions or []) if p.get("symbol")}
     filtered_trades = []
     skipped_open_symbol = []
+    preplace_skipped: list[dict] = []
     for t in trades:
         sym = mexc_native_symbol(t.get("symbol"))
         if sym in open_symbols:
             skipped_open_symbol.append(sym)
-            chatgpt_log_event("setup_trade_skipped_existing_position", symbol=sym)
+            reason = f"уже есть открытая позиция: {sym}"
+            preplace_skipped.append({"symbol": sym, "ok": False, "reason": reason, "skipped_existing_position": True})
+            chatgpt_log_event("setup_trade_skipped_existing_position", symbol=sym, reason=reason)
             continue
         filtered_trades.append(t)
     trades = filtered_trades
 
-    requested_trades = len(trades)
+    requested_trades = original_requested_trades
     if limits_to_place <= 0:
         chatgpt_log_event(
             "setup_no_limit_capacity",
@@ -1694,9 +1716,14 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
             open_positions=open_slots,
             skipped_open_symbol=skipped_open_symbol,
         )
+        no_slot_reason = f"нет свободного общего слота: {open_slots}/{CHATGPT_MAX_TOTAL_SLOTS}"
+        capacity_skipped = [
+            {"symbol": mexc_native_symbol(t.get("symbol")), "ok": False, "reason": no_slot_reason, "skipped_no_total_slot": True}
+            for t in trades
+        ]
         return {
             "ok": True,
-            "opened": [],
+            "opened": preplace_skipped + capacity_skipped,
             "message": "NO_LIMIT_CAPACITY",
             "rotation": rotation_result,
             "open_positions": open_slots,
@@ -1708,6 +1735,11 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         }
     if len(trades) > limits_to_place:
         skipped = trades[limits_to_place:]
+        no_slot_reason = f"нет свободного общего слота: {CHATGPT_MAX_TOTAL_SLOTS}/{CHATGPT_MAX_TOTAL_SLOTS}"
+        preplace_skipped.extend([
+            {"symbol": mexc_native_symbol(t.get("symbol")), "ok": False, "reason": no_slot_reason, "skipped_no_total_slot": True}
+            for t in skipped
+        ])
         trades = trades[:limits_to_place]
         chatgpt_log_event(
             "setup_trades_trimmed_to_limit_capacity",
@@ -1718,6 +1750,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
             requested_trades=requested_trades,
             accepted_trades=len(trades),
             skipped_symbols=[t.get("symbol") for t in skipped],
+            skipped_reason=no_slot_reason,
             skipped_open_symbol=skipped_open_symbol,
         )
 
@@ -1842,6 +1875,10 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
                 res = {"ok": False, "reason": "open order exists on exchange; same-symbol cleanup failed", "cleanup": cleanup, "first_result": res}
         chatgpt_log_event("setup_trade_place_result", symbol=plan.symbol, ok=bool((res or {}).get("ok")), result=res)
         return {"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": bool((res or {}).get("ok")), "result": res}
+
+    # Pre-placement skips (existing open position / no total slot) must remain
+    # visible in the final monitor instead of disappearing from the report.
+    opened.extend(preplace_skipped)
 
     # V34 SPEED FIX: place up to three setup LIMITs concurrently after one
     # exchange-first sync/cleanup pass.  Per-symbol locks in ExecutionEngine
