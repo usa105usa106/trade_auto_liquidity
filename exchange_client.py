@@ -678,25 +678,52 @@ class ExchangeClient:
 
         return await self.exchange.create_order(norm, type_, side, amount, price, params)
 
+    async def _mexc_cancel_body_value(self, value):
+        """Return MEXC order id as int when possible, otherwise as string."""
+        text = str(value or "").split(":", 1)[0].strip()
+        if not text:
+            raise ValueError("empty order_id")
+        try:
+            return int(text)
+        except Exception:
+            return text
+
     async def cancel_order(self, order_id, symbol):
-        # v23: MEXC normal entry LIMIT orders created by native fallback must be
-        # cancelled through the native futures endpoint first.  Relying only on
-        # ccxt cancel_order could leave old ChatGPT pending limits alive after
-        # redeploy/setup replacement.
+        # v24: route MEXC futures cancels to the documented native endpoint/body.
+        # Normal LIMIT orders:      POST /order/cancel        body=[orderId, ...]
+        # Plan orders:              POST /planorder/cancel    body=[{symbol, orderId}, ...]
+        # TP/SL stop orders:        POST /stoporder/cancel    body=[{stopPlanOrderId}, ...]
+        # The old body {symbol, orderId} sent to /order/cancel returns code 600
+        # and left old ChatGPT pending limits alive. Do not fallback to ccxt's
+        # contract.mexc.com cancel endpoint because it can produce CDN 403.
         if self.exchange_id == "mexc":
-            native_error = None
+            msym = self._mexc_symbol(symbol)
+            oid = await self._mexc_cancel_body_value(order_id)
+            oid_text = str(oid)
+
+            # Find the order family if it is still visible. This lets generic
+            # cancel_order() safely cancel normal, plan and TP/SL rows.
+            source_endpoint = ""
+            stop_plan_id = ""
             try:
-                msym = self._mexc_symbol(symbol)
-                oid = str(order_id or "").split(":", 1)[0].strip()
-                if not oid:
-                    raise ValueError("empty order_id")
-                return await self._mexc_private("POST", "/api/v1/private/order/cancel", body={"symbol": msym, "orderId": oid})
-            except Exception as e:
-                native_error = e
-                try:
-                    return await self.exchange.cancel_order(order_id, self.normalize_symbol(symbol))
-                except Exception as ccxt_error:
-                    raise RuntimeError(f"MEXC cancel_order failed: native={native_error}; ccxt={ccxt_error}")
+                for o in await self._mexc_fetch_open_orders(symbol):
+                    info = o.get("info") if isinstance(o.get("info"), dict) else {}
+                    row_id = str(o.get("id") or info.get("orderId") or info.get("planOrderId") or info.get("stopOrderId") or "").split(":", 1)[0].strip()
+                    if row_id == oid_text:
+                        source_endpoint = str(info.get("_source_endpoint") or "").lower()
+                        stop_plan_id = str(info.get("stopPlanOrderId") or info.get("stopOrderId") or info.get("orderId") or row_id).split(":", 1)[0].strip()
+                        break
+            except Exception:
+                # Discovery failure must not prevent a normal order cancel.
+                source_endpoint = ""
+
+            if "planorder" in source_endpoint:
+                return await self._mexc_private("POST", "/api/v1/private/planorder/cancel", body=[{"symbol": msym, "orderId": oid}])
+            if "stoporder" in source_endpoint:
+                return await self._mexc_private("POST", "/api/v1/private/stoporder/cancel", body=[{"stopPlanOrderId": int(stop_plan_id or oid_text)}])
+
+            # Default for ChatGPT entry LIMITs from /order/list/open_orders.
+            return await self._mexc_private("POST", "/api/v1/private/order/cancel", body=[oid])
         return await self.exchange.cancel_order(order_id, self.normalize_symbol(symbol))
 
     async def cancel_all_orders(self, symbol=None):

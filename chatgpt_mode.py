@@ -34,7 +34,7 @@ CHATGPT_MODE_KEYS = {
 # estimated deposit risk in % for one trade.
 CHATGPT_MIN_STOP_DISTANCE_PCT = 1.0
 CHATGPT_MAX_STOP_DISTANCE_PCT = 5.0
-CHATGPT_SETUP_VERSION = "1.4"
+CHATGPT_SETUP_VERSION = "1.5"
 CHATGPT_MAX_ACTIVE_TRADES = 3
 CHATGPT_MAX_TOTAL_SLOTS = 3  # open ChatGPT positions + new pending limits must not exceed this
 
@@ -756,8 +756,9 @@ async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
             try:
                 chatgpt_log_event("cancel_old_pending_local_start", symbol=sym, order_id=oid, old_entry=pos.get("entry_price"))
                 res = await exec_engine.cancel_entry(pos, live=True, reason="chatgpt_new_setup_cancel_old_pending")
-                chatgpt_log_event("cancel_old_pending_local_done", symbol=sym, order_id=oid, result=res)
-                cancelled.append({"source": "local", "symbol": sym, "order_id": oid, "ok": True, "result": res})
+                ok = bool((res or {}).get("ok"))
+                chatgpt_log_event("cancel_old_pending_local_done", symbol=sym, order_id=oid, ok=ok, result=res)
+                cancelled.append({"source": "local", "symbol": sym, "order_id": oid, "ok": ok, "result": res})
             except Exception as e:
                 chatgpt_log_event("cancel_old_pending_local_error", symbol=sym, order_id=oid, error=str(e))
                 cancelled.append({"source": "local", "symbol": sym, "order_id": oid, "ok": False, "error": str(e)})
@@ -820,6 +821,8 @@ async def _cancel_all_old_pending_limits(storage, exec_engine) -> list[dict]:
                 leftovers.append({"symbol": _order_symbol(o), "order_id": _order_id(o)})
         if leftovers:
             chatgpt_log_event("cancel_old_pending_verify_still_exists_error", leftovers=leftovers[:20], count=len(leftovers))
+            for item in leftovers:
+                cancelled.append({"source": "verify", "symbol": item.get("symbol"), "order_id": item.get("order_id"), "ok": False, "error": "order_still_open_after_cancel"})
         else:
             chatgpt_log_event("cancel_old_pending_verify_after_cancel_ok")
     except Exception as e:
@@ -885,6 +888,12 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
     cancelled_pending = await _cancel_all_old_pending_limits(storage, exec_engine)
     if cancelled_pending:
         chatgpt_log_event("setup_cancelled_old_pending_limits", items=cancelled_pending)
+    cancel_failed = [x for x in (cancelled_pending or []) if not bool(x.get("ok"))]
+    if cancel_failed:
+        # Hard safety gate: never place new setup limits while an old ChatGPT
+        # entry limit is still open or its cancellation was not verified.
+        chatgpt_log_event("setup_abort_old_pending_cancel_failed", failed=cancel_failed[:20], count=len(cancel_failed))
+        return {"ok": False, "opened": [], "message": "OLD_PENDING_CANCEL_FAILED", "failed_cancelled_pending": cancel_failed}
 
     open_slots, open_positions = await _count_open_chatgpt_slots(storage)
     free_slots = max(0, CHATGPT_MAX_TOTAL_SLOTS - open_slots)

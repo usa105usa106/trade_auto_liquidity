@@ -1657,15 +1657,22 @@ class ExecutionEngine:
 
     async def cancel_entry(self, pos: dict, live: bool, reason: str = "limit_timeout"):
         symbol = pos["symbol"]
-        if live and pos.get("order_id"):
+        order_id = pos.get("order_id")
+        if live and order_id:
             try:
-                await self.exchange_client.cancel_order(pos["order_id"], symbol)
+                cancel_res = await self.exchange_client.cancel_order(order_id, symbol)
             except Exception as e:
+                # Do not remove the local pending row if the exchange cancel failed.
+                # Otherwise ChatGPT Mode can think a stale limit was cancelled and
+                # place a replacement while the old order is still frozen/open.
                 pos["cancel_error"] = str(e)
                 await self.storage.upsert_position(pos)
+                return {"ok": False, "reason": reason, "error": str(e), "order_id": order_id}
+        else:
+            cancel_res = None
         await self.storage.remove_position(symbol)
         await self.storage.set_lock(symbol, 30, reason)
-        return {"ok": True, "reason": reason}
+        return {"ok": True, "reason": reason, "order_id": order_id, "cancel_result": cancel_res}
 
 
     async def _close_until_flat(self, symbol: str, reason: str, side: str, fallback_qty: float) -> tuple[bool, list]:
