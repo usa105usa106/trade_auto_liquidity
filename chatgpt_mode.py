@@ -181,6 +181,12 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v in (None, ""):
             return default
+        if isinstance(v, str):
+            v = v.strip().replace(",", ".")
+            if v.endswith("%"):
+                v = v[:-1].strip()
+            if v == "":
+                return default
         return float(v)
     except Exception:
         return default
@@ -555,7 +561,7 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
     except Exception:
         pass
 
-    task = 'ЗАДАЧА ДЛЯ CHATGPT MODE:\n\nТы анализируешь торговый log.txt для выбора сделок на MEXC Futures.\n\nВАЖНО:\nНе проси сразу 15m / 1H / 4H по всем монетам.\nНе проси 20–30 скриншотов сразу.\nСкриншоты браузером бот пока НЕ делает.\nСначала нужен только 4H.\n\nЗАПРЕЩЁННЫЕ ИНСТРУМЕНТЫ:\nНе рассматривай и не добавляй в setup любые инструменты, где в символе есть STOCK.\nПримеры: MSFTSTOCK_USDT, DELLSTOCK_USDT, IBMSTOCK_USDT, SPCXSTOCK_USDT.\nТакие инструменты регионально блокируются и не могут быть открыты ботом.\n\nПОРЯДОК РАБОТЫ:\n\n1. Проанализируй весь log.txt.\n   Используй все метрики скана: 15m / 1H / 4H, объём, ликвидность,\n   RSI, MACD, MA7/MA25/MA99, orderbook, движение, силу/слабость,\n   риск перегрева и общий фон BTC/ETH.\n   Символы со STOCK не рассматривать.\n\n2. Выбери 10 лучших инструментов-кандидатов для ручной проверки по графикам.\n   В эти 10 инструментов нельзя включать символы со STOCK.\n\n3. Сначала попроси у пользователя только 10 скриншотов 4H:\n   по одному 4H-графику на каждый выбранный инструмент.\n\n4. После получения 4H-графиков оставь 5 лучших кандидатов\n   и попроси по ним графики на 1H:\n   по одному 1H-графику на каждый из 5 кандидатов.\n\n5. По графикам 1H выбери 3 лучшие монеты для setup.\n\n6. 15m проси только если точка входа по 1H неясная,\n   максимум по 1–2 монетам.\n   15m нужен только для уточнения входа, а не для отбора всех кандидатов.\n\n7. После финального выбора ОБЯЗАТЕЛЬНО верни готовый setup как прикреплённый .txt файл.\n   Не пиши setup просто текстом в сообщении.\n   Не пиши setup в Markdown.\n   Не пиши setup в ```json блоке.\n   Нужно именно создать и приложить файл.\n\n   Имя файла строго:\n   setup-HHMM_DDMM.txt\n\n   Пример имени:\n   setup-0059_0106.txt\n\n8. Внутри setup-файла должен быть ЧИСТЫЙ JSON object.\n   Файл должен начинаться с { и заканчиваться }.\n   Не используй Markdown, не используй ```json, не используй поясняющий текст до или после JSON.\n   В файле не должно быть строк вида setup_version: 1.6 вне JSON.\n\n   Обязательные поля верхнего уровня:\n   "setup_version": "1.6"\n   "mode": "AUTO_OPEN"\n   "exchange": "MEXC_FUTURES"\n   "margin_mode": "ISOLATED"\n   "default_margin_percent_per_trade": 10\n   "default_leverage": 10\n   "verdict": "TRADE" или "NO_TRADE"\n   "blocked_symbol_substrings": ["STOCK"]\n   "symbol_format": "MEXC_NATIVE_UNDERSCORE"\n   "trades": максимум 3 сделки.\n\n   Минимальный пример структуры файла:\n   {\n     "setup_version": "1.6",\n     "mode": "AUTO_OPEN",\n     "exchange": "MEXC_FUTURES",\n     "margin_mode": "ISOLATED",\n     "default_margin_percent_per_trade": 10,\n     "default_leverage": 10,\n     "verdict": "TRADE",\n     "blocked_symbol_substrings": ["STOCK"],\n     "symbol_format": "MEXC_NATIVE_UNDERSCORE",\n     "trades": []\n   }\n\n9. По каждой сделке обязательно указать:\n   symbol\n   direction: LONG или SHORT\n   order_type: LIMIT\n   entry\n   stop_loss\n   take_profits:\n     TP1: 35%\n     TP2: 35%\n     TP3: REMAINDER\n   cancel_if_not_filled_minutes: 120\n   cancel_if_tp1_before_entry: true\n   invalidation\n   comment\n   risk.stop_distance_percent\n   risk.estimated_deposit_risk_percent\n\n10. ВАЖНО ПО STOP_LOSS:\n\n   ChatGPT сам рассчитывает entry, stop_loss и take_profits.\n   Сделки выставляются лимитными ордерами, не рыночными.\n\n   Stop_loss должен быть структурным и находиться в диапазоне:\n   минимум 1% от entry,\n   максимум 5% от entry.\n\n   Если структурный стоп получается меньше 1%, не используй микростоп.\n   Расширь stop_loss до логичного уровня, чтобы расстояние было не меньше 1%.\n\n   Если структурный стоп получается больше 5%, не давай эту сделку в setup.\n\n   Take_profits НЕ пересчитываются от округлённого или расширенного stop_loss.\n   TP1 / TP2 / TP3 выбираются по графику, уровням, ликвидности и структуре рынка.\n\n   Схема фиксации:\n   TP1: 35%\n   TP2: 35%\n   TP3: REMAINDER\n\n   После TP1 бот переносит stop_loss в breakeven.\n   Trailing: OFF.\n   Scalp exit: OFF.\n\n11. Старые версии setup не использовать.\n   Бот принимает только setup_version "1.6".\n   Не использовать setup_version "1.4", "1.5", "2.3" и любые другие версии.\n\n12. Если нет 3 качественных сделок, не выдумывай.\n   Лучше дай 1–2 сделки или verdict: "NO_TRADE".\n'.strip()
+    task = 'ЗАДАЧА ДЛЯ CHATGPT MODE:\n\nТы анализируешь торговый log.txt для выбора сделок на MEXC Futures.\n\nКРИТИЧЕСКИ ВАЖНО ДЛЯ SETUP:\n1. Финальный setup нужно вернуть ТОЛЬКО прикреплённым .txt файлом.\n2. Нельзя писать setup обычным текстом в сообщении.\n3. Нельзя писать setup в Markdown.\n4. Нельзя писать setup в ```json блоке.\n5. Нельзя использовать старый plain-text формат:\n   VERSION=1.6\n   [TRADE_1]\n   symbol=...\n   Такой формат ЗАПРЕЩЁН.\n6. Нужен только файл с чистым JSON object.\n7. Файл должен называться строго: setup-HHMM_DDMM.txt\n   Пример: setup-0059_0106.txt\n8. Файл должен начинаться с символа { и заканчиваться символом }.\n9. Если ты не можешь прикрепить файл, прямо напиши: "не могу создать файл" и НЕ выдавай setup текстом.\n\nВАЖНО ПО СКРИНШОТАМ:\nНе проси сразу 15m / 1H / 4H по всем монетам.\nНе проси 20–30 скриншотов сразу.\nСкриншоты браузером бот пока НЕ делает.\nСначала нужен только 4H.\n\nЗАПРЕЩЁННЫЕ ИНСТРУМЕНТЫ:\nНе рассматривай и не добавляй в setup любые инструменты, где в символе есть STOCK.\nПримеры: MSFTSTOCK_USDT, DELLSTOCK_USDT, IBMSTOCK_USDT, SPCXSTOCK_USDT.\nТакие инструменты регионально блокируются и не могут быть открыты ботом.\n\nПОРЯДОК РАБОТЫ:\n\n1. Проанализируй весь log.txt.\n   Используй все метрики скана: 15m / 1H / 4H, объём, ликвидность,\n   RSI, MACD, MA7/MA25/MA99, orderbook, движение, силу/слабость,\n   риск перегрева и общий фон BTC/ETH.\n   Символы со STOCK не рассматривать.\n\n2. Выбери 10 лучших инструментов-кандидатов для ручной проверки по графикам.\n   В эти 10 инструментов нельзя включать символы со STOCK.\n\n3. Сначала попроси у пользователя только 10 скриншотов 4H:\n   по одному 4H-графику на каждый выбранный инструмент.\n\n4. После получения 4H-графиков оставь 5 лучших кандидатов\n   и попроси по ним графики на 1H:\n   по одному 1H-графику на каждый из 5 кандидатов.\n\n5. По графикам 1H выбери 3 лучшие монеты для setup.\n\n6. 15m проси только если точка входа по 1H неясная,\n   максимум по 1–2 монетам.\n   15m нужен только для уточнения входа, а не для отбора всех кандидатов.\n\nФОРМАТ SETUP-ФАЙЛА:\n\nВерни именно прикреплённый файл setup-HHMM_DDMM.txt.\nВнутри файла должен быть чистый JSON object без любого текста до/после JSON.\n\nОбязательные поля верхнего уровня:\n{\n  "setup_version": "1.6",\n  "mode": "AUTO_OPEN",\n  "exchange": "MEXC_FUTURES",\n  "margin_mode": "ISOLATED",\n  "default_margin_percent_per_trade": 10,\n  "default_leverage": 10,\n  "verdict": "TRADE",\n  "blocked_symbol_substrings": ["STOCK"],\n  "symbol_format": "MEXC_NATIVE_UNDERSCORE",\n  "trades": []\n}\n\nЕсли нет качественных сделок, используй:\n{\n  "setup_version": "1.6",\n  "mode": "AUTO_OPEN",\n  "exchange": "MEXC_FUTURES",\n  "margin_mode": "ISOLATED",\n  "default_margin_percent_per_trade": 10,\n  "default_leverage": 10,\n  "verdict": "NO_TRADE",\n  "blocked_symbol_substrings": ["STOCK"],\n  "symbol_format": "MEXC_NATIVE_UNDERSCORE",\n  "trades": []\n}\n\nПОЛЯ КАЖДОЙ СДЕЛКИ:\nКаждая сделка в trades обязана содержать:\n- symbol\n- direction: "LONG" или "SHORT"\n- order_type: "LIMIT"\n- entry\n- stop_loss\n- take_profits\n- cancel_if_not_filled_minutes: 120\n- cancel_if_tp1_before_entry: true\n- invalidation\n- comment\n- risk.stop_distance_percent\n- risk.estimated_deposit_risk_percent\n\nСТРОГИЙ ФОРМАТ TAKE_PROFITS:\ntake_profits должен быть только JSON-массивом из 3 объектов.\nИспользуй только ключи "price" и "size_percent".\n\nПравильно:\n"take_profits": [\n  {"price": TP1_PRICE, "size_percent": 35},\n  {"price": TP2_PRICE, "size_percent": 35},\n  {"price": TP3_PRICE, "size_percent": "REMAINDER"}\n]\n\nЗапрещено:\n- "size": "35%"\n- "size": 35\n- "percent": 35\n- "take_profit_1_size_pct"\n- "take_profit_1"\n- "tp1"\n- TP3 без "size_percent"\n\nПоследний TP обязан иметь ровно:\n"size_percent": "REMAINDER"\n\nПОЛНЫЙ ПРИМЕР ОДНОЙ СДЕЛКИ:\n{\n  "symbol": "ZEC_USDT",\n  "direction": "LONG",\n  "order_type": "LIMIT",\n  "entry": 553.0,\n  "stop_loss": 545.5,\n  "take_profits": [\n    {"price": 568.0, "size_percent": 35},\n    {"price": 575.0, "size_percent": 35},\n    {"price": 590.0, "size_percent": "REMAINDER"}\n  ],\n  "cancel_if_not_filled_minutes": 120,\n  "cancel_if_tp1_before_entry": true,\n  "invalidation": "Отмена идеи, если цена пробьёт структурный уровень до исполнения лимитки.",\n  "comment": "Причина сделки по структуре 4H/1H, уровню входа и ликвидности.",\n  "risk": {\n    "stop_distance_percent": 1.36,\n    "estimated_deposit_risk_percent": 1.36\n  }\n}\n\nВАЖНО ПО STOP_LOSS:\nChatGPT сам рассчитывает entry, stop_loss и take_profits.\nСделки выставляются лимитными ордерами, не рыночными.\n\nStop_loss должен быть структурным и находиться в диапазоне:\nминимум 1% от entry,\nмаксимум 5% от entry.\n\nЕсли структурный стоп получается меньше 1%, не используй микростоп.\nРасширь stop_loss до логичного уровня, чтобы расстояние было не меньше 1%.\n\nЕсли структурный стоп получается больше 5%, не давай эту сделку в setup.\n\nTake_profits НЕ пересчитываются от округлённого или расширенного stop_loss.\nTP1 / TP2 / TP3 выбираются по графику, уровням, ликвидности и структуре рынка.\n\nСхема фиксации:\nTP1: 35%\nTP2: 35%\nTP3: REMAINDER\n\nПосле TP1 бот переносит stop_loss в breakeven.\nTrailing: OFF.\nScalp exit: OFF.\n\nСТАРЫЕ ВЕРСИИ ЗАПРЕЩЕНЫ:\nБот принимает только setup_version "1.6".\nНе использовать setup_version "1.4", "1.5", "2.3" и любые другие версии.\n\nФИНАЛЬНАЯ САМОПРОВЕРКА ПЕРЕД ОТПРАВКОЙ ФАЙЛА:\nПеред отправкой setup-файла проверь:\n1. Файл прикреплён как .txt, а не написан текстом в сообщении.\n2. Имя файла похоже на setup-0059_0106.txt.\n3. В файле чистый JSON, начинается с { и заканчивается }.\n4. setup_version ровно "1.6".\n5. В trades максимум 3 сделки.\n6. Нет символов со STOCK.\n7. У каждой сделки order_type "LIMIT".\n8. У каждой сделки take_profits ровно в формате:\n   35 / 35 / "REMAINDER" через ключ size_percent.\n9. Стоп каждой сделки от 1% до 5%.\n10. Если условий нет, лучше дай NO_TRADE, чем кривой setup.'.strip()
 
     header = [
         "CHATGPT MARKET SCAN LOG",
@@ -721,18 +727,38 @@ def validate_setup(data: dict) -> list[dict]:
         if not isinstance(tps, list):
             raise ValueError(f"TRADE_{i}: take_profits must be a list")
 
+        def _tp_raw_size(tp: dict, idx: int, total: int) -> Any:
+            # ChatGPT иногда пишет size / percent / size_pct вместо size_percent.
+            # Торговую логику не меняем — только нормализуем входной setup v1.6.
+            for key in ("size_percent", "size_pct", "percent", "size", "qty_percent"):
+                if key in tp:
+                    return tp.get(key)
+            # Если TP3 без размера, но первые TP уже числовые — считаем остатком.
+            if idx == total - 1 and total >= 2:
+                return "REMAINDER"
+            return None
+
+        def _is_remainder(v: Any) -> bool:
+            if not isinstance(v, str):
+                return False
+            return v.strip().upper() in {"REMAINDER", "REMAINING", "REST", "ОСТАТОК"}
+
         has_remainder = False
         numeric_total = 0.0
+        normalized_sizes: list[float | str] = []
         for idx, x in enumerate(tps):
             if not isinstance(x, dict):
                 raise ValueError(f"TRADE_{i}: invalid TP row")
-            raw_size = x.get("size_percent")
-            if isinstance(raw_size, str) and raw_size.strip().upper() == "REMAINDER":
+            raw_size = _tp_raw_size(x, idx, len(tps))
+            if _is_remainder(raw_size):
                 if idx != len(tps) - 1:
                     raise ValueError(f"TRADE_{i}: REMAINDER is allowed only on the last TP")
                 has_remainder = True
+                normalized_sizes.append("REMAINDER")
             else:
-                numeric_total += _safe_float(raw_size)
+                size = _safe_float(raw_size)
+                normalized_sizes.append(size)
+                numeric_total += size
 
         if has_remainder:
             if numeric_total <= 0 or numeric_total >= 100.0:
@@ -744,11 +770,7 @@ def validate_setup(data: dict) -> list[dict]:
         clean_tps = []
         for idx, tp in enumerate(tps):
             p = _safe_float(tp.get("price") if isinstance(tp, dict) else 0)
-            raw_size = tp.get("size_percent") if isinstance(tp, dict) else 0
-            if isinstance(raw_size, str) and raw_size.strip().upper() == "REMAINDER":
-                s: float | str = "REMAINDER"
-            else:
-                s = _safe_float(raw_size)
+            s: float | str = normalized_sizes[idx]
             if p <= 0 or (s != "REMAINDER" and float(s) <= 0):
                 raise ValueError(f"TRADE_{i}: invalid TP")
             if direction == "LONG" and p <= entry:
