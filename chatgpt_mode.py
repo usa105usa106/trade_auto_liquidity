@@ -301,12 +301,30 @@ def _chatgpt_stop_breached(direction: str, current_price: float, stop_price: flo
     return False
 
 
-def _chatgpt_tp1_already_touched(direction: str, current_price: float, tp1_price: float) -> bool:
-    """True when the market already reached TP1 before entry placement.
+def _chatgpt_tp2_already_touched(direction: str, current_price: float, tp2_price: float) -> bool:
+    """True when the market already reached TP2 before entry placement.
 
-    LONG is stale if current >= TP1.  SHORT is stale if current <= TP1.
-    If TP1 has already been touched, risk/reward is no longer the setup that
-    ChatGPT approved, so the LIMIT must be skipped for safety.
+    LONG is stale if current >= TP2. SHORT is stale if current <= TP2.
+    TP1 touch alone is allowed: otherwise normal pullback setups are skipped too
+    aggressively. TP2 touch means the setup has already played out enough that
+    a fresh entry should wait for a new setup.
+    """
+    d = str(direction or "").upper()
+    if tp2_price <= 0:
+        return False
+    if d == "LONG":
+        return current_price >= tp2_price
+    if d == "SHORT":
+        return current_price <= tp2_price
+    return False
+
+
+def _chatgpt_tp1_already_touched(direction: str, current_price: float, tp1_price: float) -> bool:
+    """Compatibility wrapper kept for older tests/imports.
+
+    New ChatGPT Mode safety uses TP2, not TP1. This helper retains the old TP1
+    comparison only for code that imports it directly; execution paths do not
+    call it for setup-entry rejection anymore.
     """
     d = str(direction or "").upper()
     if tp1_price <= 0:
@@ -561,7 +579,7 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
     except Exception:
         pass
 
-    task = 'ЗАДАЧА ДЛЯ CHATGPT MODE:\n\nТы анализируешь торговый log.txt для выбора сделок на MEXC Futures.\n\nКРИТИЧЕСКИ ВАЖНО ДЛЯ SETUP:\n1. Финальный setup нужно вернуть ТОЛЬКО прикреплённым .txt файлом.\n2. Нельзя писать setup обычным текстом в сообщении.\n3. Нельзя писать setup в Markdown.\n4. Нельзя писать setup в ```json блоке.\n5. Нельзя использовать старый plain-text формат:\n   VERSION=1.6\n   [TRADE_1]\n   symbol=...\n   Такой формат ЗАПРЕЩЁН.\n6. Нужен только файл с чистым JSON object.\n7. Файл должен называться строго: setup-HHMM_DDMM.txt\n   Пример: setup-0059_0106.txt\n8. Файл должен начинаться с символа { и заканчиваться символом }.\n9. Если ты не можешь прикрепить файл, прямо напиши: "не могу создать файл" и НЕ выдавай setup текстом.\n\nВАЖНО ПО СКРИНШОТАМ:\nНе проси сразу 15m / 1H / 4H по всем монетам.\nНе проси 20–30 скриншотов сразу.\nСкриншоты браузером бот пока НЕ делает.\nСначала нужен только 4H.\n\nЗАПРЕЩЁННЫЕ ИНСТРУМЕНТЫ:\nНе рассматривай и не добавляй в setup любые инструменты, где в символе есть STOCK.\nПримеры: MSFTSTOCK_USDT, DELLSTOCK_USDT, IBMSTOCK_USDT, SPCXSTOCK_USDT.\nТакие инструменты регионально блокируются и не могут быть открыты ботом.\n\nПОРЯДОК РАБОТЫ:\n\n1. Проанализируй весь log.txt.\n   Используй все метрики скана: 15m / 1H / 4H, объём, ликвидность,\n   RSI, MACD, MA7/MA25/MA99, orderbook, движение, силу/слабость,\n   риск перегрева и общий фон BTC/ETH.\n   Символы со STOCK не рассматривать.\n\n2. Выбери 10 лучших инструментов-кандидатов для ручной проверки по графикам.\n   В эти 10 инструментов нельзя включать символы со STOCK.\n\n3. Сначала попроси у пользователя только 10 скриншотов 4H:\n   по одному 4H-графику на каждый выбранный инструмент.\n\n4. После получения 4H-графиков оставь 5 лучших кандидатов\n   и попроси по ним графики на 1H:\n   по одному 1H-графику на каждый из 5 кандидатов.\n\n5. По графикам 1H выбери 3 лучшие монеты для setup.\n\n6. 15m проси только если точка входа по 1H неясная,\n   максимум по 1–2 монетам.\n   15m нужен только для уточнения входа, а не для отбора всех кандидатов.\n\nФОРМАТ SETUP-ФАЙЛА:\n\nВерни именно прикреплённый файл setup-HHMM_DDMM.txt.\nВнутри файла должен быть чистый JSON object без любого текста до/после JSON.\n\nОбязательные поля верхнего уровня:\n{\n  "setup_version": "1.6",\n  "mode": "AUTO_OPEN",\n  "exchange": "MEXC_FUTURES",\n  "margin_mode": "ISOLATED",\n  "default_margin_percent_per_trade": 10,\n  "default_leverage": 10,\n  "verdict": "TRADE",\n  "blocked_symbol_substrings": ["STOCK"],\n  "symbol_format": "MEXC_NATIVE_UNDERSCORE",\n  "trades": []\n}\n\nЕсли нет качественных сделок, используй:\n{\n  "setup_version": "1.6",\n  "mode": "AUTO_OPEN",\n  "exchange": "MEXC_FUTURES",\n  "margin_mode": "ISOLATED",\n  "default_margin_percent_per_trade": 10,\n  "default_leverage": 10,\n  "verdict": "NO_TRADE",\n  "blocked_symbol_substrings": ["STOCK"],\n  "symbol_format": "MEXC_NATIVE_UNDERSCORE",\n  "trades": []\n}\n\nПОЛЯ КАЖДОЙ СДЕЛКИ:\nКаждая сделка в trades обязана содержать:\n- symbol\n- direction: "LONG" или "SHORT"\n- order_type: "LIMIT"\n- entry\n- stop_loss\n- take_profits\n- cancel_if_not_filled_minutes: 120\n- cancel_if_tp1_before_entry: true\n- invalidation\n- comment\n- risk.stop_distance_percent\n- risk.estimated_deposit_risk_percent\n\nСТРОГИЙ ФОРМАТ TAKE_PROFITS:\ntake_profits должен быть только JSON-массивом из 3 объектов.\nИспользуй только ключи "price" и "size_percent".\n\nПравильно:\n"take_profits": [\n  {"price": TP1_PRICE, "size_percent": 35},\n  {"price": TP2_PRICE, "size_percent": 35},\n  {"price": TP3_PRICE, "size_percent": "REMAINDER"}\n]\n\nЗапрещено:\n- "size": "35%"\n- "size": 35\n- "percent": 35\n- "take_profit_1_size_pct"\n- "take_profit_1"\n- "tp1"\n- TP3 без "size_percent"\n\nПоследний TP обязан иметь ровно:\n"size_percent": "REMAINDER"\n\nПОЛНЫЙ ПРИМЕР ОДНОЙ СДЕЛКИ:\n{\n  "symbol": "ZEC_USDT",\n  "direction": "LONG",\n  "order_type": "LIMIT",\n  "entry": 553.0,\n  "stop_loss": 545.5,\n  "take_profits": [\n    {"price": 568.0, "size_percent": 35},\n    {"price": 575.0, "size_percent": 35},\n    {"price": 590.0, "size_percent": "REMAINDER"}\n  ],\n  "cancel_if_not_filled_minutes": 120,\n  "cancel_if_tp1_before_entry": true,\n  "invalidation": "Отмена идеи, если цена пробьёт структурный уровень до исполнения лимитки.",\n  "comment": "Причина сделки по структуре 4H/1H, уровню входа и ликвидности.",\n  "risk": {\n    "stop_distance_percent": 1.36,\n    "estimated_deposit_risk_percent": 1.36\n  }\n}\n\nВАЖНО ПО STOP_LOSS:\nChatGPT сам рассчитывает entry, stop_loss и take_profits.\nСделки выставляются лимитными ордерами, не рыночными.\n\nStop_loss должен быть структурным и находиться в диапазоне:\nминимум 1% от entry,\nмаксимум 5% от entry.\n\nЕсли структурный стоп получается меньше 1%, не используй микростоп.\nРасширь stop_loss до логичного уровня, чтобы расстояние было не меньше 1%.\n\nЕсли структурный стоп получается больше 5%, не давай эту сделку в setup.\n\nTake_profits НЕ пересчитываются от округлённого или расширенного stop_loss.\nTP1 / TP2 / TP3 выбираются по графику, уровням, ликвидности и структуре рынка.\n\nСхема фиксации:\nTP1: 35%\nTP2: 35%\nTP3: REMAINDER\n\nПосле TP1 бот переносит stop_loss в breakeven.\nTrailing: OFF.\nScalp exit: OFF.\n\nСТАРЫЕ ВЕРСИИ ЗАПРЕЩЕНЫ:\nБот принимает только setup_version "1.6".\nНе использовать setup_version "1.4", "1.5", "2.3" и любые другие версии.\n\nФИНАЛЬНАЯ САМОПРОВЕРКА ПЕРЕД ОТПРАВКОЙ ФАЙЛА:\nПеред отправкой setup-файла проверь:\n1. Файл прикреплён как .txt, а не написан текстом в сообщении.\n2. Имя файла похоже на setup-0059_0106.txt.\n3. В файле чистый JSON, начинается с { и заканчивается }.\n4. setup_version ровно "1.6".\n5. В trades максимум 3 сделки.\n6. Нет символов со STOCK.\n7. У каждой сделки order_type "LIMIT".\n8. У каждой сделки take_profits ровно в формате:\n   35 / 35 / "REMAINDER" через ключ size_percent.\n9. Стоп каждой сделки от 1% до 5%.\n10. Если условий нет, лучше дай NO_TRADE, чем кривой setup.'.strip()
+    task = 'ЗАДАЧА ДЛЯ CHATGPT MODE:\n\nТы анализируешь торговый log.txt для выбора сделок на MEXC Futures.\n\nКРИТИЧЕСКИ ВАЖНО ДЛЯ SETUP:\n1. Финальный setup нужно вернуть ТОЛЬКО прикреплённым .txt файлом.\n2. Нельзя писать setup обычным текстом в сообщении.\n3. Нельзя писать setup в Markdown.\n4. Нельзя писать setup в ```json блоке.\n5. Нельзя использовать старый plain-text формат:\n   VERSION=1.6\n   [TRADE_1]\n   symbol=...\n   Такой формат ЗАПРЕЩЁН.\n6. Нужен только файл с чистым JSON object.\n7. Файл должен называться строго: setup-HHMM_DDMM.txt\n   Пример: setup-0059_0106.txt\n8. Файл должен начинаться с символа { и заканчиваться символом }.\n9. Если ты не можешь прикрепить файл, прямо напиши: "не могу создать файл" и НЕ выдавай setup текстом.\n\nВАЖНО ПО СКРИНШОТАМ:\nНе проси сразу 15m / 1H / 4H по всем монетам.\nНе проси 20–30 скриншотов сразу.\nСкриншоты браузером бот пока НЕ делает.\nСначала нужен только 4H.\n\nЗАПРЕЩЁННЫЕ ИНСТРУМЕНТЫ:\nНе рассматривай и не добавляй в setup только инструменты, где в символе есть STOCK.\nПримеры: MSFTSTOCK_USDT, DELLSTOCK_USDT, IBMSTOCK_USDT, SPCXSTOCK_USDT.\nТакие инструменты регионально блокируются и не могут быть открыты ботом.\n\nНЕ ЗАПРЕЩАЙ COMMODITIES / METALS:\nНе исключай автоматически XAU, XAUT, GOLD, SILVER, OIL, XPD и похожие инструменты.\nЕсли инструмент есть в MEXC Futures, проходит по ликвидности, структуре, риску и правилам setup — его можно рассматривать наравне с остальными.\nЗапрещён только STOCK.\n\nПОРЯДОК РАБОТЫ:\n\n1. Проанализируй весь log.txt.\n   Используй все метрики скана: 15m / 1H / 4H, объём, ликвидность,\n   RSI, MACD, MA7/MA25/MA99, orderbook, движение, силу/слабость,\n   риск перегрева и общий фон BTC/ETH.\n   Символы со STOCK не рассматривать.\n\n2. Выбери 10 лучших инструментов-кандидатов для ручной проверки по графикам.\n   В эти 10 инструментов нельзя включать символы со STOCK.\n\n3. Сначала попроси у пользователя только 10 скриншотов 4H:\n   по одному 4H-графику на каждый выбранный инструмент.\n\n4. После получения 4H-графиков оставь 5 лучших кандидатов\n   и попроси по ним графики на 1H:\n   по одному 1H-графику на каждый из 5 кандидатов.\n\n5. По графикам 1H выбери 3 лучшие монеты для setup.\n\n6. 15m проси только если точка входа по 1H неясная,\n   максимум по 1–2 монетам.\n   15m нужен только для уточнения входа, а не для отбора всех кандидатов.\n\nФОРМАТ SETUP-ФАЙЛА:\n\nВерни именно прикреплённый файл setup-HHMM_DDMM.txt.\nВнутри файла должен быть чистый JSON object без любого текста до/после JSON.\n\nОбязательные поля верхнего уровня:\n{\n  "setup_version": "1.6",\n  "mode": "AUTO_OPEN",\n  "exchange": "MEXC_FUTURES",\n  "margin_mode": "ISOLATED",\n  "default_margin_percent_per_trade": 10,\n  "default_leverage": 10,\n  "verdict": "TRADE",\n  "blocked_symbol_substrings": ["STOCK"],\n  "symbol_format": "MEXC_NATIVE_UNDERSCORE",\n  "trades": []\n}\n\nЕсли нет качественных сделок, используй:\n{\n  "setup_version": "1.6",\n  "mode": "AUTO_OPEN",\n  "exchange": "MEXC_FUTURES",\n  "margin_mode": "ISOLATED",\n  "default_margin_percent_per_trade": 10,\n  "default_leverage": 10,\n  "verdict": "NO_TRADE",\n  "blocked_symbol_substrings": ["STOCK"],\n  "symbol_format": "MEXC_NATIVE_UNDERSCORE",\n  "trades": []\n}\n\nПОЛЯ КАЖДОЙ СДЕЛКИ:\nКаждая сделка в trades обязана содержать:\n- symbol\n- direction: "LONG" или "SHORT"\n- order_type: "LIMIT" или "MARKET"\n- entry\n- stop_loss\n- take_profits\n- cancel_if_not_filled_minutes: 120\n- cancel_if_tp2_before_entry: true\n- invalidation\n- comment\n- risk.stop_distance_percent\n- risk.estimated_deposit_risk_percent\n\nСТРОГИЙ ФОРМАТ TAKE_PROFITS:\ntake_profits должен быть только JSON-массивом из 3 объектов.\nИспользуй только ключи "price" и "size_percent".\n\nПравильно:\n"take_profits": [\n  {"price": TP1_PRICE, "size_percent": 35},\n  {"price": TP2_PRICE, "size_percent": 35},\n  {"price": TP3_PRICE, "size_percent": "REMAINDER"}\n]\n\nЗапрещено:\n- "size": "35%"\n- "size": 35\n- "percent": 35\n- "take_profit_1_size_pct"\n- "take_profit_1"\n- "tp1"\n- TP3 без "size_percent"\n\nПоследний TP обязан иметь ровно:\n"size_percent": "REMAINDER"\n\nПОЛНЫЙ ПРИМЕР ОДНОЙ СДЕЛКИ:\n{\n  "symbol": "ZEC_USDT",\n  "direction": "LONG",\n  "order_type": "LIMIT",\n  "entry": 553.0,\n  "stop_loss": 545.5,\n  "take_profits": [\n    {"price": 568.0, "size_percent": 35},\n    {"price": 575.0, "size_percent": 35},\n    {"price": 590.0, "size_percent": "REMAINDER"}\n  ],\n  "cancel_if_not_filled_minutes": 120,\n  "cancel_if_tp2_before_entry": true,\n  "invalidation": "Отмена идеи, если цена пробьёт структурный уровень до исполнения лимитки.",\n  "comment": "Причина сделки по структуре 4H/1H, уровню входа и ликвидности.",\n  "risk": {\n    "stop_distance_percent": 1.36,\n    "estimated_deposit_risk_percent": 1.36\n  }\n}\n\nВАЖНО ПО STOP_LOSS:\nChatGPT сам рассчитывает entry, stop_loss и take_profits.\nСделки обычно выставляются лимитными ордерами. MARKET не запрещён, но используй его только если вход нужен с рынка и это явно обосновано.\n\nStop_loss должен быть структурным и находиться в диапазоне:\nминимум 1% от entry,\nмаксимум 5% от entry.\n\nЕсли структурный стоп получается меньше 1%, не используй микростоп.\nРасширь stop_loss до логичного уровня, чтобы расстояние было не меньше 1%.\n\nЕсли структурный стоп получается больше 5%, не давай эту сделку в setup.\n\nTake_profits НЕ пересчитываются от округлённого или расширенного stop_loss.\nTP1 / TP2 / TP3 выбираются по графику, уровням, ликвидности и структуре рынка.\n\nСхема фиксации:\nTP1: 35%\nTP2: 35%\nTP3: REMAINDER\n\nПосле TP1 бот переносит stop_loss в breakeven.\nДо входа бот НЕ отменяет сделку из-за касания TP1.\nДо входа бот отменяет/не выставляет сделку только если цена уже дошла до TP2 или прошла stop_loss.\nTrailing: OFF.\nScalp exit: OFF.\n\nСТАРЫЕ ВЕРСИИ ЗАПРЕЩЕНЫ:\nБот принимает только setup_version "1.6".\nНе использовать setup_version "1.4", "1.5", "2.3" и любые другие версии.\n\nФИНАЛЬНАЯ САМОПРОВЕРКА ПЕРЕД ОТПРАВКОЙ ФАЙЛА:\nПеред отправкой setup-файла проверь:\n1. Файл прикреплён как .txt, а не написан текстом в сообщении.\n2. Имя файла похоже на setup-0059_0106.txt.\n3. В файле чистый JSON, начинается с { и заканчивается }.\n4. setup_version ровно "1.6".\n5. В trades максимум 3 сделки.\n6. Нет символов со STOCK.\n7. У каждой сделки order_type "LIMIT" или "MARKET".\n8. У каждой сделки take_profits ровно в формате:\n   35 / 35 / "REMAINDER" через ключ size_percent.\n9. Стоп каждой сделки от 1% до 5%.\n10. Если условий нет, лучше дай NO_TRADE, чем кривой setup.'.strip()
 
     header = [
         "CHATGPT MARKET SCAN LOG",
@@ -1735,7 +1753,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
                 "invalidation": str(t.get("invalidation") or ""),
                 "comment": str(t.get("comment") or ""),
                 "cancel_if_not_filled_minutes": CHATGPT_LIMIT_TTL_MINUTES,
-                "cancel_if_tp1_before_entry": _truthy(t.get("cancel_if_tp1_before_entry", False)),
+                "cancel_if_tp2_before_entry": _truthy(t.get("cancel_if_tp2_before_entry", t.get("cancel_if_tp1_before_entry", True))),
                 "cancel_if_stop_before_entry": _truthy(t.get("cancel_if_stop_before_entry", False)),
                 "max_price_deviation_percent": float(t.get("max_price_deviation_percent") or 0),
                 "risk": t.get("risk") or {},
@@ -1756,10 +1774,10 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         stop_price = float(plan.stop_price)
         tp_rows = plan.signal_details.get("chatgpt_take_profits") or []
         tp1_price = _safe_float((tp_rows[0] or {}).get("price") if tp_rows else 0)
-        # V38 hard safety gate: before entry placement, reject stale setups if
-        # either the setup SL has already been crossed OR TP1 has already been
-        # reached.  In both cases the original risk/reward is broken before the
-        # limit order even exists.
+        tp2_price = _safe_float((tp_rows[1] or {}).get("price") if isinstance(tp_rows, list) and len(tp_rows) > 1 else 0)
+        # v0381 safety gate: before entry placement, reject only if the setup SL
+        # has already been crossed OR TP2 has already been reached. TP1 touch is
+        # allowed, because otherwise normal pullback setups are skipped too often.
         try:
             cur = await _fetch_chatgpt_current_price(exchange_client, plan.symbol)
             if _chatgpt_stop_breached(plan.side, cur, stop_price):
@@ -1774,14 +1792,15 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
                     entry=entry,
                     stop=stop_price,
                     tp1=tp1_price,
+                    tp2=tp2_price,
                     reason=reason,
                 )
-                return {"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": False, "reason": reason, "safety_stop_breached": True, "current_price": cur, "stop": stop_price, "tp1": tp1_price}
-            if _chatgpt_tp1_already_touched(plan.side, cur, tp1_price):
-                side_word = "выше TP1" if str(plan.side).upper() == "LONG" else "ниже TP1"
-                reason = f"цена уже {side_word}: current={_fmt(cur)}, tp1={_fmt(tp1_price)}; лимитка не выставлена в целях безопасности"
+                return {"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": False, "reason": reason, "safety_stop_breached": True, "current_price": cur, "stop": stop_price, "tp1": tp1_price, "tp2": tp2_price}
+            if _chatgpt_tp2_already_touched(plan.side, cur, tp2_price):
+                side_word = "выше TP2" if str(plan.side).upper() == "LONG" else "ниже TP2"
+                reason = f"цена уже {side_word}: current={_fmt(cur)}, tp2={_fmt(tp2_price)}; лимитка не выставлена в целях безопасности"
                 chatgpt_log_event(
-                    "setup_trade_rejected_tp1_already_touched",
+                    "setup_trade_rejected_tp2_already_touched",
                     symbol=plan.symbol,
                     side=plan.side,
                     order_type=plan.order_type,
@@ -1789,12 +1808,13 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
                     entry=entry,
                     stop=stop_price,
                     tp1=tp1_price,
+                    tp2=tp2_price,
                     reason=reason,
                 )
-                return {"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": False, "reason": reason, "safety_tp1_touched": True, "current_price": cur, "stop": stop_price, "tp1": tp1_price}
+                return {"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": False, "reason": reason, "safety_tp2_touched": True, "current_price": cur, "stop": stop_price, "tp1": tp1_price, "tp2": tp2_price}
         except Exception as e:
             reason = f"не смог проверить текущую цену перед входом: {e}; лимитка не выставлена в целях безопасности"
-            chatgpt_log_event("setup_trade_rejected_price_safety_check_failed", symbol=plan.symbol, side=plan.side, entry=entry, stop=stop_price, tp1=tp1_price, error=str(e))
+            chatgpt_log_event("setup_trade_rejected_price_safety_check_failed", symbol=plan.symbol, side=plan.side, entry=entry, stop=stop_price, tp1=tp1_price, tp2=tp2_price, error=str(e))
             return {"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": False, "reason": reason, "price_safety_check_failed": True}
 
         # Market stale-price guard. LIMIT entries are already handled by expiry/TP-before-entry rules.

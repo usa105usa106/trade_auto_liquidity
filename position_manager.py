@@ -540,27 +540,28 @@ class PositionManager:
                 chatgpt_log_event("pending_limit_timeout_cancel_done", symbol=symbol, result=res)
             return {"type": "limit_timeout", "symbol": symbol, "result": res}
 
-        # ChatGPT LIMIT safety: if price already reached TP1 before entry fill,
-        # the idea is stale; cancel the pending order. Optional stop-before-entry
-        # cancellation is also supported if setup.txt includes it.
+        # ChatGPT LIMIT safety: if price already reached TP2 before entry fill,
+        # the idea is stale; cancel the pending order. TP1 touch alone is allowed
+        # because normal pullback setups often happen after TP1 was tagged.
+        # Optional stop-before-entry cancellation is also supported.
         try:
             tps = details.get("chatgpt_take_profits") or []
-            tp1 = float((tps[0] or {}).get("price") or 0) if isinstance(tps, list) and tps else 0.0
+            tp2 = float((tps[1] or {}).get("price") or 0) if isinstance(tps, list) and len(tps) > 1 else 0.0
             sl = float(pos.get("stop_price") or 0)
             side_u = str(pos.get("side") or "").upper()
-            cancel_tp1 = str(details.get("cancel_if_tp1_before_entry") or "").lower() in {"1", "true", "yes", "on"}
+            cancel_tp2 = str(details.get("cancel_if_tp2_before_entry") or details.get("cancel_if_tp1_before_entry") or "").lower() in {"1", "true", "yes", "on"}
             cancel_sl = str(details.get("cancel_if_stop_before_entry") or "").lower() in {"1", "true", "yes", "on"}
-            if (cancel_tp1 and tp1 > 0) or (cancel_sl and sl > 0):
+            if (cancel_tp2 and tp2 > 0) or (cancel_sl and sl > 0):
                 ticker = await self.execution_engine.exchange_client.fetch_ticker(symbol)
                 cur = float(ticker.get("last") or ticker.get("close") or 0)
                 if cur > 0:
-                    if cancel_tp1 and tp1 > 0 and ((side_u == "LONG" and cur >= tp1) or (side_u == "SHORT" and cur <= tp1)):
+                    if cancel_tp2 and tp2 > 0 and ((side_u == "LONG" and cur >= tp2) or (side_u == "SHORT" and cur <= tp2)):
                         if is_chatgpt_setup:
-                            chatgpt_log_event("pending_limit_stale_tp1_before_entry", symbol=symbol, current_price=cur, tp1=tp1, order_id=pos.get("order_id"))
-                        res = await self.execution_engine.cancel_entry(pos, live=True, reason="tp1_touched_before_entry")
+                            chatgpt_log_event("pending_limit_stale_tp2_before_entry", symbol=symbol, current_price=cur, tp2=tp2, order_id=pos.get("order_id"))
+                        res = await self.execution_engine.cancel_entry(pos, live=True, reason="tp2_touched_before_entry")
                         if is_chatgpt_setup:
-                            chatgpt_log_event("pending_limit_stale_tp1_cancel_done", symbol=symbol, result=res)
-                        return {"type": "limit_stale_tp1_before_entry", "symbol": symbol, "result": res}
+                            chatgpt_log_event("pending_limit_stale_tp2_cancel_done", symbol=symbol, result=res)
+                        return {"type": "limit_stale_tp2_before_entry", "symbol": symbol, "result": res}
                     if cancel_sl and sl > 0 and ((side_u == "LONG" and cur <= sl) or (side_u == "SHORT" and cur >= sl)):
                         if is_chatgpt_setup:
                             chatgpt_log_event("pending_limit_stale_stop_before_entry", symbol=symbol, current_price=cur, stop=sl, order_id=pos.get("order_id"))
