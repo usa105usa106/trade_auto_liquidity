@@ -598,6 +598,12 @@ class PositionManager:
                 pos["updated_at"] = now
                 pos = self.execution_engine._decorate_position_metrics(pos)
                 if is_chatgpt_setup:
+                    # Prevent another monitor tick from locally closing the just-filled
+                    # position while exchange SL/TP is still being placed/verified.
+                    grace = float(os.getenv("CHATGPT_PROTECTION_GRACE_SEC", "30") or 30)
+                    pos["chatgpt_protection_pending"] = True
+                    pos["chatgpt_protection_pending_until"] = time.time() + max(5.0, grace)
+                    await self.storage.upsert_position(pos)
                     chatgpt_log_event("limit_filled_confirmed", symbol=symbol, order_id=oid, filled=filled, amount=amount, entry_price=pos.get("entry_price"), qty=pos.get("qty"))
                     events_note = "limit filled"
                     chatgpt_log_event("sl_tp_place_start", symbol=symbol, qty=pos.get("qty"), stop=pos.get("stop_price"), take=pos.get("take_price"), tps=details.get("chatgpt_take_profits"))
@@ -605,6 +611,9 @@ class PositionManager:
                 if is_chatgpt_setup:
                     chatgpt_log_event("sl_tp_place_result", symbol=symbol, ok=bool(protection.get("ok")), protection=protection)
                 pos.update(protection)
+                if is_chatgpt_setup:
+                    pos["chatgpt_protection_pending"] = False
+                    pos["chatgpt_protection_pending_until"] = 0
                 await self.storage.upsert_position(pos)
                 if not protection.get("ok"):
                     # v0066: keep the local position and let PositionManager
@@ -699,6 +708,45 @@ class PositionManager:
             if not price:
                 continue
             side=str(pos.get("side")).upper(); stop=float(pos.get("stop_price") or 0); take=float(pos.get("take_price") or 0); entry=float(pos.get("entry_price") or 0); opened=float(pos.get("opened_at") or now); pnl=self.pnl_pct(pos, price)
+
+            chatgpt_protection_pending = False
+            chatgpt_exchange_protected = False
+            if is_chatgpt_setup:
+                try:
+                    chatgpt_protection_pending = bool(pos.get("chatgpt_protection_pending")) and now < float(pos.get("chatgpt_protection_pending_until") or 0)
+                except Exception:
+                    chatgpt_protection_pending = False
+                mode_txt = str(pos.get("protection_mode") or "").lower()
+                status_txt = str(pos.get("protection_status") or "").upper()
+                chatgpt_exchange_protected = mode_txt == "exchange" or status_txt in {"EXCHANGE PROTECTED", "SL + TP", "TP + SL"}
+
+                # If Telegram/local state says open but MEXC no longer has a position,
+                # send a clear event instead of silently dropping the row. This catches
+                # exchange SL/TP fills and accidental local emergency closes after restart.
+                if live and not chatgpt_protection_pending and (now - opened) > 5:
+                    try:
+                        ex_row = await self._find_exchange_position_row(symbol)
+                    except Exception:
+                        ex_row = None
+                    if not ex_row:
+                        if side == "LONG" and stop and price <= stop:
+                            ev_type, reason = "sl", "stop_loss"
+                        elif side == "SHORT" and stop and price >= stop:
+                            ev_type, reason = "sl", "stop_loss"
+                        elif side == "LONG" and take and price >= take:
+                            ev_type, reason = "tp", "take_profit"
+                        elif side == "SHORT" and take and price <= take:
+                            ev_type, reason = "tp", "take_profit"
+                        else:
+                            ev_type, reason = "position_closed", "exchange_position_missing"
+                        chatgpt_log_event("chatgpt_position_missing_on_exchange", symbol=symbol, event_type=ev_type, reason=reason, price=price, stop=stop, take=take, pnl_pct=pnl)
+                        try:
+                            await self.storage.remove_position(symbol)
+                        except Exception:
+                            pass
+                        events.append({"type": ev_type, "symbol": symbol, "reason": reason, "price": price, "pnl_pct": pnl})
+                        continue
+
             if is_chatgpt_setup and now - opened >= 86400 and not pos.get("chatgpt_24h_checked_done"):
                 # v29: after 24h, close only if in profit; leave losing positions untouched.
                 if pnl > 0:
@@ -863,7 +911,7 @@ class PositionManager:
                     events.append({"type":"boost_fast_profit_error", "symbol": symbol, "error": str(e)[:160]})
 
             if side=="LONG":
-                if take and price>=take:
+                if take and price>=take and not (is_chatgpt_setup and (chatgpt_exchange_protected or chatgpt_protection_pending)):
                     if live and strategy == "boost_scalping":
                         min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.09) or 0.09)
                         ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, min_profit)
@@ -883,7 +931,7 @@ class PositionManager:
                     ev = await self._close_and_event(pos, "tp", "take_profit", live, price)
                     if ev: events.append(ev)
                     continue
-                if stop and price<=stop and not liquidation_stop_mode:
+                if stop and price<=stop and not liquidation_stop_mode and not (is_chatgpt_setup and (chatgpt_exchange_protected or chatgpt_protection_pending)):
                     if boost_monitor_only_no_exchange:
                         pos["boost_monitor_only_skip_sl"] = f"exchange TP/SL missing; local SL close skipped at pnl {pnl:+.3f}%"
                         pos["updated_at"] = now
@@ -894,7 +942,7 @@ class PositionManager:
                         if ev: events.append(ev)
                         continue
             else:
-                if take and price<=take:
+                if take and price<=take and not (is_chatgpt_setup and (chatgpt_exchange_protected or chatgpt_protection_pending)):
                     if live and strategy == "boost_scalping":
                         min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.09) or 0.09)
                         ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, min_profit)
@@ -914,7 +962,7 @@ class PositionManager:
                     ev = await self._close_and_event(pos, "tp", "take_profit", live, price)
                     if ev: events.append(ev)
                     continue
-                if stop and price>=stop and not liquidation_stop_mode:
+                if stop and price>=stop and not liquidation_stop_mode and not (is_chatgpt_setup and (chatgpt_exchange_protected or chatgpt_protection_pending)):
                     if boost_monitor_only_no_exchange:
                         pos["boost_monitor_only_skip_sl"] = f"exchange TP/SL missing; local SL close skipped at pnl {pnl:+.3f}%"
                         pos["updated_at"] = now

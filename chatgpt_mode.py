@@ -1581,6 +1581,11 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
         if skipped:
             for row in skipped[:6]:
                 reason = row.get("reason") or (row.get("result") or {}).get("reason") or "unknown"
+                rlow = str(reason).lower()
+                if "duplicate order id" in rlow or "2042" in rlow:
+                    reason = "entry не поставлена: duplicate clientOrderId, повтор не помог"
+                elif "symbol locked: chatgpt_new_setup_cancel_old_pending" in rlow:
+                    reason = "entry не поставлена: старый pending снят, но символ был ошибочно заблокирован"
                 lines.append(f"• {row.get('symbol')}: {reason}")
         else:
             lines.append("• нет")
@@ -1852,20 +1857,28 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
     # visible in the final monitor instead of disappearing from the report.
     opened.extend(preplace_skipped)
 
-    # V34 SPEED FIX: place up to three setup LIMITs concurrently after one
-    # exchange-first sync/cleanup pass.  Per-symbol locks in ExecutionEngine
-    # still prevent duplicates; this removes the old one-by-one delay.
+    # v0383 SAFETY FIX: ChatGPT setup entries are private trading operations,
+    # so place them strictly one-by-one.  Parallel entry placement caused MEXC
+    # private requests (leverage/order/margin/protection) to overlap and return
+    # misleading Duplicate order ID / lock states.  Scanning can stay parallel,
+    # but setup execution must be deterministic.
     if trades:
-        chatgpt_log_event("setup_trade_place_batch_start", trades=len(trades), symbols=[t.get("symbol") for t in trades])
-        batch_results = await asyncio.gather(*[_place_one_setup_trade(t) for t in trades], return_exceptions=True)
-        for t, r in zip(trades, batch_results):
-            if isinstance(r, Exception):
-                sym = str(t.get("symbol") or "")
-                chatgpt_log_event("setup_trade_place_exception", symbol=sym, error=str(r))
-                opened.append({"symbol": sym, "ok": False, "reason": str(r)})
-            else:
+        chatgpt_log_event("setup_trade_place_sequence_start", trades=len(trades), symbols=[t.get("symbol") for t in trades])
+        for idx, t in enumerate(trades, start=1):
+            sym = str(t.get("symbol") or "")
+            try:
+                chatgpt_log_event("setup_trade_place_sequence_item_start", index=idx, symbol=sym)
+                r = await _place_one_setup_trade(t)
                 opened.append(r)
-        chatgpt_log_event("setup_trade_place_batch_done", opened=opened)
+                chatgpt_log_event("setup_trade_place_sequence_item_done", index=idx, symbol=sym, result=r)
+                # Give MEXC a short breath between private trading operations so
+                # order/leverage/protection requests do not collide internally.
+                await asyncio.sleep(float(os.getenv("CHATGPT_SETUP_SEQUENCE_DELAY_SEC", "1.2")))
+            except Exception as e:
+                chatgpt_log_event("setup_trade_place_exception", symbol=sym, error=str(e))
+                opened.append({"symbol": sym, "ok": False, "reason": str(e)})
+                await asyncio.sleep(float(os.getenv("CHATGPT_SETUP_SEQUENCE_DELAY_SEC", "1.2")))
+        chatgpt_log_event("setup_trade_place_sequence_done", opened=opened)
     chatgpt_log_event("setup_execute_done", opened=opened, rotation=rotation_result)
     return {
         "ok": True,

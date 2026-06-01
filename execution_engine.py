@@ -24,6 +24,19 @@ class ExecutionEngine:
         self.storage = storage
         self.exchange_client = exchange_client
 
+    def _new_client_order_id(self, prefix: str, symbol: str = "", side: str = "") -> str:
+        """Return a short but practically unique MEXC externalOid/clientOrderId.
+
+        MEXC rejects reused externalOid values with code 2042 (Duplicate order ID).
+        Millisecond-only IDs collide when ChatGPT Mode sends 2-3 entries in parallel.
+        Keep the ID <= 32 chars because exchange_client truncates externalOid to 32.
+        """
+        import secrets
+        sym = str(symbol or "").upper().replace("/", "").replace(":USDT", "").replace("_", "")[:7]
+        sd = str(side or "").lower()[:1] or "x"
+        base = f"{prefix}_{sym}{sd}_{time.time_ns()}_{secrets.token_hex(2)}"
+        return base[:32]
+
 
     @staticmethod
     def _truthy(value, default: bool = False) -> bool:
@@ -229,6 +242,10 @@ class ExecutionEngine:
             "only close existing positions",
         )
         return any(marker in text for marker in restricted_markers)
+
+    def _is_mexc_duplicate_client_order_error(self, exc: Exception) -> bool:
+        text = str(exc or "").lower()
+        return ("2042" in text and "duplicate" in text and "order" in text) or "duplicate order id" in text
 
     async def _create_order_retry(self, *args, attempts: int = 2, **kwargs):
         last = None
@@ -604,7 +621,7 @@ class ExecutionEngine:
             side = "buy" if plan.side.upper() == "LONG" else "sell"
             order_type = plan.order_type.lower()
             price = plan.entry_price if order_type == "limit" else None
-            params = {"clientOrderId": f"bot_entry_{int(time.time()*1000)}", "leverage": getattr(plan, "leverage", None)}
+            params = {"clientOrderId": self._new_client_order_id("bot_entry", plan.symbol, side), "leverage": getattr(plan, "leverage", None)}
             # v0146: for normal MEXC scalping attach TP/SL already to the entry order.
             # MEXC /order/create supports takeProfitPrice/stopLossPrice on opening
             # orders; this is more reliable than opening first and trying to attach
@@ -664,6 +681,31 @@ class ExecutionEngine:
                     params = clean_params
                     if str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup":
                         chatgpt_log_event("entry_order_retry_ok", symbol=plan.symbol, order_id=order.get("id"), order=order)
+                elif self._is_mexc_duplicate_client_order_error(e):
+                    # MEXC code 2042 is a duplicate externalOid/clientOrderId, not a duplicate trade.
+                    # Retry with a fresh ID and only fail if all retries fail.
+                    order = None
+                    duplicate_errors = [str(e)]
+                    for retry_i in range(2):
+                        params = dict(params or {})
+                        params["clientOrderId"] = self._new_client_order_id("bot_entry", plan.symbol, side)
+                        if str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup":
+                            chatgpt_log_event("entry_order_duplicate_retry", symbol=plan.symbol, attempt=retry_i+1, params=params, previous_error=str(e))
+                        try:
+                            order = await self._create_order_retry(plan.symbol, order_type, side, plan.qty, price, params, attempts=1)
+                            if str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup":
+                                chatgpt_log_event("entry_order_duplicate_retry_ok", symbol=plan.symbol, attempt=retry_i+1, order_id=(order or {}).get("id"), order=order)
+                            break
+                        except Exception as de:
+                            duplicate_errors.append(str(de))
+                            if not self._is_mexc_duplicate_client_order_error(de):
+                                e = de
+                                break
+                            await asyncio.sleep(0.35 * (retry_i + 1))
+                    if order is None:
+                        if str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup":
+                            chatgpt_log_event("entry_order_duplicate_failed", symbol=plan.symbol, errors=duplicate_errors)
+                        return {"ok": False, "reason": "entry не поставлена: duplicate clientOrderId, повтор не помог", "errors": duplicate_errors}
                 elif self._is_mexc_opening_restricted_error(e):
                     if str(getattr(plan, "strategy", "") or "").lower() == "chatgpt_setup":
                         chatgpt_log_event("entry_order_restricted_error", symbol=plan.symbol, error=str(e))
@@ -1113,7 +1155,7 @@ class ExecutionEngine:
         try:
             res = await self._create_order_retry(
                 order["symbol"], "market", order["side"], order["qty"], None,
-                {"reduceOnly": True, "clientOrderId": f"bot_{reason}_{int(time.time()*1000)}"}, attempts=2
+                {"reduceOnly": True, "clientOrderId": self._new_client_order_id(f"bot_{reason}", order.get("symbol") or pos.get("symbol"), order.get("side"))}, attempts=2
             )
             return {"ok": True, "order": res, "native_mexc_error": native_reason}
         except Exception as e:
@@ -1158,14 +1200,14 @@ class ExecutionEngine:
                 lev = await self._stored_position_leverage(symbol)
                 return await fn(
                     symbol=symbol, close_side=close_side, amount=qty, trigger_price=trigger_price,
-                    client_order_id=f"bot_{kind}_{int(time.time()*1000)}", leverage=lev,
+                    client_order_id=self._new_client_order_id(f"bot_{kind}", symbol, close_side), leverage=lev,
                 )
         except Exception as e:
             errors.append(f"native_{kind}_plan: {e}")
         attempts = [
-            ("market", None, {"reduceOnly": True, "stopPrice": trigger_price, "triggerPrice": trigger_price, "clientOrderId": f"bot_{kind}_{int(time.time()*1000)}"}),
-            ("market", None, {"reduceOnly": True, f"{'takeProfitPrice' if kind == 'tp' else 'stopLossPrice'}": trigger_price, "clientOrderId": f"bot_{kind}_{int(time.time()*1000)}"}),
-            ("stop_market", None, {"reduceOnly": True, "stopPrice": trigger_price, "triggerPrice": trigger_price, "clientOrderId": f"bot_{kind}_{int(time.time()*1000)}"}),
+            ("market", None, {"reduceOnly": True, "stopPrice": trigger_price, "triggerPrice": trigger_price, "clientOrderId": self._new_client_order_id(f"bot_{kind}", symbol, close_side)}),
+            ("market", None, {"reduceOnly": True, f"{'takeProfitPrice' if kind == 'tp' else 'stopLossPrice'}": trigger_price, "clientOrderId": self._new_client_order_id(f"bot_{kind}", symbol, close_side)}),
+            ("stop_market", None, {"reduceOnly": True, "stopPrice": trigger_price, "triggerPrice": trigger_price, "clientOrderId": self._new_client_order_id(f"bot_{kind}", symbol, close_side)}),
         ]
         for type_, price, params in attempts:
             try:
@@ -1847,7 +1889,11 @@ class ExecutionEngine:
         else:
             cancel_res = None
         await self.storage.remove_position(symbol)
-        await self.storage.set_lock(symbol, 30, reason)
+        # ChatGPT Mode replaces stale pending entries with fresh setup entries.
+        # Do not leave a 30s symbol lock after a successful cleanup cancel; that
+        # caused: cancel old XLM -> immediately fail new XLM with "symbol locked".
+        if str(reason) != "chatgpt_new_setup_cancel_old_pending":
+            await self.storage.set_lock(symbol, 30, reason)
         return {"ok": True, "reason": reason, "order_id": order_id, "cancel_result": cancel_res}
 
 
