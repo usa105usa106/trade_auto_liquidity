@@ -295,40 +295,65 @@ def _stop_distance_pct(entry: float, stop: float) -> float:
 async def _fetch_chatgpt_current_price(exchange_client, symbol: str) -> float:
     """Return the best available current price for a setup safety gate.
 
-    For stale LIMIT setups, the dangerous case is a fast move through the
-    planned stop before the bot places the entry order.  We prefer mark/index
-    prices when MEXC exposes them, then last/close/bid/ask.  Any failure is
-    surfaced to the caller so the setup row can be skipped safely instead of
-    placing a blind order.
+    v0389: the setup entry safety check must not skip a good trade after one
+    transient MEXC 510 rate-limit response.  We retry only the live ticker read
+    with fixed backoff 2s -> 5s, then fail closed.  No cached price fallback is
+    used here because stale prices can make TP2/SL safety checks misleading.
     """
-    ticker = await exchange_client.fetch_ticker(symbol)
-    info = ticker.get("info") if isinstance(ticker, dict) else {}
-    candidates = []
-    if isinstance(ticker, dict):
-        candidates += [
-            ticker.get("mark"),
-            ticker.get("markPrice"),
-            ticker.get("last"),
-            ticker.get("close"),
-            ticker.get("bid"),
-            ticker.get("ask"),
-        ]
-    if isinstance(info, dict):
-        candidates += [
-            info.get("markPrice"),
-            info.get("fairPrice"),
-            info.get("indexPrice"),
-            info.get("lastPrice"),
-            info.get("last"),
-            info.get("close"),
-            info.get("bid1"),
-            info.get("ask1"),
-        ]
-    for raw in candidates:
-        price = _safe_float(raw)
-        if price > 0:
-            return price
-    raise ValueError("ticker has no usable current price")
+    waits = [0.0, 2.0, 5.0]
+    last_exc = None
+    chatgpt_log_event("setup_price_check_start", symbol=symbol, attempts=len(waits), retry_schedule_sec="2,5", cache_fallback="off")
+    for idx, wait in enumerate(waits, start=1):
+        if wait > 0:
+            chatgpt_log_event("setup_price_check_retry_sleep", symbol=symbol, attempt=idx, sleep_sec=wait)
+            await asyncio.sleep(wait)
+        try:
+            chatgpt_log_event("setup_price_check_fetch_start", symbol=symbol, attempt=idx)
+            ticker = await exchange_client.fetch_ticker(symbol)
+            info = ticker.get("info") if isinstance(ticker, dict) else {}
+            candidates = []
+            if isinstance(ticker, dict):
+                candidates += [
+                    ticker.get("mark"),
+                    ticker.get("markPrice"),
+                    ticker.get("last"),
+                    ticker.get("close"),
+                    ticker.get("bid"),
+                    ticker.get("ask"),
+                ]
+            if isinstance(info, dict):
+                candidates += [
+                    info.get("markPrice"),
+                    info.get("fairPrice"),
+                    info.get("indexPrice"),
+                    info.get("lastPrice"),
+                    info.get("last"),
+                    info.get("close"),
+                    info.get("bid1"),
+                    info.get("ask1"),
+                ]
+            for raw in candidates:
+                price = _safe_float(raw)
+                if price > 0:
+                    chatgpt_log_event("setup_price_check_ok", symbol=symbol, attempt=idx, current_price=price)
+                    return price
+            raise ValueError("ticker has no usable current price")
+        except Exception as e:
+            last_exc = e
+            is_rate_limit = _is_mexc_rate_limit_error(e)
+            chatgpt_log_event(
+                "setup_price_check_fetch_error",
+                symbol=symbol,
+                attempt=idx,
+                will_retry=bool(is_rate_limit and idx < len(waits)),
+                rate_limit=bool(is_rate_limit),
+                error=repr(e),
+            )
+            if is_rate_limit and idx < len(waits):
+                continue
+            break
+    chatgpt_log_event("setup_price_check_failed", symbol=symbol, attempts=len(waits), error=repr(last_exc))
+    raise last_exc if last_exc is not None else RuntimeError("price check failed")
 
 
 def _chatgpt_stop_breached(direction: str, current_price: float, stop_price: float) -> bool:
@@ -934,7 +959,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "v0388 final"
+        _bot_code_version = "v0389 final"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),
