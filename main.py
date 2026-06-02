@@ -33,7 +33,7 @@ from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
 from ai_btc_autopilot import BTCVisionAutopilot
-from chatgpt_mode import build_chatgpt_log, build_chatgpt_scan_pack, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log, build_chatgpt_monitor_text, CHATGPT_MONITOR_INTERVAL_SEC, CHATGPT_SETUP_VERSION
+from chatgpt_mode import build_chatgpt_log, build_chatgpt_scan_pack, build_chatgpt_runtime_manifest_from_mexc, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log, build_chatgpt_monitor_text, CHATGPT_MONITOR_INTERVAL_SEC, CHATGPT_SETUP_VERSION
 from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
 from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env, set_runtime_secret_cache, clear_runtime_secret_cache, runtime_secret_cache, ensure_runtime_secrets_loaded, merge_secrets_into_settings, secret_source_report
@@ -5777,7 +5777,12 @@ async def _chatgpt_scan_background_job(app, chat_id: int):
 
 
 async def chatgpt_accept_setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Enter ChatGPT setup import mode without starting a new market scan."""
+    """Enter ChatGPT setup import mode without starting a new market scan.
+
+    v0390: build a fast runtime MEXC-symbol manifest on button press.
+    This avoids stale/missing scan-pack manifests after redeploy and prevents
+    false rejects like ICP_USDT not in BTC/ETH-only context.
+    """
     global running, entries_enabled, position_task
     if not allowed(update):
         return
@@ -5788,12 +5793,38 @@ async def chatgpt_accept_setup_cmd(update: Update, context: ContextTypes.DEFAULT
     running = True
     if position_task is None or position_task.done():
         position_task = context.application.create_task(position_management_loop(context.application))
+
+    try:
+        ns = await storage.all_settings()
+        apply_mexc_runtime_env({**ns, "mexc_order_leverage": "10", "mexc_order_open_type": "1"})
+        ex = await get_exchange(ns)
+        manifest = await build_chatgpt_runtime_manifest_from_mexc(storage, ex, source="accept_setup_button")
+        runtime_manifest_msg = (
+            f"\n⚡ Быстрый symbol-manifest создан: {len(manifest.get('selected_symbols') or [])} "
+            "MEXC Futures symbols. Это не scan top-200, без графиков."
+        )
+    except Exception as e:
+        chatgpt_log_event("mode_accept_setup_runtime_manifest_failed", error=repr(e))
+        await storage.set("chatgpt_waiting_setup", False)
+        await storage.set("chatgpt_setup_mode", False)
+        await reply(
+            update,
+            "❌ Приём setup не включён\n"
+            f"Причина: не смог быстро создать manifest актуальных MEXC symbols: {str(e)[:900]}\n\n"
+            "Нажми «📥 Принять setup» ещё раз или запусти ChatGPT Scan Mode.",
+            reply_markup=MAIN_MENU,
+        )
+        return
+
     await storage.set("chatgpt_waiting_setup", True)
     await storage.set("chatgpt_setup_mode", True)
     chatgpt_log_event("mode_waiting_setup_manual")
     await reply(
         update,
-        "📥 Приём setup включён\nСкан НЕ запускаю. Пришли setup-HHMM_DDMM.txt с setup_version 1.6. Старые режимы входа отключены, сопровождение позиций остаётся включённым.",
+        "📥 Приём setup включён\n"
+        "Скан НЕ запускаю. Пришли setup-HHMM_DDMM.txt с setup_version 1.6. "
+        "Старые режимы входа отключены, сопровождение позиций остаётся включённым."
+        f"{runtime_manifest_msg}",
         reply_markup=MAIN_MENU,
     )
 

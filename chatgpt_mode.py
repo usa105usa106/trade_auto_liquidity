@@ -150,6 +150,80 @@ def _chatgpt_pack_allowed_symbols_from_manifest(manifest: Any) -> set[str]:
     return symbols
 
 
+async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, source: str = "accept_setup") -> dict:
+    """Build a fast runtime symbol manifest from live MEXC futures markets.
+
+    Used by the manual "Accept setup" button after redeploy or without a
+    fresh ChatGPT scan pack. This is intentionally NOT a top-200 scan: no
+    OHLCV, no scoring, no charts. It only loads tradable futures symbols so
+    setup validation can check exact MEXC symbols without requiring Railway
+    volume/persistent scan-pack files.
+    """
+    chatgpt_log_event("setup_runtime_manifest_build_start", source=source)
+    try:
+        ex = getattr(exchange_client, "exchange", None)
+        markets = getattr(ex, "markets", None) if ex is not None else None
+        if ex is not None and not markets:
+            chatgpt_log_event("setup_runtime_manifest_load_markets_start", source=source)
+            await asyncio.wait_for(ex.load_markets(), timeout=float(os.getenv("CHATGPT_RUNTIME_MANIFEST_LOAD_MARKETS_TIMEOUT", "12") or 12))
+            chatgpt_log_event("setup_runtime_manifest_load_markets_done", source=source, markets=len(getattr(ex, "markets", {}) or {}))
+    except Exception as e:
+        chatgpt_log_event("setup_runtime_manifest_load_markets_error", source=source, error=repr(e))
+
+    raw_symbols = []
+    try:
+        if hasattr(exchange_client, "futures_market_symbols"):
+            raw_symbols = list(exchange_client.futures_market_symbols() or [])
+    except Exception as e:
+        chatgpt_log_event("setup_runtime_manifest_futures_symbols_error", source=source, error=repr(e))
+        raw_symbols = []
+
+    native_symbols = mexc_native_symbols(raw_symbols)
+    # Keep only USDT contracts; block only symbols containing STOCK.
+    native_symbols = [s for s in native_symbols if s.endswith("_USDT")]
+    allowed, blocked = filter_chatgpt_symbols(native_symbols)
+    # De-duplicate preserving order.
+    selected_symbols = mexc_native_symbols(allowed)
+
+    chatgpt_log_event(
+        "setup_runtime_manifest_symbols_loaded",
+        source=source,
+        raw_count=len(raw_symbols),
+        native_count=len(native_symbols),
+        allowed_count=len(selected_symbols),
+        blocked_count=len(blocked),
+        blocked_sample=",".join(blocked[:20]),
+        allowed_sample=",".join(selected_symbols[:30]),
+    )
+    if len(selected_symbols) < int(os.getenv("CHATGPT_RUNTIME_MANIFEST_MIN_SYMBOLS", "20") or 20):
+        chatgpt_log_event("setup_runtime_manifest_incomplete", source=source, allowed_count=len(selected_symbols), sample=",".join(selected_symbols[:20]))
+        raise ValueError(
+            f"не смог быстро создать runtime manifest MEXC symbols: найдено только {len(selected_symbols)} symbols. "
+            "Попробуй нажать «Принять setup» ещё раз или запусти ChatGPT Scan Mode."
+        )
+
+    manifest = {
+        "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
+        "source": source,
+        "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "bot_version": os.getenv("BOT_VERSION", "v0390 final"),
+        "symbol_guard_mode": "runtime_mexc_symbols",
+        "selected_count": len(selected_symbols),
+        "selected_symbols": selected_symbols,
+        "blocked_symbol_substrings": list(CHATGPT_BLOCKED_SYMBOL_SUBSTRINGS),
+        "note": "Fast manifest from live MEXC futures symbols; no scan/log/charts/score.",
+    }
+    await storage.set("chatgpt_last_scan_manifest", manifest, bump_revision=False)
+    await storage.set("chatgpt_last_scan_manifest_source", source, bump_revision=False)
+    chatgpt_log_event(
+        "setup_runtime_manifest_saved",
+        source=source,
+        selected_count=len(selected_symbols),
+        sample=",".join(selected_symbols[:30]),
+    )
+    return manifest
+
+
 CHATGPT_RUNTIME_LOG_PATH = Path(os.getenv("CHATGPT_RUNTIME_LOG_PATH", "/tmp/chatgpt_mode_runtime.log"))
 CHATGPT_RUNTIME_LOG_MAX_BYTES = int(os.getenv("CHATGPT_RUNTIME_LOG_MAX_BYTES", "700000") or 700000)
 
@@ -295,7 +369,7 @@ def _stop_distance_pct(entry: float, stop: float) -> float:
 async def _fetch_chatgpt_current_price(exchange_client, symbol: str) -> float:
     """Return the best available current price for a setup safety gate.
 
-    v0389: the setup entry safety check must not skip a good trade after one
+    v0390: the setup entry safety check must not skip a good trade after one
     transient MEXC 510 rate-limit response.  We retry only the live ticker read
     with fixed backoff 2s -> 5s, then fail closed.  No cached price fallback is
     used here because stale prices can make TP2/SL safety checks misleading.
@@ -959,7 +1033,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "v0389 final"
+        _bot_code_version = "v0390 final"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),
@@ -2148,10 +2222,20 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         guard_enabled = str(os.getenv("CHATGPT_SETUP_SYMBOL_GUARD_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
         if guard_enabled and isinstance(setup, dict):
             manifest = await storage.get("chatgpt_last_scan_manifest", {})
+            source = (manifest or {}).get("source") if isinstance(manifest, dict) else None
+            guard_mode = (manifest or {}).get("symbol_guard_mode") if isinstance(manifest, dict) else None
+            selected_count = len((manifest or {}).get("selected_symbols") or []) if isinstance(manifest, dict) else 0
             allowed = sorted(_chatgpt_pack_allowed_symbols_from_manifest(manifest))
             if allowed:
                 setup["_scan_pack_allowed_symbols"] = allowed
-                chatgpt_log_event("setup_symbol_guard_enabled", count=len(allowed), sample=",".join(allowed[:30]))
+                chatgpt_log_event(
+                    "setup_symbol_guard_enabled",
+                    source=source or "scan_pack",
+                    guard_mode=guard_mode or "scan_pack_selected_symbols",
+                    selected_count=selected_count,
+                    count=len(allowed),
+                    sample=",".join(allowed[:30]),
+                )
             else:
                 chatgpt_log_event("setup_symbol_guard_no_manifest")
         else:
