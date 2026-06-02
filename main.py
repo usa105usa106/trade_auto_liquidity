@@ -33,7 +33,7 @@ from ai_stats import AIStatsManager
 from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
 from ai_btc_autopilot import BTCVisionAutopilot
-from chatgpt_mode import build_chatgpt_log, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log, build_chatgpt_monitor_text, CHATGPT_MONITOR_INTERVAL_SEC, CHATGPT_SETUP_VERSION
+from chatgpt_mode import build_chatgpt_log, build_chatgpt_scan_pack, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log, build_chatgpt_monitor_text, CHATGPT_MONITOR_INTERVAL_SEC, CHATGPT_SETUP_VERSION
 from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
 from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env, set_runtime_secret_cache, clear_runtime_secret_cache, runtime_secret_cache, ensure_runtime_secrets_loaded, merge_secrets_into_settings, secret_source_report
@@ -5667,16 +5667,16 @@ async def _chatgpt_scan_background_job(app, chat_id: int):
         ws = await get_ws(ns)
         chatgpt_log_event("mode_scan_call")
         scan_limit = int(os.getenv("CHATGPT_SCAN_LIMIT", "200") or 200)
-        log_path = await build_chatgpt_log(ex, scanner, ns, ws_supervisor=ws, limit=scan_limit)
-        with open(log_path, "rb") as f:
+        pack_path = await build_chatgpt_scan_pack(ex, scanner, ns, ws_supervisor=ws, limit=scan_limit)
+        with open(pack_path, "rb") as f:
             await app.bot.send_document(
                 chat_id=chat_id,
                 document=f,
-                filename="log.txt",
-                caption="✅ log.txt готов. Скинь его ChatGPT. После финального анализа загрузи сюда setup-HHMM_DDMM.txt с setup_version 1.6.",
+                filename="chatgpt_scan_pack.zip",
+                caption="✅ ChatGPT pack готов: log.txt + task.txt + manifest.json + raw-графики. Скинь ZIP в ChatGPT. После финального анализа загрузи сюда setup-HHMM_DDMM.txt с setup_version 1.6.",
             )
         await storage.set("chatgpt_waiting_setup", True)
-        chatgpt_log_event("mode_waiting_setup", log_path=log_path)
+        chatgpt_log_event("mode_waiting_setup", pack_path=pack_path)
     except Exception as e:
         chatgpt_log_event("mode_scan_failed", error=repr(e))
         log.exception("chatgpt scan background failed")
@@ -5736,7 +5736,7 @@ async def chatgpt_scan_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     context.application.create_task(_chatgpt_scan_background_job(context.application, chat_id))
     await reply(
         update,
-        "🤖 ChatGPT Scan Mode ON\nОтключил остальные режимы входа. Скан топ-200 запущен в фоне. Интерфейс не зависнет; когда log.txt будет готов, я пришлю файл сюда.",
+        "🤖 ChatGPT Scan Mode ON\nОтключил остальные режимы входа. Скан топ-200 запущен в фоне. Интерфейс не зависнет; когда ZIP pack будет готов, я пришлю архив сюда.",
         reply_markup=MAIN_MENU,
     )
 

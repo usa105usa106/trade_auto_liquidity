@@ -2,7 +2,9 @@ import asyncio
 import json
 import math
 import os
+import re
 import time
+import zipfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -472,6 +474,470 @@ async def disable_other_modes(storage) -> None:
     except Exception:
         pass
 
+
+
+
+def _parse_chatgpt_log_candidates(log_text: str, limit: int = 15) -> list[dict]:
+    """Pick strongest non-STOCK candidates only from the TOP-200 scan section.
+
+    This intentionally uses the existing log scores instead of inventing a new
+    strategy: candidates are sorted by max(LONG, SHORT), then by volume, then by
+    the weaker opposite score.  STOCK contracts are excluded before selection.
+
+    Important: BTC/ETH market-context blocks appear before the full scan and may
+    have slightly different scores.  For ChatGPT Scan Pack we must select the
+    top-15 strictly from the TOP-200 FULL SCAN section, so context blocks are
+    stripped before parsing candidates.
+    """
+    out: list[dict] = []
+    text = str(log_text or "")
+    marker = "=== TOP-200 FULL SCAN ==="
+    if marker in text:
+        text = text.split(marker, 1)[1]
+    text = re.split(r"\n\n(?:=== TASK ===|CHATGPT_SCAN_PACK_NOTE:)", text, maxsplit=1)[0]
+    blocks = re.split(r"\n---\n", text)
+    for block in blocks:
+        m = re.search(r"^SYMBOL:\s*([A-Z0-9_:/.-]+)", block, re.M)
+        if not m:
+            continue
+        symbol = mexc_native_symbol(m.group(1))
+        if not symbol or is_chatgpt_blocked_symbol(symbol):
+            continue
+        sm = re.search(r"SCORES:\s*LONG\s*=\s*(\d+)\s*/\s*100\s+SHORT\s*=\s*(\d+)\s*/\s*100", block, re.I)
+        if not sm:
+            continue
+        long_score = int(sm.group(1)); short_score = int(sm.group(2))
+        vm = re.search(r"QUOTE_VOL:\s*([0-9.eE+-]+)", block)
+        quote_vol = _safe_float(vm.group(1) if vm else 0)
+        spm = re.search(r"spread=([0-9.]+)%", block)
+        spread = _safe_float(spm.group(1) if spm else 0)
+        strength = max(long_score, short_score)
+        # Soft penalty for wide spread, without changing the user's score model.
+        score_adj = strength - min(15.0, spread * 20.0)
+        out.append({
+            "symbol": symbol,
+            "long_score": long_score,
+            "short_score": short_score,
+            "strength": strength,
+            "score_adj": score_adj,
+            "quote_vol": quote_vol,
+            "spread_pct": spread,
+        })
+    # de-dupe preserving best occurrence
+    best: dict[str, dict] = {}
+    for row in out:
+        sym = row["symbol"]
+        if sym not in best or (row["score_adj"], row["quote_vol"]) > (best[sym]["score_adj"], best[sym]["quote_vol"]):
+            best[sym] = row
+    rows = list(best.values())
+    rows.sort(key=lambda r: (r["score_adj"], r["strength"], r["quote_vol"]), reverse=True)
+    return rows[: int(limit)]
+
+
+def _chatgpt_tf_to_exchange(tf: str) -> str:
+    t = str(tf or "").lower().strip()
+    if t in {"15min", "15m", "15"}:
+        return "15m"
+    if t in {"1h", "1hour", "60m"}:
+        return "1h"
+    if t in {"4h", "4hour", "240m"}:
+        return "4h"
+    return t or "4h"
+
+
+def _chatgpt_tf_to_filename(tf: str) -> str:
+    t = _chatgpt_tf_to_exchange(tf)
+    return "15min" if t == "15m" else t
+
+
+def _chatgpt_chart_filename(symbol: str, tf: str) -> str:
+    base = mexc_native_symbol(symbol).replace("_USDT", "").replace("_", "").lower()
+    return f"{base}_{_chatgpt_tf_to_filename(tf)}.png"
+
+
+def _chatgpt_prepare_chart_df(candles: list, tail: int = 120):
+    import pandas as pd
+    df = pd.DataFrame(candles or [], columns=["ts", "open", "high", "low", "close", "volume"])
+    if df.empty:
+        return df
+    df["dt"] = pd.to_datetime(df.ts.astype(float), unit="ms", errors="coerce")
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = df[c].astype(float)
+    df["MA7"] = df.close.rolling(7).mean()
+    df["MA25"] = df.close.rolling(25).mean()
+    df["MA99"] = df.close.rolling(99).mean()
+    ema12 = df.close.ewm(span=12, adjust=False).mean()
+    ema26 = df.close.ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["Signal"] = df.MACD.ewm(span=9, adjust=False).mean()
+    df["Hist"] = df.MACD - df.Signal
+    # RSI(14) over full series, then crop.
+    delta = df.close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, float("nan"))
+    df["RSI"] = 100.0 - (100.0 / (1.0 + rs))
+    df["RSI"] = df["RSI"].fillna(50.0)
+    return df.tail(tail).reset_index(drop=True)
+
+
+def _render_chatgpt_candidate_chart(symbol: str, timeframe: str, candles: list, meta: dict, out_path: Path) -> str:
+    """Render raw candidate chart for ChatGPT Scan Mode, without ENTRY/SL/TP."""
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    from matplotlib.ticker import FuncFormatter
+
+    df = _chatgpt_prepare_chart_df(candles, tail=120)
+    if df.empty or len(df) < 30:
+        raise ValueError(f"not enough candles for {symbol} {timeframe}: {len(df)}")
+
+    bg = "#0f1722"; grid = "#263241"; txt = "#d5dde8"
+    green = "#21c087"; red = "#f6465d"; orange = "#f59e0b"; blue = "#3b82f6"; purple = "#a855f7"
+    fig = plt.figure(figsize=(12.8, 7.2), dpi=100)
+    gs = fig.add_gridspec(3, 1, height_ratios=[5.2, 1.2, 1.5], hspace=0.06)
+    ax = fig.add_subplot(gs[0]); av = fig.add_subplot(gs[1], sharex=ax); am = fig.add_subplot(gs[2], sharex=ax)
+    fig.patch.set_facecolor(bg)
+    for a in (ax, av, am):
+        a.set_facecolor(bg); a.grid(True, color=grid, alpha=0.42, linewidth=0.8)
+        a.tick_params(colors=txt, labelsize=9); a.yaxis.tick_right()
+        for sp in a.spines.values(): sp.set_color(grid)
+
+    x = np.arange(len(df)); w = 0.58
+    min_body = max(float(df.close.iloc[-1]) * 0.00005, max((float(df.high.max())-float(df.low.min()))*0.001, 1e-12))
+    for i, r in enumerate(df.itertuples()):
+        col = green if r.close >= r.open else red
+        ax.vlines(i, r.low, r.high, color=col, linewidth=1.0, alpha=0.95)
+        body_low = min(r.open, r.close); body_h = max(abs(r.close - r.open), min_body)
+        ax.add_patch(Rectangle((i - w/2, body_low), w, body_h, facecolor=col, edgecolor=col, linewidth=0.55))
+
+    ax.plot(x, df.MA7, color=blue, linewidth=1.25, label=f"MA7 {df.MA7.iloc[-1]:.8g}")
+    ax.plot(x, df.MA25, color=orange, linewidth=1.25, label=f"MA25 {df.MA25.iloc[-1]:.8g}")
+    if not np.isnan(df.MA99.iloc[-1]):
+        ax.plot(x, df.MA99, color=purple, linewidth=1.35, label=f"MA99 {df.MA99.iloc[-1]:.8g}")
+
+    last = _safe_float(meta.get("last_price"), float(df.close.iloc[-1]))
+    all_price_levels = [float(df.low.min()), float(df.high.max()), last]
+    high24 = _safe_float(meta.get("high_24h")); low24 = _safe_float(meta.get("low_24h"))
+    if high24 > 0: all_price_levels.append(high24)
+    if low24 > 0: all_price_levels.append(low24)
+    ymin, ymax = min(all_price_levels), max(all_price_levels)
+    pad = max((ymax - ymin) * 0.12, max(last * 0.003, 1e-12))
+    ax.set_ylim(ymin - pad, ymax + pad); ax.set_xlim(-1, len(df) + 12)
+    ax.axhline(last, color=txt, linestyle=":", linewidth=1.05, alpha=0.75)
+    ax.text(len(df)+0.4, last, f"LAST {last:.8g}", color=txt, va="center", fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#111827", edgecolor=txt, alpha=0.75))
+
+    lookback = min(len(df), 6 if _chatgpt_tf_to_exchange(timeframe) == "4h" else 24)
+    if lookback > 0:
+        df24 = df.iloc[-lookback:].copy()
+        hi_idx = int(df24["high"].astype(float).idxmax()); lo_idx = int(df24["low"].astype(float).idxmin())
+        hi = float(df.at[hi_idx, "high"]); lo = float(df.at[lo_idx, "low"])
+        ax.axvspan(len(df)-lookback-0.5, len(df)-0.5, color="#94a3b8", alpha=0.045, zorder=0)
+        ax.scatter([hi_idx], [hi], marker="^", s=76, color="#f8fafc", edgecolor="#0b111c", linewidth=0.8, zorder=8)
+        ax.scatter([lo_idx], [lo], marker="v", s=76, color="#f8fafc", edgecolor="#0b111c", linewidth=0.8, zorder=8)
+        ax.annotate(f"▲ HIGH {hi:.8g}", xy=(hi_idx, hi), xytext=(0, 14), textcoords="offset points", color="#f8fafc", ha="center", fontsize=8,
+                    bbox=dict(boxstyle="round,pad=0.16", facecolor="#0b111c", edgecolor="#94a3b8", alpha=0.82))
+        ax.annotate(f"▼ LOW {lo:.8g}", xy=(lo_idx, lo), xytext=(0, -18), textcoords="offset points", color="#f8fafc", ha="center", va="top", fontsize=8,
+                    bbox=dict(boxstyle="round,pad=0.16", facecolor="#0b111c", edgecolor="#94a3b8", alpha=0.82))
+
+    rsi = float(df.RSI.iloc[-1]) if "RSI" in df else 0.0
+    long_score = meta.get("long_score", "-"); short_score = meta.get("short_score", "-")
+    ax.set_title(f"{mexc_native_symbol(symbol)} · MEXC Futures · {_chatgpt_tf_to_exchange(timeframe).upper()} · Last {last:.8g} · RSI {rsi:.1f} · LONG {long_score} · SHORT {short_score}",
+                 color=txt, loc="left", fontsize=12.5, fontweight="bold")
+    ax.legend(loc="upper left", frameon=False, labelcolor=txt, fontsize=8)
+
+    cols = [green if c >= o else red for o, c in zip(df.open, df.close)]
+    av.bar(x, df.volume, color=cols, alpha=0.62, width=w)
+    def _compact_volume_formatter(value, _pos=None):
+        value = float(value or 0); sign = "-" if value < 0 else ""; value = abs(value)
+        if value >= 1_000_000_000: return f"{sign}{value/1_000_000_000:.1f}B"
+        if value >= 1_000_000: return f"{sign}{value/1_000_000:.0f}M"
+        if value >= 1_000: return f"{sign}{value/1_000:.0f}K"
+        return f"{sign}{value:.0f}"
+    av.yaxis.set_major_formatter(FuncFormatter(_compact_volume_formatter))
+    vol24 = _safe_float(meta.get("quote_volume"))
+    vol_ratio = _safe_float(meta.get("vol_ratio"))
+    av.text(0.01, 0.86, f"MEXC VOL 24H {_compact_volume_formatter(vol24)} | ratio {vol_ratio:.2f}x", transform=av.transAxes,
+            color=txt, fontsize=9, fontweight="bold", bbox=dict(boxstyle="round,pad=0.20", facecolor="#111827", edgecolor=grid, alpha=0.76), va="top", ha="left")
+
+    hcols = [green if h >= 0 else red for h in df.Hist]
+    am.bar(x, df.Hist, color=hcols, alpha=0.72, width=w)
+    am.plot(x, df.MACD, color=blue, linewidth=1.15, label="MACD")
+    am.plot(x, df.Signal, color=orange, linewidth=1.15, label="Signal")
+    am.axhline(0, color=txt, alpha=0.45, linewidth=0.8)
+    am.legend(loc="upper left", frameon=False, labelcolor=txt, fontsize=8)
+    step = max(10, len(df)//6); ticks = list(range(0, len(df), step))
+    am.set_xticks(ticks); am.set_xticklabels([df.dt.iloc[i].strftime("%m-%d %H:%M") for i in ticks], color=txt)
+    plt.setp(ax.get_xticklabels(), visible=False); plt.setp(av.get_xticklabels(), visible=False)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, facecolor=fig.get_facecolor(), dpi=100)
+    plt.close(fig)
+    return str(out_path)
+
+
+CHATGPT_SCAN_TASK_TEXT = """CHATGPT_TASK
+
+1. Прочитай log.txt, manifest.json и все PNG-графики из папки screenshots.
+2. Используй графики как raw/candidate charts. На них не должно быть заранее заданных ENTRY/SL/TP.
+3. Сначала оцени BTC/ETH market context по btc_4h/btc_1h/eth_4h/eth_1h.
+4. Перед анализом графиков перепроверь по log.txt, насколько правильно бот отобрал top-15 монет.
+5. Если из твоего независимого отбора по full top-200 log совпадает хотя бы top-10 с selected_symbols из manifest.json/графиками, доверяй этому пакету скринов и переходи к анализу по графикам.
+6. Если совпало меньше 10 монет из 15, не делай setup сразу. Верни список недостающих/лучших монет и попроси новый pack.
+7. Проверь manifest.json: expected_png_count, actual_png_count, missing_charts, generation_errors.
+8. Если missing_charts/generation_errors пустые или не мешают анализу — продолжай.
+9. Если у выбранной для сделки монеты нет полного набора 4h/1h/15min или график нечитаемый — не выбирай эту монету для setup.
+10. Игнорируй и не выбирай для сделок инструменты, в symbol/name которых есть substring STOCK в любом регистре. Такие инструменты регионально запрещены к торговле.
+11. Не исключай автоматически commodities/metals: XAU, XAUT, GOLD, SILVER, OIL, XPD и похожие инструменты можно рассматривать, если они есть в MEXC Futures и проходят по ликвидности, структуре и риску. Запрещён только STOCK.
+12. Выбери максимум 3 лучшие сделки.
+13. Если хороших сделок нет — верни setup-файл с verdict: NO_TRADE.
+14. Если сделки есть — верни setup-HHMM_DDMM.txt версии 1.6.
+
+CRITICAL OUTPUT RULES:
+- Финальный setup нужно вернуть только прикреплённым .txt файлом.
+- Нельзя писать setup обычным текстом в сообщении.
+- Нельзя писать setup в Markdown.
+- Нельзя писать setup в json/code block.
+- Нельзя использовать старый plain-text формат VERSION=1.6 / [TRADE_1].
+- Нужен только файл с чистым JSON object.
+- Файл должен называться строго: setup-HHMM_DDMM.txt. Пример: setup-0059_0106.txt.
+- Файл должен начинаться с символа { и заканчиваться символом }.
+- Если ты не можешь прикрепить файл, прямо напиши: не могу создать файл — и НЕ выдавай setup текстом.
+
+ORDER TYPE RULE:
+- По умолчанию используй order_type: LIMIT.
+- Используй order_type: MARKET только для очень сильного A+ setup, где 4H/1H/15min подтверждают направление, цена не находится после позднего вертикального импульса, риск до stop_loss приемлемый, а R/R до TP2 минимум 1:2.
+- Если есть сомнения по точке входа — используй LIMIT.
+- Не используй MARKET, если цена уже далеко ушла от оптимального входа или находится у локального high/low после резкого движения.
+
+STOP/RISK RULE:
+- ChatGPT сам рассчитывает entry, stop_loss и take_profits.
+- Stop_loss должен быть структурным и находиться в диапазоне: минимум 1% от entry, максимум 5% от entry.
+- Если расчетный stop_loss получается ближе 1% от entry, не используй микростоп: расширь stop_loss до логичного структурного уровня минимум 1%.
+- Если для нормальной структуры нужен стоп больше 5%, не бери эту сделку.
+- risk.stop_distance_percent должен соответствовать расстоянию от entry до stop_loss.
+- estimated_deposit_risk_percent считай по текущей логике бота: 10% депозита на сделку и 10x isolated, но не занижай stop_distance_percent.
+
+TAKE PROFIT RULE:
+- Take profits не считать механически от размера стопа.
+- TP ставить по структуре графика: ближайшие уровни ликвидности, high/low, зоны сопротивления/поддержки, MA/диапазоны и реальные цели движения.
+- TP1 / TP2 / TP3 выбираются по графику, уровням, ликвидности и структуре рынка.
+- Если структурные TP не дают адекватный risk/reward хотя бы до TP2, сделку не брать.
+- Схема фиксации: TP1 35%, TP2 35%, TP3 REMAINDER.
+- После TP1 бот переносит stop_loss в breakeven.
+- До входа бот НЕ отменяет сделку из-за касания TP1.
+- До входа бот отменяет/не выставляет сделку только если цена уже дошла до TP2 или прошла stop_loss.
+- Trailing: OFF. Scalp exit: OFF.
+
+SETUP FORMAT STRICT:
+- Только чистый JSON object.
+- Файл должен начинаться с { и заканчиваться }.
+- Никакого Markdown внутри setup-файла.
+- Никакого plain-text setup.
+- Не использовать TRADE_1 / TRADE_2 / TRADE_3.
+- Все сделки должны быть внутри массива trades.
+- entry — только одно число.
+- stop_loss — только одно число.
+- take_profits — массив из 3 объектов price/size_percent.
+- Старые версии запрещены. Бот принимает только setup_version "1.6".
+
+REQUIRED TOP LEVEL JSON:
+{
+  "setup_version": "1.6",
+  "mode": "AUTO_OPEN",
+  "exchange": "MEXC_FUTURES",
+  "margin_mode": "ISOLATED",
+  "default_margin_percent_per_trade": 10,
+  "default_leverage": 10,
+  "verdict": "TRADE" или "NO_TRADE",
+  "blocked_symbol_substrings": ["STOCK"],
+  "symbol_format": "MEXC_NATIVE_UNDERSCORE",
+  "trades": []
+}
+
+TRADE OBJECT FORMAT:
+{
+  "symbol": "BTC_USDT",
+  "direction": "LONG или SHORT",
+  "order_type": "LIMIT или MARKET",
+  "entry": 0.0,
+  "stop_loss": 0.0,
+  "take_profits": [
+    {"price": 0.0, "size_percent": 35},
+    {"price": 0.0, "size_percent": 35},
+    {"price": 0.0, "size_percent": "REMAINDER"}
+  ],
+  "cancel_if_not_filled_minutes": 120,
+  "cancel_if_tp2_before_entry": true,
+  "invalidation": "Краткая отмена идеи.",
+  "comment": "Краткая причина сделки.",
+  "risk": {
+    "stop_distance_percent": 0.0,
+    "estimated_deposit_risk_percent": 0.0
+  }
+}
+
+STRICT TAKE_PROFITS FORMAT:
+- take_profits должен быть только JSON-массивом из 3 объектов.
+- Используй только ключи price и size_percent.
+- Последний TP обязан иметь ровно: "size_percent": "REMAINDER".
+- Запрещено: size, percent, take_profit_1_size_pct, take_profit_1, tp1, TP3 без size_percent.
+
+ANALYSIS RULES:
+- Используй все метрики скана: 15m / 1H / 4H, объём, ликвидность, RSI, MACD, MA7/MA25/MA99, orderbook, движение, силу/слабость, риск перегрева и общий фон BTC/ETH.
+- Сравни top-15 кандидатов по 4H/1H/15min.
+- Не входи в поздний вертикальный памп без ретеста.
+- Не шорти сильную альту без слома структуры.
+- Если BTC падает, BTC.D падает, а альты держатся лучше — отдавай приоритет strong-alt long-кандидатам, а не шортам по альтам.
+- Если рынок грязный или риск/прибыль плохой — verdict должен быть NO_TRADE.
+
+FINAL SELF-CHECK BEFORE SENDING FILE:
+1. Файл прикреплён как .txt, а не написан текстом в сообщении.
+2. Имя файла похоже на setup-0059_0106.txt.
+3. В файле чистый JSON, начинается с { и заканчивается }.
+4. setup_version ровно "1.6".
+5. В trades максимум 3 сделки.
+6. Нет символов со STOCK.
+7. У каждой сделки order_type LIMIT или MARKET.
+8. У каждой сделки take_profits ровно в формате 35 / 35 / REMAINDER через ключ size_percent.
+9. Стоп каждой сделки от 1% до 5%.
+10. Если условий нет, лучше дай NO_TRADE, чем кривой setup."""
+
+
+async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200) -> str:
+    """Build a full ChatGPT Scan Mode ZIP: log.txt + task.txt + manifest + charts."""
+    started = time.time()
+    chatgpt_log_event("scan_pack_start", limit=limit, top=os.getenv("CHATGPT_SCAN_PACK_TOP", "15"), chart_workers=os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")))
+    log_path = await build_chatgpt_log(exchange_client, scanner, settings, ws_supervisor=ws_supervisor, limit=limit)
+    raw_log_text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    selected_rows = _parse_chatgpt_log_candidates(raw_log_text, limit=int(os.getenv("CHATGPT_SCAN_PACK_TOP", "15") or 15))
+    # The legacy log still contains manual-screenshot instructions for old flow.
+    # For ZIP pack mode, task.txt is the source of truth, so keep the market data
+    # and replace the legacy instruction block with a short pointer.
+    log_text = re.split(r"\n\n(?:=== TASK ===\n)?ЗАДАЧА ДЛЯ CHATGPT MODE:", raw_log_text, maxsplit=1)[0].rstrip() + "\n\nCHATGPT_SCAN_PACK_NOTE:\nUse task.txt and manifest.json from this ZIP as the active instructions for this pack.\n"
+    selected_symbols = [r["symbol"] for r in selected_rows]
+    chatgpt_log_event(
+        "scan_pack_top15_selected",
+        selected_count=len(selected_symbols),
+        symbols=",".join(selected_symbols),
+        rows=json.dumps(selected_rows, ensure_ascii=False)[:1800],
+    )
+    meta_by_symbol = {r["symbol"]: r for r in selected_rows}
+    # Market context must always exist, but it must not duplicate selected charts.
+    required_context = [("BTC_USDT", "4h"), ("BTC_USDT", "1h"), ("ETH_USDT", "4h"), ("ETH_USDT", "1h")]
+    chart_jobs: list[tuple[str, str]] = []
+    seen_files: set[str] = set()
+    for sym in selected_symbols:
+        for tf in ("4h", "1h", "15m"):
+            fn = _chatgpt_chart_filename(sym, tf)
+            if fn not in seen_files:
+                seen_files.add(fn); chart_jobs.append((sym, tf))
+    for sym, tf in required_context:
+        fn = _chatgpt_chart_filename(sym, tf)
+        if fn not in seen_files:
+            seen_files.add(fn); chart_jobs.append((sym, tf))
+
+    chatgpt_log_event(
+        "scan_pack_chart_jobs_prepared",
+        jobs=len(chart_jobs),
+        expected_png_count=len(seen_files),
+        selected_count=len(selected_symbols),
+        context=",".join([f"{s}:{t}" for s, t in required_context]),
+        sample_files=",".join(sorted(list(seen_files))[:20]),
+    )
+
+    stamp = datetime.now(timezone.utc).strftime("%H%M_%d%m")
+    work = Path(os.getenv("CHATGPT_LOG_DIR", "/tmp")) / f"chatgpt_scan_pack_{stamp}_{int(time.time())}"
+    screens = work / "screenshots"
+    screens.mkdir(parents=True, exist_ok=True)
+    (work / "log.txt").write_text(log_text, encoding="utf-8")
+    (work / "task.txt").write_text(CHATGPT_SCAN_TASK_TEXT, encoding="utf-8")
+
+    workers = int(os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")) or 3)
+    sem = asyncio.Semaphore(max(1, workers))
+    missing: list[str] = []
+    errors: list[str] = []
+
+    async def _render_one(sym: str, tf: str):
+        native = mexc_native_symbol(sym)
+        ex_tf = _chatgpt_tf_to_exchange(tf)
+        filename = _chatgpt_chart_filename(native, ex_tf)
+        out = screens / filename
+        try:
+            chatgpt_log_event("scan_pack_chart_start", symbol=native, timeframe=ex_tf, file=filename)
+            async with sem:
+                candles = await _mexc_call(f"chart_fetch_ohlcv_{ex_tf}", lambda: exchange_client.fetch_ohlcv(native, timeframe=ex_tf, limit=160), symbol=native)
+                ticker = await _mexc_call("chart_fetch_ticker", lambda: exchange_client.fetch_ticker(native), symbol=native)
+            closes = _closes(candles); vols = _volumes(candles)
+            vol_now = vols[-1] if vols else 0.0
+            vol_avg = (sum(vols[-21:-1]) / 20.0) if len(vols) >= 21 else 0.0
+            meta = dict(meta_by_symbol.get(native) or {})
+            meta.update({
+                "last_price": _safe_float((ticker or {}).get("last") or (ticker or {}).get("close")),
+                "quote_volume": _safe_float((ticker or {}).get("quoteVolume") or ((ticker or {}).get("info") or {}).get("volume24")),
+                "high_24h": _safe_float((ticker or {}).get("high") or ((ticker or {}).get("info") or {}).get("high24Price")),
+                "low_24h": _safe_float((ticker or {}).get("low") or ((ticker or {}).get("info") or {}).get("low24Price")),
+                "vol_ratio": (vol_now / vol_avg) if vol_avg else 0.0,
+            })
+            _render_chatgpt_candidate_chart(native, ex_tf, candles, meta, out)
+            try:
+                size_kb = round(out.stat().st_size / 1024, 1)
+                chatgpt_log_event("scan_pack_chart_done", symbol=native, timeframe=ex_tf, file=filename, candles=len(candles or []), size_kb=size_kb, resolution="1280x720")
+                if out.stat().st_size > int(os.getenv("CHATGPT_MAX_PNG_SIZE_KB", "900")) * 1024:
+                    chatgpt_log_event("scan_pack_chart_large", file=filename, size_kb=size_kb)
+            except Exception:
+                pass
+        except Exception as e:
+            missing.append(filename)
+            errors.append(f"{filename}: {str(e)[:240]}")
+            chatgpt_log_event("scan_pack_chart_error", symbol=native, timeframe=ex_tf, file=filename, error=repr(e))
+
+    await asyncio.gather(*(_render_one(sym, tf) for sym, tf in chart_jobs))
+    png_files = sorted([p for p in screens.glob("*.png")])
+    try:
+        from config import VERSION as _bot_code_version
+    except Exception:
+        _bot_code_version = "v0385 final"
+    manifest = {
+        "pack_type": "CHATGPT_SCAN_MODE",
+        "created_utc": _now_utc(),
+        "bot_version": _bot_code_version,
+        "scan_limit": int(limit),
+        "selected_count": len(selected_symbols),
+        "selected_symbols": selected_symbols,
+        "selected_rows": selected_rows,
+        "timeframes": ["4h", "1h", "15min"],
+        "required_context": ["btc_4h", "btc_1h", "eth_4h", "eth_1h"],
+        "blocked_symbol_substrings": list(CHATGPT_BLOCKED_SYMBOL_SUBSTRINGS),
+        "chart_source": "python_ohlcv_mexc",
+        "chart_resolution": "1280x720",
+        "chart_dpi": 100,
+        "candles_per_chart": 120,
+        "ohlcv_fetch_limit": 160,
+        "expected_png_count": len(seen_files),
+        "actual_png_count": len(png_files),
+        "missing_charts": sorted(set(missing)),
+        "generation_errors": errors,
+        "max_png_size_kb_target": 600,
+        "elapsed_sec": round(time.time() - started, 2),
+    }
+    (work / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    chatgpt_log_event("scan_pack_manifest_written", expected=manifest["expected_png_count"], actual=manifest["actual_png_count"], missing=len(manifest["missing_charts"]), errors=len(manifest["generation_errors"]), resolution=manifest["chart_resolution"])
+    zip_path = work.with_suffix(".zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for rel in ("log.txt", "task.txt", "manifest.json"):
+            z.write(work / rel, rel)
+        for p in png_files:
+            z.write(p, f"screenshots/{p.name}")
+    try:
+        zip_size_kb = round(zip_path.stat().st_size / 1024, 1)
+    except Exception:
+        zip_size_kb = 0
+    chatgpt_log_event("scan_pack_zip_written", zip_path=str(zip_path), zip_size_kb=zip_size_kb, png_count=len(png_files))
+    chatgpt_log_event("scan_pack_done", zip_path=str(zip_path), selected=len(selected_symbols), expected=len(seen_files), actual=len(png_files), missing=len(missing), elapsed_sec=round(time.time() - started, 2))
+    return str(zip_path)
 
 async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200) -> str:
     """Run one top-N scan and write a ChatGPT-ready log.txt."""
@@ -1575,7 +2041,7 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
             f"• entry-лимитки: найдено {cleanup.get('entry_found', 0)}, снято {cleanup.get('entry_cancelled', cancelled)}, осталось {cleanup.get('entry_left', 0)}",
             f"• старые условные ордера без позиции: найдено {cleanup.get('orphan_found', 0)}, снято {cleanup.get('orphan_cancelled', 0)}, осталось {cleanup.get('orphan_left', 0)}",
             f"📄 к установке из setup: {requested}/{CHATGPT_MAX_PENDING_LIMITS}",
-            f"✅ поставлено новых лимиток: {placed}",
+            f"✅ поставлено новых входов: {placed}",
             f"❌ пропущено: {len(skipped)}",
         ]
         if skipped:
@@ -1594,7 +2060,7 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
     lines += [
         "",
         "🔁 сопровождение включено",
-        f"⏳ лимитки живут {CHATGPT_LIMIT_TTL_MINUTES} мин, установка: {setup_time}",
+        f"⏳ LIMIT живут {CHATGPT_LIMIT_TTL_MINUTES} мин, MARKET исполняется сразу, установка: {setup_time}",
         f"⏱ проверка каждые {CHATGPT_MONITOR_INTERVAL_SEC} сек",
         f"🕒 последнее обновление: {_now_chatgpt_display()}",
     ]
@@ -1857,7 +2323,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
     # visible in the final monitor instead of disappearing from the report.
     opened.extend(preplace_skipped)
 
-    # v0383 SAFETY FIX: ChatGPT setup entries are private trading operations,
+    # v0385 SAFETY FIX: ChatGPT setup entries are private trading operations,
     # so place them strictly one-by-one.  Parallel entry placement caused MEXC
     # private requests (leverage/order/margin/protection) to overlap and return
     # misleading Duplicate order ID / lock states.  Scanning can stay parallel,
