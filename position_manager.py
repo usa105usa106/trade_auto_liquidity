@@ -65,6 +65,143 @@ class PositionManager:
 
 
 
+
+    @staticmethod
+    def _chatgpt_levels_from_position(pos: dict) -> list[dict]:
+        """Return SL/TP levels in a normalized order for close-reason diagnostics."""
+        levels: list[dict] = []
+        try:
+            sl = float(pos.get("stop_price") or 0)
+            if sl > 0:
+                levels.append({"name": "SL", "price": sl, "kind": "SL"})
+        except Exception:
+            pass
+        try:
+            details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
+            tps = details.get("chatgpt_take_profits") or []
+            if isinstance(tps, list):
+                for idx, row in enumerate(tps, start=1):
+                    if not isinstance(row, dict):
+                        continue
+                    price = float(row.get("price") or 0)
+                    if price > 0:
+                        levels.append({"name": f"TP{idx}", "price": price, "kind": f"TP{idx}", "size_percent": row.get("size_percent")})
+        except Exception:
+            pass
+        # Fallback to final take_price when the split TP list is not available.
+        try:
+            take = float(pos.get("take_price") or 0)
+            has_tp = any(str(x.get("kind", "")).startswith("TP") for x in levels)
+            if take > 0 and not has_tp:
+                levels.append({"name": "TP final", "price": take, "kind": "TP_FINAL"})
+        except Exception:
+            pass
+        return levels
+
+    @staticmethod
+    def _chatgpt_nearest_level(price: float, levels: list[dict]) -> dict:
+        best: dict = {}
+        try:
+            p = float(price or 0)
+            if p <= 0:
+                return {}
+            for lvl in levels or []:
+                lp = float(lvl.get("price") or 0)
+                if lp <= 0:
+                    continue
+                dist_pct = abs(p - lp) / lp * 100.0
+                row = {**lvl, "distance_pct": dist_pct}
+                if not best or dist_pct < float(best.get("distance_pct") or 1e9):
+                    best = row
+        except Exception:
+            return best or {}
+        return best or {}
+
+    @staticmethod
+    def _infer_chatgpt_close_reason(pos: dict, price: float, now: float) -> dict:
+        """Best-effort explanation when the local ChatGPT position disappeared on exchange.
+
+        MEXC may remove the live position after an exchange SL/TP trigger, but the
+        normal position snapshot does not include a close reason.  This function
+        does not pretend to know the exact fill if order history is unavailable;
+        it reports a clear inference based on the last ticker, setup levels and
+        stored protection ids.
+        """
+        side = str(pos.get("side") or "").upper()
+        entry = float(pos.get("entry_price") or 0)
+        stop = float(pos.get("stop_price") or 0)
+        take = float(pos.get("take_price") or 0)
+        opened = float(pos.get("opened_at") or now)
+        qty = float(pos.get("qty") or 0)
+        levels = PositionManager._chatgpt_levels_from_position(pos)
+        nearest = PositionManager._chatgpt_nearest_level(price, levels)
+        tol = float(os.getenv("CHATGPT_CLOSE_REASON_TOLERANCE_PCT", "0.35") or 0.35)
+
+        reason_code = "UNKNOWN_EXCHANGE_CLOSED"
+        reason_label = "закрыта на бирже; точная причина не подтверждена"
+        confidence = "LOW"
+        matched_level = nearest.get("name") or ""
+
+        try:
+            p = float(price or 0)
+            if side == "LONG":
+                if stop > 0 and p <= stop * (1 + tol / 100.0):
+                    reason_code = "LIKELY_SL"
+                    reason_label = "похоже, сработал Stop Loss"
+                    confidence = "MEDIUM"
+                    matched_level = "SL"
+                elif take > 0 and p >= take * (1 - tol / 100.0):
+                    reason_code = "LIKELY_FINAL_TP"
+                    reason_label = "похоже, сработал финальный Take Profit"
+                    confidence = "MEDIUM"
+                    matched_level = "TP3/final"
+                elif nearest and str(nearest.get("kind") or "").startswith("TP") and float(nearest.get("distance_pct") or 99) <= tol:
+                    reason_code = f"LIKELY_{nearest.get('kind')}"
+                    reason_label = f"похоже, сработал {nearest.get('name')}"
+                    confidence = "MEDIUM"
+                    matched_level = str(nearest.get("name") or matched_level)
+            elif side == "SHORT":
+                if stop > 0 and p >= stop * (1 - tol / 100.0):
+                    reason_code = "LIKELY_SL"
+                    reason_label = "похоже, сработал Stop Loss"
+                    confidence = "MEDIUM"
+                    matched_level = "SL"
+                elif take > 0 and p <= take * (1 + tol / 100.0):
+                    reason_code = "LIKELY_FINAL_TP"
+                    reason_label = "похоже, сработал финальный Take Profit"
+                    confidence = "MEDIUM"
+                    matched_level = "TP3/final"
+                elif nearest and str(nearest.get("kind") or "").startswith("TP") and float(nearest.get("distance_pct") or 99) <= tol:
+                    reason_code = f"LIKELY_{nearest.get('kind')}"
+                    reason_label = f"похоже, сработал {nearest.get('name')}"
+                    confidence = "MEDIUM"
+                    matched_level = str(nearest.get("name") or matched_level)
+        except Exception:
+            pass
+
+        details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
+        return {
+            "reason_code": reason_code,
+            "reason_label": reason_label,
+            "confidence": confidence,
+            "side": side,
+            "entry_price": entry,
+            "close_price_estimate": float(price or 0),
+            "stop_price": stop,
+            "take_price": take,
+            "tp_levels": details.get("chatgpt_take_profits") or [],
+            "nearest_level": nearest,
+            "matched_level": matched_level,
+            "qty": qty,
+            "elapsed_minutes": max(0.0, (float(now or time.time()) - opened) / 60.0),
+            "protection_mode": pos.get("protection_mode"),
+            "protection_status": pos.get("protection_status"),
+            "sl_order_id": pos.get("sl_order_id"),
+            "tp1_order_id": pos.get("tp1_order_id"),
+            "tp2_order_id": pos.get("tp2_order_id"),
+            "tp3_order_id": pos.get("tp3_order_id"),
+        }
+
     async def _liquidity_runner_enabled(self) -> bool:
         value = await self._setting("liquidity_runner_enabled", os.getenv("LIQUIDITY_RUNNER_ENABLED", "false"))
         return self._truthy(value, False)
@@ -731,22 +868,39 @@ class PositionManager:
                     except Exception:
                         ex_row = None
                     if not ex_row:
-                        if side == "LONG" and stop and price <= stop:
-                            ev_type, reason = "sl", "stop_loss"
-                        elif side == "SHORT" and stop and price >= stop:
-                            ev_type, reason = "sl", "stop_loss"
-                        elif side == "LONG" and take and price >= take:
-                            ev_type, reason = "tp", "take_profit"
-                        elif side == "SHORT" and take and price <= take:
-                            ev_type, reason = "tp", "take_profit"
-                        else:
-                            ev_type, reason = "position_closed", "exchange_position_missing"
-                        chatgpt_log_event("chatgpt_position_missing_on_exchange", symbol=symbol, event_type=ev_type, reason=reason, price=price, stop=stop, take=take, pnl_pct=pnl)
+                        close_info = self._infer_chatgpt_close_reason(pos, price, now)
+                        ev_type = "chatgpt_position_closed"
+                        reason = str(close_info.get("reason_code") or "UNKNOWN_EXCHANGE_CLOSED")
+                        chatgpt_log_event(
+                            "chatgpt_position_closed_detected",
+                            symbol=symbol,
+                            event_type=ev_type,
+                            reason=reason,
+                            reason_label=close_info.get("reason_label"),
+                            confidence=close_info.get("confidence"),
+                            side=close_info.get("side"),
+                            entry_price=close_info.get("entry_price"),
+                            close_price_estimate=close_info.get("close_price_estimate"),
+                            stop_price=close_info.get("stop_price"),
+                            take_price=close_info.get("take_price"),
+                            tp_levels=close_info.get("tp_levels"),
+                            nearest_level=close_info.get("nearest_level"),
+                            matched_level=close_info.get("matched_level"),
+                            qty=close_info.get("qty"),
+                            elapsed_minutes=close_info.get("elapsed_minutes"),
+                            protection_mode=close_info.get("protection_mode"),
+                            protection_status=close_info.get("protection_status"),
+                            sl_order_id=close_info.get("sl_order_id"),
+                            tp1_order_id=close_info.get("tp1_order_id"),
+                            tp2_order_id=close_info.get("tp2_order_id"),
+                            tp3_order_id=close_info.get("tp3_order_id"),
+                            pnl_pct=pnl,
+                        )
                         try:
                             await self.storage.remove_position(symbol)
                         except Exception:
                             pass
-                        events.append({"type": ev_type, "symbol": symbol, "reason": reason, "price": price, "pnl_pct": pnl})
+                        events.append({"type": ev_type, "symbol": symbol, "reason": reason, "price": price, "pnl_pct": pnl, **close_info})
                         continue
 
             if is_chatgpt_setup and now - opened >= 86400 and not pos.get("chatgpt_24h_checked_done"):

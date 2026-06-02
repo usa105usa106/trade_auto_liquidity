@@ -934,7 +934,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "v0386 final"
+        _bot_code_version = "v0388 final"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),
@@ -2381,8 +2381,10 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
             else:
                 chatgpt_log_event("setup_trade_open_order_conflict_cleanup_failed", symbol=plan.symbol, cleanup=cleanup)
                 res = {"ok": False, "reason": "open order exists on exchange; same-symbol cleanup failed", "cleanup": cleanup, "first_result": res}
-        chatgpt_log_event("setup_trade_place_result", symbol=plan.symbol, ok=bool((res or {}).get("ok")), result=res)
-        return {"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": bool((res or {}).get("ok")), "result": res}
+        ok_flag = bool((res or {}).get("ok"))
+        reason_value = (res or {}).get("reason") or (res or {}).get("error") or ""
+        chatgpt_log_event("setup_trade_place_result", symbol=plan.symbol, ok=ok_flag, reason=reason_value, result=res)
+        return {"symbol": plan.symbol, "side": plan.side, "order_type": plan.order_type, "entry": entry, "ok": ok_flag, "reason": reason_value, "result": res}
 
     # Pre-placement skips (existing open position / no total slot) must remain
     # visible in the final monitor instead of disappearing from the report.
@@ -2410,7 +2412,21 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
                 opened.append({"symbol": sym, "ok": False, "reason": str(e)})
                 await asyncio.sleep(float(os.getenv("CHATGPT_SETUP_SEQUENCE_DELAY_SEC", "1.2")))
         chatgpt_log_event("setup_trade_place_sequence_done", opened=opened)
+    placed_count = len([x for x in opened if isinstance(x, dict) and bool(x.get("ok"))])
+    skipped_rows = [x for x in opened if isinstance(x, dict) and not bool(x.get("ok"))]
     chatgpt_log_event("setup_execute_done", opened=opened, rotation=rotation_result)
+    chatgpt_log_event(
+        "setup_execute_summary",
+        requested_trades=requested_trades,
+        limits_to_place=limits_to_place,
+        placed=placed_count,
+        skipped=len(skipped_rows),
+        skipped_rows=skipped_rows[:20],
+        cleanup_summary=cleanup_summary,
+        open_positions=open_slots,
+        max_open_positions=CHATGPT_MAX_OPEN_POSITIONS,
+        max_pending_limits=CHATGPT_MAX_PENDING_LIMITS,
+    )
     return {
         "ok": True,
         "opened": opened,

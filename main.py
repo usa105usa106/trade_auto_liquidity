@@ -1208,6 +1208,67 @@ def format_position_event(ev: dict) -> str:
             "Бот сопровождает позицию локально и будет пытаться восстановить защиту.",
         ])
 
+
+    if typ == "chatgpt_position_closed":
+        side = str(ev.get("side") or ev.get("direction") or "").upper()
+        reason_label = str(ev.get("reason_label") or "закрыта на бирже; точная причина не подтверждена")
+        reason_code = str(ev.get("reason_code") or ev.get("reason") or "UNKNOWN_EXCHANGE_CLOSED")
+        confidence = str(ev.get("confidence") or "LOW")
+        def _p(x):
+            try:
+                return _fmt_price(float(x))
+            except Exception:
+                return str(x)
+        lines = [
+            "📌 Позиция закрыта",
+            f"{symbol}",
+            f"Direction: {side if side in {'LONG', 'SHORT'} else 'неизвестно'}",
+            f"Причина: {reason_label}",
+            f"Confidence: {confidence}",
+        ]
+        if ev.get("entry_price") not in (None, "", 0, "0"):
+            lines.append(f"Entry: {_p(ev.get('entry_price'))}")
+        if ev.get("close_price_estimate") not in (None, "", 0, "0"):
+            lines.append(f"Last price near close: {_p(ev.get('close_price_estimate'))}")
+        if ev.get("stop_price") not in (None, "", 0, "0"):
+            lines.append(f"SL: {_p(ev.get('stop_price'))}")
+        tp_levels = ev.get("tp_levels") if isinstance(ev.get("tp_levels"), list) else []
+        if tp_levels:
+            for idx, tp in enumerate(tp_levels, start=1):
+                if not isinstance(tp, dict):
+                    continue
+                price = tp.get("price")
+                size = tp.get("size_percent")
+                if price not in (None, "", 0, "0"):
+                    suffix = f" ({size})" if size not in (None, "") else ""
+                    lines.append(f"TP{idx}: {_p(price)}{suffix}")
+        elif ev.get("take_price") not in (None, "", 0, "0"):
+            lines.append(f"TP final: {_p(ev.get('take_price'))}")
+        nearest = ev.get("nearest_level") if isinstance(ev.get("nearest_level"), dict) else {}
+        if nearest:
+            try:
+                lines.append(f"Nearest level: {nearest.get('name')} {_p(nearest.get('price'))} / distance {float(nearest.get('distance_pct') or 0):.2f}%")
+            except Exception:
+                pass
+        try:
+            pnl_pct = float(ev.get("pnl_pct") or 0)
+            sign = "+" if pnl_pct >= 0 else ""
+            lines.append(f"Estimated PnL: {sign}{pnl_pct:.2f}%")
+        except Exception:
+            pass
+        try:
+            elapsed = float(ev.get("elapsed_minutes") or 0)
+            if elapsed > 0:
+                lines.append(f"Время в позиции: {elapsed:.1f} мин")
+        except Exception:
+            pass
+        lines.append("")
+        if reason_code.startswith("UNKNOWN"):
+            lines.append("Точно SL/TP не подтверждаю: позиция исчезла из exchange snapshot, истории fill в этом событии нет.")
+        else:
+            lines.append("Это best-effort вывод по последней цене и уровням setup; точный fill смотри в истории ордеров MEXC.")
+        return "\n".join(lines)
+
     if typ == "chatgpt_tp1_breakeven":
         return "\n".join([
             "🎯 TP1 достигнут",
@@ -1291,6 +1352,23 @@ def format_position_event(ev: dict) -> str:
 
         return "\n".join(lines)
 
+    if str(typ) in {"position_closed", "closed"}:
+        # Legacy event path: make it obvious that this old callback cannot prove SL/TP.
+        return "\n".join([
+            "📌 Позиция закрыта",
+            f"{symbol}",
+            "Причина: закрыта на бирже; точная причина не подтверждена",
+            "Confidence: LOW",
+            "В этом событии нет истории fill/SL/TP. Проверь /log_chatgpt или историю MEXC.",
+        ])
+    if str(typ) in {"limit_canceled", "limit_cancelled"}:
+        reason = str(result.get("reason") or ev.get("reason") or "")
+        lines = ["📌 Лимитка отменена", f"{symbol}"]
+        if reason:
+            lines.append(f"Причина: {reason[:500]}")
+        else:
+            lines.append("Причина: отмена старой pending-лимитки перед новым setup или истечение TTL")
+        return "\n".join(lines)
     label = reason_map.get(str(typ), str(typ))
     lines = [f"📌 Position event", f"{symbol}: {label}"]
     if "pnl_usdt" in result or "pnl_pct" in result:
@@ -5776,6 +5854,54 @@ async def log_chatgpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reply(update, f"❌ Не смог отправить /log_chatgpt: {str(e)[:900]}\n\nПоследние строки:\n{tail_chatgpt_runtime_log(40)[:2500]}", reply_markup=MAIN_MENU)
 
 
+def format_chatgpt_setup_execution_report(result: dict) -> str:
+    """Human-readable immediate report after setup upload.
+
+    This is intentionally separate from the persistent monitor message: when no
+    entries are placed, the user must see exact skip reasons in chat instead of
+    guessing from /log_chatgpt.
+    """
+    if not isinstance(result, dict):
+        return "❌ setup обработан, но результат пустой/непонятный"
+    opened = result.get("opened") if isinstance(result.get("opened"), list) else []
+    placed_rows = [x for x in opened if isinstance(x, dict) and bool(x.get("ok"))]
+    skipped_rows = [x for x in opened if isinstance(x, dict) and not bool(x.get("ok"))]
+    requested = result.get("requested_trades", result.get("limits_to_place", len(opened)))
+    cleanup = result.get("cleanup_summary") or {}
+    status = "✅ setup-файл обработан" if bool(result.get("ok", True)) else "❌ setup-файл НЕ исполнен"
+    lines = [
+        status,
+        f"📄 к установке из setup: {requested}",
+        f"✅ поставлено новых входов: {len(placed_rows)}",
+        f"❌ пропущено: {len(skipped_rows)}",
+    ]
+    if cleanup:
+        lines += [
+            "",
+            "🧹 очистка перед setup:",
+            f"• entry-лимитки: найдено {cleanup.get('entry_found', 0)}, снято {cleanup.get('entry_cancelled', result.get('cancelled_pending_count', 0))}, осталось {cleanup.get('entry_left', 0)}",
+            f"• старые условные без позиции: найдено {cleanup.get('orphan_found', 0)}, снято {cleanup.get('orphan_cancelled', 0)}, осталось {cleanup.get('orphan_left', 0)}",
+        ]
+    if placed_rows:
+        lines += ["", "📌 Новые входы:"]
+        for row in placed_rows[:6]:
+            sym = row.get("symbol") or "-"
+            side = str(row.get("side") or row.get("direction") or "").upper()
+            order_type = str(row.get("order_type") or "").upper()
+            entry = row.get("entry")
+            lines.append(f"• {sym} {side or '-'} {order_type or '-'} entry={entry}")
+    if skipped_rows:
+        lines += ["", "⚠️ Почему не выставлены:"]
+        for row in skipped_rows[:10]:
+            sym = row.get("symbol") or "-"
+            reason = row.get("reason") or ((row.get("result") or {}) if isinstance(row.get("result"), dict) else {}).get("reason") or "unknown"
+            lines.append(f"• {sym}: {str(reason)[:350]}")
+    msg = result.get("message")
+    if msg:
+        lines += ["", f"status: {msg}"]
+    return "\n".join(lines)[:3900]
+
+
 async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running, position_task
     if not allowed(update):
@@ -5834,7 +5960,23 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             position_task = context.application.create_task(position_management_loop(context.application))
 
         result = await execute_setup(storage, ex, setup)
+        opened_rows = result.get("opened") if isinstance(result.get("opened"), list) else []
+        placed_count = len([x for x in opened_rows if isinstance(x, dict) and bool(x.get("ok"))])
+        skipped_count = len([x for x in opened_rows if isinstance(x, dict) and not bool(x.get("ok"))])
         chatgpt_log_event("setup_file_processed", result=result)
+        chatgpt_log_event(
+            "setup_execution_user_summary",
+            ok=bool(result.get("ok", True)) if isinstance(result, dict) else False,
+            requested=result.get("requested_trades", result.get("limits_to_place", "-")) if isinstance(result, dict) else "-",
+            placed=placed_count,
+            skipped=skipped_count,
+            message=result.get("message") if isinstance(result, dict) else "",
+            skipped_rows=[x for x in opened_rows if isinstance(x, dict) and not bool(x.get("ok"))][:10],
+        )
+        try:
+            await reply(update, format_chatgpt_setup_execution_report(result), reply_markup=MAIN_MENU)
+        except Exception as e:
+            chatgpt_log_event("setup_execution_user_summary_send_failed", error=repr(e))
 
         running = True
         if position_task is None or position_task.done():
