@@ -5779,7 +5779,7 @@ async def _chatgpt_scan_background_job(app, chat_id: int):
 async def chatgpt_accept_setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Enter ChatGPT setup import mode without starting a new market scan.
 
-    v0390: build a fast runtime MEXC-symbol manifest on button press.
+    v0391: build a fast runtime MEXC-symbol manifest on button press.
     This avoids stale/missing scan-pack manifests after redeploy and prevents
     false rejects like ICP_USDT not in BTC/ETH-only context.
     """

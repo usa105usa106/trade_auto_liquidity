@@ -206,7 +206,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": os.getenv("BOT_VERSION", "v0390 final"),
+        "bot_version": os.getenv("BOT_VERSION", "v0391 final"),
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -369,7 +369,7 @@ def _stop_distance_pct(entry: float, stop: float) -> float:
 async def _fetch_chatgpt_current_price(exchange_client, symbol: str) -> float:
     """Return the best available current price for a setup safety gate.
 
-    v0390: the setup entry safety check must not skip a good trade after one
+    v0391: the setup entry safety check must not skip a good trade after one
     transient MEXC 510 rate-limit response.  We retry only the live ticker read
     with fixed backoff 2s -> 5s, then fail closed.  No cached price fallback is
     used here because stale prices can make TP2/SL safety checks misleading.
@@ -1033,7 +1033,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "v0390 final"
+        _bot_code_version = "v0391 final"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),
@@ -2265,6 +2265,35 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
     cleanup_summary = _chatgpt_cleanup_summary(cancelled_pending)
     if cancelled_pending:
         chatgpt_log_event("setup_cancelled_old_pending_limits", items=cancelled_pending)
+
+    # v0391: when a new setup replaces an old pending LIMIT for the same symbol,
+    # the cancel monitor can briefly create a `limit_canceled` lock. That lock is
+    # correct for normal expired/cancelled orders, but it must not block the fresh
+    # replacement inside this same setup cycle.  Clear only successful ENTRY
+    # cleanup locks for symbols that are present in the new setup.  Do not clear
+    # restricted/exchange-error locks such as mexc_opening_restricted_8950.
+    replacement_unlocked_symbols: set[str] = set()
+    for item in cancelled_pending or []:
+        try:
+            sym = mexc_native_symbol(item.get("symbol"))
+            is_ok = bool(item.get("ok"))
+            is_entry_cleanup = str(item.get("reason") or "").lower() == "entry"
+            if is_ok and is_entry_cleanup and sym and sym in {mexc_native_symbol(t.get("symbol")) for t in trades}:
+                if hasattr(storage, "clear_lock"):
+                    await storage.clear_lock(sym)
+                else:
+                    await storage.set_lock(sym, 0, "chatgpt_replacement_unlock")
+                replacement_unlocked_symbols.add(sym)
+                chatgpt_log_event(
+                    "setup_symbol_unlock_after_cleanup",
+                    symbol=sym,
+                    reason="replacing_old_pending_from_new_setup",
+                    source=item.get("source"),
+                    order_id=item.get("order_id"),
+                )
+        except Exception as e:
+            chatgpt_log_event("setup_symbol_unlock_after_cleanup_error", item=item, error=str(e))
+
     chatgpt_log_event("setup_cleanup_summary", **cleanup_summary)
     cancel_failed = [x for x in (cancelled_pending or []) if not bool(x.get("ok"))]
     if cancel_failed:
@@ -2480,6 +2509,37 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         chatgpt_log_event("setup_trade_place_start", symbol=plan.symbol, side=plan.side, order_type=plan.order_type, entry=entry, qty=plan.qty, stop=plan.stop_price, final_tp=final_tp)
         res = await exec_engine.place_entry(plan, live=live)
         reason_text = str((res or {}).get("reason") or "").lower()
+
+        # v0391 second safety net: if the position monitor created a `limit_canceled`
+        # lock after cleanup but before this entry placement, clear it and retry once
+        # only for symbols that were successfully cancelled for replacement in this
+        # setup cycle.  This is the real fix for: old ONDO pending cancelled -> new
+        # ONDO setup skipped as `symbol locked: limit_canceled`.
+        if (
+            not bool((res or {}).get("ok"))
+            and plan.symbol in replacement_unlocked_symbols
+            and "symbol locked" in reason_text
+            and "limit_canceled" in reason_text
+        ):
+            chatgpt_log_event(
+                "setup_symbol_lock_cleared_for_replacement",
+                symbol=plan.symbol,
+                first_reason=(res or {}).get("reason"),
+                action="clear_lock_and_retry_once",
+            )
+            try:
+                if hasattr(storage, "clear_lock"):
+                    await storage.clear_lock(plan.symbol)
+                else:
+                    await storage.set_lock(plan.symbol, 0, "chatgpt_replacement_unlock_retry")
+                res = await exec_engine.place_entry(plan, live=live)
+                reason_text = str((res or {}).get("reason") or "").lower()
+                chatgpt_log_event("setup_symbol_lock_retry_after_cleanup_result", symbol=plan.symbol, result=res)
+            except Exception as e:
+                res = {"ok": False, "reason": f"replacement unlock retry failed: {e}"}
+                reason_text = str(res.get("reason") or "").lower()
+                chatgpt_log_event("setup_symbol_lock_retry_after_cleanup_error", symbol=plan.symbol, error=str(e))
+
         if (not bool((res or {}).get("ok"))) and "open" in reason_text and "order" in reason_text and "exchange" in reason_text:
             chatgpt_log_event("setup_trade_open_order_conflict_retry_start", symbol=plan.symbol, first_result=res)
             cleanup = await exec_engine.cancel_same_symbol_stale_orders(plan.symbol, reason="chatgpt_setup_retry_open_order_exists")

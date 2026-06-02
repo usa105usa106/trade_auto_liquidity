@@ -698,6 +698,18 @@ class Storage:
             await db.execute("INSERT OR REPLACE INTO locks(symbol,locked_until,reason) VALUES(?,?,?)", (symbol, time.time()+seconds, reason))
             await db.commit()
 
+    async def clear_lock(self, symbol: str) -> None:
+        """Remove a temporary symbol lock.
+
+        ChatGPT Mode uses this when replacing an old pending entry with a new
+        setup entry for the same symbol.  A cancel event can create a short
+        `limit_canceled` lock, but that cleanup lock must not block the fresh
+        replacement inside the same setup cycle.
+        """
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM locks WHERE symbol=?", (symbol,))
+            await db.commit()
+
     async def is_locked(self, symbol: str) -> tuple[bool, str]:
         now = time.time()
         async with aiosqlite.connect(self.path) as db:
