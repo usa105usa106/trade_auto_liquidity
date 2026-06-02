@@ -107,6 +107,49 @@ def mexc_native_symbols(symbols: list[str]) -> list[str]:
     return out
 
 
+# Optional display names are informational only. Trading must always use the
+# exact MEXC native symbol from log.txt/manifest.json (for example NVDA_USDT),
+# never a long human name like NVIDIA_USDT.
+CHATGPT_SYMBOL_DISPLAY_NAMES = {
+    "NVDA": "NVIDIA",
+    "TSLA": "Tesla",
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "AMZN": "Amazon",
+    "GOOGL": "Google",
+    "META": "Meta",
+    "XAU": "Gold",
+    "XAUT": "Tether Gold",
+    "GOLD": "Gold",
+    "SILVER": "Silver",
+    "COPPER": "Copper",
+    "OIL": "Oil",
+    "USOIL": "US Oil",
+    "UKOIL": "UK Oil",
+    "XPD": "Palladium",
+}
+
+
+def chatgpt_symbol_display_name(sym: Any) -> str:
+    native = mexc_native_symbol(sym)
+    base = native[:-5] if native.endswith("_USDT") else native.split("_", 1)[0]
+    return CHATGPT_SYMBOL_DISPLAY_NAMES.get(base, base)
+
+
+def _chatgpt_pack_allowed_symbols_from_manifest(manifest: Any) -> set[str]:
+    if not isinstance(manifest, dict):
+        return set()
+    symbols: set[str] = set()
+    for sym in manifest.get("selected_symbols") or []:
+        native = mexc_native_symbol(sym)
+        if native:
+            symbols.add(native)
+    # BTC/ETH are context charts and may be valid setup candidates too.
+    for sym in ("BTC_USDT", "ETH_USDT"):
+        symbols.add(sym)
+    return symbols
+
+
 CHATGPT_RUNTIME_LOG_PATH = Path(os.getenv("CHATGPT_RUNTIME_LOG_PATH", "/tmp/chatgpt_mode_runtime.log"))
 CHATGPT_RUNTIME_LOG_MAX_BYTES = int(os.getenv("CHATGPT_RUNTIME_LOG_MAX_BYTES", "700000") or 700000)
 
@@ -516,6 +559,7 @@ def _parse_chatgpt_log_candidates(log_text: str, limit: int = 15) -> list[dict]:
         score_adj = strength - min(15.0, spread * 20.0)
         out.append({
             "symbol": symbol,
+            "display_name": chatgpt_symbol_display_name(symbol),
             "long_score": long_score,
             "short_score": short_score,
             "strength": strength,
@@ -689,11 +733,12 @@ CHATGPT_SCAN_TASK_TEXT = """CHATGPT_TASK
 7. Проверь manifest.json: expected_png_count, actual_png_count, missing_charts, generation_errors.
 8. Если missing_charts/generation_errors пустые или не мешают анализу — продолжай.
 9. Если у выбранной для сделки монеты нет полного набора 4h/1h/15min или график нечитаемый — не выбирай эту монету для setup.
-10. Игнорируй и не выбирай для сделок инструменты, в symbol/name которых есть substring STOCK в любом регистре. Такие инструменты регионально запрещены к торговле.
-11. Не исключай автоматически commodities/metals: XAU, XAUT, GOLD, SILVER, OIL, XPD и похожие инструменты можно рассматривать, если они есть в MEXC Futures и проходят по ликвидности, структуре и риску. Запрещён только STOCK.
-12. Выбери максимум 3 лучшие сделки.
-13. Если хороших сделок нет — верни setup-файл с verdict: NO_TRADE.
-14. Если сделки есть — верни setup-HHMM_DDMM.txt версии 1.6.
+10. Запрещены только instruments/symbols, где в symbol/name есть substring STOCK в любом регистре. Пример запрещённого: JPMSTOCK_USDT.
+11. Акции/stock-токены без substring STOCK, металлы, commodities и индексы разрешены. Не блокируй NVDA_USDT, TSLA_USDT, AAPL_USDT, XAU, XAUT, GOLD, SILVER, COPPER, OIL, XPD и похожие symbols только из-за категории инструмента.
+12. SYMBOL RULE: используй только exact symbols из log.txt / manifest.json. Не переименовывай биржевые тикеры в длинные названия. Если manifest говорит NVDA_USDT, в setup должен быть NVDA_USDT, не NVIDIA_USDT. display_name является только информацией и не должен использоваться как order symbol.
+13. Выбери максимум 3 лучшие сделки.
+14. Если хороших сделок нет — верни setup-файл с verdict: NO_TRADE.
+15. Если сделки есть — верни setup-HHMM_DDMM.txt версии 1.6.
 
 CRITICAL OUTPUT RULES:
 - Финальный setup нужно вернуть только прикреплённым .txt файлом.
@@ -702,46 +747,17 @@ CRITICAL OUTPUT RULES:
 - Нельзя писать setup в json/code block.
 - Нельзя использовать старый plain-text формат VERSION=1.6 / [TRADE_1].
 - Нужен только файл с чистым JSON object.
-- Файл должен называться строго: setup-HHMM_DDMM.txt. Пример: setup-0059_0106.txt.
-- Файл должен начинаться с символа { и заканчиваться символом }.
-- Если ты не можешь прикрепить файл, прямо напиши: не могу создать файл — и НЕ выдавай setup текстом.
-
-ORDER TYPE RULE:
-- По умолчанию используй order_type: LIMIT.
-- Используй order_type: MARKET только для очень сильного A+ setup, где 4H/1H/15min подтверждают направление, цена не находится после позднего вертикального импульса, риск до stop_loss приемлемый, а R/R до TP2 минимум 1:2.
-- Если есть сомнения по точке входа — используй LIMIT.
-- Не используй MARKET, если цена уже далеко ушла от оптимального входа или находится у локального high/low после резкого движения.
-
-STOP/RISK RULE:
-- ChatGPT сам рассчитывает entry, stop_loss и take_profits.
-- Stop_loss должен быть структурным и находиться в диапазоне: минимум 1% от entry, максимум 5% от entry.
-- Если расчетный stop_loss получается ближе 1% от entry, не используй микростоп: расширь stop_loss до логичного структурного уровня минимум 1%.
-- Если для нормальной структуры нужен стоп больше 5%, не бери эту сделку.
-- risk.stop_distance_percent должен соответствовать расстоянию от entry до stop_loss.
-- estimated_deposit_risk_percent считай по текущей логике бота: 10% депозита на сделку и 10x isolated, но не занижай stop_distance_percent.
-
-TAKE PROFIT RULE:
-- Take profits не считать механически от размера стопа.
-- TP ставить по структуре графика: ближайшие уровни ликвидности, high/low, зоны сопротивления/поддержки, MA/диапазоны и реальные цели движения.
-- TP1 / TP2 / TP3 выбираются по графику, уровням, ликвидности и структуре рынка.
-- Если структурные TP не дают адекватный risk/reward хотя бы до TP2, сделку не брать.
-- Схема фиксации: TP1 35%, TP2 35%, TP3 REMAINDER.
-- После TP1 бот переносит stop_loss в breakeven.
-- До входа бот НЕ отменяет сделку из-за касания TP1.
-- До входа бот отменяет/не выставляет сделку только если цена уже дошла до TP2 или прошла stop_loss.
-- Trailing: OFF. Scalp exit: OFF.
+- Файл должен называться строго: setup-HHMM_DDMM.txt.
+- Если не можешь создать файл, прямо напиши: не могу создать файл, и НЕ выдавай setup текстом.
 
 SETUP FORMAT STRICT:
 - Только чистый JSON object.
 - Файл должен начинаться с { и заканчиваться }.
-- Никакого Markdown внутри setup-файла.
-- Никакого plain-text setup.
-- Не использовать TRADE_1 / TRADE_2 / TRADE_3.
 - Все сделки должны быть внутри массива trades.
+- Не использовать TRADE_1 / TRADE_2 / TRADE_3.
 - entry — только одно число.
 - stop_loss — только одно число.
 - take_profits — массив из 3 объектов price/size_percent.
-- Старые версии запрещены. Бот принимает только setup_version "1.6".
 
 REQUIRED TOP LEVEL JSON:
 {
@@ -779,15 +795,33 @@ TRADE OBJECT FORMAT:
   }
 }
 
-STRICT TAKE_PROFITS FORMAT:
-- take_profits должен быть только JSON-массивом из 3 объектов.
-- Используй только ключи price и size_percent.
-- Последний TP обязан иметь ровно: "size_percent": "REMAINDER".
-- Запрещено: size, percent, take_profit_1_size_pct, take_profit_1, tp1, TP3 без size_percent.
+ORDER TYPE RULE:
+- По умолчанию используй order_type: "LIMIT".
+- Используй order_type: "MARKET" только для очень сильных A+ setup, где 4H/1H/15min подтверждают направление, цена не находится после позднего вертикального импульса, риск до stop_loss приемлемый, а R/R до TP2 минимум 1:2.
+- Если есть сомнения по точке входа — используй LIMIT.
+- Не используй MARKET, если цена уже далеко ушла от оптимального входа или находится у локального high/low после резкого движения.
+
+STOP/RISK RULE:
+- Стоп должен быть не меньше 1% от entry.
+- Если расчетный stop_loss получается ближе 1% от entry, расширь stop_loss минимум до 1%.
+- Максимальный stop_distance_percent — 5%.
+- Если для нормальной структуры нужен стоп больше 5%, не бери эту сделку.
+- risk.stop_distance_percent должен соответствовать расстоянию от entry до stop_loss.
+
+TAKE PROFIT RULE:
+- Take profits не считать механически от размера стопа.
+- TP ставить по структуре графика: ближайшие уровни ликвидности, high/low, зоны сопротивления/поддержки, MA/диапазоны и реальные цели движения.
+- Если структурные TP не дают адекватный risk/reward хотя бы до TP2, сделку не брать.
+
+EXECUTION SAFETY RULES:
+- После TP1 бот переносит stop_loss в breakeven.
+- До входа бот НЕ отменяет сделку из-за касания TP1.
+- До входа бот отменяет/не выставляет сделку, если цена уже дошла до TP2 или прошла stop_loss.
+- Trailing: OFF. Scalp exit: OFF.
 
 ANALYSIS RULES:
-- Используй все метрики скана: 15m / 1H / 4H, объём, ликвидность, RSI, MACD, MA7/MA25/MA99, orderbook, движение, силу/слабость, риск перегрева и общий фон BTC/ETH.
-- Сравни top-15 кандидатов по 4H/1H/15min.
+- Сначала оцени BTC/ETH market context.
+- Потом сравни top-15 кандидатов по 4H/1H/15min.
 - Не входи в поздний вертикальный памп без ретеста.
 - Не шорти сильную альту без слома структуры.
 - Если BTC падает, BTC.D падает, а альты держатся лучше — отдавай приоритет strong-alt long-кандидатам, а не шортам по альтам.
@@ -799,14 +833,15 @@ FINAL SELF-CHECK BEFORE SENDING FILE:
 3. В файле чистый JSON, начинается с { и заканчивается }.
 4. setup_version ровно "1.6".
 5. В trades максимум 3 сделки.
-6. Нет символов со STOCK.
-7. У каждой сделки order_type LIMIT или MARKET.
-8. У каждой сделки take_profits ровно в формате 35 / 35 / REMAINDER через ключ size_percent.
-9. Стоп каждой сделки от 1% до 5%.
-10. Если условий нет, лучше дай NO_TRADE, чем кривой setup."""
+6. Нет symbols с substring STOCK.
+7. Каждый symbol точно совпадает с symbol из log.txt/manifest.json; не использовать длинные названия вместо тикеров.
+8. У каждой сделки order_type LIMIT или MARKET.
+9. У каждой сделки take_profits ровно в формате 35 / 35 / REMAINDER через ключ size_percent.
+10. Стоп каждой сделки от 1% до 5%.
+11. Если условий нет, лучше дай NO_TRADE, чем кривой setup."""
 
 
-async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200) -> str:
+async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None) -> str:
     """Build a full ChatGPT Scan Mode ZIP: log.txt + task.txt + manifest + charts."""
     started = time.time()
     chatgpt_log_event("scan_pack_start", limit=limit, top=os.getenv("CHATGPT_SCAN_PACK_TOP", "15"), chart_workers=os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")))
@@ -899,7 +934,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "v0385 final"
+        _bot_code_version = "v0386 final"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),
@@ -924,6 +959,13 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         "elapsed_sec": round(time.time() - started, 2),
     }
     (work / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    if storage is not None:
+        try:
+            await storage.set("chatgpt_last_scan_manifest", manifest, bump_revision=False)
+            await storage.set("chatgpt_last_scan_allowed_symbols", sorted(_chatgpt_pack_allowed_symbols_from_manifest(manifest)), bump_revision=False)
+            chatgpt_log_event("scan_pack_allowed_symbols_saved", count=len(_chatgpt_pack_allowed_symbols_from_manifest(manifest)))
+        except Exception as e:
+            chatgpt_log_event("scan_pack_allowed_symbols_save_error", error=repr(e))
     chatgpt_log_event("scan_pack_manifest_written", expected=manifest["expected_png_count"], actual=manifest["actual_png_count"], missing=len(manifest["missing_charts"]), errors=len(manifest["generation_errors"]), resolution=manifest["chart_resolution"])
     zip_path = work.with_suffix(".zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -1157,6 +1199,9 @@ def validate_setup(data: dict) -> list[dict]:
     max_trades = CHATGPT_MAX_ACTIVE_TRADES
     if len(trades) > max_trades:
         raise ValueError(f"too many trades: max {max_trades} for ChatGPT Mode")
+    scan_pack_allowed_symbols = {mexc_native_symbol(x) for x in (data.get("_scan_pack_allowed_symbols") or []) if mexc_native_symbol(x)}
+    if scan_pack_allowed_symbols:
+        chatgpt_log_event("setup_symbol_guard_loaded", count=len(scan_pack_allowed_symbols), sample=",".join(sorted(scan_pack_allowed_symbols)[:20]))
     duplicate_skipped: list[dict] = []
     seen_setup_symbols: set[str] = set()
     valid_until = str(data.get("valid_until_utc") or "").replace("UTC", "").strip()
@@ -1180,6 +1225,12 @@ def validate_setup(data: dict) -> list[dict]:
         symbol = mexc_native_symbol(raw_symbol)
         if is_chatgpt_blocked_symbol(symbol):
             raise ValueError(f"TRADE_{i}: symbol {symbol} is region-blocked because it contains STOCK")
+        if scan_pack_allowed_symbols and symbol not in scan_pack_allowed_symbols:
+            chatgpt_log_event("setup_symbol_rejected_not_in_scan_pack", index=i, raw_symbol=raw_symbol, normalized_symbol=symbol, allowed_sample=",".join(sorted(scan_pack_allowed_symbols)[:30]))
+            raise ValueError(
+                f"TRADE_{i}: symbol {symbol} is not in latest ChatGPT scan pack. "
+                "Use exact MEXC symbols from log.txt/manifest.json; do not rename tickers, e.g. use NVDA_USDT not NVIDIA_USDT."
+            )
         if symbol in seen_setup_symbols:
             reason = f"дубль в setup-файле: {symbol}; повторная сделка пропущена"
             duplicate_skipped.append({"symbol": symbol, "ok": False, "reason": reason, "skipped_duplicate_in_setup": True})
@@ -2068,6 +2119,20 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
 
 async def execute_setup(storage, exchange_client, setup: dict) -> dict:
     chatgpt_log_event("setup_execute_start")
+    try:
+        guard_enabled = str(os.getenv("CHATGPT_SETUP_SYMBOL_GUARD_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
+        if guard_enabled and isinstance(setup, dict):
+            manifest = await storage.get("chatgpt_last_scan_manifest", {})
+            allowed = sorted(_chatgpt_pack_allowed_symbols_from_manifest(manifest))
+            if allowed:
+                setup["_scan_pack_allowed_symbols"] = allowed
+                chatgpt_log_event("setup_symbol_guard_enabled", count=len(allowed), sample=",".join(allowed[:30]))
+            else:
+                chatgpt_log_event("setup_symbol_guard_no_manifest")
+        else:
+            chatgpt_log_event("setup_symbol_guard_disabled")
+    except Exception as e:
+        chatgpt_log_event("setup_symbol_guard_error", error=repr(e))
     trades = validate_setup(setup)
     if not trades:
         chatgpt_log_event("setup_execute_no_trade")

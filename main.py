@@ -1179,9 +1179,12 @@ def format_position_event(ev: dict) -> str:
             tp_lines.append(f"TP{idx}: {price}{suffix}{oid_suffix}")
         if not tp_lines:
             tp_lines = [f"TP final: {ev.get('take_price')}"]
+        side = str(ev.get("side") or ev.get("direction") or "").upper()
+        side_line = f"Direction: {side}" if side in {"LONG", "SHORT"} else "Direction: неизвестно"
         return "\n".join([
             "📌 Лимитка исполнена",
             f"{symbol}",
+            side_line,
             f"Entry: {ev.get('entry_price')}",
             "",
             "✅ Позиция под полной защитой",
@@ -1192,9 +1195,12 @@ def format_position_event(ev: dict) -> str:
         ])
 
     if typ == "chatgpt_limit_filled_local_protection":
+        side = str(ev.get("side") or ev.get("direction") or "").upper()
+        side_line = f"Direction: {side}" if side in {"LONG", "SHORT"} else "Direction: неизвестно"
         return "\n".join([
             "📌 Лимитка исполнена",
             f"{symbol}",
+            side_line,
             f"Entry: {ev.get('entry_price')}",
             "",
             "🚨 LOCAL PROTECTION MODE",
@@ -5667,7 +5673,7 @@ async def _chatgpt_scan_background_job(app, chat_id: int):
         ws = await get_ws(ns)
         chatgpt_log_event("mode_scan_call")
         scan_limit = int(os.getenv("CHATGPT_SCAN_LIMIT", "200") or 200)
-        pack_path = await build_chatgpt_scan_pack(ex, scanner, ns, ws_supervisor=ws, limit=scan_limit)
+        pack_path = await build_chatgpt_scan_pack(ex, scanner, ns, ws_supervisor=ws, limit=scan_limit, storage=storage)
         with open(pack_path, "rb") as f:
             await app.bot.send_document(
                 chat_id=chat_id,
