@@ -5756,8 +5756,8 @@ async def _chatgpt_scan_background_job(app, chat_id: int):
             await app.bot.send_document(
                 chat_id=chat_id,
                 document=f,
-                filename="chatgpt_scan_pack.zip",
-                caption="✅ ChatGPT pack готов: log.txt + task.txt + manifest.json + raw-графики. Скинь ZIP в ChatGPT. После финального анализа загрузи сюда setup-HHMM_DDMM.txt с setup_version 1.6.",
+                filename=os.path.basename(pack_path),
+                caption=f"✅ ChatGPT pack готов: {os.path.basename(pack_path)}\nlog.txt + task.txt + manifest.json + raw-графики. Скинь ZIP в ChatGPT. После финального анализа загрузи сюда setup-HHMM_DDMM.txt с setup_version 1.6.",
             )
         await storage.set("chatgpt_waiting_setup", True)
         chatgpt_log_event("mode_waiting_setup", pack_path=pack_path)

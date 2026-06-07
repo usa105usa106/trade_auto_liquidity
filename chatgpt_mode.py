@@ -206,7 +206,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": os.getenv("BOT_VERSION", "v0395 final"),
+        "bot_version": os.getenv("BOT_VERSION", "v0396 final"),
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -847,6 +847,7 @@ CRITICAL OUTPUT RULES:
 - Нельзя использовать старый plain-text формат VERSION=1.6 / [TRADE_1].
 - Нужен только файл с чистым JSON object.
 - Файл должен называться строго: setup-HHMM_DDMM.txt.
+- PRICE FORMAT RULE: все price values (entry, stop_loss, take_profits.price) пиши только обычным десятичным числом, без scientific notation / экспоненциальной записи. Пример: 0.0000242, не 2.42e-05.
 - Если не можешь создать файл, прямо напиши: не могу создать файл, и НЕ выдавай setup текстом.
 
 SETUP FORMAT STRICT:
@@ -965,7 +966,8 @@ FINAL SELF-CHECK BEFORE SENDING FILE:
 8. У каждой сделки order_type LIMIT или MARKET.
 9. У каждой сделки take_profits ровно в формате 35 / 35 / REMAINDER через ключ size_percent.
 10. Стоп каждой сделки от 1% до 5%.
-11. Если условий нет, лучше дай NO_TRADE, чем кривой setup."""
+11. Все цены записаны обычными десятичными числами без e-05 / scientific notation.
+12. Если условий нет, лучше дай NO_TRADE, чем кривой setup."""
 
 
 async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None) -> str:
@@ -1010,8 +1012,10 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         sample_files=",".join(sorted(list(seen_files))[:20]),
     )
 
-    stamp = datetime.now(timezone.utc).strftime("%H%M_%d%m")
-    work = Path(os.getenv("CHATGPT_LOG_DIR", "/tmp")) / f"chatgpt_scan_pack_{stamp}_{int(time.time())}"
+    stamp = datetime.now().strftime("%H%M_%d%m")
+    log_dir = Path(os.getenv("CHATGPT_LOG_DIR", "/tmp"))
+    work = log_dir / f"chatgpt_scan_pack_work_{stamp}_{int(time.time())}"
+    zip_path = log_dir / f"chatgpt_scan_pack-{stamp}.zip"
     screens = work / "screenshots"
     screens.mkdir(parents=True, exist_ok=True)
     (work / "log.txt").write_text(log_text, encoding="utf-8")
@@ -1061,7 +1065,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "v0395 final"
+        _bot_code_version = "v0396 final"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),
@@ -1094,7 +1098,6 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         except Exception as e:
             chatgpt_log_event("scan_pack_allowed_symbols_save_error", error=repr(e))
     chatgpt_log_event("scan_pack_manifest_written", expected=manifest["expected_png_count"], actual=manifest["actual_png_count"], missing=len(manifest["missing_charts"]), errors=len(manifest["generation_errors"]), resolution=manifest["chart_resolution"])
-    zip_path = work.with_suffix(".zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for rel in ("log.txt", "task.txt", "manifest.json"):
             z.write(work / rel, rel)
