@@ -9,7 +9,8 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0078 SCALP EXIT SAFETY
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
-VERSION = "v0396 final"  # hard-coded; ignore stale Railway BOT_VERSION env
+# Previous packaged version marker kept for regression tests: 0368 CHATGPT ONE LIVE MONITOR V33
+VERSION = "v0401 final"  # hard-coded; ignore stale Railway BOT_VERSION env
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -271,6 +272,15 @@ class Defaults:
     multi_strategy_top_coins: int = env_int("MULTI_STRATEGY_TOP_COINS", 100)
     multi_strategy_scan_interval_sec: int = env_int("MULTI_STRATEGY_SCAN_INTERVAL_SEC", 60)
     multi_strategy_max_open_positions: int = env_int("MULTI_STRATEGY_MAX_OPEN_POSITIONS", 3)
+
+    # Claude Autopilot is a separate LIVE copy of ChatGPT Scan Mode.
+    claude_autopilot_enabled: bool = env_bool("CLAUDE_AUTOPILOT_ENABLED", False)
+    claude_autopilot_model: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+    claude_autopilot_schedule: str = os.getenv("CLAUDE_AUTOPILOT_SCHEDULE", "off")
+    claude_autopilot_cycle_enabled: bool = env_bool("CLAUDE_AUTOPILOT_CYCLE_ENABLED", True)
+    claude_chart_resolution: str = os.getenv("CLAUDE_CHART_RESOLUTION", "1280x720")
+    claude_max_tokens: int = env_int("CLAUDE_MAX_TOKENS", 6000)
+    claude_temperature: float = env_float("CLAUDE_TEMPERATURE", 0.2)
 
     # v0175 Boost Whitelist Commands: /boost_list accepts BTC,ETH,SOL format and /boost_list_del clears trusted zero-fee symbols.
     boost_zero_fee_scanner_enabled: bool = env_bool("BOOST_ZERO_FEE_SCANNER_ENABLED", True)

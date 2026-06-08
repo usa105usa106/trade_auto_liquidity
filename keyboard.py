@@ -24,6 +24,7 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["🧠 multi strategy"],
     ["🚀 BOOST MODE", "🛑 STOP BOOST"],
     ["🤖 ChatGPT Scan Mode", "📥 Принять setup"],
+    ["🤖 Claude Autopilot"],
     ["📄 Log ChatGPT", "❌ Exit ChatGPT Mode"],
     ["📊 BOOST STATUS", "📊 AI Stats"],
     ["⚙️ MEXC"],

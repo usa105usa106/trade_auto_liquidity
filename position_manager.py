@@ -156,9 +156,14 @@ class PositionManager:
                     confidence = "MEDIUM"
                     matched_level = "TP3/final"
                 elif nearest and str(nearest.get("kind") or "").startswith("TP") and float(nearest.get("distance_pct") or 99) <= tol:
-                    reason_code = f"LIKELY_{nearest.get('kind')}"
-                    reason_label = f"похоже, сработал {nearest.get('name')}"
-                    confidence = "MEDIUM"
+                    if str(nearest.get("kind") or "") not in {"TP3", "TP_FINAL"}:
+                        reason_code = f"FULL_CLOSE_NEAR_{nearest.get('kind')}"
+                        reason_label = f"позиция полностью закрыта рядом с {nearest.get('name')}; возможна аномалия TP/full close или закрытие другим ордером"
+                        confidence = "LOW"
+                    else:
+                        reason_code = f"LIKELY_{nearest.get('kind')}"
+                        reason_label = f"похоже, сработал {nearest.get('name')}"
+                        confidence = "MEDIUM"
                     matched_level = str(nearest.get("name") or matched_level)
             elif side == "SHORT":
                 if stop > 0 and p >= stop * (1 - tol / 100.0):
@@ -172,9 +177,14 @@ class PositionManager:
                     confidence = "MEDIUM"
                     matched_level = "TP3/final"
                 elif nearest and str(nearest.get("kind") or "").startswith("TP") and float(nearest.get("distance_pct") or 99) <= tol:
-                    reason_code = f"LIKELY_{nearest.get('kind')}"
-                    reason_label = f"похоже, сработал {nearest.get('name')}"
-                    confidence = "MEDIUM"
+                    if str(nearest.get("kind") or "") not in {"TP3", "TP_FINAL"}:
+                        reason_code = f"FULL_CLOSE_NEAR_{nearest.get('kind')}"
+                        reason_label = f"позиция полностью закрыта рядом с {nearest.get('name')}; возможна аномалия TP/full close или закрытие другим ордером"
+                        confidence = "LOW"
+                    else:
+                        reason_code = f"LIKELY_{nearest.get('kind')}"
+                        reason_label = f"похоже, сработал {nearest.get('name')}"
+                        confidence = "MEDIUM"
                     matched_level = str(nearest.get("name") or matched_level)
         except Exception:
             pass
@@ -783,6 +793,11 @@ class PositionManager:
                         "tp_orders": [protection.get("tp1_order_id"), protection.get("tp2_order_id"), protection.get("tp3_order_id")],
                         "sl_order_id": protection.get("sl_order_id"),
                         "protection_note": protection.get("protection_note"),
+                        "expected_tp_count": protection.get("chatgpt_expected_tp_count"),
+                        "verified_tp_count": protection.get("chatgpt_verified_tp_count"),
+                        "verified_tp_ids": protection.get("chatgpt_verified_tp_ids"),
+                        "missing_tp_ids": protection.get("chatgpt_missing_tp_ids"),
+                        "sl_verified": protection.get("chatgpt_sl_plan_verified"),
                     }
                 return {"type": "limit_filled", "symbol": symbol}
             if status in {"canceled", "cancelled", "rejected", "expired"}:

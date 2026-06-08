@@ -1,4 +1,4 @@
-import os, time, asyncio, logging, json
+import os, time, asyncio, logging, json, re
 from datetime import datetime, timezone, timedelta
 import aiohttp
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -34,6 +34,7 @@ from position_manager import PositionManager
 from chart_renderer import render_trade_setup_chart
 from ai_btc_autopilot import BTCVisionAutopilot
 from chatgpt_mode import build_chatgpt_log, build_chatgpt_scan_pack, build_chatgpt_runtime_manifest_from_mexc, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log, build_chatgpt_monitor_text, CHATGPT_MONITOR_INTERVAL_SEC, CHATGPT_SETUP_VERSION
+from claude_autopilot import call_claude_for_setup, save_claude_setup_text, normalize_claude_model, claude_model_label, schedule_label, next_schedule_run, schedule_due, CLAUDE_SONNET_46, CLAUDE_OPUS_48, MSK
 from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
 from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env, set_runtime_secret_cache, clear_runtime_secret_cache, runtime_secret_cache, ensure_runtime_secrets_loaded, merge_secrets_into_settings, secret_source_report
@@ -58,6 +59,7 @@ ws_supervisor = None
 trading_task = None
 position_task = None
 btc_ai_task = None
+claude_scheduler_task = None
 
 def admin_id_list() -> list[str]:
     return [x.strip() for x in str(ADMIN_IDS or os.getenv("ADMIN_IDS", "")).split(",") if x.strip()]
@@ -1179,6 +1181,12 @@ def format_position_event(ev: dict) -> str:
             tp_lines.append(f"TP{idx}: {price}{suffix}{oid_suffix}")
         if not tp_lines:
             tp_lines = [f"TP final: {ev.get('take_price')}"]
+        expected_tp = ev.get("expected_tp_count")
+        verified_tp = ev.get("verified_tp_count")
+        if expected_tp is not None or verified_tp is not None:
+            verify_line = f"TP verified: {verified_tp if verified_tp is not None else '?'} / {expected_tp if expected_tp is not None else '?'}; SL verified: {'yes' if ev.get('sl_verified') else 'no'}"
+        else:
+            verify_line = "TP/SL accepted by exchange"
         side = str(ev.get("side") or ev.get("direction") or "").upper()
         side_line = f"Direction: {side}" if side in {"LONG", "SHORT"} else "Direction: неизвестно"
         return "\n".join([
@@ -1190,6 +1198,7 @@ def format_position_event(ev: dict) -> str:
             "✅ Позиция под полной защитой",
             f"SL: {ev.get('stop_price')} ✅",
             *tp_lines,
+            verify_line,
             "",
             "SL один на всю позицию; TP разбиты на 3 части.",
         ])
@@ -5742,6 +5751,334 @@ async def orderflow_impulse_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+def _claude_api_key(settings: dict | None = None) -> str:
+    return str(os.getenv("ANTHROPIC_API_KEY") or (settings or {}).get("anthropic_api_key") or "").strip()
+
+
+def _boolish(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y", "да"}
+
+
+def _claude_settings_snapshot(settings: dict | None = None) -> dict:
+    s = settings or {}
+    model = normalize_claude_model(s.get("claude_autopilot_model") or os.getenv("CLAUDE_MODEL") or CLAUDE_SONNET_46)
+    enabled = _boolish(s.get("claude_autopilot_enabled"), False)
+    cycle_enabled = _boolish(s.get("claude_autopilot_cycle_enabled"), True)
+    schedule = str(s.get("claude_autopilot_schedule") or "off").lower()
+    chart_resolution = str(s.get("claude_chart_resolution") or os.getenv("CLAUDE_CHART_RESOLUTION") or "1280x720").lower().replace("×", "x").replace(" ", "")
+    if chart_resolution not in {"1280x720", "960x540"}:
+        chart_resolution = "1280x720"
+    api_key_present = bool(_claude_api_key(s))
+    last_ts = float(s.get("claude_autopilot_last_run_ts") or 0)
+    nxt = next_schedule_run(schedule, last_ts=last_ts) if cycle_enabled else None
+    return {"enabled": enabled, "cycle_enabled": cycle_enabled, "model": model, "schedule": schedule, "chart_resolution": chart_resolution, "api_key_present": api_key_present, "next_run": nxt}
+
+
+def claude_autopilot_keyboard(settings: dict | None = None) -> InlineKeyboardMarkup:
+    snap = _claude_settings_snapshot(settings or {})
+    enabled = snap["enabled"]
+    model = snap["model"]
+    schedule = snap["schedule"]
+    chart_resolution = snap.get("chart_resolution", "1280x720")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Включить" if not enabled else "✅ ВКЛ", callback_data="claude:enable"), InlineKeyboardButton("🔴 Выключить" if enabled else "○ ВЫКЛ", callback_data="claude:disable")],
+        [InlineKeyboardButton(("✅ Скан по кругу: ВКЛ" if snap.get("cycle_enabled", True) else "○ Скан по кругу: ВЫКЛ"), callback_data="claude:cycle_toggle")],
+        [InlineKeyboardButton(("✅ " if model == CLAUDE_SONNET_46 else "") + "🧠 Sonnet 4.6", callback_data="claude:model:sonnet"), InlineKeyboardButton(("✅ " if model == CLAUDE_OPUS_48 else "") + "🧠 Opus 4.8", callback_data="claude:model:opus")],
+        [InlineKeyboardButton(("✅ " if schedule == "4h" else "") + "⏱ 4H свеча +1м", callback_data="claude:schedule:4h")],
+        [InlineKeyboardButton(("✅ " if schedule == "1h" else "") + "⏱ 1H свеча +1м", callback_data="claude:schedule:1h")],
+        [InlineKeyboardButton(("✅ " if schedule == "2h" else "") + "⏱ Каждые 2 часа", callback_data="claude:schedule:2h")],
+        [InlineKeyboardButton("⏱ Выключить расписание", callback_data="claude:schedule:off")],
+        [InlineKeyboardButton(("✅ " if chart_resolution == "1280x720" else "") + "🖼 1280x720", callback_data="claude:resolution:1280"), InlineKeyboardButton(("✅ " if chart_resolution == "960x540" else "") + "🖼 960x540", callback_data="claude:resolution:960")],
+        [InlineKeyboardButton("🚀 Запустить сейчас LIVE", callback_data="claude:run")],
+        [InlineKeyboardButton("🚨 EXIT / CLOSE ALL", callback_data="claude:exit_confirm")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="noop:claude")],
+    ])
+
+
+def claude_autopilot_menu_text(settings: dict | None = None) -> str:
+    snap = _claude_settings_snapshot(settings or {})
+    nxt = snap.get("next_run")
+    nxt_s = nxt.strftime("%H:%M МСК") if nxt else "-"
+    return (
+        "🤖 Claude Autopilot LIVE\n\n"
+        f"Статус: {'ВКЛ' if snap['enabled'] else 'ВЫКЛ'}\n"
+        f"Модель: {claude_model_label(snap['model'])}\n"
+        f"Скан по кругу: {'ВКЛ' if snap.get('cycle_enabled', True) else 'ВЫКЛ'}\n"
+        f"Расписание: {schedule_label(snap['schedule'])}\n"
+        f"Графики: {snap.get('chart_resolution', '1280x720')}\n"
+        f"Следующий запуск: {nxt_s}\n"
+        f"API key: {'есть' if snap['api_key_present'] else 'НЕТ'}\n\n"
+        "Основа та же, что ChatGPT Scan Mode: top-200 → top-15 → графики → setup v1.6 → текущий валидатор → LIVE сделки."
+    )
+
+
+async def claude_autopilot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    s = await storage.all_settings()
+    await reply(update, claude_autopilot_menu_text(s), reply_markup=claude_autopilot_keyboard(s))
+
+
+def _claude_raw_dir() -> str:
+    path = os.getenv("CLAUDE_RAW_DIR", os.getenv("CHATGPT_LOG_DIR", "/tmp"))
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        path = "/tmp"
+    return path
+
+def _save_claude_raw_response(raw_text: str, *, stamp: str, kind: str = "response") -> str:
+    safe_kind = re.sub(r"[^a-zA-Z0-9_\-]", "_", str(kind or "response"))
+    path = os.path.join(_claude_raw_dir(), f"claude_{safe_kind}-{stamp}.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(raw_text or ""))
+            if not str(raw_text or "").endswith("\n"):
+                f.write("\n")
+    except Exception:
+        path = ""
+    return path
+
+async def _claude_status(app, message, lines: list[str], line: str):
+    lines.append(line)
+    text = "🤖 Claude Autopilot LIVE\n\n" + "\n".join(lines)
+    if message is not None:
+        await _safe_edit_message_text(message, text)
+    return text
+
+
+async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", status_message=None):
+    """Run one Claude Autopilot cycle using the existing ChatGPT Scan Mode engine."""
+    global running, entries_enabled, position_task
+    if app.bot_data.get("claude_autopilot_running"):
+        if status_message is not None:
+            await _safe_edit_message_text(status_message, "⏳ Claude Autopilot уже выполняется. Новый запуск пропущен.")
+        else:
+            await _safe_send_bot_message(app, chat_id, "⏳ Claude Autopilot уже выполняется. Новый запуск пропущен.", reply_markup=MAIN_MENU)
+        return
+    app.bot_data["claude_autopilot_running"] = True
+    lines: list[str] = []
+    pack_path = setup_path = None
+    try:
+        settings = await storage.all_settings()
+        if not _boolish(settings.get("claude_autopilot_enabled"), False) and trigger != "manual_force":
+            await _claude_status(app, status_message, lines, "⏸ Автопилот выключен. Запуск пропущен.")
+            return
+        api_key = _claude_api_key(settings)
+        if not api_key:
+            await _claude_status(app, status_message, lines, "❌ ANTHROPIC_API_KEY не найден. Сделки не открывались.")
+            return
+        model = normalize_claude_model(settings.get("claude_autopilot_model") or os.getenv("CLAUDE_MODEL") or CLAUDE_SONNET_46)
+        max_tokens = int(os.getenv("CLAUDE_MAX_TOKENS", str(settings.get("claude_max_tokens", 6000) or 6000)) or 6000)
+        temperature = float(os.getenv("CLAUDE_TEMPERATURE", str(settings.get("claude_temperature", 0.2) or 0.2)) or 0.2)
+        chart_resolution = str(settings.get("claude_chart_resolution") or os.getenv("CLAUDE_CHART_RESOLUTION") or "1280x720").lower().replace("×", "x").replace(" ", "")
+        if chart_resolution not in {"1280x720", "960x540"}:
+            chart_resolution = "1280x720"
+
+        await storage.set("claude_autopilot_last_run_ts", time.time(), bump_revision=False)
+        await disable_other_modes(storage)
+        entries_enabled = False
+        running = True
+        if position_task is None or position_task.done():
+            position_task = app.create_task(position_management_loop(app))
+
+        await _claude_status(app, status_message, lines, f"⏳ Шаг 1/7: запустил scan top-200...\nПричина: {trigger}\nМодель: {claude_model_label(model)}\nГрафики: {chart_resolution}")
+        apply_mexc_runtime_env({**settings, "mexc_order_leverage": "10", "mexc_order_open_type": "1"})
+        ex = await get_exchange(settings)
+        ws = await get_ws(settings)
+        scan_limit = int(os.getenv("CHATGPT_SCAN_LIMIT", "200") or 200)
+        pack_path = await build_chatgpt_scan_pack(ex, scanner, settings, ws_supervisor=ws, limit=scan_limit, storage=storage, chart_resolution=chart_resolution)
+        await _claude_status(app, status_message, lines, f"✅ Шаг 1/7: scan готов\n✅ Шаг 2/7: архив собран: {os.path.basename(pack_path)}")
+        try:
+            with open(pack_path, "rb") as f:
+                await app.bot.send_document(chat_id=chat_id, document=f, filename=os.path.basename(pack_path), caption=f"📦 Claude Autopilot scan pack: {os.path.basename(pack_path)}")
+        except Exception as e:
+            chatgpt_log_event("claude_pack_send_failed", error=repr(e))
+
+        async def _progress(msg: str):
+            await _claude_status(app, status_message, lines, f"📤 Claude: {msg}")
+
+        await _claude_status(app, status_message, lines, f"⏳ Шаг 3/7: отправляю данные в {claude_model_label(model)}...")
+        chatgpt_log_event(
+            "claude_api_request_start",
+            trigger=trigger,
+            pack=pack_path,
+            model=model,
+            model_label=claude_model_label(model),
+            max_tokens=max_tokens,
+            temperature=temperature if model != CLAUDE_OPUS_48 else "default_for_opus",
+            chart_resolution=chart_resolution,
+            scan_limit=scan_limit,
+        )
+        raw_setup, meta = await call_claude_for_setup(pack_path, api_key=api_key, model=model, max_tokens=max_tokens, temperature=temperature, progress=_progress)
+        stamp = datetime.now(MSK).strftime("%H%M_%d%m")
+        raw_path = _save_claude_raw_response(raw_setup, stamp=stamp, kind="response")
+        await _claude_status(app, status_message, lines, "📥 Шаг 4/7: setup получен от Claude")
+        chatgpt_log_event(
+            "claude_api_response_received",
+            model=model,
+            response_id=(meta or {}).get("response_id"),
+            usage=(meta or {}).get("usage"),
+            image_count=(meta or {}).get("image_count"),
+            image_names=(meta or {}).get("image_names"),
+            selected_symbols=(meta or {}).get("selected_symbols"),
+            raw_len=len(raw_setup or ""),
+            raw_path=raw_path,
+            raw_response=raw_setup,
+            http_status=(meta or {}).get("http_status"),
+            response_body_preview=(meta or {}).get("response_body_preview"),
+        )
+
+        await _claude_status(app, status_message, lines, "⏳ Шаг 5/7: проверяю setup v1.6 валидатором...")
+        setup = extract_setup_json(raw_setup)
+        chatgpt_log_event("claude_setup_json_extracted", setup_version=str(setup.get("setup_version") or ""), trades=setup.get("trades"), verdict=setup.get("verdict"), raw_path=raw_path)
+        setup_version = str(setup.get("setup_version") or "").strip()
+        if setup_version != CHATGPT_SETUP_VERSION:
+            raise ValueError(f"Claude setup_version={setup_version or 'MISSING'}, нужна {CHATGPT_SETUP_VERSION}")
+
+        # Save and send a clean bot-ready setup file, even if Claude wrapped JSON
+        # in text/code fences. execute_setup uses the same parsed object below.
+        clean_setup_text = json.dumps(setup, ensure_ascii=False, indent=2)
+        setup_path = save_claude_setup_text(clean_setup_text, stamp=stamp)
+        await _claude_status(app, status_message, lines, f"✅ Шаг 5/7: setup валиден и сохранён: {os.path.basename(setup_path)}")
+        try:
+            with open(setup_path, "rb") as f:
+                await app.bot.send_document(chat_id=chat_id, document=f, filename=os.path.basename(setup_path), caption=f"📄 Setup от Claude: {os.path.basename(setup_path)}")
+        except Exception as e:
+            chatgpt_log_event("claude_setup_send_failed", error=repr(e))
+
+        await _claude_status(app, status_message, lines, "⏳ Шаг 6/7: открываю сделки LIVE текущим ChatGPT executor...")
+        result = await execute_setup(storage, ex, setup)
+        opened_rows = result.get("opened") if isinstance(result.get("opened"), list) else []
+        placed = [x for x in opened_rows if isinstance(x, dict) and bool(x.get("ok"))]
+        skipped = [x for x in opened_rows if isinstance(x, dict) and not bool(x.get("ok"))]
+        result["setup_installed_at"] = datetime.now(MSK).strftime("%H:%M МСК")
+        result["_monitor_persist"] = True
+        result["source"] = "claude_autopilot"
+        await storage.set("chatgpt_last_setup_result", result)
+        try:
+            await update_chatgpt_monitor_message(app, ex=ex, setup_result=result)
+        except Exception as e:
+            chatgpt_log_event("claude_monitor_after_setup_error", error=repr(e))
+        nxt = next_schedule_run(str((await storage.all_settings()).get("claude_autopilot_schedule") or "off"), last_ts=float(time.time()))
+        nxt_s = nxt.strftime("%H:%M МСК") if nxt else "-"
+        summary = [
+            "✅ Шаг 7/7: Claude Autopilot LIVE завершён",
+            f"📦 Архив: {os.path.basename(pack_path)}",
+            f"📄 Setup: {os.path.basename(setup_path)}",
+            f"🧠 Claude: {claude_model_label(model)}",
+            f"✅ поставлено/открыто: {len(placed)}",
+            f"❌ пропущено: {len(skipped)}",
+            f"Следующий запуск: {nxt_s}",
+        ]
+        for r in placed[:5]:
+            summary.append(f"✅ {r.get('symbol')} {r.get('side')} {r.get('order_type')} — {r.get('entry')}")
+        for r in skipped[:5]:
+            summary.append(f"❌ {r.get('symbol')} {r.get('side')} — {str(r.get('reason') or r.get('error') or '')[:120]}")
+        await _safe_edit_message_text(status_message, "🤖 Claude Autopilot LIVE\n\n" + "\n".join(summary)) if status_message is not None else await _safe_send_bot_message(app, chat_id, "🤖 Claude Autopilot LIVE\n\n" + "\n".join(summary), reply_markup=MAIN_MENU)
+        chatgpt_log_event("claude_autopilot_done", pack=pack_path, setup=setup_path, model=model, meta=meta, result=result)
+    except Exception as e:
+        chatgpt_log_event("claude_autopilot_failed", error=repr(e), pack=pack_path, setup=setup_path)
+        log.exception("Claude Autopilot failed")
+        txt = "❌ Claude Autopilot остановлен\n\n" + "\n".join(lines[-20:]) + f"\n\nОшибка: {str(e)[:1200]}\nСделки НЕ открывались, если ошибка была до execute_setup."
+        if status_message is not None:
+            await _safe_edit_message_text(status_message, txt)
+        else:
+            await _safe_send_bot_message(app, chat_id, txt, reply_markup=MAIN_MENU)
+    finally:
+        app.bot_data["claude_autopilot_running"] = False
+
+
+async def _claude_emergency_close_all(app, chat_id: int, status_message=None):
+    """Global emergency kill switch: stop Claude schedule, cancel orders, close positions."""
+    global entries_enabled
+    if app.bot_data.get("claude_exit_running"):
+        return
+    app.bot_data["claude_exit_running"] = True
+    lines = []
+    try:
+        entries_enabled = False
+        await storage.set("claude_autopilot_enabled", False, bump_revision=False)
+        await storage.set("claude_autopilot_schedule", "off", bump_revision=False)
+        await storage.set("chatgpt_waiting_setup", False, bump_revision=False)
+        await storage.set("chatgpt_setup_mode", False, bump_revision=False)
+        await storage.set("boost_autopilot_active", False, bump_revision=False)
+        await storage.set("btc_ai_autopilot_enabled", False, bump_revision=False)
+        _boost_disarm_runtime(app)
+        lines.append("✅ Автопилот выключен, расписание остановлено")
+        if status_message is not None:
+            await _safe_edit_message_text(status_message, "🚨 EXIT / CLOSE ALL\n\n" + "\n".join(lines) + "\n⏳ Отменяю лимитки...", )
+        s = await storage.all_settings()
+        ex = await _get_exchange_emergency(s, 45)
+        cancel_fail = []
+        for sym in ["BTC_USDT", "BTC/USDT:USDT", None]:
+            try:
+                await _await_with_timeout(ex.cancel_all_orders(sym), 35, f"cancel_all_orders {sym or '*'}")
+            except Exception as e:
+                cancel_fail.append(f"{sym or '*'}: {e}")
+        lines.append("✅ Команды отмены лимиток отправлены" if not cancel_fail else f"⚠️ Ошибки отмены: {cancel_fail[:3]}")
+        if status_message is not None:
+            await _safe_edit_message_text(status_message, "🚨 EXIT / CLOSE ALL\n\n" + "\n".join(lines) + "\n⏳ Закрываю позиции market...", )
+        close_res = None
+        if hasattr(ex, "mexc_hard_close_all_positions"):
+            close_res = await _await_with_timeout(ex.mexc_hard_close_all_positions(None, retries=5), 90, "mexc_hard_close_all_positions")
+        else:
+            exec_engine = ExecutionEngine(storage, ex)
+            positions = [p for p in (await _await_with_timeout(ex.fetch_positions(), 20, "fetch_positions") or []) if exec_engine.exchange_position_qty(p) > 0]
+            close_res = []
+            for p in positions:
+                close_res.append(await _await_with_timeout(exec_engine.close_exchange_position(p, "claude_exit_close_all"), 35, "close_exchange_position"))
+        lines.append(f"✅ Закрытие позиций выполнено: {str(close_res)[:500]}")
+        try:
+            await storage.clear_positions()
+            lines.append("✅ Local position cache очищен")
+        except Exception as e:
+            lines.append(f"⚠️ cache clear error: {e}")
+        txt = "🚨 EXIT / CLOSE ALL завершён\n\n" + "\n".join(lines) + "\n\nНовые автозапуски остановлены."
+        if status_message is not None:
+            await _safe_edit_message_text(status_message, txt)
+        else:
+            await _safe_send_bot_message(app, chat_id, txt, reply_markup=MAIN_MENU)
+    except Exception as e:
+        log.exception("Claude EXIT/CLOSE ALL failed")
+        txt = "🚨 EXIT / CLOSE ALL ошибка\n\n" + "\n".join(lines) + f"\n\nОшибка: {str(e)[:1200]}"
+        if status_message is not None:
+            await _safe_edit_message_text(status_message, txt)
+        else:
+            await _safe_send_bot_message(app, chat_id, txt, reply_markup=MAIN_MENU)
+    finally:
+        app.bot_data["claude_exit_running"] = False
+
+
+async def _claude_scheduler_loop(app):
+    await asyncio.sleep(5)
+    while True:
+        try:
+            s = await storage.all_settings()
+            if _boolish(s.get("claude_autopilot_enabled"), False) and _boolish(s.get("claude_autopilot_cycle_enabled"), True):
+                sched = str(s.get("claude_autopilot_schedule") or "off").lower()
+                last_ts = float(s.get("claude_autopilot_last_run_ts") or 0)
+                if schedule_due(sched, last_ts=last_ts):
+                    if app.bot_data.get("claude_autopilot_running"):
+                        chatgpt_log_event("claude_schedule_skipped_already_running", schedule=sched)
+                        await storage.set("claude_autopilot_last_run_ts", time.time(), bump_revision=False)
+                    else:
+                        chat_id = first_admin_id()
+                        if chat_id:
+                            msg = await _safe_send_bot_message(app, int(chat_id), f"🤖 Claude Autopilot LIVE\n\n⏳ Сработало расписание: {schedule_label(sched)}", reply_markup=MAIN_MENU)
+                            app.create_task(_claude_run_cycle(app, int(chat_id), trigger=f"schedule:{sched}", status_message=msg))
+            await asyncio.sleep(20)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("claude scheduler loop error: %s", e)
+            await asyncio.sleep(30)
+
+
 async def _chatgpt_scan_background_job(app, chat_id: int):
     """Run the slow top-200 scan outside Telegram command timeout."""
     try:
@@ -5884,6 +6221,10 @@ async def log_chatgpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await reply(update, f"❌ Не смог отправить /log_chatgpt: {str(e)[:900]}\n\nПоследние строки:\n{tail_chatgpt_runtime_log(40)[:2500]}", reply_markup=MAIN_MENU)
 
+
+async def log_claude_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Claude Autopilot writes into the same detailed runtime log.
+    await log_chatgpt_cmd(update, context)
 
 def format_chatgpt_setup_execution_report(result: dict) -> str:
     """Human-readable immediate report after setup upload.
@@ -6070,8 +6411,9 @@ def _button_mapping():
         ("🚀 BOOST MODE", boost_start_cmd), ("BOOST MODE", boost_start_cmd),
         ("🛑 STOP BOOST", boost_stop_cmd), ("STOP BOOST", boost_stop_cmd),
         ("🤖 ChatGPT Scan Mode", chatgpt_scan_mode_cmd), ("ChatGPT Scan Mode", chatgpt_scan_mode_cmd),
+        ("🤖 Claude Autopilot", claude_autopilot_cmd), ("Claude Autopilot", claude_autopilot_cmd),
         ("📥 Принять setup", chatgpt_accept_setup_cmd), ("Принять setup", chatgpt_accept_setup_cmd), ("Accept setup", chatgpt_accept_setup_cmd), ("/import_setup", chatgpt_accept_setup_cmd),
-        ("📄 Log ChatGPT", log_chatgpt_cmd), ("Log ChatGPT", log_chatgpt_cmd),
+        ("📄 Log ChatGPT", log_chatgpt_cmd), ("Log ChatGPT", log_chatgpt_cmd), ("📄 Log Claude", log_claude_cmd), ("Log Claude", log_claude_cmd),
         ("❌ Exit ChatGPT Mode", chatgpt_exit_mode_cmd), ("Exit ChatGPT Mode", chatgpt_exit_mode_cmd),
         ("📊 BOOST STATUS", boost_status_cmd), ("BOOST STATUS", boost_status_cmd),
         ("⚙️ MEXC", mexc_settings_cmd), ("⚙ MEXC", mexc_settings_cmd), ("MEXC", mexc_settings_cmd),
@@ -6119,7 +6461,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     raw_data = str(q.data or "")
     data = raw_data.split(":")
-    allowed_prefixes = {"boost", "toggle", "set", "menu", "api", "aistats", "openai", "noop"}
+    allowed_prefixes = {"boost", "toggle", "set", "menu", "api", "aistats", "openai", "claude", "noop"}
     if not data or data[0] not in allowed_prefixes:
         log.warning("ignored unknown callback_data: %s", raw_data[:120])
         return
@@ -6131,6 +6473,82 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rev = current_rev
     if rev != current_rev and data[0] != "menu":
         await _safe_edit_message_text(q.message, "⚠️ Старое меню. Открой Settings заново.")
+        return
+
+
+    if data[0] == "claude":
+        action = data[1] if len(data) > 1 else "menu"
+        if action == "enable":
+            await storage.set("claude_autopilot_enabled", True)
+            ns = await storage.all_settings()
+            await _safe_edit_message_text(q.message, claude_autopilot_menu_text(ns), reply_markup=claude_autopilot_keyboard(ns))
+            return
+        if action == "disable":
+            await storage.set("claude_autopilot_enabled", False)
+            ns = await storage.all_settings()
+            await _safe_edit_message_text(q.message, claude_autopilot_menu_text(ns), reply_markup=claude_autopilot_keyboard(ns))
+            return
+        if action == "cycle_toggle":
+            cur = _boolish((await storage.all_settings()).get("claude_autopilot_cycle_enabled"), True)
+            await storage.set("claude_autopilot_cycle_enabled", not cur)
+            ns = await storage.all_settings()
+            await _safe_edit_message_text(q.message, claude_autopilot_menu_text(ns), reply_markup=claude_autopilot_keyboard(ns))
+            chatgpt_log_event("claude_cycle_toggle", enabled=str(not cur))
+            return
+        if action == "model":
+            choice = data[2] if len(data) > 2 else "sonnet"
+            await storage.set("claude_autopilot_model", CLAUDE_OPUS_48 if choice == "opus" else CLAUDE_SONNET_46)
+            ns = await storage.all_settings()
+            await _safe_edit_message_text(q.message, claude_autopilot_menu_text(ns), reply_markup=claude_autopilot_keyboard(ns))
+            return
+        if action == "schedule":
+            value = data[2] if len(data) > 2 else "off"
+            if value not in {"off", "4h", "1h", "2h"}:
+                value = "off"
+            await storage.set("claude_autopilot_schedule", value)
+            # Reset the 2h timer from the moment the user selects it.
+            if value == "2h":
+                await storage.set("claude_autopilot_last_run_ts", time.time(), bump_revision=False)
+            ns = await storage.all_settings()
+            await _safe_edit_message_text(q.message, claude_autopilot_menu_text(ns), reply_markup=claude_autopilot_keyboard(ns))
+            return
+        if action == "resolution":
+            choice = data[2] if len(data) > 2 else "1280"
+            value = "960x540" if choice == "960" else "1280x720"
+            await storage.set("claude_chart_resolution", value)
+            ns = await storage.all_settings()
+            await _safe_edit_message_text(q.message, claude_autopilot_menu_text(ns), reply_markup=claude_autopilot_keyboard(ns))
+            return
+        if action == "run":
+            ns = await storage.all_settings()
+            if not _boolish(ns.get("claude_autopilot_enabled"), False):
+                await _safe_edit_message_text(q.message, "⛔ Claude Autopilot выключен. Сначала нажми 🟢 Включить.", reply_markup=claude_autopilot_keyboard(ns))
+                return
+            if context.application.bot_data.get("claude_autopilot_running"):
+                await _safe_edit_message_text(q.message, "⏳ Claude Autopilot уже выполняется. Новый запуск не создан.", reply_markup=claude_autopilot_keyboard(ns))
+                chatgpt_log_event("claude_manual_run_skipped_already_running")
+                return
+            await _safe_edit_message_text(q.message, "🤖 Claude Autopilot LIVE\n\n⏳ Запуск сейчас LIVE...")
+            chat_id = q.message.chat_id if q.message else int(first_admin_id() or 0)
+            context.application.create_task(_claude_run_cycle(context.application, int(chat_id), trigger="manual", status_message=q.message))
+            return
+        if action == "exit_confirm":
+            await _safe_edit_message_text(
+                q.message,
+                "🚨 EXIT / CLOSE ALL\n\n⚠️ Подтвердить: выключить Claude Autopilot, остановить расписание, отменить лимитки и закрыть ВСЕ позиции market?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ ДА, ЗАКРЫТЬ ВСЁ", callback_data="claude:exit_do")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="claude:menu")],
+                ]),
+            )
+            return
+        if action == "exit_do":
+            await _safe_edit_message_text(q.message, "🚨 EXIT / CLOSE ALL\n\n⏳ Выполняю аварийное закрытие...")
+            chat_id = q.message.chat_id if q.message else int(first_admin_id() or 0)
+            context.application.create_task(_claude_emergency_close_all(context.application, int(chat_id), status_message=q.message))
+            return
+        ns = await storage.all_settings()
+        await _safe_edit_message_text(q.message, claude_autopilot_menu_text(ns), reply_markup=claude_autopilot_keyboard(ns))
         return
 
     if data[0] == "boost":
@@ -6584,6 +7002,7 @@ async def position_management_loop(app):
     finally:
         position_task = None
 btc_ai_task = None
+claude_scheduler_task = None
 
 
 
@@ -7909,6 +8328,13 @@ async def on_startup(app):
         "mode": "disabled_v52_exchange_source_of_truth",
         "local_cache_cleared": app.bot_data.get("startup_local_position_cache_cleared", 0),
     }
+    global claude_scheduler_task
+    try:
+        if claude_scheduler_task is None or claude_scheduler_task.done():
+            claude_scheduler_task = app.create_task(_claude_scheduler_loop(app))
+            log_event("claude_autopilot_scheduler_started_v0401", ok=True)
+    except Exception as e:
+        log_event("claude_autopilot_scheduler_start_failed_v0401", ok=False, error=str(e)[:500])
 
 def _wrap_command(fn, name: str):
     async def _inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7939,9 +8365,11 @@ def build_app():
     app.add_handler(CommandHandler("boost_stop", _wrap_command(boost_stop_cmd, "/boost_stop")))
     app.add_handler(CommandHandler("boost_status", _wrap_command(boost_status_cmd, "/boost_status")))
     app.add_handler(CommandHandler("chatgpt_scan", _wrap_command(chatgpt_scan_mode_cmd, "/chatgpt_scan")))
+    app.add_handler(CommandHandler("claude_autopilot", _wrap_command(claude_autopilot_cmd, "/claude_autopilot")))
     app.add_handler(CommandHandler("import_setup", _wrap_command(chatgpt_accept_setup_cmd, "/import_setup")))
     app.add_handler(CommandHandler("chatgpt_exit", _wrap_command(chatgpt_exit_mode_cmd, "/chatgpt_exit")))
     app.add_handler(CommandHandler("log_chatgpt", _wrap_command(log_chatgpt_cmd, "/log_chatgpt")))
+    app.add_handler(CommandHandler("log_claude", _wrap_command(log_claude_cmd, "/log_claude")))
     app.add_handler(CommandHandler("cascade_hunter", _wrap_command(cascade_hunter_cmd, "/cascade_hunter")))
     app.add_handler(CommandHandler("boost_rotation", _wrap_command(boost_rotation_cmd, "/boost_rotation")))
     app.add_handler(CommandHandler("boost_list", _wrap_command(boost_list_cmd, "/boost_list")))

@@ -1570,6 +1570,7 @@ class ExecutionEngine:
                         log_event("chatgpt_tp_request", symbol=symbol, side=side, qty=tp_qty, trigger_price=tp_price, size_pct=size_pct, attempt=i + 1)
                         chatgpt_log_event("chatgpt_tp_place_start", symbol=symbol, tp_index=idx, side=side, qty=tp_qty, trigger_price=tp_price, size_pct=size_pct, remaining_qty_before=remaining_before)
                         order = await self._create_take_profit_market_order(symbol, side, tp_qty, tp_price)
+                        log_event("chatgpt_tp_place_ok", symbol=symbol, tp_index=idx, order_id=order.get("id"), qty=tp_qty, trigger_price=tp_price, size_pct=size_pct, attempt=i + 1, ok=True)
                         chatgpt_log_event("chatgpt_tp_place_ok", symbol=symbol, tp_index=idx, order_id=order.get("id"), order=order)
                         return idx, order
 
@@ -1589,6 +1590,7 @@ class ExecutionEngine:
                     for r in results[:len(tasks)]:
                         if isinstance(r, Exception):
                             out["tp_error"] = (str(out.get("tp_error") or "") + "; " + str(r))[:800].strip("; ")
+                            log_event("chatgpt_tp_place_error", symbol=symbol, side=side, qty=qty, tps=tps, attempt=i + 1, error=str(r), ok=False)
                             chatgpt_log_event("chatgpt_tp_place_error", symbol=symbol, side=side, qty=qty, tps=tps, error=str(r))
                             continue
                         idx, order = r
@@ -1785,6 +1787,8 @@ class ExecutionEngine:
                     out["chatgpt_tp_ids"] = tp_ids
                     out["chatgpt_verified_tp_ids"] = verified_tp_ids
                     out["chatgpt_missing_tp_ids"] = missing_tp_ids
+                    out["chatgpt_expected_tp_count"] = len(tp_ids)
+                    out["chatgpt_verified_tp_count"] = len(verified_tp_ids)
                     out["chatgpt_sl_plan_verified"] = bool(sl_verified)
                     if verify_error:
                         out["chatgpt_plan_verify_error"] = verify_error
@@ -1846,7 +1850,19 @@ class ExecutionEngine:
                     out["ok"] = bool(out.get("tp_exists") and out.get("sl_exists"))
                     out["protection_status"] = "EXCHANGE PROTECTED" if out["ok"] else "LOCAL BOT PROTECTED"
                     out["protection_mode"] = "exchange" if out["ok"] else "local_monitoring"
-            log_event("protection_attempt_result", symbol=symbol, side=side, attempt=i + 1, ok=out.get("ok"), tp_exists=out.get("tp_exists"), sl_exists=out.get("sl_exists"), tp_order_id=out.get("tp_order_id"), sl_order_id=out.get("sl_order_id"), tpsl_error=out.get("tpsl_error"), tp_error=out.get("tp_error"), sl_error=out.get("sl_error"), verify_error=out.get("verify_error"))
+            log_event(
+                "protection_attempt_result",
+                symbol=symbol, side=side, attempt=i + 1, ok=out.get("ok"),
+                tp_exists=out.get("tp_exists"), sl_exists=out.get("sl_exists"),
+                tp_order_id=out.get("tp_order_id"), sl_order_id=out.get("sl_order_id"),
+                expected_tp_count=out.get("chatgpt_expected_tp_count"),
+                verified_tp_count=out.get("chatgpt_verified_tp_count"),
+                verified_tp_ids=out.get("chatgpt_verified_tp_ids"),
+                missing_tp_ids=out.get("chatgpt_missing_tp_ids"),
+                sl_plan_verified=out.get("chatgpt_sl_plan_verified"),
+                tpsl_error=out.get("tpsl_error"), tp_error=out.get("tp_error"), sl_error=out.get("sl_error"),
+                verify_error=out.get("verify_error") or out.get("chatgpt_plan_verify_error"),
+            )
             history.append({k: v for k, v in out.items() if k not in {"tp_raw", "sl_raw"}})
             best = out
             if out["ok"]:
