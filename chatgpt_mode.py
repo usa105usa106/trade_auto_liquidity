@@ -206,7 +206,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": os.getenv("BOT_VERSION", "0404 mexc native public scan + empty-pack hard stop"),
+        "bot_version": os.getenv("BOT_VERSION", "v0407 classic v0396 scan + telegram retry/dedupe + Claude kept"),
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -699,16 +699,6 @@ def _chatgpt_chart_filename(symbol: str, tf: str) -> str:
     return f"{base}_{_chatgpt_tf_to_filename(tf)}.png"
 
 
-def _normalize_chart_resolution(value: str | None) -> tuple[int, int]:
-    raw = str(value or "1280x720").lower().replace("×", "x").replace(" ", "")
-    allowed = {"1280x720": (1280, 720), "960x540": (960, 540)}
-    return allowed.get(raw, (1280, 720))
-
-
-def _chart_resolution_label(width: int, height: int) -> str:
-    return f"{int(width)}x{int(height)}"
-
-
 def _chatgpt_prepare_chart_df(candles: list, tail: int = 120):
     import pandas as pd
     df = pd.DataFrame(candles or [], columns=["ts", "open", "high", "low", "close", "volume"])
@@ -735,7 +725,7 @@ def _chatgpt_prepare_chart_df(candles: list, tail: int = 120):
     return df.tail(tail).reset_index(drop=True)
 
 
-def _render_chatgpt_candidate_chart(symbol: str, timeframe: str, candles: list, meta: dict, out_path: Path, *, width: int = 1280, height: int = 720) -> str:
+def _render_chatgpt_candidate_chart(symbol: str, timeframe: str, candles: list, meta: dict, out_path: Path) -> str:
     """Render raw candidate chart for ChatGPT Scan Mode, without ENTRY/SL/TP."""
     import numpy as np
     import matplotlib
@@ -750,8 +740,7 @@ def _render_chatgpt_candidate_chart(symbol: str, timeframe: str, candles: list, 
 
     bg = "#0f1722"; grid = "#263241"; txt = "#d5dde8"
     green = "#21c087"; red = "#f6465d"; orange = "#f59e0b"; blue = "#3b82f6"; purple = "#a855f7"
-    dpi = 100
-    fig = plt.figure(figsize=(float(width) / dpi, float(height) / dpi), dpi=dpi)
+    fig = plt.figure(figsize=(12.8, 7.2), dpi=100)
     gs = fig.add_gridspec(3, 1, height_ratios=[5.2, 1.2, 1.5], hspace=0.06)
     ax = fig.add_subplot(gs[0]); av = fig.add_subplot(gs[1], sharex=ax); am = fig.add_subplot(gs[2], sharex=ax)
     fig.patch.set_facecolor(bg)
@@ -852,13 +841,15 @@ CHATGPT_SCAN_TASK_TEXT = """CHATGPT_TASK
 15. Если сделки есть — верни setup-HHMM_DDMM.txt версии 1.6.
 
 CRITICAL OUTPUT RULES:
-- Если работаешь в ChatGPT/Claude приложении и есть возможность прикрепить файл: верни финальный setup только прикреплённым .txt файлом.
-- Если работаешь через API или файл прикрепить невозможно: верни только чистое содержимое setup.txt как JSON object, без пояснений до/после. Бот сам сохранит ответ как setup-HHMM_DDMM.txt.
-- Нельзя писать обычную болтовню, анализ, Markdown или code block.
+- Финальный setup нужно вернуть только прикреплённым .txt файлом.
+- Нельзя писать setup обычным текстом в сообщении.
+- Нельзя писать setup в Markdown.
+- Нельзя писать setup в json/code block.
 - Нельзя использовать старый plain-text формат VERSION=1.6 / [TRADE_1].
-- Нужен только чистый JSON object.
-- Имя файла при attach-режиме должно быть строго: setup-HHMM_DDMM.txt.
+- Нужен только файл с чистым JSON object.
+- Файл должен называться строго: setup-HHMM_DDMM.txt.
 - PRICE FORMAT RULE: все price values (entry, stop_loss, take_profits.price) пиши только обычным десятичным числом, без scientific notation / экспоненциальной записи. Пример: 0.0000242, не 2.42e-05.
+- Если не можешь создать файл, прямо напиши: не могу создать файл, и НЕ выдавай setup текстом.
 
 SETUP FORMAT STRICT:
 - Только чистый JSON object.
@@ -965,10 +956,10 @@ ANALYSIS RULES:
 - Если рынок грязный или риск/прибыль плохой — не входи посередине диапазона; ищи лучшие лимитные идеи от поддержки/сопротивления. NO_TRADE используй только если реально нет приемлемого setup.
 - Цель режима — до 3 лучших сделок, с фокусом на качество входа, а не на автоматический отказ от сделок.
 
-FINAL SELF-CHECK BEFORE SENDING RESULT:
-1. Если доступен file attach — файл прикреплён как .txt; если API/attach недоступен — ответ содержит только чистый JSON object без Markdown и пояснений.
-2. Имя файла в attach-режиме похоже на setup-0059_0106.txt.
-3. JSON начинается с { и заканчивается }.
+FINAL SELF-CHECK BEFORE SENDING FILE:
+1. Файл прикреплён как .txt, а не написан текстом в сообщении.
+2. Имя файла похоже на setup-0059_0106.txt.
+3. В файле чистый JSON, начинается с { и заканчивается }.
 4. setup_version ровно "1.6".
 5. В trades максимум 3 сделки.
 6. Нет symbols с substring STOCK.
@@ -980,12 +971,10 @@ FINAL SELF-CHECK BEFORE SENDING RESULT:
 12. Если условий нет, лучше дай NO_TRADE, чем кривой setup."""
 
 
-async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None, chart_resolution: str | None = None) -> str:
+async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None) -> str:
     """Build a full ChatGPT Scan Mode ZIP: log.txt + task.txt + manifest + charts."""
     started = time.time()
-    width, height = _normalize_chart_resolution(chart_resolution or os.getenv("CHATGPT_CHART_RESOLUTION") or "1280x720")
-    resolution_label = _chart_resolution_label(width, height)
-    chatgpt_log_event("scan_pack_start", limit=limit, top=os.getenv("CHATGPT_SCAN_PACK_TOP", "15"), chart_workers=os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")), chart_resolution=resolution_label)
+    chatgpt_log_event("scan_pack_start", limit=limit, top=os.getenv("CHATGPT_SCAN_PACK_TOP", "15"), chart_workers=os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")))
     log_path = await build_chatgpt_log(exchange_client, scanner, settings, ws_supervisor=ws_supervisor, limit=limit)
     raw_log_text = Path(log_path).read_text(encoding="utf-8", errors="replace")
     selected_rows = _parse_chatgpt_log_candidates(raw_log_text, limit=int(os.getenv("CHATGPT_SCAN_PACK_TOP", "15") or 15))
@@ -1000,14 +989,6 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         symbols=",".join(selected_symbols),
         rows=json.dumps(selected_rows, ensure_ascii=False)[:1800],
     )
-    if not selected_symbols:
-        # v0404: do not build/send a fake BTC/ETH-only ZIP when the top-200
-        # scan produced only ERROR blocks. This was the 6.8 KB pack bug.
-        err_lines = [ln for ln in raw_log_text.splitlines() if "ERROR:" in ln][:8]
-        raise RuntimeError(
-            "ChatGPT scan produced 0 valid scored symbols; ZIP not created. "
-            + ("First errors: " + " | ".join(err_lines) if err_lines else "Check scanner/exchange log.")
-        )
     meta_by_symbol = {r["symbol"]: r for r in selected_rows}
     # Market context must always exist, but it must not duplicate selected charts.
     required_context = [("BTC_USDT", "4h"), ("BTC_USDT", "1h"), ("ETH_USDT", "4h"), ("ETH_USDT", "1h")]
@@ -1067,10 +1048,10 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
                 "low_24h": _safe_float((ticker or {}).get("low") or ((ticker or {}).get("info") or {}).get("low24Price")),
                 "vol_ratio": (vol_now / vol_avg) if vol_avg else 0.0,
             })
-            _render_chatgpt_candidate_chart(native, ex_tf, candles, meta, out, width=width, height=height)
+            _render_chatgpt_candidate_chart(native, ex_tf, candles, meta, out)
             try:
                 size_kb = round(out.stat().st_size / 1024, 1)
-                chatgpt_log_event("scan_pack_chart_done", symbol=native, timeframe=ex_tf, file=filename, candles=len(candles or []), size_kb=size_kb, resolution=resolution_label)
+                chatgpt_log_event("scan_pack_chart_done", symbol=native, timeframe=ex_tf, file=filename, candles=len(candles or []), size_kb=size_kb, resolution="1280x720")
                 if out.stat().st_size > int(os.getenv("CHATGPT_MAX_PNG_SIZE_KB", "900")) * 1024:
                     chatgpt_log_event("scan_pack_chart_large", file=filename, size_kb=size_kb)
             except Exception:
@@ -1085,7 +1066,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "0404 mexc native public scan + empty-pack hard stop"
+        _bot_code_version = "v0407 classic v0396 scan + telegram retry/dedupe + Claude kept"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),
@@ -1098,7 +1079,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         "required_context": ["btc_4h", "btc_1h", "eth_4h", "eth_1h"],
         "blocked_symbol_substrings": list(CHATGPT_BLOCKED_SYMBOL_SUBSTRINGS),
         "chart_source": "python_ohlcv_mexc",
-        "chart_resolution": resolution_label,
+        "chart_resolution": "1280x720",
         "chart_dpi": 100,
         "candles_per_chart": 120,
         "ohlcv_fetch_limit": 160,
@@ -1225,8 +1206,6 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
         else:
             ok_blocks += 1
     chatgpt_log_event("scan_workers_done", workers=workers, symbols=len(symbols), ok=ok_blocks, errors=err_blocks, elapsed_sec=round(time.time() - scan_started_at, 2))
-    if symbols and ok_blocks == 0:
-        chatgpt_log_event("scan_all_symbols_failed", symbols=len(symbols), errors=err_blocks)
 
     btc = ""
     eth = ""
@@ -2072,12 +2051,14 @@ def _chatgpt_protection_kind(o: dict) -> str:
     txt = " ".join(str(info.get(k) or "").lower() for k in ("externalOid", "clientOrderId", "side", "orderType", "triggerType", "type"))
     if kind in {"tp", "sl"}:
         return kind
-    # V32+: ChatGPT protection is placed through MEXC planorder/place with
+    # V32: ChatGPT protection is placed through MEXC planorder/place with
     # externalOid bot_tp_* / bot_sl_*. MEXC list endpoints often return orderType=5
-    # for both TP and SL, so explicit markers win when they are present.
-    if "bot_tp" in txt or "chatgpt_tp" in txt or "takeprofit" in txt or "take_profit" in txt or "tp" == typ or "tp" in typ or "tpsl_tp" in typ:
+    # for both TP and SL, so side/orderType alone cannot classify them. The bot
+    # must read the explicit externalOid marker first, otherwise real TP orders are
+    # shown as missing and the monitor enters false LOCAL PROTECTION MODE.
+    if "bot_tp" in txt or "chatgpt_tp" in txt or "takeprofit" in txt or "take_profit" in txt or "tp" == typ or "tp" in typ:
         return "tp"
-    if "bot_sl" in txt or "chatgpt_sl" in txt or "stoploss" in txt or "stop_loss" in txt or "sl" == typ or "sl" in typ or "tpsl_sl" in typ:
+    if "bot_sl" in txt or "chatgpt_sl" in txt or "stoploss" in txt or "stop_loss" in txt or "sl" == typ or "sl" in typ:
         return "sl"
     # If no bot marker survived in the MEXC row, use the plan trigger direction
     # as a best-effort classifier: side=4 closes LONG, triggerType=1 is TP
@@ -2098,105 +2079,27 @@ def _chatgpt_protection_kind(o: dict) -> str:
     return ""
 
 
-def _chatgpt_order_trigger_price(o: dict) -> float:
-    info = o.get("info") if isinstance(o.get("info"), dict) else {}
-    for key in ("price", "triggerPrice", "stopPrice", "takeProfitPrice", "stopLossPrice", "takeProfitOrderPrice", "stopLossOrderPrice", "_protection_price"):
-        try:
-            v = o.get(key) if key in o else info.get(key)
-            if v not in (None, "", 0, "0"):
-                f = float(v)
-                if f > 0:
-                    return f
-        except Exception:
-            pass
-    return 0.0
-
-
-def _chatgpt_infer_protection_kind_for_position(o: dict, pos: dict) -> str:
-    explicit = _chatgpt_protection_kind(o)
-    if explicit in {"tp", "sl"}:
-        return explicit
-    info = o.get("info") if isinstance(o.get("info"), dict) else {}
-    src = str(info.get("_source_endpoint") or "").lower()
-    if not ("planorder" in src or "stoporder" in src or "tpsl" in src):
-        return ""
-    # Restart/redeploy recovery must not depend on cached setup levels.  For old
-    # positions use only live exchange orders plus the current position side/entry:
-    # LONG close trigger above entry is TP, below entry is SL; SHORT is inverse.
-    side = str(pos.get("side") or "").upper()
-    try:
-        entry = float(pos.get("entry_price") or pos.get("entryPrice") or 0)
-    except Exception:
-        entry = 0.0
-    price = _chatgpt_order_trigger_price(o)
-    if entry > 0 and price > 0:
-        if side == "LONG":
-            return "tp" if price > entry else "sl"
-        if side == "SHORT":
-            return "tp" if price < entry else "sl"
-    return ""
-
-
-def _chatgpt_group_protection_details(positions: list[dict], all_orders: list[dict]) -> dict[str, dict]:
-    details: dict[str, dict] = {}
-    orders_by_symbol: dict[str, list[dict]] = {}
+def _chatgpt_group_protection(positions: list[dict], all_orders: list[dict]) -> tuple[list[str], list[str]]:
+    protected, emergency = [], []
+    by_symbol: dict[str, set[str]] = {}
     for o in all_orders or []:
         sym = _chatgpt_order_symbol(o)
-        if sym:
-            orders_by_symbol.setdefault(sym, []).append(o)
+        if not sym:
+            continue
+        kind = _chatgpt_protection_kind(o)
+        if kind:
+            by_symbol.setdefault(sym, set()).add(kind)
     for p in positions or []:
         sym = mexc_native_symbol(p.get("symbol"))
-        kinds: dict[str, list[dict]] = {"tp": [], "sl": []}
-        for o in orders_by_symbol.get(sym, []):
-            kind = _chatgpt_infer_protection_kind_for_position(o, p)
-            if kind in kinds:
-                kinds[kind].append(o)
-        tp_count = len(kinds["tp"])
-        sl_count = len(kinds["sl"])
-        missing = []
-        if sl_count <= 0:
-            missing.append("SL")
-        if tp_count <= 0:
-            missing.append("TP")
-        order_samples = []
-        for kind_name, rows in kinds.items():
-            for oo in rows[:3]:
-                info = oo.get("info") if isinstance(oo.get("info"), dict) else {}
-                order_samples.append({
-                    "kind": kind_name,
-                    "id": _chatgpt_order_id(oo),
-                    "price": _chatgpt_order_trigger_price(oo),
-                    "source": info.get("_source_endpoint"),
-                })
-        details[sym] = {
-            "symbol": sym,
-            "tp_found": tp_count > 0,
-            "sl_found": sl_count > 0,
-            "tp_count": tp_count,
-            "sl_count": sl_count,
-            "missing": missing,
-            "protected": bool(tp_count > 0 and sl_count > 0),
-            "source": "MEXC active plan/stop orders",
-            "order_samples": order_samples,
-        }
-        chatgpt_log_event(
-            "protection_reconcile_symbol",
-            symbol=sym, tp_found=tp_count > 0, sl_found=sl_count > 0,
-            tp_count=tp_count, sl_count=sl_count, missing=missing,
-            source="MEXC active plan/stop orders", order_samples=order_samples,
-        )
-    return details
-
-
-def _chatgpt_group_protection(positions: list[dict], all_orders: list[dict]) -> tuple[list[str], list[str]]:
-    details = _chatgpt_group_protection_details(positions, all_orders)
-    protected: list[str] = []
-    emergency: list[str] = []
-    for sym, row in details.items():
-        if row.get("protected"):
+        kinds = by_symbol.get(sym, set())
+        if "sl" in kinds and "tp" in kinds:
             protected.append(sym)
         else:
-            missing = row.get("missing") or []
+            missing = []
+            if "sl" not in kinds:
+                missing.append("SL")
+            if "tp" not in kinds:
+                missing.append("TP")
             emergency.append(f"{sym} — {'/'.join(missing)} missing")
     return protected, emergency
 
@@ -2286,9 +2189,7 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
         all_orders = await exchange_client.fetch_open_orders()
     except Exception:
         all_orders = []
-    protection_details = _chatgpt_group_protection_details(positions, all_orders)
-    protected = [sym for sym, row in protection_details.items() if row.get("protected")]
-    emergency = [sym for sym, row in protection_details.items() if not row.get("protected")]
+    protected, emergency = _chatgpt_group_protection(positions, all_orders)
     res = setup_result or {}
     opened = res.get("opened") if isinstance(res.get("opened"), list) else []
     placed = len([x for x in opened if x.get("ok")])
@@ -2308,17 +2209,12 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
         "🛡 полная защита:",
     ]
     if protected:
-        for x in protected:
-            row = protection_details.get(x, {})
-            lines.append(f"• {x} — SL + TP (TP {int(row.get('tp_count') or 0)}, SL {int(row.get('sl_count') or 0)})")
+        lines += [f"• {x} — SL + TP" for x in protected]
     else:
         lines.append("• нет подтверждённых")
     lines += ["", "🚨 аварийные позиции:"]
     if emergency:
-        for x in emergency:
-            row = protection_details.get(x, {})
-            miss = "/".join(row.get("missing") or ["UNKNOWN"])
-            lines.append(f"• {x} — {miss} missing (SL found: {'yes' if row.get('sl_found') else 'no'}, TP found: {'yes' if row.get('tp_found') else 'no'})")
+        lines += [f"• {x}" for x in emergency]
     else:
         lines.append("• нет")
     if setup_result is not None:
