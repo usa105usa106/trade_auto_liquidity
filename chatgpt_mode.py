@@ -206,7 +206,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": os.getenv("BOT_VERSION", "v0408 classic v0396 scan + 4 workers + bottom monitor fix"),
+        "bot_version": os.getenv("BOT_VERSION", "410_plus_full"),
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -974,10 +974,14 @@ FINAL SELF-CHECK BEFORE SENDING FILE:
 async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None) -> str:
     """Build a full ChatGPT Scan Mode ZIP: log.txt + task.txt + manifest + charts."""
     started = time.time()
-    chatgpt_log_event("scan_pack_start", limit=limit, top=os.getenv("CHATGPT_SCAN_PACK_TOP", "15"), chart_workers=os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "4")))
+    _phase_t0 = started
+    chatgpt_log_event("scan_pack_start", limit=limit, top=os.getenv("CHATGPT_SCAN_PACK_TOP", "15"), chart_workers=os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")))
     log_path = await build_chatgpt_log(exchange_client, scanner, settings, ws_supervisor=ws_supervisor, limit=limit)
+    _timing_build_log_sec = round(time.time() - _phase_t0, 2)
+    _phase_t0 = time.time()
     raw_log_text = Path(log_path).read_text(encoding="utf-8", errors="replace")
     selected_rows = _parse_chatgpt_log_candidates(raw_log_text, limit=int(os.getenv("CHATGPT_SCAN_PACK_TOP", "15") or 15))
+    _timing_select_sec = round(time.time() - _phase_t0, 2)
     # The legacy log still contains manual-screenshot instructions for old flow.
     # For ZIP pack mode, task.txt is the source of truth, so keep the market data
     # and replace the legacy instruction block with a short pointer.
@@ -1004,6 +1008,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         if fn not in seen_files:
             seen_files.add(fn); chart_jobs.append((sym, tf))
 
+    _timing_jobs_prepare_sec = round(time.time() - _phase_t0, 2)
     chatgpt_log_event(
         "scan_pack_chart_jobs_prepared",
         jobs=len(chart_jobs),
@@ -1022,7 +1027,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     (work / "log.txt").write_text(log_text, encoding="utf-8")
     (work / "task.txt").write_text(CHATGPT_SCAN_TASK_TEXT, encoding="utf-8")
 
-    workers = int(os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "4")) or 4)
+    workers = int(os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")) or 3)
     sem = asyncio.Semaphore(max(1, workers))
     missing: list[str] = []
     errors: list[str] = []
@@ -1061,12 +1066,14 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
             errors.append(f"{filename}: {str(e)[:240]}")
             chatgpt_log_event("scan_pack_chart_error", symbol=native, timeframe=ex_tf, file=filename, error=repr(e))
 
+    _phase_t0 = time.time()
     await asyncio.gather(*(_render_one(sym, tf) for sym, tf in chart_jobs))
+    _timing_charts_sec = round(time.time() - _phase_t0, 2)
     png_files = sorted([p for p in screens.glob("*.png")])
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "v0408 classic v0396 scan + 4 workers + bottom monitor fix"
+        _bot_code_version = "410_plus_full"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),
@@ -1088,9 +1095,18 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         "missing_charts": sorted(set(missing)),
         "generation_errors": errors,
         "max_png_size_kb_target": 600,
+        "timing_sec": {
+            "build_log_full_scan": _timing_build_log_sec,
+            "parse_select_top": _timing_select_sec,
+            "prepare_chart_jobs": _timing_jobs_prepare_sec,
+            "render_fetch_all_charts": _timing_charts_sec,
+            "total_until_manifest": round(time.time() - started, 2),
+        },
         "elapsed_sec": round(time.time() - started, 2),
     }
+    _phase_t0 = time.time()
     (work / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    _timing_manifest_write_sec = round(time.time() - _phase_t0, 2)
     if storage is not None:
         try:
             await storage.set("chatgpt_last_scan_manifest", manifest, bump_revision=False)
@@ -1099,23 +1115,36 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         except Exception as e:
             chatgpt_log_event("scan_pack_allowed_symbols_save_error", error=repr(e))
     chatgpt_log_event("scan_pack_manifest_written", expected=manifest["expected_png_count"], actual=manifest["actual_png_count"], missing=len(manifest["missing_charts"]), errors=len(manifest["generation_errors"]), resolution=manifest["chart_resolution"])
+    _phase_t0 = time.time()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for rel in ("log.txt", "task.txt", "manifest.json"):
             z.write(work / rel, rel)
         for p in png_files:
             z.write(p, f"screenshots/{p.name}")
+    _timing_zip_write_sec = round(time.time() - _phase_t0, 2)
     try:
         zip_size_kb = round(zip_path.stat().st_size / 1024, 1)
     except Exception:
         zip_size_kb = 0
-    chatgpt_log_event("scan_pack_zip_written", zip_path=str(zip_path), zip_size_kb=zip_size_kb, png_count=len(png_files))
+    chatgpt_log_event("scan_pack_zip_written", zip_path=str(zip_path), zip_size_kb=zip_size_kb, png_count=len(png_files), zip_write_sec=_timing_zip_write_sec)
+    chatgpt_log_event(
+        "scan_pack_timing",
+        build_log_full_scan_sec=_timing_build_log_sec,
+        parse_select_top_sec=_timing_select_sec,
+        prepare_chart_jobs_sec=_timing_jobs_prepare_sec,
+        render_fetch_all_charts_sec=_timing_charts_sec,
+        manifest_write_sec=_timing_manifest_write_sec,
+        zip_write_sec=_timing_zip_write_sec,
+        total_sec=round(time.time() - started, 2),
+        chart_workers=workers,
+    )
     chatgpt_log_event("scan_pack_done", zip_path=str(zip_path), selected=len(selected_symbols), expected=len(seen_files), actual=len(png_files), missing=len(missing), elapsed_sec=round(time.time() - started, 2))
     return str(zip_path)
 
 async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200) -> str:
     """Run one top-N scan and write a ChatGPT-ready log.txt."""
     scan_started_at = time.time()
-    workers = int(os.getenv("CHATGPT_SCAN_CONCURRENCY", "4") or 4)
+    workers = int(os.getenv("CHATGPT_SCAN_CONCURRENCY", "3") or 3)
     chatgpt_log_event("scan_start", limit=limit, workers=workers, retries=os.getenv("CHATGPT_SCAN_RETRIES", "2"))
     work = Path(os.getenv("CHATGPT_LOG_DIR", "/tmp"))
     work.mkdir(parents=True, exist_ok=True)
@@ -1126,10 +1155,14 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
     # Load extra symbols first, then remove region-blocked STOCK contracts, so
     # the final scan can still contain up to the requested top-N tradable coins.
     scan_settings["max_symbols"] = int(os.getenv("CHATGPT_SCAN_PREFILTER_LIMIT", str(max(int(limit) * 2, int(limit)))))
+    _phase_t0 = time.time()
     await scanner.refresh_symbols(exchange_client, scan_settings, ws_supervisor)
+    _timing_refresh_symbols_sec = round(time.time() - _phase_t0, 2)
+    _phase_t0 = time.time()
     raw_symbols = list(dict.fromkeys(getattr(scanner, "hot_symbols", []) or []))
     filtered_symbols, blocked_symbols = filter_chatgpt_symbols(raw_symbols)
     symbols = mexc_native_symbols(filtered_symbols)[:int(limit)]
+    _timing_symbol_filter_sec = round(time.time() - _phase_t0, 2)
     chatgpt_log_event(
         "scan_symbols_loaded",
         raw_count=len(raw_symbols),
@@ -1196,7 +1229,9 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
     async def guarded(sym):
         async with sem:
             return await one_symbol(sym)
+    _phase_t0 = time.time()
     blocks = await asyncio.gather(*(guarded(s) for s in symbols), return_exceptions=True)
+    _timing_workers_scan_sec = round(time.time() - _phase_t0, 2)
     ok_blocks = 0
     err_blocks = 0
     for b in blocks:
@@ -1205,18 +1240,22 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
             err_blocks += 1
         else:
             ok_blocks += 1
-    chatgpt_log_event("scan_workers_done", workers=workers, symbols=len(symbols), ok=ok_blocks, errors=err_blocks, elapsed_sec=round(time.time() - scan_started_at, 2))
+    chatgpt_log_event("scan_workers_done", workers=workers, symbols=len(symbols), ok=ok_blocks, errors=err_blocks, worker_scan_sec=_timing_workers_scan_sec, elapsed_sec=round(time.time() - scan_started_at, 2))
 
     btc = ""
     eth = ""
+    _phase_t0 = time.time()
     try:
         btc = await one_symbol("BTC_USDT")
     except Exception:
         pass
+    _timing_btc_context_sec = round(time.time() - _phase_t0, 2)
+    _phase_t0 = time.time()
     try:
         eth = await one_symbol("ETH_USDT")
     except Exception:
         pass
+    _timing_eth_context_sec = round(time.time() - _phase_t0, 2)
 
     # Keep the legacy log task synchronized with the active ZIP task.txt instructions.
     task = CHATGPT_SCAN_TASK_TEXT.replace("CHATGPT_TASK", "ЗАДАЧА ДЛЯ CHATGPT MODE:", 1)
@@ -1244,7 +1283,21 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
         else:
             body.append(str(b))
     text = "\n".join(header + ["\n---\n".join(body), "", "=== TASK ===", task, ""])
+    _phase_t0 = time.time()
     path.write_text(text, encoding="utf-8-sig")
+    _timing_log_write_sec = round(time.time() - _phase_t0, 2)
+    chatgpt_log_event(
+        "scan_timing",
+        refresh_symbols_sec=_timing_refresh_symbols_sec,
+        symbol_filter_sec=_timing_symbol_filter_sec,
+        worker_scan_sec=_timing_workers_scan_sec,
+        btc_context_sec=_timing_btc_context_sec,
+        eth_context_sec=_timing_eth_context_sec,
+        log_write_sec=_timing_log_write_sec,
+        total_sec=round(time.time() - scan_started_at, 2),
+        workers=workers,
+        symbols=len(symbols),
+    )
     chatgpt_log_event("scan_log_created", path=str(path), symbols=len(symbols), bytes=len(text.encode("utf-8-sig")))
     return str(path)
 

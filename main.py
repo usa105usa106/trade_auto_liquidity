@@ -1956,6 +1956,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /mexc_debug_state [SYMBOL] - raw debug MEXC positions/orders/symbol variants
 /test_btc - toggle LIVE BTC AI test: рисует график, отправляет ИИ, открывает TEST market сделку при любом ответе ИИ, пишет полный лог
 /game_btc_ai - one-shot Game BTC AI: ИИ играет против маркетмейкера, WAIT не форсируется
+/scan_potok 2|3|4|5 - изменить потоки ChatGPT Scan/графиков на текущий запуск бота; default после рестарта = 3
 
 Note: /positions checks MEXC exchange-first; /open_orders scans normal + plan + stop + TP/SL endpoints. If exchange TP/SL is missing after retries, new AI scalping entries are closed immediately.
 /proxy on|off|test|set URL
@@ -6365,6 +6366,67 @@ async def chatgpt_accept_setup_cmd(update: Update, context: ContextTypes.DEFAULT
     )
 
 
+def _current_chatgpt_scan_workers() -> tuple[int, int]:
+    """Return current ChatGPT Scan Mode workers for scan and chart stages."""
+    try:
+        scan_workers = int(os.getenv("CHATGPT_SCAN_CONCURRENCY", "3") or 3)
+    except Exception:
+        scan_workers = 3
+    try:
+        chart_workers = int(os.getenv("CHATGPT_CHART_CONCURRENCY", str(scan_workers)) or scan_workers)
+    except Exception:
+        chart_workers = scan_workers
+    return scan_workers, chart_workers
+
+
+async def scan_potok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runtime command: /scan_potok 2, /scan_potok 3, /scan_potok 4, etc.
+
+    It changes both ChatGPT Scan Mode scan workers and chart workers in the
+    current running process. Defaults in .env remain 3 after restart.
+    Claude Autopilot uses the same scan-pack engine, so it also uses this
+    current runtime value for pack creation.
+    """
+    if not allowed(update):
+        return
+    args = list(getattr(context, "args", []) or [])
+    if not args:
+        sw, cw = _current_chatgpt_scan_workers()
+        await reply(
+            update,
+            "🧵 ChatGPT Scan потоки сейчас:\n"
+            f"scan={sw}, charts={cw}\n\n"
+            "Изменить: /scan_potok 2, /scan_potok 3, /scan_potok 4 или /scan_potok 5.\n"
+            "По умолчанию после перезапуска: 3.",
+            reply_markup=MAIN_MENU,
+        )
+        return
+    raw = str(args[0]).strip().replace(",", ".")
+    try:
+        workers = int(float(raw))
+    except Exception:
+        await reply(update, "❌ Нужна цифра. Пример: /scan_potok 3", reply_markup=MAIN_MENU)
+        return
+    if workers < 1 or workers > 8:
+        await reply(update, "❌ Разрешено 1–8 потоков. Для теста лучше 2, 3, 4 или 5.", reply_markup=MAIN_MENU)
+        return
+    os.environ["CHATGPT_SCAN_CONCURRENCY"] = str(workers)
+    os.environ["CHATGPT_CHART_CONCURRENCY"] = str(workers)
+    chatgpt_log_event("scan_potok_changed", workers=workers, source="command")
+    note = ""
+    if workers >= 5:
+        note = "\n⚠️ 5+ потоков могут быть медленнее на слабом VPS или при лимитах MEXC."
+    await reply(
+        update,
+        f"✅ Потоки ChatGPT Scan изменены на {workers}\n"
+        f"scan={workers}, charts={workers}\n"
+        "Claude Autopilot использует тот же scan-pack engine, поэтому тоже возьмёт это значение для формирования pack.\n"
+        "После перезапуска бота снова будет default из .env: 3."
+        f"{note}",
+        reply_markup=MAIN_MENU,
+    )
+
+
 async def chatgpt_scan_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """One-shot ChatGPT market scan mode.
 
@@ -8571,6 +8633,7 @@ def build_app():
     app.add_handler(CommandHandler("boost_stop", _wrap_command(boost_stop_cmd, "/boost_stop")))
     app.add_handler(CommandHandler("boost_status", _wrap_command(boost_status_cmd, "/boost_status")))
     app.add_handler(CommandHandler("chatgpt_scan", _wrap_command(chatgpt_scan_mode_cmd, "/chatgpt_scan")))
+    app.add_handler(CommandHandler("scan_potok", _wrap_command(scan_potok_cmd, "/scan_potok")))
     app.add_handler(CommandHandler("claude_autopilot", _wrap_command(claude_autopilot_cmd, "/claude_autopilot")))
     app.add_handler(CommandHandler("import_setup", _wrap_command(chatgpt_accept_setup_cmd, "/import_setup")))
     app.add_handler(CommandHandler("chatgpt_exit", _wrap_command(chatgpt_exit_mode_cmd, "/chatgpt_exit")))
