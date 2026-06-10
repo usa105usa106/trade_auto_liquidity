@@ -206,7 +206,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": os.getenv("BOT_VERSION", "410_plus_full"),
+        "bot_version": os.getenv("BOT_VERSION", "411_plus_full"),
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -1073,7 +1073,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "410_plus_full"
+        _bot_code_version = "411_plus_full"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),
@@ -2132,8 +2132,7 @@ def _chatgpt_protection_kind(o: dict) -> str:
     return ""
 
 
-def _chatgpt_group_protection(positions: list[dict], all_orders: list[dict]) -> tuple[list[str], list[str]]:
-    protected, emergency = [], []
+def _chatgpt_protection_kinds_by_symbol(all_orders: list[dict]) -> dict[str, set[str]]:
     by_symbol: dict[str, set[str]] = {}
     for o in all_orders or []:
         sym = _chatgpt_order_symbol(o)
@@ -2142,9 +2141,47 @@ def _chatgpt_group_protection(positions: list[dict], all_orders: list[dict]) -> 
         kind = _chatgpt_protection_kind(o)
         if kind:
             by_symbol.setdefault(sym, set()).add(kind)
+    return by_symbol
+
+
+def _chatgpt_protection_kinds_for_position(pos: dict, all_orders: list[dict]) -> set[str]:
+    sym = mexc_native_symbol(pos.get("symbol"))
+    side = str(pos.get("side") or "LONG").upper()
+    try:
+        entry = float(pos.get("entry_price") or pos.get("entry") or 0)
+    except Exception:
+        entry = 0.0
+    kinds: set[str] = set()
+    for o in all_orders or []:
+        if _chatgpt_order_symbol(o) != sym:
+            continue
+        kind = _chatgpt_protection_kind(o)
+        if not kind:
+            # Redeploy fallback: old MEXC plan rows sometimes lose bot_tp/bot_sl
+            # marker and triggerType.  Classify reduce/plan orders by trigger price
+            # around the live entry price.
+            info = o.get("info") if isinstance(o.get("info"), dict) else {}
+            src = str(info.get("_source_endpoint") or "").lower()
+            if entry > 0 and ("planorder" in src or "stoporder" in src):
+                try:
+                    price = float(o.get("price") or info.get("triggerPrice") or info.get("price") or 0)
+                except Exception:
+                    price = 0.0
+                if price > 0:
+                    if side == "SHORT":
+                        kind = "tp" if price < entry else "sl"
+                    else:
+                        kind = "tp" if price > entry else "sl"
+        if kind:
+            kinds.add(kind)
+    return kinds
+
+
+def _chatgpt_group_protection(positions: list[dict], all_orders: list[dict]) -> tuple[list[str], list[str]]:
+    protected, emergency = [], []
     for p in positions or []:
         sym = mexc_native_symbol(p.get("symbol"))
-        kinds = by_symbol.get(sym, set())
+        kinds = _chatgpt_protection_kinds_for_position(p, all_orders)
         if "sl" in kinds and "tp" in kinds:
             protected.append(sym)
         else:
@@ -2155,6 +2192,55 @@ def _chatgpt_group_protection(positions: list[dict], all_orders: list[dict]) -> 
                 missing.append("TP")
             emergency.append(f"{sym} — {'/'.join(missing)} missing")
     return protected, emergency
+
+
+def _chatgpt_group_protection_details(positions: list[dict], all_orders: list[dict]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for p in positions or []:
+        sym = mexc_native_symbol(p.get("symbol"))
+        kinds = _chatgpt_protection_kinds_for_position(p, all_orders)
+        out[sym] = {
+            "sl_found": "sl" in kinds,
+            "tp_found": "tp" in kinds,
+            "sl_count": 1 if "sl" in kinds else 0,
+            "tp_count": 1 if "tp" in kinds else 0,
+            "missing": [x for x in ("SL", "TP") if x.lower() not in kinds],
+        }
+    return out
+
+
+async def _chatgpt_group_protection_exchange_confirmed(exchange_client, positions: list[dict], all_orders: list[dict]) -> tuple[list[str], list[str]]:
+    """Classify protection using global orders, then symbol-specific rechecks.
+
+    After a redeploy MEXC sometimes returns positions immediately, while the
+    account-wide open-orders call can miss TP/SL rows for a short moment or omit
+    one endpoint variant.  Do not move an old protected position to the аварийные
+    section until the symbol-specific exchange query also fails to find SL/TP.
+    """
+    merged_orders = list(all_orders or [])
+    by_symbol = _chatgpt_protection_kinds_by_symbol(merged_orders)
+    for p in positions or []:
+        sym = mexc_native_symbol(p.get("symbol"))
+        if not sym:
+            continue
+        kinds = by_symbol.get(sym, set())
+        if "sl" in kinds and "tp" in kinds:
+            continue
+        try:
+            direct = await exchange_client.fetch_open_orders(sym)
+            merged_orders.extend(direct or [])
+            by_symbol = _chatgpt_protection_kinds_by_symbol(merged_orders)
+            dkinds = by_symbol.get(sym, set())
+            chatgpt_log_event(
+                "protection_redeploy_symbol_recheck",
+                symbol=sym,
+                sl_found="sl" in dkinds,
+                tp_found="tp" in dkinds,
+                direct_orders=len(direct or []),
+            )
+        except Exception as e:
+            chatgpt_log_event("protection_redeploy_symbol_recheck_error", symbol=sym, error=repr(e))
+    return _chatgpt_group_protection(positions, merged_orders)
 
 
 
@@ -2242,7 +2328,7 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
         all_orders = await exchange_client.fetch_open_orders()
     except Exception:
         all_orders = []
-    protected, emergency = _chatgpt_group_protection(positions, all_orders)
+    protected, emergency = await _chatgpt_group_protection_exchange_confirmed(exchange_client, positions, all_orders)
     res = setup_result or {}
     opened = res.get("opened") if isinstance(res.get("opened"), list) else []
     placed = len([x for x in opened if x.get("ok")])
