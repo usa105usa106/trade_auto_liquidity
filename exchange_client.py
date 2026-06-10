@@ -103,14 +103,22 @@ class ExchangeClient:
         return base.strip("_/:-"), (quote or "USDT").strip("_/:-")
 
     def normalize_symbol(self, symbol: str) -> str:
-        """Return an exchange-compatible swap symbol, or a safe MEXC futures display symbol when ccxt is not initialized."""
+        """Return an exchange-compatible swap symbol.
+
+        v0404: MEXC public scan mode must not die when ccxt exists but
+        load_markets() was skipped/timed out and ``exchange.markets`` is empty.
+        In that state BTC_USDT is still a valid native MEXC futures contract,
+        so return the normal swap display symbol instead of raising
+        "no compatible swap market".
+        """
+        base, quote = self._split_symbol_parts(symbol)
         if not self.exchange:
-            base, quote = self._split_symbol_parts(symbol)
             return f"{base}/{quote}:USDT"
         markets = getattr(self.exchange, "markets", None) or {}
+        if not markets and self.exchange_id == "mexc":
+            return f"{base}/{quote}:USDT"
         if symbol in markets:
             return symbol
-        base, quote = self._split_symbol_parts(symbol)
         aliases = [
             symbol,
             f"{base}/{quote}:USDT",
@@ -531,7 +539,7 @@ class ExchangeClient:
         return await self.exchange.fetch_tickers()
 
     async def fetch_order_book(self, symbol, limit=20):
-        if self.exchange_id == "mexc" and self.exchange is None:
+        if self.exchange_id == "mexc":
             msym = self._mexc_symbol(symbol)
             lim = max(5, min(int(limit or 20), 100))
             try:
@@ -594,7 +602,7 @@ class ExchangeClient:
         return await self.exchange.fetch_order_book(f"{base}/{quote}", limit=lim)
 
     async def fetch_ticker(self, symbol, params=None):
-        if self.exchange_id == "mexc" and self.exchange is None:
+        if self.exchange_id == "mexc":
             msym = self._mexc_symbol(symbol)
             resp = await self._mexc_public("GET", f"/api/v1/contract/ticker", query={"symbol": msym})
             data = resp.get("data") if isinstance(resp, dict) else None
@@ -614,7 +622,7 @@ class ExchangeClient:
         return await self.exchange.fetch_ticker(self.normalize_symbol(symbol), params or {})
 
     async def fetch_ohlcv(self, symbol, timeframe="1m", limit=60, params=None):
-        if self.exchange_id == "mexc" and self.exchange is None:
+        if self.exchange_id == "mexc":
             msym = self._mexc_symbol(symbol)
             tf = str(timeframe or "1m")
             interval_map = {"1m": "Min1", "5m": "Min5", "15m": "Min15", "30m": "Min30", "1h": "Min60", "4h": "Hour4", "1d": "Day1"}

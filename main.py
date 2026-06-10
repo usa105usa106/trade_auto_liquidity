@@ -58,6 +58,7 @@ balance_locks = {}
 ws_supervisor = None
 trading_task = None
 position_task = None
+bottom_replace_locks = {}
 btc_ai_task = None
 claude_scheduler_task = None
 
@@ -120,57 +121,68 @@ async def notify_admin(app, text: str, min_interval_sec: int = 0, key: str = "no
 async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", min_interval_sec: int = 0) -> None:
     """Keep one live Telegram status message without duplicating cards.
 
-    v0402: edit the previously stored message first. Older builds deleted the
-    old card and then sent a fresh one; if Telegram delete timed out, duplicate
-    ChatGPT monitor cards stayed in the chat. Editing is idempotent and prevents
-    the visible duplicates from the screenshots. If edit is impossible because
-    the message is gone/too old, fall back to delete+send and persist the new id.
+    v0404: per-key asyncio lock fixes the real duplicate race: two monitor
+    refresh tasks could start at the same time, both see no stored message id,
+    and both send a fresh card. Now only one update for the same key can run.
     """
     chat_id = first_admin_id()
     if not chat_id:
         return
-    now = time.time()
-    if min_interval_sec:
-        last_key = f"last_bottom_{key}"
-        last = float(app.bot_data.get(last_key, 0) or 0)
-        if now - last < min_interval_sec:
-            return
-        app.bot_data[last_key] = now
-
-    msg_key = f"bottom_msg_id_{key}"
-    old_msg_id = app.bot_data.get(msg_key)
-    if not old_msg_id:
-        try:
-            old_msg_id = await storage.get(msg_key, None)
-        except Exception:
-            old_msg_id = None
-
-    payload = str(text)[:3900]
-    if old_msg_id:
-        try:
-            await asyncio.wait_for(app.bot.edit_message_text(chat_id=chat_id, message_id=int(old_msg_id), text=payload), timeout=6)
-            app.bot_data[msg_key] = int(old_msg_id)
-            return
-        except Exception as e:
-            msg = str(e).lower()
-            if "message is not modified" in msg:
-                app.bot_data[msg_key] = int(old_msg_id)
+    lock = bottom_replace_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        bottom_replace_locks[key] = lock
+    async with lock:
+        now = time.time()
+        if min_interval_sec:
+            last_key = f"last_bottom_{key}"
+            last = float(app.bot_data.get(last_key, 0) or 0)
+            if now - last < min_interval_sec:
                 return
-            log.debug("telegram bottom status edit skipped: %s", e)
+            app.bot_data[last_key] = now
+
+        msg_key = f"bottom_msg_id_{key}"
+        old_msg_id = app.bot_data.get(msg_key)
+        if not old_msg_id:
             try:
-                await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id)), timeout=4)
-            except Exception as de:
-                log.debug("telegram bottom status delete skipped after edit fail: %s", de)
-    try:
-        msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=payload), timeout=6)
-        new_id = getattr(msg, "message_id", None)
-        app.bot_data[msg_key] = new_id
+                old_msg_id = await storage.get(msg_key, None)
+            except Exception:
+                old_msg_id = None
+
+        payload = str(text)[:3900]
+        if old_msg_id:
+            try:
+                await asyncio.wait_for(app.bot.edit_message_text(chat_id=chat_id, message_id=int(old_msg_id), text=payload), timeout=6)
+                app.bot_data[msg_key] = int(old_msg_id)
+                try:
+                    await storage.set(msg_key, int(old_msg_id), bump_revision=False)
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                msg = str(e).lower()
+                if "message is not modified" in msg:
+                    app.bot_data[msg_key] = int(old_msg_id)
+                    return
+                log.debug("telegram bottom status edit skipped: %s", e)
+                try:
+                    await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id)), timeout=4)
+                except Exception as de:
+                    log.debug("telegram bottom status delete skipped after edit fail: %s", de)
+                try:
+                    await storage.set(msg_key, None, bump_revision=False)
+                except Exception:
+                    pass
         try:
-            await storage.set(msg_key, new_id, bump_revision=False)
-        except Exception:
-            pass
-    except Exception as e:
-        log.warning("telegram bottom status failed: %s", e)
+            msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=payload), timeout=6)
+            new_id = getattr(msg, "message_id", None)
+            app.bot_data[msg_key] = new_id
+            try:
+                await storage.set(msg_key, new_id, bump_revision=False)
+            except Exception:
+                pass
+        except Exception as e:
+            log.warning("telegram bottom status failed: %s", e)
 
 async def send_trade_chart(app, ex, plan, settings: dict) -> None:
     """Send one clear setup chart after an auto-trade is opened.
@@ -6154,7 +6166,13 @@ async def _send_chatgpt_pack_document(app, chat_id: int, pack_path: str, caption
 
 
 async def _edit_or_send_scan_status(app, chat_id: int, text: str, message_id: int | None = None) -> int | None:
-    """Update one ChatGPT Scan status message; send only if there is no editable id."""
+    """Update one ChatGPT Scan status message.
+
+    v0404: scan status cards are sent without reply-keyboard markup because
+    Telegram can reject editing some reply-keyboard messages with
+    "Message can't be edited".  If edit is rejected, delete the stale card
+    before sending the replacement so the chat does not accumulate duplicates.
+    """
     payload = str(text)[:3900]
     if message_id:
         try:
@@ -6164,7 +6182,12 @@ async def _edit_or_send_scan_status(app, chat_id: int, text: str, message_id: in
             if "message is not modified" in str(e).lower():
                 return int(message_id)
             chatgpt_log_event("mode_scan_status_edit_failed", error=repr(e))
-    msg = await _safe_send_bot_message(app, chat_id, payload, reply_markup=MAIN_MENU)
+            try:
+                await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(message_id)), timeout=4)
+                chatgpt_log_event("mode_scan_status_old_deleted_after_edit_fail", message_id=message_id)
+            except Exception as de:
+                chatgpt_log_event("mode_scan_status_old_delete_failed", error=repr(de))
+    msg = await app.bot.send_message(chat_id=chat_id, text=payload)
     return getattr(msg, "message_id", None) if msg is not None else message_id
 
 
@@ -6175,6 +6198,42 @@ async def _delete_scan_status(app, chat_id: int, message_id: int | None) -> None
         await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(message_id)), timeout=4)
     except Exception as e:
         chatgpt_log_event("mode_scan_status_delete_skipped", error=repr(e))
+
+
+async def _delete_known_bottom_message(app, chat_id: int, key: str) -> None:
+    """Best-effort cleanup for the latest persisted live card before scan mode.
+
+    Telegram does not let the bot discover old message ids, so this can remove
+    only the last id that newer builds stored. The v0404 lock prevents new
+    duplicates going forward.
+    """
+    msg_key = f"bottom_msg_id_{key}"
+    msg_id = app.bot_data.get(msg_key)
+    if not msg_id:
+        try:
+            msg_id = await storage.get(msg_key, None)
+        except Exception:
+            msg_id = None
+    if msg_id:
+        try:
+            await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(msg_id)), timeout=4)
+        except Exception as e:
+            chatgpt_log_event("bottom_message_delete_skipped", key=key, error=repr(e))
+    app.bot_data[msg_key] = None
+    try:
+        await storage.set(msg_key, None, bump_revision=False)
+    except Exception:
+        pass
+
+
+async def _delete_user_command_message(update: Update) -> None:
+    """Best-effort cleanup of the user's button/command bubble."""
+    try:
+        msg = getattr(update, "effective_message", None)
+        if msg is not None:
+            await asyncio.wait_for(msg.delete(), timeout=3)
+    except Exception:
+        pass
 
 async def _chatgpt_scan_background_job(app, chat_id: int, status_message_id: int | None = None):
     """Run the slow top-200 scan outside Telegram command timeout."""
@@ -6193,10 +6252,26 @@ async def _chatgpt_scan_background_job(app, chat_id: int, status_message_id: int
         )
         pack_path = await build_chatgpt_scan_pack(ex, scanner, ns, ws_supervisor=ws, limit=scan_limit, storage=storage)
         size_kb = round(os.path.getsize(pack_path) / 1024, 1) if os.path.exists(pack_path) else 0
+        # v0404: never send a tiny/empty pack as if it were a real scan.
+        # A 6-7 KB ZIP means log/task/manifest exists, but charts are absent.
+        import zipfile as _zipfile
+        with _zipfile.ZipFile(pack_path, "r") as _z:
+            _manifest = json.loads(_z.read("manifest.json").decode("utf-8", errors="replace"))
+        expected_png = int(_manifest.get("expected_png_count") or 0)
+        actual_png = int(_manifest.get("actual_png_count") or 0)
+        min_required_png = max(1, int(expected_png * float(os.getenv("CHATGPT_SCAN_MIN_CHART_RATIO", "0.80") or 0.80))) if expected_png else 1
+        if actual_png < min_required_png:
+            errors = _manifest.get("generation_errors") or []
+            missing = _manifest.get("missing_charts") or []
+            raise RuntimeError(
+                "scan pack rejected: charts missing "
+                f"actual={actual_png}, expected={expected_png}, required={min_required_png}; "
+                f"errors={errors[:3]}; missing={missing[:5]}"
+            )
         status_message_id = await _edit_or_send_scan_status(
             app,
             chat_id,
-            f"🤖 ChatGPT Scan Mode\n✅ ZIP собран: {os.path.basename(pack_path)} ({size_kb} KB)\n📤 Отправляю архив в Telegram...",
+            f"🤖 ChatGPT Scan Mode\n✅ ZIP собран: {os.path.basename(pack_path)} ({size_kb} KB)\n📊 графики: {actual_png}/{expected_png}\n📤 Отправляю архив в Telegram...",
             status_message_id,
         )
         ok = await _send_chatgpt_pack_document(
@@ -6214,12 +6289,14 @@ async def _chatgpt_scan_background_job(app, chat_id: int, status_message_id: int
         chatgpt_log_event("mode_scan_failed", error=repr(e))
         log.exception("chatgpt scan background failed")
         try:
-            await app.bot.send_message(chat_id=chat_id, text=f"❌ ChatGPT scan failed: {str(e)[:900]}", reply_markup=MAIN_MENU)
+            err_text = "❌ ChatGPT scan failed:\n" + str(e)[:1600] + "\n\nСкинь /log_chatgpt, если нужно добить причину."
+            await _edit_or_send_scan_status(app, chat_id, err_text, status_message_id)
         except Exception:
             pass
     finally:
         try:
             app.bot_data["chatgpt_scan_running"] = False
+            app.bot_data["chatgpt_monitor_paused_for_scan"] = False
         except Exception:
             pass
 
@@ -6293,14 +6370,16 @@ async def chatgpt_scan_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     if position_task is None or position_task.done():
         position_task = context.application.create_task(position_management_loop(context.application))
     chat_id = update.effective_chat.id if update.effective_chat else first_admin_id()
+    await _delete_user_command_message(update)
     if context.application.bot_data.get("chatgpt_scan_running"):
-        await reply(update, "⏳ ChatGPT Scan уже идёт. Дождись log.txt или проверь /log_chatgpt.", reply_markup=MAIN_MENU)
+        await context.application.bot.send_message(chat_id=chat_id, text="⏳ ChatGPT Scan уже идёт. Дождись ZIP или проверь /log_chatgpt.", reply_markup=MAIN_MENU)
         return
     context.application.bot_data["chatgpt_scan_running"] = True
-    status_msg = await reply(
-        update,
-        "🤖 ChatGPT Scan Mode ON\nОтключил остальные режимы входа. Скан топ-200 запущен в фоне. Это сообщение будет обновляться, а после отправки ZIP удалится.",
-        reply_markup=MAIN_MENU,
+    context.application.bot_data["chatgpt_monitor_paused_for_scan"] = True
+    await _delete_known_bottom_message(context.application, chat_id, "chatgpt_mode_monitor")
+    status_msg = await context.application.bot.send_message(
+        chat_id=chat_id,
+        text="🤖 ChatGPT Scan Mode ON\nОтключил остальные режимы входа. Скан топ-200 запущен в фоне. Это сообщение будет обновляться, а после отправки ZIP удалится.",
     )
     status_message_id = getattr(status_msg, "message_id", None)
     context.application.create_task(_chatgpt_scan_background_job(context.application, chat_id, status_message_id=status_message_id))
@@ -7074,6 +7153,8 @@ async def emit_position_events(app, events: list[dict]) -> None:
 async def update_chatgpt_monitor_message(app, ex=None, setup_result: dict | None = None) -> None:
     """Refresh one live ChatGPT monitor message from exchange state."""
     try:
+        if app.bot_data.get("chatgpt_monitor_paused_for_scan") and setup_result is None:
+            return
         settings = await storage.all_settings()
         exchange = ex or await get_exchange(settings)
         text = await build_chatgpt_monitor_text(storage, exchange, setup_result=setup_result)
@@ -7118,8 +7199,6 @@ async def position_management_loop(app):
                 await asyncio.sleep(1)
     finally:
         position_task = None
-btc_ai_task = None
-claude_scheduler_task = None
 
 
 

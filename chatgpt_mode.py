@@ -206,7 +206,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": os.getenv("BOT_VERSION", "v0402 chatgpt scan zip retry + monitor dedupe"),
+        "bot_version": os.getenv("BOT_VERSION", "0404 mexc native public scan + empty-pack hard stop"),
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -1000,6 +1000,14 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         symbols=",".join(selected_symbols),
         rows=json.dumps(selected_rows, ensure_ascii=False)[:1800],
     )
+    if not selected_symbols:
+        # v0404: do not build/send a fake BTC/ETH-only ZIP when the top-200
+        # scan produced only ERROR blocks. This was the 6.8 KB pack bug.
+        err_lines = [ln for ln in raw_log_text.splitlines() if "ERROR:" in ln][:8]
+        raise RuntimeError(
+            "ChatGPT scan produced 0 valid scored symbols; ZIP not created. "
+            + ("First errors: " + " | ".join(err_lines) if err_lines else "Check scanner/exchange log.")
+        )
     meta_by_symbol = {r["symbol"]: r for r in selected_rows}
     # Market context must always exist, but it must not duplicate selected charts.
     required_context = [("BTC_USDT", "4h"), ("BTC_USDT", "1h"), ("ETH_USDT", "4h"), ("ETH_USDT", "1h")]
@@ -1077,7 +1085,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "v0402 chatgpt scan zip retry + monitor dedupe"
+        _bot_code_version = "0404 mexc native public scan + empty-pack hard stop"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),
@@ -1217,6 +1225,8 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
         else:
             ok_blocks += 1
     chatgpt_log_event("scan_workers_done", workers=workers, symbols=len(symbols), ok=ok_blocks, errors=err_blocks, elapsed_sec=round(time.time() - scan_started_at, 2))
+    if symbols and ok_blocks == 0:
+        chatgpt_log_event("scan_all_symbols_failed", symbols=len(symbols), errors=err_blocks)
 
     btc = ""
     eth = ""
