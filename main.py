@@ -5895,7 +5895,16 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
         await _claude_status(app, status_message, lines, f"✅ Шаг 1/7: scan готов\n✅ Шаг 2/7: архив собран: {os.path.basename(pack_path)}")
         try:
             with open(pack_path, "rb") as f:
-                await app.bot.send_document(chat_id=chat_id, document=f, filename=os.path.basename(pack_path), caption=f"📦 Claude Autopilot scan pack: {os.path.basename(pack_path)}")
+                await app.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=os.path.basename(pack_path),
+                    caption=f"📦 Claude Autopilot scan pack: {os.path.basename(pack_path)}",
+                    connect_timeout=float(os.getenv("TELEGRAM_DOCUMENT_CONNECT_TIMEOUT_SEC", "30") or 30),
+                    read_timeout=float(os.getenv("TELEGRAM_DOCUMENT_READ_TIMEOUT_SEC", "180") or 180),
+                    write_timeout=float(os.getenv("TELEGRAM_DOCUMENT_WRITE_TIMEOUT_SEC", "180") or 180),
+                    pool_timeout=float(os.getenv("TELEGRAM_DOCUMENT_POOL_TIMEOUT_SEC", "30") or 30),
+                )
         except Exception as e:
             chatgpt_log_event("claude_pack_send_failed", error=repr(e))
 
@@ -5947,7 +5956,16 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
         await _claude_status(app, status_message, lines, f"✅ Шаг 5/7: setup валиден и сохранён: {os.path.basename(setup_path)}")
         try:
             with open(setup_path, "rb") as f:
-                await app.bot.send_document(chat_id=chat_id, document=f, filename=os.path.basename(setup_path), caption=f"📄 Setup от Claude: {os.path.basename(setup_path)}")
+                await app.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=os.path.basename(setup_path),
+                    caption=f"📄 Setup от Claude: {os.path.basename(setup_path)}",
+                    connect_timeout=float(os.getenv("TELEGRAM_DOCUMENT_CONNECT_TIMEOUT_SEC", "30") or 30),
+                    read_timeout=float(os.getenv("TELEGRAM_DOCUMENT_READ_TIMEOUT_SEC", "180") or 180),
+                    write_timeout=float(os.getenv("TELEGRAM_DOCUMENT_WRITE_TIMEOUT_SEC", "180") or 180),
+                    pool_timeout=float(os.getenv("TELEGRAM_DOCUMENT_POOL_TIMEOUT_SEC", "30") or 30),
+                )
         except Exception as e:
             chatgpt_log_event("claude_setup_send_failed", error=repr(e))
 
@@ -6095,6 +6113,10 @@ async def _chatgpt_scan_background_job(app, chat_id: int):
                 document=f,
                 filename=os.path.basename(pack_path),
                 caption=f"✅ ChatGPT pack готов: {os.path.basename(pack_path)}\nlog.txt + task.txt + manifest.json + raw-графики. Скинь ZIP в ChatGPT. После финального анализа загрузи сюда setup-HHMM_DDMM.txt с setup_version 1.6.",
+                connect_timeout=float(os.getenv("TELEGRAM_DOCUMENT_CONNECT_TIMEOUT_SEC", "30") or 30),
+                read_timeout=float(os.getenv("TELEGRAM_DOCUMENT_READ_TIMEOUT_SEC", "180") or 180),
+                write_timeout=float(os.getenv("TELEGRAM_DOCUMENT_WRITE_TIMEOUT_SEC", "180") or 180),
+                pool_timeout=float(os.getenv("TELEGRAM_DOCUMENT_POOL_TIMEOUT_SEC", "30") or 30),
             )
         await storage.set("chatgpt_waiting_setup", True)
         chatgpt_log_event("mode_waiting_setup", pack_path=pack_path)
@@ -6214,7 +6236,11 @@ async def log_chatgpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     document=f,
                     filename="chatgpt_mode_runtime.log",
-                    caption="📄 Подробный лог ChatGPT Mode. При ошибке скинь этот файл мне."
+                    caption="📄 Подробный лог ChatGPT Mode. При ошибке скинь этот файл мне.",
+                    connect_timeout=float(os.getenv("TELEGRAM_DOCUMENT_CONNECT_TIMEOUT_SEC", "30") or 30),
+                    read_timeout=float(os.getenv("TELEGRAM_DOCUMENT_READ_TIMEOUT_SEC", "180") or 180),
+                    write_timeout=float(os.getenv("TELEGRAM_DOCUMENT_WRITE_TIMEOUT_SEC", "180") or 180),
+                    pool_timeout=float(os.getenv("TELEGRAM_DOCUMENT_POOL_TIMEOUT_SEC", "30") or 30),
                 )
         else:
             await reply(update, "Лог ChatGPT Mode пока пустой.", reply_markup=MAIN_MENU)

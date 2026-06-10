@@ -44,6 +44,10 @@ class ExchangeClient:
             "secret": self.api_secret,
             "enableRateLimit": True,
             "headers": {"User-Agent": "Mozilla/5.0"},
+            # ChatGPT/Claude scan reads many public endpoints.  The ccxt default
+            # timeout is often too short on Railway/MEXC during bursts, which
+            # surfaces in Telegram as just "Timed out".
+            "timeout": int(os.getenv("MEXC_CCXT_TIMEOUT_MS", os.getenv("MEXC_TIMEOUT_MS", "20000")) or 20000),
             "options": {
                 "defaultType": "swap",
                 "adjustForTimeDifference": True,
