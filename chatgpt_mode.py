@@ -206,7 +206,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": os.getenv("BOT_VERSION", "v0401 final"),
+        "bot_version": os.getenv("BOT_VERSION", "v0402 chatgpt scan zip retry + monitor dedupe"),
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -1077,7 +1077,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "v0401 final"
+        _bot_code_version = "v0402 chatgpt scan zip retry + monitor dedupe"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),

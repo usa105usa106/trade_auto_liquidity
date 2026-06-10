@@ -10,7 +10,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
 # Previous packaged version marker kept for regression tests: 0368 CHATGPT ONE LIVE MONITOR V33
-VERSION = "v0401 final"  # hard-coded; ignore stale Railway BOT_VERSION env
+VERSION = "v0402 chatgpt scan zip retry + monitor dedupe"  # hard-coded; ignore stale Railway BOT_VERSION env
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)

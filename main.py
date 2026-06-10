@@ -118,12 +118,13 @@ async def notify_admin(app, text: str, min_interval_sec: int = 0, key: str = "no
 
 
 async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", min_interval_sec: int = 0) -> None:
-    """Keep one live Telegram status message at the bottom of the chat.
+    """Keep one live Telegram status message without duplicating cards.
 
-    Telegram edits do not move old messages down, so for noisy live updates
-    (watchdogs, protection checks, etc.) we delete the previous status message
-    and send a fresh one. Important lifecycle events should still use
-    notify_admin() so they remain in the history.
+    v0402: edit the previously stored message first. Older builds deleted the
+    old card and then sent a fresh one; if Telegram delete timed out, duplicate
+    ChatGPT monitor cards stayed in the chat. Editing is idempotent and prevents
+    the visible duplicates from the screenshots. If edit is impossible because
+    the message is gone/too old, fall back to delete+send and persist the new id.
     """
     chat_id = first_admin_id()
     if not chat_id:
@@ -143,14 +144,25 @@ async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", 
             old_msg_id = await storage.get(msg_key, None)
         except Exception:
             old_msg_id = None
+
+    payload = str(text)[:3900]
     if old_msg_id:
         try:
-            await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id)), timeout=4)
+            await asyncio.wait_for(app.bot.edit_message_text(chat_id=chat_id, message_id=int(old_msg_id), text=payload), timeout=6)
+            app.bot_data[msg_key] = int(old_msg_id)
+            return
         except Exception as e:
-            # Message may already be gone or too old; continue and post a fresh one.
-            log.debug("telegram bottom status delete skipped: %s", e)
+            msg = str(e).lower()
+            if "message is not modified" in msg:
+                app.bot_data[msg_key] = int(old_msg_id)
+                return
+            log.debug("telegram bottom status edit skipped: %s", e)
+            try:
+                await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id)), timeout=4)
+            except Exception as de:
+                log.debug("telegram bottom status delete skipped after edit fail: %s", de)
     try:
-        msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=str(text)[:3900]), timeout=6)
+        msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=payload), timeout=6)
         new_id = getattr(msg, "message_id", None)
         app.bot_data[msg_key] = new_id
         try:
@@ -6097,7 +6109,74 @@ async def _claude_scheduler_loop(app):
             await asyncio.sleep(30)
 
 
-async def _chatgpt_scan_background_job(app, chat_id: int):
+
+async def _send_chatgpt_pack_document(app, chat_id: int, pack_path: str, caption: str, attempts: int = 3) -> bool:
+    """Send ZIP scan pack with retries and detailed runtime logging."""
+    filename = os.path.basename(pack_path or "chatgpt_scan_pack.zip")
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            if not pack_path or not os.path.exists(pack_path):
+                raise FileNotFoundError(f"pack not found: {pack_path}")
+            size_kb = round(os.path.getsize(pack_path) / 1024, 1)
+            chatgpt_log_event("mode_pack_send_attempt", attempt=attempt, filename=filename, size_kb=size_kb)
+            with open(pack_path, "rb") as f:
+                await app.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=filename,
+                    caption=caption,
+                    connect_timeout=float(os.getenv("TELEGRAM_DOCUMENT_CONNECT_TIMEOUT_SEC", "45") or 45),
+                    read_timeout=float(os.getenv("TELEGRAM_DOCUMENT_READ_TIMEOUT_SEC", "300") or 300),
+                    write_timeout=float(os.getenv("TELEGRAM_DOCUMENT_WRITE_TIMEOUT_SEC", "300") or 300),
+                    pool_timeout=float(os.getenv("TELEGRAM_DOCUMENT_POOL_TIMEOUT_SEC", "45") or 45),
+                )
+            chatgpt_log_event("mode_pack_send_ok", attempt=attempt, filename=filename)
+            return True
+        except Exception as e:
+            chatgpt_log_event("mode_pack_send_failed", attempt=attempt, filename=filename, error=repr(e))
+            if attempt < max(1, attempts):
+                await asyncio.sleep(2 * attempt)
+    try:
+        tail = tail_chatgpt_runtime_log(80)[:2500]
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "❌ ZIP pack собран, но Telegram не смог отправить архив после повторов.\n"
+                f"Файл на сервере: {pack_path}\n"
+                "Скинь мне /log_chatgpt для диагностики или перезапусти ChatGPT Scan Mode.\n\n"
+                f"Последний runtime log:\n{tail}"
+            )[:3900],
+            reply_markup=MAIN_MENU,
+        )
+    except Exception:
+        pass
+    return False
+
+
+async def _edit_or_send_scan_status(app, chat_id: int, text: str, message_id: int | None = None) -> int | None:
+    """Update one ChatGPT Scan status message; send only if there is no editable id."""
+    payload = str(text)[:3900]
+    if message_id:
+        try:
+            await asyncio.wait_for(app.bot.edit_message_text(chat_id=chat_id, message_id=int(message_id), text=payload), timeout=6)
+            return int(message_id)
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return int(message_id)
+            chatgpt_log_event("mode_scan_status_edit_failed", error=repr(e))
+    msg = await _safe_send_bot_message(app, chat_id, payload, reply_markup=MAIN_MENU)
+    return getattr(msg, "message_id", None) if msg is not None else message_id
+
+
+async def _delete_scan_status(app, chat_id: int, message_id: int | None) -> None:
+    if not message_id:
+        return
+    try:
+        await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(message_id)), timeout=4)
+    except Exception as e:
+        chatgpt_log_event("mode_scan_status_delete_skipped", error=repr(e))
+
+async def _chatgpt_scan_background_job(app, chat_id: int, status_message_id: int | None = None):
     """Run the slow top-200 scan outside Telegram command timeout."""
     try:
         ns = await storage.all_settings()
@@ -6106,19 +6185,30 @@ async def _chatgpt_scan_background_job(app, chat_id: int):
         ws = await get_ws(ns)
         chatgpt_log_event("mode_scan_call")
         scan_limit = int(os.getenv("CHATGPT_SCAN_LIMIT", "200") or 200)
+        status_message_id = await _edit_or_send_scan_status(
+            app,
+            chat_id,
+            "🤖 ChatGPT Scan Mode ON\n⏳ Скан top-200 идёт в фоне. Собираю log.txt + task.txt + manifest.json + графики в ZIP...",
+            status_message_id,
+        )
         pack_path = await build_chatgpt_scan_pack(ex, scanner, ns, ws_supervisor=ws, limit=scan_limit, storage=storage)
-        with open(pack_path, "rb") as f:
-            await app.bot.send_document(
-                chat_id=chat_id,
-                document=f,
-                filename=os.path.basename(pack_path),
-                caption=f"✅ ChatGPT pack готов: {os.path.basename(pack_path)}\nlog.txt + task.txt + manifest.json + raw-графики. Скинь ZIP в ChatGPT. После финального анализа загрузи сюда setup-HHMM_DDMM.txt с setup_version 1.6.",
-                connect_timeout=float(os.getenv("TELEGRAM_DOCUMENT_CONNECT_TIMEOUT_SEC", "30") or 30),
-                read_timeout=float(os.getenv("TELEGRAM_DOCUMENT_READ_TIMEOUT_SEC", "180") or 180),
-                write_timeout=float(os.getenv("TELEGRAM_DOCUMENT_WRITE_TIMEOUT_SEC", "180") or 180),
-                pool_timeout=float(os.getenv("TELEGRAM_DOCUMENT_POOL_TIMEOUT_SEC", "30") or 30),
-            )
+        size_kb = round(os.path.getsize(pack_path) / 1024, 1) if os.path.exists(pack_path) else 0
+        status_message_id = await _edit_or_send_scan_status(
+            app,
+            chat_id,
+            f"🤖 ChatGPT Scan Mode\n✅ ZIP собран: {os.path.basename(pack_path)} ({size_kb} KB)\n📤 Отправляю архив в Telegram...",
+            status_message_id,
+        )
+        ok = await _send_chatgpt_pack_document(
+            app,
+            chat_id,
+            pack_path,
+            caption=f"✅ ChatGPT pack готов: {os.path.basename(pack_path)}\nlog.txt + task.txt + manifest.json + raw-графики. Скинь ZIP в ChatGPT. После финального анализа загрузи сюда setup-HHMM_DDMM.txt с setup_version 1.6.",
+        )
+        if not ok:
+            raise RuntimeError("Telegram send_document failed after retries")
         await storage.set("chatgpt_waiting_setup", True)
+        await _delete_scan_status(app, chat_id, status_message_id)
         chatgpt_log_event("mode_waiting_setup", pack_path=pack_path)
     except Exception as e:
         chatgpt_log_event("mode_scan_failed", error=repr(e))
@@ -6207,12 +6297,13 @@ async def chatgpt_scan_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         await reply(update, "⏳ ChatGPT Scan уже идёт. Дождись log.txt или проверь /log_chatgpt.", reply_markup=MAIN_MENU)
         return
     context.application.bot_data["chatgpt_scan_running"] = True
-    context.application.create_task(_chatgpt_scan_background_job(context.application, chat_id))
-    await reply(
+    status_msg = await reply(
         update,
-        "🤖 ChatGPT Scan Mode ON\nОтключил остальные режимы входа. Скан топ-200 запущен в фоне. Интерфейс не зависнет; когда ZIP pack будет готов, я пришлю архив сюда.",
+        "🤖 ChatGPT Scan Mode ON\nОтключил остальные режимы входа. Скан топ-200 запущен в фоне. Это сообщение будет обновляться, а после отправки ZIP удалится.",
         reply_markup=MAIN_MENU,
     )
+    status_message_id = getattr(status_msg, "message_id", None)
+    context.application.create_task(_chatgpt_scan_background_job(context.application, chat_id, status_message_id=status_message_id))
 
 
 async def chatgpt_exit_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8358,9 +8449,9 @@ async def on_startup(app):
     try:
         if claude_scheduler_task is None or claude_scheduler_task.done():
             claude_scheduler_task = app.create_task(_claude_scheduler_loop(app))
-            log_event("claude_autopilot_scheduler_started_v0401", ok=True)
+            log_event("claude_autopilot_scheduler_started_v0402", ok=True)
     except Exception as e:
-        log_event("claude_autopilot_scheduler_start_failed_v0401", ok=False, error=str(e)[:500])
+        log_event("claude_autopilot_scheduler_start_failed_v0402", ok=False, error=str(e)[:500])
 
 def _wrap_command(fn, name: str):
     async def _inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
