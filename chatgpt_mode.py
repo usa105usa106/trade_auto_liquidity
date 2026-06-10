@@ -206,7 +206,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": os.getenv("BOT_VERSION", "v0407 classic v0396 scan + telegram retry/dedupe + Claude kept"),
+        "bot_version": os.getenv("BOT_VERSION", "v0408 classic v0396 scan + 4 workers + bottom monitor fix"),
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -974,7 +974,7 @@ FINAL SELF-CHECK BEFORE SENDING FILE:
 async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None) -> str:
     """Build a full ChatGPT Scan Mode ZIP: log.txt + task.txt + manifest + charts."""
     started = time.time()
-    chatgpt_log_event("scan_pack_start", limit=limit, top=os.getenv("CHATGPT_SCAN_PACK_TOP", "15"), chart_workers=os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")))
+    chatgpt_log_event("scan_pack_start", limit=limit, top=os.getenv("CHATGPT_SCAN_PACK_TOP", "15"), chart_workers=os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "4")))
     log_path = await build_chatgpt_log(exchange_client, scanner, settings, ws_supervisor=ws_supervisor, limit=limit)
     raw_log_text = Path(log_path).read_text(encoding="utf-8", errors="replace")
     selected_rows = _parse_chatgpt_log_candidates(raw_log_text, limit=int(os.getenv("CHATGPT_SCAN_PACK_TOP", "15") or 15))
@@ -1022,7 +1022,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     (work / "log.txt").write_text(log_text, encoding="utf-8")
     (work / "task.txt").write_text(CHATGPT_SCAN_TASK_TEXT, encoding="utf-8")
 
-    workers = int(os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")) or 3)
+    workers = int(os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "4")) or 4)
     sem = asyncio.Semaphore(max(1, workers))
     missing: list[str] = []
     errors: list[str] = []
@@ -1066,7 +1066,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "v0407 classic v0396 scan + telegram retry/dedupe + Claude kept"
+        _bot_code_version = "v0408 classic v0396 scan + 4 workers + bottom monitor fix"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),
@@ -1115,7 +1115,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
 async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200) -> str:
     """Run one top-N scan and write a ChatGPT-ready log.txt."""
     scan_started_at = time.time()
-    workers = int(os.getenv("CHATGPT_SCAN_CONCURRENCY", "3") or 3)
+    workers = int(os.getenv("CHATGPT_SCAN_CONCURRENCY", "4") or 4)
     chatgpt_log_event("scan_start", limit=limit, workers=workers, retries=os.getenv("CHATGPT_SCAN_RETRIES", "2"))
     work = Path(os.getenv("CHATGPT_LOG_DIR", "/tmp"))
     work.mkdir(parents=True, exist_ok=True)
@@ -1587,7 +1587,7 @@ async def _cancel_all_old_pending_limits(storage, exec_engine, setup_symbols: se
     if cancel_candidates:
         # MEXC can rate-limit, so keep it parallel but bounded. This prevents a
         # 6-order stale TP/SL cleanup from taking ~30 seconds sequentially.
-        sem = asyncio.Semaphore(int(os.getenv("CHATGPT_CANCEL_CONCURRENCY", "3") or 3))
+        sem = asyncio.Semaphore(int(os.getenv("CHATGPT_CANCEL_CONCURRENCY", "3") or 4))
 
         async def _bounded_cancel(item):
             async with sem:

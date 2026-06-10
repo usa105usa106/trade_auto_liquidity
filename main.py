@@ -150,7 +150,14 @@ async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", 
                 old_msg_id = None
 
         payload = str(text)[:3900]
-        if old_msg_id:
+
+        # ChatGPT monitor must stay at the *bottom* of the chat. Editing a
+        # Telegram message keeps it in its old position, so for this card we
+        # intentionally delete the previous card and send a fresh one. The
+        # per-key lock above prevents duplicates when two refreshes overlap.
+        force_bottom_resend = key == "chatgpt_mode_monitor"
+
+        if old_msg_id and not force_bottom_resend:
             try:
                 await asyncio.wait_for(app.bot.edit_message_text(chat_id=chat_id, message_id=int(old_msg_id), text=payload), timeout=6)
                 app.bot_data[msg_key] = int(old_msg_id)
@@ -165,14 +172,17 @@ async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", 
                     app.bot_data[msg_key] = int(old_msg_id)
                     return
                 log.debug("telegram bottom status edit skipped: %s", e)
-                try:
-                    await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id)), timeout=4)
-                except Exception as de:
-                    log.debug("telegram bottom status delete skipped after edit fail: %s", de)
-                try:
-                    await storage.set(msg_key, None, bump_revision=False)
-                except Exception:
-                    pass
+
+        if old_msg_id:
+            try:
+                await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id)), timeout=4)
+            except Exception as de:
+                log.debug("telegram bottom status delete skipped before resend: %s", de)
+            try:
+                await storage.set(msg_key, None, bump_revision=False)
+            except Exception:
+                pass
+
         try:
             msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=payload), timeout=6)
             new_id = getattr(msg, "message_id", None)
