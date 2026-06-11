@@ -5966,7 +5966,7 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             return
         model = normalize_claude_model(settings.get("claude_autopilot_model") or os.getenv("CLAUDE_MODEL") or CLAUDE_SONNET_46)
         max_tokens = int(os.getenv("CLAUDE_MAX_TOKENS", str(settings.get("claude_max_tokens", 6000) or 6000)) or 6000)
-        temperature = float(os.getenv("CLAUDE_TEMPERATURE", str(settings.get("claude_temperature", 0.2) or 0.2)) or 0.2)
+        temperature = float(os.getenv("CLAUDE_TEMPERATURE", str(settings.get("claude_temperature", 0.2) or 0.2)))
         chart_resolution = str(settings.get("claude_chart_resolution") or os.getenv("CLAUDE_CHART_RESOLUTION") or "960x540").lower().replace("×", "x").replace(" ", "")
         if chart_resolution not in {"1280x720", "960x540"}:
             chart_resolution = "960x540"
@@ -6165,6 +6165,9 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
         result["setup_installed_at"] = datetime.now(MSK).strftime("%H:%M МСК")
         result["_monitor_persist"] = True
         result["source"] = "claude_autopilot"
+        # Claude Autopilot already executed the setup; do not leave the monitor in
+        # manual "waiting for setup file" mode, otherwise setup time is shown as '-'.
+        await storage.set("chatgpt_waiting_setup", False)
         await storage.set("chatgpt_last_setup_result", result)
         try:
             await update_chatgpt_monitor_message(app, ex=ex, setup_result=result)

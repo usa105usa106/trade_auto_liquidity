@@ -260,17 +260,18 @@ async def build_claude_messages_from_scan_pack(zip_path: str | Path) -> tuple[li
 
         content: list[dict[str, Any]] = []
         content.append(_content_text(
-            "SYSTEM ORDER FOR CLAUDE AUTOPILOT:\n"
+            "SYSTEM ORDER FOR CLAUDE AUTOPILOT — OUTPUT BUDGET IS STRICT:\n"
             "Follow task.txt as the highest-priority trading instruction. "
-            "Analyze in this order: task.txt -> manifest.json -> log.txt -> BTC/ETH charts -> candidate charts. "
-            "Return ONLY the clean bot-ready setup.txt v1.6 JSON content. "
-            "No Markdown, no code fences, no explanations, no comments before or after JSON. "
+            "Analyze privately/silently in this order: task.txt -> manifest.json -> log.txt -> BTC/ETH charts -> candidate charts. "
+            "Do NOT write reasoning, chain-of-thought, explanation, summary, markdown, code fences, comments, or preface. "
+            "Return ONLY the clean bot-ready setup.txt v1.6 JSON object. "
+            "The first character of your answer must be { and the last character must be }. "
             "The bot will save your response as setup-HHMM_DDMM.txt automatically."
         ))
         content.append(_content_text("=== task.txt ===\n" + task[:120_000]))
         content.append(_content_text("=== manifest.json ===\n" + manifest_text[:80_000]))
         content.append(_content_text("=== log.txt ===\n" + log_text[:180_000]))
-        content.append(_content_text("=== CHARTS START ===\nCharts are supplied in deterministic order. First BTC/ETH context, then each selected symbol 4H -> 1H -> 15m."))
+        content.append(_content_text("=== CHARTS START ===\nCharts are supplied in deterministic order. First BTC/ETH context, then each selected symbol according to manifest timeframes. Use filenames/timeframes exactly as supplied."))
         for n in image_names:
             raw = zf.read(n)
             media_type = mimetypes.guess_type(n)[0] or "image/png"
@@ -279,7 +280,8 @@ async def build_claude_messages_from_scan_pack(zip_path: str | Path) -> tuple[li
             content.append(_content_text(f"CHART_FILE: {Path(n).name}"))
             content.append(_content_image(media_type, base64.b64encode(raw).decode("ascii")))
         content.append(_content_text(
-            "FINAL REMINDER: Return only valid JSON for setup.txt. "
+            "FINAL OUTPUT CONTRACT: Return only valid JSON for setup.txt. "
+            "No reasoning text. No analysis text. No explanations. No markdown. "
             "setup_version must be 1.6. Use exactly up to 3 trades. "
             "All prices must be normal decimal numbers, never scientific notation."
         ))
@@ -336,9 +338,17 @@ async def call_claude_for_setup(
     if progress:
         await progress("готовлю task/log/manifest/графики для Claude...")
     messages, meta = await build_claude_messages_from_scan_pack(zip_path)
+    system_prompt = (
+        "You are a strict trading setup JSON generator. "
+        "Think silently only. Never reveal reasoning or analysis. "
+        "Output only one valid JSON object that matches setup.txt v1.6. "
+        "No markdown, no code fences, no preface, no suffix. "
+        "The response must start with { and end with }."
+    )
     payload: dict[str, Any] = {
         "model": model,
         "max_tokens": int(max_tokens or 6000),
+        "system": system_prompt,
         "messages": messages,
     }
     # Opus 4.8 rejects non-default sampling parameters on the current Anthropic API.
@@ -364,6 +374,7 @@ async def call_claude_for_setup(
         model=model,
         model_label=claude_model_label(model),
         max_tokens=max_tokens,
+        output_contract="json_only_no_reasoning",
         temperature=(temperature if model != CLAUDE_OPUS_48 else "default_for_opus"),
         timeout_sec=timeout_sec,
         image_count=meta.get("image_count"),

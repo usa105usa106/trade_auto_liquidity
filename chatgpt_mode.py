@@ -207,7 +207,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": os.getenv("BOT_VERSION", "412"),
+        "bot_version": "420",
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -989,6 +989,53 @@ FINAL SELF-CHECK BEFORE SENDING FILE:
 12. Если условий нет, лучше дай NO_TRADE, чем кривой setup."""
 
 
+def _trim_chatgpt_scan_log_to_top_blocks(log_text: str, top: int = 20) -> str:
+    """Keep the existing scan log format, but remove lower-ranked scan blocks.
+
+    The scan still runs across the full top-N universe. This only trims the
+    written log.txt that is placed into the scan-pack and sent to Claude. Task
+    instructions and trading logic are intentionally unchanged.
+    """
+    text = str(log_text or "")
+    marker = "=== TOP-200 FULL SCAN ==="
+    if marker not in text:
+        return text
+    before, rest = text.split(marker, 1)
+    task_part = ""
+    body_part = rest
+    m_task = re.search(r"\n\n=== TASK ===\n", rest)
+    if m_task:
+        body_part = rest[:m_task.start()]
+        task_part = rest[m_task.start():]
+    blocks = [b.strip() for b in re.split(r"\n---\n", body_part.strip()) if b.strip()]
+    scored: list[tuple[tuple[float, int, float], int, str]] = []
+    unscored: list[tuple[int, str]] = []
+    for idx, block in enumerate(blocks):
+        m = re.search(r"^SYMBOL:\s*([A-Z0-9_:/.-]+)", block, re.M)
+        sm = re.search(r"SCORES:\s*LONG\s*=\s*(\d+)\s*/\s*100\s+SHORT\s*=\s*(\d+)\s*/\s*100", block, re.I)
+        if not m or not sm:
+            unscored.append((idx, block)); continue
+        symbol = mexc_native_symbol(m.group(1))
+        if not symbol or is_chatgpt_blocked_symbol(symbol):
+            continue
+        long_score = int(sm.group(1)); short_score = int(sm.group(2))
+        vm = re.search(r"QUOTE_VOL:\s*([0-9.eE+-]+)", block)
+        quote_vol = _safe_float(vm.group(1) if vm else 0)
+        spm = re.search(r"spread=([0-9.]+)%", block)
+        spread = _safe_float(spm.group(1) if spm else 0)
+        strength = max(long_score, short_score)
+        score_adj = strength - min(15.0, spread * 20.0)
+        scored.append(((score_adj, strength, quote_vol), idx, block))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    kept_blocks = [b for _, _, b in scored[:max(1, int(top or 20))]]
+    trimmed_note = (
+        f"TRIMMED_LOG_NOTE: Full scan was executed, but log.txt keeps only TOP-{int(top or 20)} ranked scan blocks to reduce Claude input tokens.\n"
+        "TRIMMED_LOG_NOTE: Charts/manifest still use TOP-15 selected candidates exactly as before.\n"
+    )
+    new_body = "\n---\n".join(kept_blocks)
+    return before + marker + "\n" + trimmed_note + new_body + task_part
+
+
 async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None, chart_resolution: str | None = None, pack_timeframes_override: list[str] | tuple[str, ...] | None = None, pack_label: str | None = None) -> str:
     """Build a full ChatGPT Scan Mode ZIP: log.txt + task.txt + manifest + charts."""
     started = time.time()
@@ -1108,7 +1155,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "414"
+        _bot_code_version = "420"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "pack_label": pack_label,
@@ -1318,7 +1365,13 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
             body.append(f"ERROR_BLOCK: {str(b)[:240]}")
         else:
             body.append(str(b))
-    text = "\n".join(header + ["\n---\n".join(body), "", "=== TASK ===", task, ""])
+    text_full = "\n".join(header + ["\n---\n".join(body), "", "=== TASK ===", task, ""])
+    try:
+        log_top_n = int(os.getenv("CHATGPT_SCAN_LOG_TOP", "20") or 20)
+    except Exception:
+        log_top_n = 20
+    text = _trim_chatgpt_scan_log_to_top_blocks(text_full, top=log_top_n)
+    chatgpt_log_event("scan_log_trimmed", scanned_symbols=len(symbols), kept_top=log_top_n, full_bytes=len(text_full.encode("utf-8-sig")), trimmed_bytes=len(text.encode("utf-8-sig")))
     _phase_t0 = time.time()
     path.write_text(text, encoding="utf-8-sig")
     _timing_log_write_sec = round(time.time() - _phase_t0, 2)
@@ -1730,6 +1783,33 @@ def _chatgpt_order_id(o: dict) -> str:
     return str(o.get("id") or info.get("orderId") or info.get("id") or info.get("planOrderId") or "").split(":", 1)[0].strip()
 
 
+def _chatgpt_order_opened_at_from_exchange(o: dict) -> float:
+    """Best-effort creation timestamp for a live exchange pending order.
+
+    Used only for LIMIT TTL accounting. Exchange remains the source of truth for
+    whether the pending order exists; this timestamp prevents exchange-first
+    reconciliation from resetting the 120-minute timer every monitor cycle.
+    """
+    info = o.get("info") if isinstance(o.get("info"), dict) else {}
+    candidates = [
+        o.get("timestamp"), o.get("created"), o.get("created_at"), o.get("createTime"), o.get("createdTime"),
+        info.get("timestamp"), info.get("created"), info.get("created_at"), info.get("createTime"),
+        info.get("createdTime"), info.get("create_time"), info.get("orderCreateTime"), info.get("time"),
+    ]
+    for v in candidates:
+        try:
+            if v is None or v == "":
+                continue
+            ts = float(v)
+            if ts > 10_000_000_000:  # milliseconds
+                ts = ts / 1000.0
+            if ts > 1_500_000_000:
+                return ts
+        except Exception:
+            continue
+    return 0.0
+
+
 def _chatgpt_is_entry_order(o: dict, known_order_ids: set[str] | None = None) -> bool:
     """True only for ChatGPT entry LIMIT orders, never TP/SL/reduce-only.
 
@@ -1934,6 +2014,18 @@ async def _reconcile_chatgpt_state_from_exchange(storage, exchange_client) -> di
             chatgpt_log_event("exchange_first_upsert_position_error", symbol=rec.get("symbol"), error=str(e))
 
     upserted_pending = []
+    existing_pending_opened_at: dict[tuple[str, str], float] = {}
+    try:
+        for p in await storage.positions():
+            if str(p.get("strategy") or "").lower() == "chatgpt_setup" and str(p.get("status") or "").lower() == "pending":
+                _sym = mexc_native_symbol(p.get("symbol"))
+                _oid = str(p.get("order_id") or "").split(":", 1)[0].strip()
+                _opened = float(p.get("opened_at") or 0)
+                if _sym and _oid and _opened > 0:
+                    existing_pending_opened_at[(_sym, _oid)] = _opened
+    except Exception as e:
+        chatgpt_log_event("exchange_first_existing_pending_opened_at_error", error=str(e))
+
     for o in snapshot.get("pending_orders", []) or []:
         oid = _chatgpt_order_id(o)
         sym = _chatgpt_order_symbol(o)
@@ -1942,6 +2034,8 @@ async def _reconcile_chatgpt_state_from_exchange(storage, exchange_client) -> di
         info = o.get("info") if isinstance(o.get("info"), dict) else {}
         side_raw = str(o.get("side") or info.get("side") or "").lower()
         side = "SHORT" if side_raw in {"3", "sell", "short"} else "LONG"
+        now_ts = time.time()
+        opened_at = existing_pending_opened_at.get((sym, oid)) or _chatgpt_order_opened_at_from_exchange(o) or now_ts
         rec = {
             "symbol": sym,
             "side": side,
@@ -1953,7 +2047,8 @@ async def _reconcile_chatgpt_state_from_exchange(storage, exchange_client) -> di
             "take_price": 0.0,
             "strategy": "chatgpt_setup",
             "order_id": oid,
-            "opened_at": time.time(),
+            "opened_at": opened_at,
+            "chatgpt_pending_age_sec": round(max(0.0, now_ts - opened_at), 2),
             "chatgpt_exchange_reconciled": True,
             "exchange_source_of_truth": True,
             "raw_exchange_order": o,
@@ -2427,10 +2522,34 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
                 pending_symbols.append(_sym)
     except Exception:
         pending_symbols = []
+    monitor_title = "🤖 ChatGPT Mode Monitor"
+    claude_next_scan_line = None
+    try:
+        settings = await storage.all_settings()
+        claude_enabled = str(settings.get("claude_autopilot_enabled") or "").strip().lower() in {"1", "true", "yes", "on", "y", "да"}
+        if claude_enabled:
+            monitor_title = "🤖 Claude Mode Autopilot"
+            schedule = str(settings.get("claude_autopilot_schedule") or "off").strip().lower()
+            last_ts = float(settings.get("claude_autopilot_last_run_ts") or 0)
+            try:
+                from claude_autopilot import next_schedule_run
+                nxt = next_schedule_run(schedule, last_ts=last_ts)
+            except Exception:
+                nxt = None
+            schedule_short = {"4h": "4H+1м", "1h": "1H+1м", "2h": "каждые 2 часа", "off": "выкл"}.get(schedule, schedule or "-")
+            next_s = nxt.strftime("%H:%M МСК") if nxt else "-"
+            claude_next_scan_line = f"⏭ Время следующего скана: {schedule_short} — {next_s}"
+    except Exception:
+        pass
+
     lines = [
-        "🤖 ChatGPT Mode Monitor",
+        monitor_title,
         f"✅ {setup_status}" if setup_result is not None and bool(res.get("ok", True)) else f"❌ {setup_status}" if setup_result is not None else f"📥 {setup_status}",
         "🔄 биржа синхронизирована",
+    ]
+    if claude_next_scan_line:
+        lines.append(claude_next_scan_line)
+    lines += [
         f"📊 открытые позиции: {len(positions)}/{CHATGPT_MAX_OPEN_POSITIONS}",
         f"📌 pending лимитки: {len(pending)}/{CHATGPT_MAX_PENDING_LIMITS}",
     ]
