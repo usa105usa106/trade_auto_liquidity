@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from claude_runtime_logger import mirror_to_claude_log
+
 CHATGPT_RUNTIME_LOG_PATH = Path(os.getenv("CHATGPT_RUNTIME_LOG_PATH", "/tmp/chatgpt_mode_runtime.log"))
 CHATGPT_RUNTIME_LOG_MAX_BYTES = int(os.getenv("CHATGPT_RUNTIME_LOG_MAX_BYTES", "900000") or 900000)
 
@@ -39,5 +41,6 @@ def chatgpt_log_event(event: str, **fields: Any) -> None:
         line = json.dumps({"ts": _now_utc(), "event": event, **safe}, ensure_ascii=False)
         with CHATGPT_RUNTIME_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
+        mirror_to_claude_log(event, **fields)
     except Exception:
         pass

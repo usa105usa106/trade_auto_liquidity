@@ -15,6 +15,8 @@ from typing import Any, Callable, Awaitable
 
 import aiohttp
 
+from claude_runtime_logger import claude_log_event
+
 
 CLAUDE_SONNET_46 = "claude-sonnet-4-6"
 CLAUDE_OPUS_48 = "claude-opus-4-8"
@@ -219,14 +221,26 @@ async def build_claude_messages_from_scan_pack(zip_path: str | Path) -> tuple[li
             "setup_version must be 1.6. Use exactly up to 3 trades. "
             "All prices must be normal decimal numbers, never scientific notation."
         ))
+        image_sizes = {}
+        for n in image_names:
+            try:
+                image_sizes[Path(n).name] = len(zf.read(n))
+            except Exception:
+                image_sizes[Path(n).name] = -1
         meta = {
             "zip_path": str(zip_path),
+            "zip_size_bytes": zip_path.stat().st_size if zip_path.exists() else 0,
             "task_len": len(task),
             "log_len": len(log_text),
+            "manifest_len": len(manifest_text),
             "image_count": len(image_names),
             "image_names": [Path(n).name for n in image_names],
+            "image_sizes": image_sizes,
             "selected_symbols": selected,
+            "selected_count": len(selected),
+            "content_blocks": len(content),
         }
+        claude_log_event("claude_pack_prepared_for_api", **meta)
         return [{"role": "user", "content": content}], meta
 
 
@@ -262,20 +276,40 @@ async def call_claude_for_setup(
     }
     if progress:
         await progress(f"отправляю в {claude_model_label(model)}...")
+    claude_log_event(
+        "claude_api_http_start",
+        api_url=CLAUDE_API_URL,
+        api_version=CLAUDE_API_VERSION,
+        model=model,
+        model_label=claude_model_label(model),
+        max_tokens=max_tokens,
+        temperature=(temperature if model != CLAUDE_OPUS_48 else "default_for_opus"),
+        timeout_sec=timeout_sec,
+        image_count=meta.get("image_count"),
+        selected_symbols=meta.get("selected_symbols"),
+        zip_path=meta.get("zip_path"),
+        zip_size_bytes=meta.get("zip_size_bytes"),
+    )
     timeout = aiohttp.ClientTimeout(total=float(timeout_sec))
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(CLAUDE_API_URL, headers=headers, json=payload) as resp:
-            body = await resp.text()
-            http_status = int(resp.status)
-            if resp.status >= 400:
-                raise RuntimeError(f"Claude API HTTP {resp.status}: {body[:1200]}")
-            data = json.loads(body)
+        try:
+            async with session.post(CLAUDE_API_URL, headers=headers, json=payload) as resp:
+                body = await resp.text()
+                http_status = int(resp.status)
+                claude_log_event("claude_api_http_response", http_status=http_status, body_preview=body[:12000])
+                if resp.status >= 400:
+                    raise RuntimeError(f"Claude API HTTP {resp.status}: {body[:1200]}")
+                data = json.loads(body)
+        except Exception as e:
+            claude_log_event("claude_api_http_error", error=repr(e), model=model, api_url=CLAUDE_API_URL)
+            raise
     parts = []
     for item in data.get("content") or []:
         if isinstance(item, dict) and item.get("type") == "text":
             parts.append(str(item.get("text") or ""))
     text = "\n".join(parts).strip()
     if not text:
+        claude_log_event("claude_api_empty_text", response_id=data.get("id"), usage=data.get("usage") or {})
         raise RuntimeError("Claude returned empty text")
     meta["model"] = model
     meta["usage"] = data.get("usage") or {}
@@ -283,6 +317,14 @@ async def call_claude_for_setup(
     meta["http_status"] = http_status
     meta["response_body_preview"] = body[:12000]
     meta["content_block_count"] = len(data.get("content") or [])
+    claude_log_event(
+        "claude_api_text_extracted",
+        model=model,
+        response_id=meta.get("response_id"),
+        usage=meta.get("usage"),
+        raw_len=len(text or ""),
+        content_block_count=meta.get("content_block_count"),
+    )
     return text, meta
 
 

@@ -1,4 +1,4 @@
-import os, time, asyncio, logging, json, re
+import os, time, asyncio, logging, json, re, zipfile
 from datetime import datetime, timezone, timedelta
 import aiohttp
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -35,6 +35,7 @@ from chart_renderer import render_trade_setup_chart
 from ai_btc_autopilot import BTCVisionAutopilot
 from chatgpt_mode import build_chatgpt_log, build_chatgpt_scan_pack, build_chatgpt_runtime_manifest_from_mexc, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log, build_chatgpt_monitor_text, CHATGPT_MONITOR_INTERVAL_SEC, CHATGPT_SETUP_VERSION
 from claude_autopilot import call_claude_for_setup, save_claude_setup_text, normalize_claude_model, claude_model_label, schedule_label, next_schedule_run, schedule_due, CLAUDE_SONNET_46, CLAUDE_OPUS_48, MSK
+from claude_runtime_logger import claude_log_event, claude_runtime_log_path, tail_claude_runtime_log
 from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
 from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env, set_runtime_secret_cache, clear_runtime_secret_cache, runtime_secret_cache, ensure_runtime_secrets_loaded, merge_secrets_into_settings, secret_source_report
@@ -5804,9 +5805,9 @@ def _claude_settings_snapshot(settings: dict | None = None) -> dict:
     enabled = _boolish(s.get("claude_autopilot_enabled"), False)
     cycle_enabled = _boolish(s.get("claude_autopilot_cycle_enabled"), True)
     schedule = str(s.get("claude_autopilot_schedule") or "off").lower()
-    chart_resolution = str(s.get("claude_chart_resolution") or os.getenv("CLAUDE_CHART_RESOLUTION") or "1280x720").lower().replace("×", "x").replace(" ", "")
+    chart_resolution = str(s.get("claude_chart_resolution") or os.getenv("CLAUDE_CHART_RESOLUTION") or "960x540").lower().replace("×", "x").replace(" ", "")
     if chart_resolution not in {"1280x720", "960x540"}:
-        chart_resolution = "1280x720"
+        chart_resolution = "960x540"
     api_key_present = bool(_claude_api_key(s))
     last_ts = float(s.get("claude_autopilot_last_run_ts") or 0)
     nxt = next_schedule_run(schedule, last_ts=last_ts) if cycle_enabled else None
@@ -5818,7 +5819,7 @@ def claude_autopilot_keyboard(settings: dict | None = None) -> InlineKeyboardMar
     enabled = snap["enabled"]
     model = snap["model"]
     schedule = snap["schedule"]
-    chart_resolution = snap.get("chart_resolution", "1280x720")
+    chart_resolution = snap.get("chart_resolution", "960x540")
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🟢 Включить" if not enabled else "✅ ВКЛ", callback_data="claude:enable"), InlineKeyboardButton("🔴 Выключить" if enabled else "○ ВЫКЛ", callback_data="claude:disable")],
         [InlineKeyboardButton(("✅ Скан по кругу: ВКЛ" if snap.get("cycle_enabled", True) else "○ Скан по кругу: ВЫКЛ"), callback_data="claude:cycle_toggle")],
@@ -5828,6 +5829,7 @@ def claude_autopilot_keyboard(settings: dict | None = None) -> InlineKeyboardMar
         [InlineKeyboardButton(("✅ " if schedule == "2h" else "") + "⏱ Каждые 2 часа", callback_data="claude:schedule:2h")],
         [InlineKeyboardButton("⏱ Выключить расписание", callback_data="claude:schedule:off")],
         [InlineKeyboardButton(("✅ " if chart_resolution == "1280x720" else "") + "🖼 1280x720", callback_data="claude:resolution:1280"), InlineKeyboardButton(("✅ " if chart_resolution == "960x540" else "") + "🖼 960x540", callback_data="claude:resolution:960")],
+        [InlineKeyboardButton("🔑 API Claude", callback_data="claude:api_help")],
         [InlineKeyboardButton("🚀 Запустить сейчас LIVE", callback_data="claude:run")],
         [InlineKeyboardButton("🚨 EXIT / CLOSE ALL", callback_data="claude:exit_confirm")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="noop:claude")],
@@ -5844,7 +5846,7 @@ def claude_autopilot_menu_text(settings: dict | None = None) -> str:
         f"Модель: {claude_model_label(snap['model'])}\n"
         f"Скан по кругу: {'ВКЛ' if snap.get('cycle_enabled', True) else 'ВЫКЛ'}\n"
         f"Расписание: {schedule_label(snap['schedule'])}\n"
-        f"Графики: {snap.get('chart_resolution', '1280x720')}\n"
+        f"Графики: {snap.get('chart_resolution', '960x540')}\n"
         f"Следующий запуск: {nxt_s}\n"
         f"API key: {'есть' if snap['api_key_present'] else 'НЕТ'}\n\n"
         "Основа та же, что ChatGPT Scan Mode: top-200 → top-15 → графики → setup v1.6 → текущий валидатор → LIVE сделки."
@@ -5856,6 +5858,49 @@ async def claude_autopilot_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     s = await storage.all_settings()
     await reply(update, claude_autopilot_menu_text(s), reply_markup=claude_autopilot_keyboard(s))
+
+
+def claude_api_help_text() -> str:
+    return (
+        "🔑 API Claude\n\n"
+        "Чтобы Claude Autopilot мог сам отправлять scan-pack в Claude, сохрани Anthropic API key:\n"
+        "/claude_api set sk-ant-...\n\n"
+        "Проверить статус:\n"
+        "/claude_api status\n\n"
+        "Очистить ключ:\n"
+        "/claude_api clear\n\n"
+        "Ключ хранится в настройках бота как anthropic_api_key. ENV ANTHROPIC_API_KEY тоже поддерживается."
+    )
+
+
+async def claude_api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    args = list(getattr(context, "args", []) or [])
+    action = (args[0].lower() if args else "help")
+    if action == "status":
+        s = await storage.all_settings()
+        saved = bool(str(s.get("anthropic_api_key") or "").strip())
+        env = bool(str(os.getenv("ANTHROPIC_API_KEY") or "").strip())
+        await reply(update, f"🔑 Claude API status\nSaved in bot: {'YES' if saved else 'NO'}\nENV fallback: {'YES' if env else 'NO'}", reply_markup=MAIN_MENU)
+        return
+    if action == "set":
+        key = " ".join(args[1:]).strip()
+        if not key or not key.startswith("sk-ant-"):
+            await reply(update, "❌ Нужен Anthropic key вида sk-ant-...\nИспользуй: /claude_api set sk-ant-...", reply_markup=MAIN_MENU)
+            return
+        await storage.set("anthropic_api_key", key)
+        os.environ["ANTHROPIC_API_KEY"] = key
+        claude_log_event("claude_api_key_saved", key_prefix=key[:10], key_len=len(key), user_id=getattr(update.effective_user, "id", ""))
+        await reply(update, "✅ Claude API key сохранён. Теперь Claude Autopilot может запускаться LIVE.", reply_markup=MAIN_MENU)
+        return
+    if action == "clear":
+        await storage.set("anthropic_api_key", "")
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        claude_log_event("claude_api_key_cleared", user_id=getattr(update.effective_user, "id", ""))
+        await reply(update, "🗑 Claude API key очищен из настроек бота.", reply_markup=MAIN_MENU)
+        return
+    await reply(update, claude_api_help_text(), reply_markup=MAIN_MENU)
 
 
 def _claude_raw_dir() -> str:
@@ -5898,21 +5943,40 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
     app.bot_data["claude_autopilot_running"] = True
     lines: list[str] = []
     pack_path = setup_path = None
+    claude_run_id = f"claude_{int(time.time())}_{trigger}"
+    os.environ["CLAUDE_AUTOPILOT_LOG_ACTIVE"] = claude_run_id
+    claude_log_event("claude_autopilot_run_start", run_id=claude_run_id, trigger=trigger, chat_id=chat_id, bot_version=VERSION)
     try:
         settings = await storage.all_settings()
         if not _boolish(settings.get("claude_autopilot_enabled"), False) and trigger != "manual_force":
             await _claude_status(app, status_message, lines, "⏸ Автопилот выключен. Запуск пропущен.")
             return
+        saved_api = bool(str(settings.get("anthropic_api_key") or "").strip())
+        env_api = bool(str(os.getenv("ANTHROPIC_API_KEY") or "").strip())
         api_key = _claude_api_key(settings)
+        claude_log_event("claude_api_key_status", saved_in_bot=saved_api, env_fallback=env_api, usable=bool(api_key))
         if not api_key:
+            claude_log_event("claude_autopilot_stop_no_api_key", run_id=claude_run_id)
             await _claude_status(app, status_message, lines, "❌ ANTHROPIC_API_KEY не найден. Сделки не открывались.")
             return
         model = normalize_claude_model(settings.get("claude_autopilot_model") or os.getenv("CLAUDE_MODEL") or CLAUDE_SONNET_46)
         max_tokens = int(os.getenv("CLAUDE_MAX_TOKENS", str(settings.get("claude_max_tokens", 6000) or 6000)) or 6000)
         temperature = float(os.getenv("CLAUDE_TEMPERATURE", str(settings.get("claude_temperature", 0.2) or 0.2)) or 0.2)
-        chart_resolution = str(settings.get("claude_chart_resolution") or os.getenv("CLAUDE_CHART_RESOLUTION") or "1280x720").lower().replace("×", "x").replace(" ", "")
+        chart_resolution = str(settings.get("claude_chart_resolution") or os.getenv("CLAUDE_CHART_RESOLUTION") or "960x540").lower().replace("×", "x").replace(" ", "")
         if chart_resolution not in {"1280x720", "960x540"}:
-            chart_resolution = "1280x720"
+            chart_resolution = "960x540"
+        claude_log_event(
+            "claude_autopilot_settings",
+            run_id=claude_run_id,
+            enabled=settings.get("claude_autopilot_enabled"),
+            schedule=settings.get("claude_autopilot_schedule"),
+            model=model,
+            model_label=claude_model_label(model),
+            max_tokens=max_tokens,
+            temperature=(temperature if model != CLAUDE_OPUS_48 else "default_for_opus"),
+            chart_resolution=chart_resolution,
+            scan_limit=os.getenv("CHATGPT_SCAN_LIMIT", "200"),
+        )
 
         await storage.set("claude_autopilot_last_run_ts", time.time(), bump_revision=False)
         await disable_other_modes(storage)
@@ -5927,6 +5991,15 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
         ws = await get_ws(settings)
         scan_limit = int(os.getenv("CHATGPT_SCAN_LIMIT", "200") or 200)
         pack_path = await build_chatgpt_scan_pack(ex, scanner, settings, ws_supervisor=ws, limit=scan_limit, storage=storage, chart_resolution=chart_resolution)
+        try:
+            pack_size = os.path.getsize(pack_path)
+            pack_names = []
+            with zipfile.ZipFile(pack_path, "r") as zf:
+                pack_names = zf.namelist()
+            image_names = [n for n in pack_names if str(n).lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
+            claude_log_event("claude_scan_pack_built", run_id=claude_run_id, pack_path=pack_path, pack_size_bytes=pack_size, file_count=len(pack_names), image_count=len(image_names), file_names=pack_names, image_names=image_names)
+        except Exception as e:
+            claude_log_event("claude_scan_pack_log_error", run_id=claude_run_id, pack_path=pack_path, error=repr(e))
         await _claude_status(app, status_message, lines, f"✅ Шаг 1/7: scan готов\n✅ Шаг 2/7: архив собран: {os.path.basename(pack_path)}")
         try:
             with open(pack_path, "rb") as f:
@@ -5940,8 +6013,10 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
                     write_timeout=float(os.getenv("TELEGRAM_DOCUMENT_WRITE_TIMEOUT_SEC", "180") or 180),
                     pool_timeout=float(os.getenv("TELEGRAM_DOCUMENT_POOL_TIMEOUT_SEC", "30") or 30),
                 )
+            claude_log_event("claude_scan_pack_sent_to_telegram", run_id=claude_run_id, pack_path=pack_path, chat_id=chat_id)
         except Exception as e:
             chatgpt_log_event("claude_pack_send_failed", error=repr(e))
+            claude_log_event("claude_scan_pack_send_to_telegram_failed", run_id=claude_run_id, pack_path=pack_path, error=repr(e))
 
         async def _progress(msg: str):
             await _claude_status(app, status_message, lines, f"📤 Claude: {msg}")
@@ -6001,11 +6076,15 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
                     write_timeout=float(os.getenv("TELEGRAM_DOCUMENT_WRITE_TIMEOUT_SEC", "180") or 180),
                     pool_timeout=float(os.getenv("TELEGRAM_DOCUMENT_POOL_TIMEOUT_SEC", "30") or 30),
                 )
+            claude_log_event("claude_setup_sent_to_telegram", run_id=claude_run_id, setup_path=setup_path, chat_id=chat_id)
         except Exception as e:
             chatgpt_log_event("claude_setup_send_failed", error=repr(e))
+            claude_log_event("claude_setup_send_to_telegram_failed", run_id=claude_run_id, setup_path=setup_path, error=repr(e))
 
         await _claude_status(app, status_message, lines, "⏳ Шаг 6/7: открываю сделки LIVE текущим ChatGPT executor...")
+        claude_log_event("claude_execute_setup_start", run_id=claude_run_id, setup_path=setup_path, trades=setup.get("trades"), verdict=setup.get("verdict"))
         result = await execute_setup(storage, ex, setup)
+        claude_log_event("claude_execute_setup_done", run_id=claude_run_id, result=result)
         opened_rows = result.get("opened") if isinstance(result.get("opened"), list) else []
         placed = [x for x in opened_rows if isinstance(x, dict) and bool(x.get("ok"))]
         skipped = [x for x in opened_rows if isinstance(x, dict) and not bool(x.get("ok"))]
@@ -6034,8 +6113,10 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             summary.append(f"❌ {r.get('symbol')} {r.get('side')} — {str(r.get('reason') or r.get('error') or '')[:120]}")
         await _safe_edit_message_text(status_message, "🤖 Claude Autopilot LIVE\n\n" + "\n".join(summary)) if status_message is not None else await _safe_send_bot_message(app, chat_id, "🤖 Claude Autopilot LIVE\n\n" + "\n".join(summary), reply_markup=MAIN_MENU)
         chatgpt_log_event("claude_autopilot_done", pack=pack_path, setup=setup_path, model=model, meta=meta, result=result)
+        claude_log_event("claude_autopilot_run_done", run_id=claude_run_id, pack=pack_path, setup=setup_path, model=model, result=result)
     except Exception as e:
         chatgpt_log_event("claude_autopilot_failed", error=repr(e), pack=pack_path, setup=setup_path)
+        claude_log_event("claude_autopilot_run_failed", run_id=claude_run_id, error=repr(e), pack=pack_path, setup=setup_path, last_status_lines=lines[-30:])
         log.exception("Claude Autopilot failed")
         txt = "❌ Claude Autopilot остановлен\n\n" + "\n".join(lines[-20:]) + f"\n\nОшибка: {str(e)[:1200]}\nСделки НЕ открывались, если ошибка была до execute_setup."
         if status_message is not None:
@@ -6044,6 +6125,7 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             await _safe_send_bot_message(app, chat_id, txt, reply_markup=MAIN_MENU)
     finally:
         app.bot_data["claude_autopilot_running"] = False
+        claude_log_event("claude_autopilot_run_finally", run_id=claude_run_id, mirror_active=os.getenv("CLAUDE_AUTOPILOT_LOG_ACTIVE", ""))
 
 
 async def _claude_emergency_close_all(app, chat_id: int, status_message=None):
@@ -6491,8 +6573,28 @@ async def log_chatgpt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def log_claude_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Claude Autopilot writes into the same detailed runtime log.
-    await log_chatgpt_cmd(update, context)
+    if not allowed(update):
+        return
+    try:
+        path = claude_runtime_log_path()
+        claude_log_event("log_claude_requested", user_id=getattr(update.effective_user, "id", ""))
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            chat_id = update.effective_chat.id if update.effective_chat else first_admin_id()
+            with open(path, "rb") as f:
+                await context.application.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename="claude_autopilot_runtime.log",
+                    caption="📄 Подробный лог Claude Autopilot: API, scan-pack, Claude, setup, LIVE-входы, SL/TP и сопровождение.",
+                    connect_timeout=float(os.getenv("TELEGRAM_DOCUMENT_CONNECT_TIMEOUT_SEC", "30") or 30),
+                    read_timeout=float(os.getenv("TELEGRAM_DOCUMENT_READ_TIMEOUT_SEC", "180") or 180),
+                    write_timeout=float(os.getenv("TELEGRAM_DOCUMENT_WRITE_TIMEOUT_SEC", "180") or 180),
+                    pool_timeout=float(os.getenv("TELEGRAM_DOCUMENT_POOL_TIMEOUT_SEC", "30") or 30),
+                )
+        else:
+            await reply(update, "Лог Claude Autopilot пока пустой.", reply_markup=MAIN_MENU)
+    except Exception as e:
+        await reply(update, f"❌ Не смог отправить /log_claude: {str(e)[:900]}\n\nПоследние строки:\n{tail_claude_runtime_log(60)[:3000]}", reply_markup=MAIN_MENU)
 
 def format_chatgpt_setup_execution_report(result: dict) -> str:
     """Human-readable immediate report after setup upload.
@@ -6781,11 +6883,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _safe_edit_message_text(q.message, claude_autopilot_menu_text(ns), reply_markup=claude_autopilot_keyboard(ns))
             return
         if action == "resolution":
-            choice = data[2] if len(data) > 2 else "1280"
-            value = "960x540" if choice == "960" else "1280x720"
+            choice = data[2] if len(data) > 2 else "960"
+            value = "1280x720" if choice == "1280" else "960x540"
             await storage.set("claude_chart_resolution", value)
             ns = await storage.all_settings()
             await _safe_edit_message_text(q.message, claude_autopilot_menu_text(ns), reply_markup=claude_autopilot_keyboard(ns))
+            return
+        if action == "api_help":
+            await _safe_edit_message_text(q.message, claude_api_help_text(), reply_markup=claude_autopilot_keyboard(await storage.all_settings()))
             return
         if action == "run":
             ns = await storage.all_settings()
@@ -8635,6 +8740,7 @@ def build_app():
     app.add_handler(CommandHandler("chatgpt_scan", _wrap_command(chatgpt_scan_mode_cmd, "/chatgpt_scan")))
     app.add_handler(CommandHandler("scan_potok", _wrap_command(scan_potok_cmd, "/scan_potok")))
     app.add_handler(CommandHandler("claude_autopilot", _wrap_command(claude_autopilot_cmd, "/claude_autopilot")))
+    app.add_handler(CommandHandler("claude_api", _wrap_command(claude_api_cmd, "/claude_api")))
     app.add_handler(CommandHandler("import_setup", _wrap_command(chatgpt_accept_setup_cmd, "/import_setup")))
     app.add_handler(CommandHandler("chatgpt_exit", _wrap_command(chatgpt_exit_mode_cmd, "/chatgpt_exit")))
     app.add_handler(CommandHandler("log_chatgpt", _wrap_command(log_chatgpt_cmd, "/log_chatgpt")))

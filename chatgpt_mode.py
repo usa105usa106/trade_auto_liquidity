@@ -12,6 +12,7 @@ from typing import Any
 from models import TradePlan
 from execution_engine import ExecutionEngine
 from debug_log import log_event
+from claude_runtime_logger import mirror_to_claude_log
 
 CHATGPT_MODE_KEYS = {
     "quick_bounce_enabled": False,
@@ -206,7 +207,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": os.getenv("BOT_VERSION", "411_plus_full"),
+        "bot_version": os.getenv("BOT_VERSION", "412"),
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -260,6 +261,7 @@ def chatgpt_log_event(event: str, **fields) -> None:
         line = json.dumps({"ts": _now_utc(), "event": event, **safe}, ensure_ascii=False)
         with CHATGPT_RUNTIME_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
+        mirror_to_claude_log(event, **fields)
     except Exception:
         pass
 
@@ -699,6 +701,16 @@ def _chatgpt_chart_filename(symbol: str, tf: str) -> str:
     return f"{base}_{_chatgpt_tf_to_filename(tf)}.png"
 
 
+def _csv_timeframes(env_name: str, default: str) -> list[str]:
+    raw = os.getenv(env_name, default)
+    out = []
+    for item in str(raw or default).split(","):
+        tf = item.strip().lower()
+        if tf:
+            out.append(tf)
+    return out or [x.strip() for x in default.split(",") if x.strip()]
+
+
 def _chatgpt_prepare_chart_df(candles: list, tail: int = 120):
     import pandas as pd
     df = pd.DataFrame(candles or [], columns=["ts", "open", "high", "low", "close", "volume"])
@@ -725,7 +737,13 @@ def _chatgpt_prepare_chart_df(candles: list, tail: int = 120):
     return df.tail(tail).reset_index(drop=True)
 
 
-def _render_chatgpt_candidate_chart(symbol: str, timeframe: str, candles: list, meta: dict, out_path: Path) -> str:
+def _chatgpt_resolution_to_figsize(resolution: str | None) -> tuple[float, float]:
+    r = str(resolution or "1280x720").lower().replace("×", "x").replace(" ", "")
+    if r == "960x540":
+        return (9.6, 5.4)
+    return (12.8, 7.2)
+
+def _render_chatgpt_candidate_chart(symbol: str, timeframe: str, candles: list, meta: dict, out_path: Path, chart_resolution: str | None = None) -> str:
     """Render raw candidate chart for ChatGPT Scan Mode, without ENTRY/SL/TP."""
     import numpy as np
     import matplotlib
@@ -740,7 +758,7 @@ def _render_chatgpt_candidate_chart(symbol: str, timeframe: str, candles: list, 
 
     bg = "#0f1722"; grid = "#263241"; txt = "#d5dde8"
     green = "#21c087"; red = "#f6465d"; orange = "#f59e0b"; blue = "#3b82f6"; purple = "#a855f7"
-    fig = plt.figure(figsize=(12.8, 7.2), dpi=100)
+    fig = plt.figure(figsize=_chatgpt_resolution_to_figsize(chart_resolution), dpi=100)
     gs = fig.add_gridspec(3, 1, height_ratios=[5.2, 1.2, 1.5], hspace=0.06)
     ax = fig.add_subplot(gs[0]); av = fig.add_subplot(gs[1], sharex=ax); am = fig.add_subplot(gs[2], sharex=ax)
     fig.patch.set_facecolor(bg)
@@ -971,11 +989,14 @@ FINAL SELF-CHECK BEFORE SENDING FILE:
 12. Если условий нет, лучше дай NO_TRADE, чем кривой setup."""
 
 
-async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None) -> str:
+async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None, chart_resolution: str | None = None) -> str:
     """Build a full ChatGPT Scan Mode ZIP: log.txt + task.txt + manifest + charts."""
     started = time.time()
     _phase_t0 = started
-    chatgpt_log_event("scan_pack_start", limit=limit, top=os.getenv("CHATGPT_SCAN_PACK_TOP", "15"), chart_workers=os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")))
+    chart_resolution = str(chart_resolution or "1280x720").lower().replace("×", "x").replace(" ", "")
+    if chart_resolution not in {"1280x720", "960x540"}:
+        chart_resolution = "1280x720"
+    chatgpt_log_event("scan_pack_start", limit=limit, top=os.getenv("CHATGPT_SCAN_PACK_TOP", "15"), chart_workers=os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")), chart_resolution=chart_resolution)
     log_path = await build_chatgpt_log(exchange_client, scanner, settings, ws_supervisor=ws_supervisor, limit=limit)
     _timing_build_log_sec = round(time.time() - _phase_t0, 2)
     _phase_t0 = time.time()
@@ -995,11 +1016,13 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     )
     meta_by_symbol = {r["symbol"]: r for r in selected_rows}
     # Market context must always exist, but it must not duplicate selected charts.
+    # Full pack default: top-15 selected symbols on 4H/1H/15m + BTC/ETH 4H/1H.
+    pack_timeframes = _csv_timeframes("CHATGPT_SCAN_PACK_TIMEFRAMES", "4h,1h,15m")
     required_context = [("BTC_USDT", "4h"), ("BTC_USDT", "1h"), ("ETH_USDT", "4h"), ("ETH_USDT", "1h")]
     chart_jobs: list[tuple[str, str]] = []
     seen_files: set[str] = set()
     for sym in selected_symbols:
-        for tf in ("4h", "1h", "15m"):
+        for tf in pack_timeframes:
             fn = _chatgpt_chart_filename(sym, tf)
             if fn not in seen_files:
                 seen_files.add(fn); chart_jobs.append((sym, tf))
@@ -1027,7 +1050,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     (work / "log.txt").write_text(log_text, encoding="utf-8")
     (work / "task.txt").write_text(CHATGPT_SCAN_TASK_TEXT, encoding="utf-8")
 
-    workers = int(os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")) or 3)
+    workers = int(os.getenv("CHATGPT_CHART_RENDER_CONCURRENCY", os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3"))) or 3)
     sem = asyncio.Semaphore(max(1, workers))
     missing: list[str] = []
     errors: list[str] = []
@@ -1053,10 +1076,10 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
                 "low_24h": _safe_float((ticker or {}).get("low") or ((ticker or {}).get("info") or {}).get("low24Price")),
                 "vol_ratio": (vol_now / vol_avg) if vol_avg else 0.0,
             })
-            _render_chatgpt_candidate_chart(native, ex_tf, candles, meta, out)
+            await asyncio.to_thread(_render_chatgpt_candidate_chart, native, ex_tf, candles, meta, out, chart_resolution)
             try:
                 size_kb = round(out.stat().st_size / 1024, 1)
-                chatgpt_log_event("scan_pack_chart_done", symbol=native, timeframe=ex_tf, file=filename, candles=len(candles or []), size_kb=size_kb, resolution="1280x720")
+                chatgpt_log_event("scan_pack_chart_done", symbol=native, timeframe=ex_tf, file=filename, candles=len(candles or []), size_kb=size_kb, resolution=str(chart_resolution or "1280x720"))
                 if out.stat().st_size > int(os.getenv("CHATGPT_MAX_PNG_SIZE_KB", "900")) * 1024:
                     chatgpt_log_event("scan_pack_chart_large", file=filename, size_kb=size_kb)
             except Exception:
@@ -1073,7 +1096,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "411_plus_full"
+        _bot_code_version = "412"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "created_utc": _now_utc(),
@@ -1082,11 +1105,11 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
         "selected_rows": selected_rows,
-        "timeframes": ["4h", "1h", "15min"],
+        "timeframes": pack_timeframes,
         "required_context": ["btc_4h", "btc_1h", "eth_4h", "eth_1h"],
         "blocked_symbol_substrings": list(CHATGPT_BLOCKED_SYMBOL_SUBSTRINGS),
         "chart_source": "python_ohlcv_mexc",
-        "chart_resolution": "1280x720",
+        "chart_resolution": str(chart_resolution or "1280x720"),
         "chart_dpi": 100,
         "candles_per_chart": 120,
         "ohlcv_fetch_limit": 160,
@@ -2144,6 +2167,51 @@ def _chatgpt_protection_kinds_by_symbol(all_orders: list[dict]) -> dict[str, set
     return by_symbol
 
 
+def _chatgpt_position_embedded_protection_kinds(pos: dict) -> set[str]:
+    """Read live TP/SL fields embedded in the MEXC position payload.
+
+    This is still exchange-source-of-truth, not local cache: after a restart,
+    MEXC can show position-level takeProfit/stopLoss even when the separate
+    open-order endpoint is briefly empty. Those live fields must prevent false
+    аварийные entries for already protected positions.
+    """
+    kinds: set[str] = set()
+    candidates = []
+    if isinstance(pos, dict):
+        candidates.append(pos)
+        raw = pos.get("raw_exchange_position")
+        if isinstance(raw, dict):
+            candidates.append(raw)
+            info = raw.get("info")
+            if isinstance(info, dict):
+                candidates.append(info)
+        info = pos.get("info")
+        if isinstance(info, dict):
+            candidates.append(info)
+    tp_keys = {
+        "takeProfitPrice", "take_profit_price", "takeProfit", "take_profit",
+        "tpPrice", "tp_price", "takeProfitTriggerPrice", "takeProfitTrigger",
+        "takeProfitOrderPrice", "profitPrice", "takeProfitPlanPrice",
+    }
+    sl_keys = {
+        "stopLossPrice", "stop_loss_price", "stopLoss", "stop_loss",
+        "slPrice", "sl_price", "stopLossTriggerPrice", "stopLossTrigger",
+        "stopLossOrderPrice", "lossPrice", "stopLossPlanPrice",
+    }
+    def has_price(v) -> bool:
+        try:
+            return v not in (None, "", 0, "0") and float(v) > 0
+        except Exception:
+            return False
+    for row in candidates:
+        for k, v in row.items():
+            if k in tp_keys and has_price(v):
+                kinds.add("tp")
+            if k in sl_keys and has_price(v):
+                kinds.add("sl")
+    return kinds
+
+
 def _chatgpt_protection_kinds_for_position(pos: dict, all_orders: list[dict]) -> set[str]:
     sym = mexc_native_symbol(pos.get("symbol"))
     side = str(pos.get("side") or "LONG").upper()
@@ -2151,7 +2219,7 @@ def _chatgpt_protection_kinds_for_position(pos: dict, all_orders: list[dict]) ->
         entry = float(pos.get("entry_price") or pos.get("entry") or 0)
     except Exception:
         entry = 0.0
-    kinds: set[str] = set()
+    kinds: set[str] = set(_chatgpt_position_embedded_protection_kinds(pos))
     for o in all_orders or []:
         if _chatgpt_order_symbol(o) != sym:
             continue
