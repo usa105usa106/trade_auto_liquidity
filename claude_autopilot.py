@@ -27,6 +27,68 @@ CLAUDE_API_VERSION = os.getenv("ANTHROPIC_VERSION", "2023-06-01")
 MSK = timezone(timedelta(hours=3))
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value or default)
+    except Exception:
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value or default)
+    except Exception:
+        return default
+
+
+def _claude_pricing_per_mtok(model: str) -> dict[str, float]:
+    """Return approximate USD per 1M tokens for log-only cost estimates.
+
+    Can be overridden by env without changing trading logic:
+    CLAUDE_INPUT_USD_PER_MTOK, CLAUDE_OUTPUT_USD_PER_MTOK,
+    CLAUDE_CACHE_CREATE_USD_PER_MTOK, CLAUDE_CACHE_READ_USD_PER_MTOK.
+    """
+    model = normalize_claude_model(model)
+    if model == CLAUDE_OPUS_48:
+        defaults = {"input": 15.0, "output": 75.0, "cache_create": 18.75, "cache_read": 1.5}
+    else:
+        defaults = {"input": 3.0, "output": 15.0, "cache_create": 3.75, "cache_read": 0.3}
+    return {
+        "input": _safe_float(os.getenv("CLAUDE_INPUT_USD_PER_MTOK"), defaults["input"]),
+        "output": _safe_float(os.getenv("CLAUDE_OUTPUT_USD_PER_MTOK"), defaults["output"]),
+        "cache_create": _safe_float(os.getenv("CLAUDE_CACHE_CREATE_USD_PER_MTOK"), defaults["cache_create"]),
+        "cache_read": _safe_float(os.getenv("CLAUDE_CACHE_READ_USD_PER_MTOK"), defaults["cache_read"]),
+    }
+
+
+def estimate_claude_cost_usd(model: str, usage: dict[str, Any] | None) -> dict[str, Any]:
+    usage = usage or {}
+    rates = _claude_pricing_per_mtok(model)
+    input_tokens = _safe_int(usage.get("input_tokens"))
+    output_tokens = _safe_int(usage.get("output_tokens"))
+    cache_create = _safe_int(usage.get("cache_creation_input_tokens"))
+    cache_read = _safe_int(usage.get("cache_read_input_tokens"))
+    input_usd = input_tokens / 1_000_000 * rates["input"]
+    output_usd = output_tokens / 1_000_000 * rates["output"]
+    cache_create_usd = cache_create / 1_000_000 * rates["cache_create"]
+    cache_read_usd = cache_read / 1_000_000 * rates["cache_read"]
+    total = input_usd + output_usd + cache_create_usd + cache_read_usd
+    return {
+        "model": normalize_claude_model(model),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_create,
+        "cache_read_input_tokens": cache_read,
+        "rates_usd_per_mtok": rates,
+        "input_usd": round(input_usd, 6),
+        "output_usd": round(output_usd, 6),
+        "cache_creation_usd": round(cache_create_usd, 6),
+        "cache_read_usd": round(cache_read_usd, 6),
+        "total_usd_estimate": round(total, 6),
+        "note": "approximate log estimate from API usage tokens; billing console is source of truth",
+    }
+
+
 def msk_stamp() -> str:
     return datetime.now(MSK).strftime("%H%M_%d%m")
 
@@ -227,18 +289,32 @@ async def build_claude_messages_from_scan_pack(zip_path: str | Path) -> tuple[li
                 image_sizes[Path(n).name] = len(zf.read(n))
             except Exception:
                 image_sizes[Path(n).name] = -1
+        image_total_bytes = sum(v for v in image_sizes.values() if isinstance(v, int) and v > 0)
+        image_timeframes = sorted({
+            ("15m" if ("15m" in Path(n).stem.lower() or "15min" in Path(n).stem.lower()) else "1h" if re.search(r"(^|[_\-])1h($|[_\-])", Path(n).stem.lower()) else "4h" if re.search(r"(^|[_\-])4h($|[_\-])", Path(n).stem.lower()) else "unknown")
+            for n in image_names
+        })
         meta = {
             "zip_path": str(zip_path),
             "zip_size_bytes": zip_path.stat().st_size if zip_path.exists() else 0,
             "task_len": len(task),
             "log_len": len(log_text),
             "manifest_len": len(manifest_text),
+            "text_total_chars": len(task) + len(log_text) + len(manifest_text),
+            "task_sent_chars": min(len(task), 120_000),
+            "log_sent_chars": min(len(log_text), 180_000),
+            "manifest_sent_chars": min(len(manifest_text), 80_000),
             "image_count": len(image_names),
             "image_names": [Path(n).name for n in image_names],
+            "image_timeframes": image_timeframes,
             "image_sizes": image_sizes,
+            "image_total_bytes": image_total_bytes,
+            "image_total_kb": round(image_total_bytes / 1024, 2),
             "selected_symbols": selected,
             "selected_count": len(selected),
             "content_blocks": len(content),
+            "content_text_blocks": sum(1 for x in content if x.get("type") == "text"),
+            "content_image_blocks": sum(1 for x in content if x.get("type") == "image"),
         }
         claude_log_event("claude_pack_prepared_for_api", **meta)
         return [{"role": "user", "content": content}], meta
@@ -274,10 +350,15 @@ async def call_claude_for_setup(
         "anthropic-version": CLAUDE_API_VERSION,
         "content-type": "application/json",
     }
+    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    payload_bytes = len(payload_json.encode("utf-8"))
+    meta["payload_bytes"] = payload_bytes
+    meta["payload_mb"] = round(payload_bytes / 1024 / 1024, 3)
+    meta["request_started_ts"] = datetime.now(timezone.utc).isoformat()
     if progress:
         await progress(f"отправляю в {claude_model_label(model)}...")
     claude_log_event(
-        "claude_api_http_start",
+        "claude_api_request_prepared",
         api_url=CLAUDE_API_URL,
         api_version=CLAUDE_API_VERSION,
         model=model,
@@ -286,22 +367,50 @@ async def call_claude_for_setup(
         temperature=(temperature if model != CLAUDE_OPUS_48 else "default_for_opus"),
         timeout_sec=timeout_sec,
         image_count=meta.get("image_count"),
+        image_timeframes=meta.get("image_timeframes"),
+        image_total_bytes=meta.get("image_total_bytes"),
+        image_total_kb=meta.get("image_total_kb"),
         selected_symbols=meta.get("selected_symbols"),
+        selected_count=meta.get("selected_count"),
         zip_path=meta.get("zip_path"),
         zip_size_bytes=meta.get("zip_size_bytes"),
+        text_total_chars=meta.get("text_total_chars"),
+        task_sent_chars=meta.get("task_sent_chars"),
+        log_sent_chars=meta.get("log_sent_chars"),
+        manifest_sent_chars=meta.get("manifest_sent_chars"),
+        content_blocks=meta.get("content_blocks"),
+        content_text_blocks=meta.get("content_text_blocks"),
+        content_image_blocks=meta.get("content_image_blocks"),
+        payload_bytes=payload_bytes,
+        payload_mb=meta.get("payload_mb"),
     )
+    claude_log_event("claude_api_http_start", model=model, api_url=CLAUDE_API_URL, timeout_sec=timeout_sec)
     timeout = aiohttp.ClientTimeout(total=float(timeout_sec))
+    started = time.time()
     async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
             async with session.post(CLAUDE_API_URL, headers=headers, json=payload) as resp:
                 body = await resp.text()
                 http_status = int(resp.status)
-                claude_log_event("claude_api_http_response", http_status=http_status, body_preview=body[:12000])
+                elapsed_sec = round(time.time() - started, 3)
+                response_headers = {
+                    k: v for k, v in dict(resp.headers).items()
+                    if k.lower().startswith("anthropic") or k.lower().startswith("x-ratelimit") or k.lower() in {"request-id", "retry-after", "content-type"}
+                }
+                claude_log_event(
+                    "claude_api_http_response",
+                    http_status=http_status,
+                    elapsed_sec=elapsed_sec,
+                    response_bytes=len(body.encode("utf-8")),
+                    response_headers=response_headers,
+                    body_preview=body[:20000],
+                )
                 if resp.status >= 400:
+                    claude_log_event("claude_api_http_error_body", http_status=http_status, elapsed_sec=elapsed_sec, body_preview=body[:20000])
                     raise RuntimeError(f"Claude API HTTP {resp.status}: {body[:1200]}")
                 data = json.loads(body)
         except Exception as e:
-            claude_log_event("claude_api_http_error", error=repr(e), model=model, api_url=CLAUDE_API_URL)
+            claude_log_event("claude_api_http_error", error=repr(e), model=model, api_url=CLAUDE_API_URL, elapsed_sec=round(time.time() - started, 3))
             raise
     parts = []
     for item in data.get("content") or []:
@@ -313,16 +422,30 @@ async def call_claude_for_setup(
         raise RuntimeError("Claude returned empty text")
     meta["model"] = model
     meta["usage"] = data.get("usage") or {}
+    meta["cost_estimate"] = estimate_claude_cost_usd(model, meta["usage"])
     meta["response_id"] = data.get("id")
+    meta["response_type"] = data.get("type")
+    meta["stop_reason"] = data.get("stop_reason")
+    meta["stop_sequence"] = data.get("stop_sequence")
     meta["http_status"] = http_status
-    meta["response_body_preview"] = body[:12000]
+    meta["response_body_preview"] = body[:20000]
     meta["content_block_count"] = len(data.get("content") or [])
+    claude_log_event(
+        "claude_usage",
+        model=model,
+        response_id=meta.get("response_id"),
+        usage=meta.get("usage"),
+        cost_estimate=meta.get("cost_estimate"),
+        stop_reason=meta.get("stop_reason"),
+    )
     claude_log_event(
         "claude_api_text_extracted",
         model=model,
         response_id=meta.get("response_id"),
         usage=meta.get("usage"),
+        cost_estimate=meta.get("cost_estimate"),
         raw_len=len(text or ""),
+        raw_preview=text[:4000],
         content_block_count=meta.get("content_block_count"),
     )
     return text, meta

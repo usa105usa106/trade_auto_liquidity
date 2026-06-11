@@ -10,7 +10,7 @@ load_dotenv()
 # Previous packaged version marker kept for regression tests: 0092 RUN IMMEDIATE SCAN WAKEUP
 # Previous packaged version marker kept for regression tests: 0155 REAL MEXC TPSL TRIGGER FIX
 # Previous packaged version marker kept for regression tests: 0368 CHATGPT ONE LIVE MONITOR V33
-VERSION = "413"  # hard-coded; ignore stale Railway BOT_VERSION env
+VERSION = "415"  # hard-coded; ignore stale Railway BOT_VERSION env
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -279,6 +279,7 @@ class Defaults:
     claude_autopilot_schedule: str = os.getenv("CLAUDE_AUTOPILOT_SCHEDULE", "off")
     claude_autopilot_cycle_enabled: bool = env_bool("CLAUDE_AUTOPILOT_CYCLE_ENABLED", True)
     claude_chart_resolution: str = os.getenv("CLAUDE_CHART_RESOLUTION", "960x540")
+    claude_analysis_mode: str = os.getenv("CLAUDE_ANALYSIS_MODE", "optimal")
     claude_max_tokens: int = env_int("CLAUDE_MAX_TOKENS", 6000)
     claude_temperature: float = env_float("CLAUDE_TEMPERATURE", 0.2)
 

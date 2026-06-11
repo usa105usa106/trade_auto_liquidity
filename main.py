@@ -5808,10 +5808,13 @@ def _claude_settings_snapshot(settings: dict | None = None) -> dict:
     chart_resolution = str(s.get("claude_chart_resolution") or os.getenv("CLAUDE_CHART_RESOLUTION") or "960x540").lower().replace("×", "x").replace(" ", "")
     if chart_resolution not in {"1280x720", "960x540"}:
         chart_resolution = "960x540"
+    analysis_mode = str(s.get("claude_analysis_mode") or os.getenv("CLAUDE_ANALYSIS_MODE") or "optimal").strip().lower()
+    if analysis_mode not in {"optimal", "full"}:
+        analysis_mode = "optimal"
     api_key_present = bool(_claude_api_key(s))
     last_ts = float(s.get("claude_autopilot_last_run_ts") or 0)
     nxt = next_schedule_run(schedule, last_ts=last_ts) if cycle_enabled else None
-    return {"enabled": enabled, "cycle_enabled": cycle_enabled, "model": model, "schedule": schedule, "chart_resolution": chart_resolution, "api_key_present": api_key_present, "next_run": nxt}
+    return {"enabled": enabled, "cycle_enabled": cycle_enabled, "model": model, "schedule": schedule, "chart_resolution": chart_resolution, "analysis_mode": analysis_mode, "api_key_present": api_key_present, "next_run": nxt}
 
 
 def claude_autopilot_keyboard(settings: dict | None = None) -> InlineKeyboardMarkup:
@@ -5824,6 +5827,7 @@ def claude_autopilot_keyboard(settings: dict | None = None) -> InlineKeyboardMar
         [InlineKeyboardButton("🟢 Включить" if not enabled else "✅ ВКЛ", callback_data="claude:enable"), InlineKeyboardButton("🔴 Выключить" if enabled else "○ ВЫКЛ", callback_data="claude:disable")],
         [InlineKeyboardButton(("✅ Скан по кругу: ВКЛ" if snap.get("cycle_enabled", True) else "○ Скан по кругу: ВЫКЛ"), callback_data="claude:cycle_toggle")],
         [InlineKeyboardButton(("✅ " if model == CLAUDE_SONNET_46 else "") + "🧠 Sonnet 4.6", callback_data="claude:model:sonnet"), InlineKeyboardButton(("✅ " if model == CLAUDE_OPUS_48 else "") + "🧠 Opus 4.8", callback_data="claude:model:opus")],
+        [InlineKeyboardButton(("✅ " if snap.get("analysis_mode", "optimal") == "full" else "") + "🔎 Анализ full", callback_data="claude:analysis:full"), InlineKeyboardButton(("✅ " if snap.get("analysis_mode", "optimal") == "optimal" else "") + "⚡ Анализ optimal", callback_data="claude:analysis:optimal")],
         [InlineKeyboardButton(("✅ " if schedule == "4h" else "") + "⏱ 4H свеча +1м", callback_data="claude:schedule:4h")],
         [InlineKeyboardButton(("✅ " if schedule == "1h" else "") + "⏱ 1H свеча +1м", callback_data="claude:schedule:1h")],
         [InlineKeyboardButton(("✅ " if schedule == "2h" else "") + "⏱ Каждые 2 часа", callback_data="claude:schedule:2h")],
@@ -5847,6 +5851,7 @@ def claude_autopilot_menu_text(settings: dict | None = None) -> str:
         f"Скан по кругу: {'ВКЛ' if snap.get('cycle_enabled', True) else 'ВЫКЛ'}\n"
         f"Расписание: {schedule_label(snap['schedule'])}\n"
         f"Графики: {snap.get('chart_resolution', '960x540')}\n"
+        f"Анализ: {'full 15m/1H/4H' if snap.get('analysis_mode') == 'full' else 'optimal 1H/4H'}\n"
         f"Следующий запуск: {nxt_s}\n"
         f"API key: {'есть' if snap['api_key_present'] else 'НЕТ'}\n\n"
         "Основа та же, что ChatGPT Scan Mode: top-200 → top-15 → графики → setup v1.6 → текущий валидатор → LIVE сделки."
@@ -5965,6 +5970,10 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
         chart_resolution = str(settings.get("claude_chart_resolution") or os.getenv("CLAUDE_CHART_RESOLUTION") or "960x540").lower().replace("×", "x").replace(" ", "")
         if chart_resolution not in {"1280x720", "960x540"}:
             chart_resolution = "960x540"
+        analysis_mode = str(settings.get("claude_analysis_mode") or os.getenv("CLAUDE_ANALYSIS_MODE") or "optimal").strip().lower()
+        if analysis_mode not in {"optimal", "full"}:
+            analysis_mode = "optimal"
+        claude_pack_timeframes = ["4h", "1h", "15m"] if analysis_mode == "full" else ["4h", "1h"]
         claude_log_event(
             "claude_autopilot_settings",
             run_id=claude_run_id,
@@ -5975,6 +5984,9 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             max_tokens=max_tokens,
             temperature=(temperature if model != CLAUDE_OPUS_48 else "default_for_opus"),
             chart_resolution=chart_resolution,
+            analysis_mode=analysis_mode,
+            pack_timeframes=",".join(claude_pack_timeframes),
+            log_timeframes="4h,1h,15m",
             scan_limit=os.getenv("CHATGPT_SCAN_LIMIT", "200"),
         )
 
@@ -5985,12 +5997,12 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
         if position_task is None or position_task.done():
             position_task = app.create_task(position_management_loop(app))
 
-        await _claude_status(app, status_message, lines, f"⏳ Шаг 1/7: запустил scan top-200...\nПричина: {trigger}\nМодель: {claude_model_label(model)}\nГрафики: {chart_resolution}")
+        await _claude_status(app, status_message, lines, f"⏳ Шаг 1/7: запустил scan top-200...\nПричина: {trigger}\nМодель: {claude_model_label(model)}\nГрафики: {chart_resolution}\nАнализ: {analysis_mode} ({','.join(claude_pack_timeframes)})")
         apply_mexc_runtime_env({**settings, "mexc_order_leverage": "10", "mexc_order_open_type": "1"})
         ex = await get_exchange(settings)
         ws = await get_ws(settings)
         scan_limit = int(os.getenv("CHATGPT_SCAN_LIMIT", "200") or 200)
-        pack_path = await build_chatgpt_scan_pack(ex, scanner, settings, ws_supervisor=ws, limit=scan_limit, storage=storage, chart_resolution=chart_resolution)
+        pack_path = await build_chatgpt_scan_pack(ex, scanner, settings, ws_supervisor=ws, limit=scan_limit, storage=storage, chart_resolution=chart_resolution, pack_timeframes_override=claude_pack_timeframes, pack_label=f"claude_{analysis_mode}")
         try:
             pack_size = os.path.getsize(pack_path)
             pack_names = []
@@ -6033,15 +6045,50 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             chart_resolution=chart_resolution,
             scan_limit=scan_limit,
         )
+        claude_log_event(
+            "claude_api_request_start",
+            run_id=claude_run_id,
+            trigger=trigger,
+            pack_path=pack_path,
+            model=model,
+            model_label=claude_model_label(model),
+            max_tokens=max_tokens,
+            temperature=temperature if model != CLAUDE_OPUS_48 else "default_for_opus",
+            chart_resolution=chart_resolution,
+            analysis_mode=analysis_mode,
+            pack_timeframes=",".join(claude_pack_timeframes),
+            scan_limit=scan_limit,
+        )
+        claude_api_started = time.time()
         raw_setup, meta = await call_claude_for_setup(pack_path, api_key=api_key, model=model, max_tokens=max_tokens, temperature=temperature, progress=_progress)
         stamp = datetime.now(MSK).strftime("%H%M_%d%m")
         raw_path = _save_claude_raw_response(raw_setup, stamp=stamp, kind="response")
+        claude_log_event(
+            "claude_api_response_received",
+            run_id=claude_run_id,
+            model=model,
+            response_id=(meta or {}).get("response_id"),
+            http_status=(meta or {}).get("http_status"),
+            elapsed_total_sec=round(time.time() - claude_api_started, 3),
+            usage=(meta or {}).get("usage"),
+            cost_estimate=(meta or {}).get("cost_estimate"),
+            image_count=(meta or {}).get("image_count"),
+            image_timeframes=(meta or {}).get("image_timeframes"),
+            image_total_kb=(meta or {}).get("image_total_kb"),
+            payload_mb=(meta or {}).get("payload_mb"),
+            selected_symbols=(meta or {}).get("selected_symbols"),
+            raw_len=len(raw_setup or ""),
+            raw_path=raw_path,
+            stop_reason=(meta or {}).get("stop_reason"),
+        )
         await _claude_status(app, status_message, lines, "📥 Шаг 4/7: setup получен от Claude")
         chatgpt_log_event(
             "claude_api_response_received",
             model=model,
             response_id=(meta or {}).get("response_id"),
             usage=(meta or {}).get("usage"),
+            cost_estimate=(meta or {}).get("cost_estimate"),
+            payload_mb=(meta or {}).get("payload_mb"),
             image_count=(meta or {}).get("image_count"),
             image_names=(meta or {}).get("image_names"),
             selected_symbols=(meta or {}).get("selected_symbols"),
@@ -6053,16 +6100,31 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
         )
 
         await _claude_status(app, status_message, lines, "⏳ Шаг 5/7: проверяю setup v1.6 валидатором...")
+        claude_log_event("claude_setup_parse_start", run_id=claude_run_id, raw_len=len(raw_setup or ""), raw_path=raw_path)
         setup = extract_setup_json(raw_setup)
+        trades = setup.get("trades") if isinstance(setup, dict) else []
+        trade_symbols = [str(t.get("symbol") or "") for t in trades if isinstance(t, dict)] if isinstance(trades, list) else []
         chatgpt_log_event("claude_setup_json_extracted", setup_version=str(setup.get("setup_version") or ""), trades=setup.get("trades"), verdict=setup.get("verdict"), raw_path=raw_path)
+        claude_log_event(
+            "claude_setup_json_extracted",
+            run_id=claude_run_id,
+            setup_version=str(setup.get("setup_version") or ""),
+            verdict=setup.get("verdict"),
+            trade_count=len(trade_symbols),
+            trade_symbols=trade_symbols,
+            raw_path=raw_path,
+        )
         setup_version = str(setup.get("setup_version") or "").strip()
         if setup_version != CHATGPT_SETUP_VERSION:
+            claude_log_event("claude_setup_validation_failed", run_id=claude_run_id, setup_version=setup_version or "MISSING", expected=CHATGPT_SETUP_VERSION, trade_symbols=trade_symbols)
             raise ValueError(f"Claude setup_version={setup_version or 'MISSING'}, нужна {CHATGPT_SETUP_VERSION}")
+        claude_log_event("claude_setup_validation_ok", run_id=claude_run_id, setup_version=setup_version, verdict=setup.get("verdict"), trade_count=len(trade_symbols), trade_symbols=trade_symbols)
 
         # Save and send a clean bot-ready setup file, even if Claude wrapped JSON
         # in text/code fences. execute_setup uses the same parsed object below.
         clean_setup_text = json.dumps(setup, ensure_ascii=False, indent=2)
         setup_path = save_claude_setup_text(clean_setup_text, stamp=stamp)
+        claude_log_event("claude_setup_saved", run_id=claude_run_id, setup_path=setup_path, setup_bytes=len(clean_setup_text.encode("utf-8")), trade_symbols=trade_symbols)
         await _claude_status(app, status_message, lines, f"✅ Шаг 5/7: setup валиден и сохранён: {os.path.basename(setup_path)}")
         try:
             with open(setup_path, "rb") as f:
@@ -6082,20 +6144,34 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             claude_log_event("claude_setup_send_to_telegram_failed", run_id=claude_run_id, setup_path=setup_path, error=repr(e))
 
         await _claude_status(app, status_message, lines, "⏳ Шаг 6/7: открываю сделки LIVE текущим ChatGPT executor...")
-        claude_log_event("claude_execute_setup_start", run_id=claude_run_id, setup_path=setup_path, trades=setup.get("trades"), verdict=setup.get("verdict"))
+        claude_log_event("claude_execute_setup_start", run_id=claude_run_id, setup_path=setup_path, trades=setup.get("trades"), verdict=setup.get("verdict"), trade_symbols=trade_symbols)
+        execute_started = time.time()
         result = await execute_setup(storage, ex, setup)
-        claude_log_event("claude_execute_setup_done", run_id=claude_run_id, result=result)
         opened_rows = result.get("opened") if isinstance(result.get("opened"), list) else []
         placed = [x for x in opened_rows if isinstance(x, dict) and bool(x.get("ok"))]
         skipped = [x for x in opened_rows if isinstance(x, dict) and not bool(x.get("ok"))]
+        placed_symbols = [str(x.get("symbol") or "") for x in placed if isinstance(x, dict)]
+        skipped_symbols = [str(x.get("symbol") or "") for x in skipped if isinstance(x, dict)]
+        claude_log_event(
+            "claude_execute_setup_done",
+            run_id=claude_run_id,
+            elapsed_sec=round(time.time() - execute_started, 3),
+            placed_count=len(placed),
+            skipped_count=len(skipped),
+            placed_symbols=placed_symbols,
+            skipped_symbols=skipped_symbols,
+            result=result,
+        )
         result["setup_installed_at"] = datetime.now(MSK).strftime("%H:%M МСК")
         result["_monitor_persist"] = True
         result["source"] = "claude_autopilot"
         await storage.set("chatgpt_last_setup_result", result)
         try:
             await update_chatgpt_monitor_message(app, ex=ex, setup_result=result)
+            claude_log_event("claude_monitor_after_setup_updated", run_id=claude_run_id, setup_installed_at=result.get("setup_installed_at"), placed_symbols=placed_symbols)
         except Exception as e:
             chatgpt_log_event("claude_monitor_after_setup_error", error=repr(e))
+            claude_log_event("claude_monitor_after_setup_error", run_id=claude_run_id, error=repr(e))
         nxt = next_schedule_run(str((await storage.all_settings()).get("claude_autopilot_schedule") or "off"), last_ts=float(time.time()))
         nxt_s = nxt.strftime("%H:%M МСК") if nxt else "-"
         summary = [
@@ -6868,6 +6944,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "model":
             choice = data[2] if len(data) > 2 else "sonnet"
             await storage.set("claude_autopilot_model", CLAUDE_OPUS_48 if choice == "opus" else CLAUDE_SONNET_46)
+            ns = await storage.all_settings()
+            await _safe_edit_message_text(q.message, claude_autopilot_menu_text(ns), reply_markup=claude_autopilot_keyboard(ns))
+            return
+        if action == "analysis":
+            value = data[2] if len(data) > 2 else "optimal"
+            if value not in {"optimal", "full"}:
+                value = "optimal"
+            await storage.set("claude_analysis_mode", value)
             ns = await storage.all_settings()
             await _safe_edit_message_text(q.message, claude_autopilot_menu_text(ns), reply_markup=claude_autopilot_keyboard(ns))
             return

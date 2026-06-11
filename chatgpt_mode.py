@@ -989,7 +989,7 @@ FINAL SELF-CHECK BEFORE SENDING FILE:
 12. Если условий нет, лучше дай NO_TRADE, чем кривой setup."""
 
 
-async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None, chart_resolution: str | None = None) -> str:
+async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None, chart_resolution: str | None = None, pack_timeframes_override: list[str] | tuple[str, ...] | None = None, pack_label: str | None = None) -> str:
     """Build a full ChatGPT Scan Mode ZIP: log.txt + task.txt + manifest + charts."""
     started = time.time()
     _phase_t0 = started
@@ -1017,7 +1017,17 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     meta_by_symbol = {r["symbol"]: r for r in selected_rows}
     # Market context must always exist, but it must not duplicate selected charts.
     # Full pack default: top-15 selected symbols on 4H/1H/15m + BTC/ETH 4H/1H.
-    pack_timeframes = _csv_timeframes("CHATGPT_SCAN_PACK_TIMEFRAMES", "4h,1h,15m")
+    if pack_timeframes_override is not None:
+        pack_timeframes = []
+        for _tf in list(pack_timeframes_override):
+            _tf_s = str(_tf or "").strip().lower()
+            if _tf_s in {"4h", "1h", "15m"} and _tf_s not in pack_timeframes:
+                pack_timeframes.append(_tf_s)
+        if not pack_timeframes:
+            pack_timeframes = ["4h", "1h", "15m"]
+    else:
+        pack_timeframes = _csv_timeframes("CHATGPT_SCAN_PACK_TIMEFRAMES", "4h,1h,15m")
+    pack_label = str(pack_label or "chatgpt").strip().lower()
     required_context = [("BTC_USDT", "4h"), ("BTC_USDT", "1h"), ("ETH_USDT", "4h"), ("ETH_USDT", "1h")]
     chart_jobs: list[tuple[str, str]] = []
     seen_files: set[str] = set()
@@ -1037,11 +1047,13 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         jobs=len(chart_jobs),
         expected_png_count=len(seen_files),
         selected_count=len(selected_symbols),
+        pack_timeframes=",".join(pack_timeframes),
+        pack_label=pack_label,
         context=",".join([f"{s}:{t}" for s, t in required_context]),
         sample_files=",".join(sorted(list(seen_files))[:20]),
     )
 
-    stamp = datetime.now().strftime("%H%M_%d%m")
+    stamp = datetime.now(timezone(timedelta(hours=3))).strftime("%H%M_%d%m")
     log_dir = Path(os.getenv("CHATGPT_LOG_DIR", "/tmp"))
     work = log_dir / f"chatgpt_scan_pack_work_{stamp}_{int(time.time())}"
     zip_path = log_dir / f"chatgpt_scan_pack-{stamp}.zip"
@@ -1096,9 +1108,10 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "412"
+        _bot_code_version = "414"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
+        "pack_label": pack_label,
         "created_utc": _now_utc(),
         "bot_version": _bot_code_version,
         "scan_limit": int(limit),
@@ -2406,12 +2419,24 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
     cleanup = res.get("cleanup_summary") or {"entry_found": cancelled, "entry_cancelled": cancelled, "entry_left": 0, "orphan_found": 0, "orphan_cancelled": 0, "orphan_left": 0}
     setup_status = "setup-файл обработан" if setup_result is not None and bool(res.get("ok", True)) else ("setup-файл НЕ исполнен" if setup_result is not None else "ожидаю setup-файл")
     setup_time = str(res.get("setup_installed_at") or res.get("setup_received_at") or "-")
+    pending_symbols = []
+    try:
+        for _o in pending or []:
+            _sym = mexc_native_symbol(_chatgpt_order_symbol(_o))
+            if _sym and _sym not in pending_symbols:
+                pending_symbols.append(_sym)
+    except Exception:
+        pending_symbols = []
     lines = [
         "🤖 ChatGPT Mode Monitor",
         f"✅ {setup_status}" if setup_result is not None and bool(res.get("ok", True)) else f"❌ {setup_status}" if setup_result is not None else f"📥 {setup_status}",
         "🔄 биржа синхронизирована",
         f"📊 открытые позиции: {len(positions)}/{CHATGPT_MAX_OPEN_POSITIONS}",
         f"📌 pending лимитки: {len(pending)}/{CHATGPT_MAX_PENDING_LIMITS}",
+    ]
+    if pending_symbols:
+        lines.append("• " + ", ".join(pending_symbols[:10]))
+    lines += [
         "",
         "🛡 полная защита:",
     ]
@@ -2457,7 +2482,8 @@ async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dic
     return "\n".join(lines)[:3900]
 
 async def execute_setup(storage, exchange_client, setup: dict) -> dict:
-    chatgpt_log_event("setup_execute_start")
+    setup_installed_at = datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M МСК")
+    chatgpt_log_event("setup_execute_start", setup_installed_at=setup_installed_at)
     try:
         guard_enabled = str(os.getenv("CHATGPT_SETUP_SYMBOL_GUARD_ENABLED", "true")).lower() in {"1", "true", "yes", "on"}
         if guard_enabled and isinstance(setup, dict):
@@ -2485,7 +2511,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
     trades = validate_setup(setup)
     if not trades:
         chatgpt_log_event("setup_execute_no_trade")
-        return {"ok": True, "opened": [], "message": "NO_TRADE"}
+        return {"ok": True, "opened": [], "message": "NO_TRADE", "setup_installed_at": setup_installed_at}
     # V28 hard rule: after redeploy/restart, never trust local SQLite/cache for
     # ChatGPT slots until a live exchange-first reconciliation has completed.
     # This prevents stale local rows from duplicating slots and prevents missing
@@ -2540,7 +2566,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         # Hard safety gate: never place new setup limits while an old ChatGPT
         # entry limit is still open or its cancellation was not verified.
         chatgpt_log_event("setup_abort_old_pending_cancel_failed", failed=cancel_failed[:20], count=len(cancel_failed))
-        return {"ok": False, "opened": [], "message": "OLD_PENDING_CANCEL_FAILED", "failed_cancelled_pending": cancel_failed, "cleanup_summary": cleanup_summary, "reconcile": reconcile}
+        return {"ok": False, "opened": [], "message": "OLD_PENDING_CANCEL_FAILED", "failed_cancelled_pending": cancel_failed, "cleanup_summary": cleanup_summary, "reconcile": reconcile, "setup_installed_at": setup_installed_at}
 
     # Re-sync after cancellation. From here local cache may be used because it is
     # rebuilt from real-time exchange state, not from stale pre-deploy data.
@@ -2566,6 +2592,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
                 "open_positions": open_slots,
                 "max_open_positions": CHATGPT_MAX_OPEN_POSITIONS,
                 "reconcile": reconcile_after_cancel,
+                "setup_installed_at": setup_installed_at,
             }
         limits_to_place = 1
         # Re-count after successful close so duplicate-symbol filtering below sees
@@ -2616,6 +2643,7 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
             "reconcile": reconcile_after_cancel,
             "requested_trades": requested_trades,
             "cleanup_summary": cleanup_summary,
+            "setup_installed_at": setup_installed_at,
         }
     if len(trades) > limits_to_place:
         skipped = trades[limits_to_place:]
@@ -2848,4 +2876,5 @@ async def execute_setup(storage, exchange_client, setup: dict) -> dict:
         "limits_to_place": limits_to_place,
         "requested_trades": requested_trades,
         "reconcile": reconcile_after_cancel,
+        "setup_installed_at": setup_installed_at,
     }
