@@ -207,7 +207,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": "421",
+        "bot_version": "426",
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -941,6 +941,15 @@ MARKET MAKER / CHESS THINKING RULE:
 - Выбирай не самый прямолинейный ход, а самый умный setup с лучшим соотношением: фаза BTC/ETH + уровень + реакция + риск/прибыль + вероятность, что вход не является ловушкой.
 - Это мягкое правило анализа, а не запрет на сделки. Цель остаётся — выбрать 3 лучшие сделки, не ломая MARKET-ордера и текущую логику режима.
 
+
+LATE-PUMP / OVERHEAT TIE-BREAK RULE:
+- Перед финальным выбором 3 сделок обязательно сделай тихую самопроверку top-15 на late-pump/overheated candidates.
+- Если 15m RSI > 75 или 4H RSI > 70, цена близко к локальному high/сопротивлению и нет нормального отката к MA/support — не выбирай эту монету для LONG только из-за высокого momentum/score.
+- Исключение: перегретую монету можно выбрать только если entry стоит заметно ниже текущей цены на понятном ретесте поддержки/MA, а invalidation/stop_loss логичны и не требуют погони за движением.
+- Если 2 кандидата близкие по качеству/score, предпочитай менее перегретую монету с более чистым LIMIT-входом от поддержки, меньшим риском late-entry и понятными TP2/TP3 по swing/high/resistance.
+- TP1 может быть близким и реалистичным, но TP2/TP3 не ставь слишком близко только ради высокой вероятности, если 4H/1H структура сильная и рядом есть очевидные swing/high/resistance цели.
+- Это мягкий tie-break выбора, а не новый жёсткий валидатор: не ломай цель 3 сделки, MARKET-логику и текущие risk rules.
+
 ORDER TYPE RULE:
 - По умолчанию используй order_type: "LIMIT".
 - Используй order_type: "MARKET" только для очень сильных A+ setup, где 4H/1H/15min подтверждают направление, цена не находится после позднего вертикального импульса, риск до stop_loss приемлемый, а R/R до TP2 минимум 1:2.
@@ -1155,7 +1164,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "421"
+        _bot_code_version = "426"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "pack_label": pack_label,
