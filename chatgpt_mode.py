@@ -207,7 +207,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": "428",
+        "bot_version": "429",
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -1045,7 +1045,7 @@ def _trim_chatgpt_scan_log_to_top_blocks(log_text: str, top: int = 20) -> str:
     return before + marker + "\n" + trimmed_note + new_body + task_part
 
 
-async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None, chart_resolution: str | None = None, pack_timeframes_override: list[str] | tuple[str, ...] | None = None, pack_label: str | None = None) -> str:
+async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None, chart_resolution: str | None = None, pack_timeframes_override: list[str] | tuple[str, ...] | None = None, pack_label: str | None = None, progress_cb=None) -> str:
     """Build a full ChatGPT Scan Mode ZIP: log.txt + task.txt + manifest + charts."""
     started = time.time()
     _phase_t0 = started
@@ -1053,8 +1053,18 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     if chart_resolution not in {"1280x720", "960x540"}:
         chart_resolution = "1280x720"
     chatgpt_log_event("scan_pack_start", limit=limit, top=os.getenv("CHATGPT_SCAN_PACK_TOP", "15"), chart_workers=os.getenv("CHATGPT_CHART_CONCURRENCY", os.getenv("CHATGPT_SCAN_CONCURRENCY", "3")), chart_resolution=chart_resolution)
+
+    async def _progress(pct: int, stage: str):
+        if progress_cb is None:
+            return
+        try:
+            await progress_cb(int(pct), str(stage))
+        except Exception as e:
+            chatgpt_log_event("scan_pack_progress_callback_error", pct=pct, stage=stage, error=repr(e))
+
     log_path = await build_chatgpt_log(exchange_client, scanner, settings, ws_supervisor=ws_supervisor, limit=limit)
     _timing_build_log_sec = round(time.time() - _phase_t0, 2)
+    await _progress(30, "scan top-200 завершён")
     _phase_t0 = time.time()
     raw_log_text = Path(log_path).read_text(encoding="utf-8", errors="replace")
     selected_rows = _parse_chatgpt_log_candidates(raw_log_text, limit=int(os.getenv("CHATGPT_SCAN_PACK_TOP", "15") or 15))
@@ -1160,11 +1170,12 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     _phase_t0 = time.time()
     await asyncio.gather(*(_render_one(sym, tf) for sym, tf in chart_jobs))
     _timing_charts_sec = round(time.time() - _phase_t0, 2)
+    await _progress(70, "графики построены / scan-pack собирается")
     png_files = sorted([p for p in screens.glob("*.png")])
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "428"
+        _bot_code_version = "429"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "pack_label": pack_label,
@@ -1231,6 +1242,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         chart_workers=workers,
     )
     chatgpt_log_event("scan_pack_done", zip_path=str(zip_path), selected=len(selected_symbols), expected=len(seen_files), actual=len(png_files), missing=len(missing), elapsed_sec=round(time.time() - started, 2))
+    await _progress(85, "архив scan-pack готов")
     return str(zip_path)
 
 async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200) -> str:

@@ -6318,21 +6318,26 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
         if position_task is None or position_task.done():
             position_task = app.create_task(position_management_loop(app))
 
-        await _claude_status(app, status_message, lines, f"⏳ Шаг 1/7: запустил scan top-200...\nПричина: {trigger}\nМодель: {claude_model_label(model)}\nГрафики: {chart_resolution}\nАнализ: {analysis_mode} ({','.join(claude_pack_timeframes)})", pct=5, stage="сканирую top-200")
+        await _claude_status(app, status_message, lines, f"⏳ Шаг 1/7: запустил scan top-200...\nПричина: {trigger}\nМодель: {claude_model_label(model)}\nГрафики: {chart_resolution}\nАнализ: {analysis_mode} ({','.join(claude_pack_timeframes)})", pct=10, stage="старт скана")
         apply_mexc_runtime_env({**settings, "mexc_order_leverage": "10", "mexc_order_open_type": "1"})
         ex = await get_exchange(settings)
         ws = await get_ws(settings)
         scan_limit = int(os.getenv("CHATGPT_SCAN_LIMIT", "200") or 200)
-        _claude_scan_stop = asyncio.Event()
-        _claude_scan_ticker = app.create_task(_claude_progress_ticker(app, status_message, lines, _claude_scan_stop, start_pct=5, end_pct=72, stage="сканирую top-200 и собираю архив", interval_sec=float(os.getenv("CLAUDE_PROGRESS_INTERVAL_SEC", "30") or 30), estimate_sec=float(os.getenv("CLAUDE_PROGRESS_ESTIMATE_SEC", "210") or 210)))
-        try:
-            pack_path = await build_chatgpt_scan_pack(ex, scanner, settings, ws_supervisor=ws, limit=scan_limit, storage=storage, chart_resolution=chart_resolution, pack_timeframes_override=claude_pack_timeframes, pack_label=f"claude_{analysis_mode}")
-        finally:
-            try:
-                _claude_scan_stop.set()
-                await asyncio.wait_for(_claude_scan_ticker, timeout=3)
-            except Exception:
-                pass
+        async def _pack_progress(pct: int, stage: str):
+            await _claude_status(app, status_message, lines, f"📦 {stage}", pct=pct, stage=stage)
+
+        pack_path = await build_chatgpt_scan_pack(
+            ex,
+            scanner,
+            settings,
+            ws_supervisor=ws,
+            limit=scan_limit,
+            storage=storage,
+            chart_resolution=chart_resolution,
+            pack_timeframes_override=claude_pack_timeframes,
+            pack_label=f"claude_{analysis_mode}",
+            progress_cb=_pack_progress,
+        )
         try:
             pack_size = os.path.getsize(pack_path)
             pack_names = []
@@ -6342,7 +6347,7 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             claude_log_event("claude_scan_pack_built", run_id=claude_run_id, pack_path=pack_path, pack_size_bytes=pack_size, file_count=len(pack_names), image_count=len(image_names), file_names=pack_names, image_names=image_names)
         except Exception as e:
             claude_log_event("claude_scan_pack_log_error", run_id=claude_run_id, pack_path=pack_path, error=repr(e))
-        await _claude_status(app, status_message, lines, f"✅ Шаг 1/7: scan готов\n✅ Шаг 2/7: архив собран: {os.path.basename(pack_path)}", pct=75, stage="архив собран")
+        await _claude_status(app, status_message, lines, f"✅ Шаг 1/7: scan готов\n✅ Шаг 2/7: архив собран: {os.path.basename(pack_path)}", pct=85, stage="архив scan-pack готов")
         try:
             with open(pack_path, "rb") as f:
                 await app.bot.send_document(
@@ -6356,14 +6361,15 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
                     pool_timeout=float(os.getenv("TELEGRAM_DOCUMENT_POOL_TIMEOUT_SEC", "30") or 30),
                 )
             claude_log_event("claude_scan_pack_sent_to_telegram", run_id=claude_run_id, pack_path=pack_path, chat_id=chat_id)
+            await _claude_status(app, status_message, lines, "📤 scan-pack отправлен в Telegram", pct=90, stage="архив отправлен")
         except Exception as e:
             chatgpt_log_event("claude_pack_send_failed", error=repr(e))
             claude_log_event("claude_scan_pack_send_to_telegram_failed", run_id=claude_run_id, pack_path=pack_path, error=repr(e))
 
         async def _progress(msg: str):
-            await _claude_status(app, status_message, lines, f"📤 Claude: {msg}", pct=88, stage="подготовка Claude API")
+            await _claude_status(app, status_message, lines, f"📤 Claude: {msg}", pct=95, stage="жду ответ Claude API")
 
-        await _claude_status(app, status_message, lines, f"⏳ Шаг 3/7: отправляю данные в {claude_model_label(model)}...", pct=90, stage="отправляю данные Claude")
+        await _claude_status(app, status_message, lines, f"⏳ Шаг 3/7: отправляю данные в {claude_model_label(model)}...", pct=95, stage="жду ответ Claude API")
         chatgpt_log_event(
             "claude_api_request_start",
             trigger=trigger,
@@ -6411,7 +6417,7 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             raw_path=raw_path,
             stop_reason=(meta or {}).get("stop_reason"),
         )
-        await _claude_status(app, status_message, lines, "📥 Шаг 4/7: setup получен от Claude", pct=94, stage="setup получен")
+        await _claude_status(app, status_message, lines, "📥 Шаг 4/7: setup получен от Claude", pct=100, stage="setup получен от ИИ")
         chatgpt_log_event(
             "claude_api_response_received",
             model=model,
@@ -6429,7 +6435,7 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             response_body_preview=(meta or {}).get("response_body_preview"),
         )
 
-        await _claude_status(app, status_message, lines, "⏳ Шаг 5/7: проверяю setup v1.6 валидатором...", pct=96, stage="проверяю setup")
+        await _claude_status(app, status_message, lines, "⏳ Шаг 5/7: проверяю setup v1.6 валидатором...", pct=100, stage="setup получен от ИИ")
         claude_log_event("claude_setup_parse_start", run_id=claude_run_id, raw_len=len(raw_setup or ""), raw_path=raw_path)
         setup = extract_setup_json(raw_setup)
         trades = setup.get("trades") if isinstance(setup, dict) else []
@@ -6455,7 +6461,7 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
         clean_setup_text = json.dumps(setup, ensure_ascii=False, indent=2)
         setup_path = save_claude_setup_text(clean_setup_text, stamp=stamp)
         claude_log_event("claude_setup_saved", run_id=claude_run_id, setup_path=setup_path, setup_bytes=len(clean_setup_text.encode("utf-8")), trade_symbols=trade_symbols)
-        await _claude_status(app, status_message, lines, f"✅ Шаг 5/7: setup валиден и сохранён: {os.path.basename(setup_path)}", pct=97, stage="setup сохранён")
+        await _claude_status(app, status_message, lines, f"✅ Шаг 5/7: setup валиден и сохранён: {os.path.basename(setup_path)}", pct=100, stage="setup получен от ИИ")
         try:
             with open(setup_path, "rb") as f:
                 await app.bot.send_document(
@@ -6473,7 +6479,7 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             chatgpt_log_event("claude_setup_send_failed", error=repr(e))
             claude_log_event("claude_setup_send_to_telegram_failed", run_id=claude_run_id, setup_path=setup_path, error=repr(e))
 
-        await _claude_status(app, status_message, lines, "⏳ Шаг 6/7: открываю сделки LIVE текущим ChatGPT executor...", pct=98, stage="выставляю входы")
+        await _claude_status(app, status_message, lines, "⏳ Шаг 6/7: открываю сделки LIVE текущим ChatGPT executor...", pct=100, stage="setup получен от ИИ")
         try:
             await notify_admin_bottom_replace(app, _format_setup_lifecycle_text(setup, phase="placing"), key="chatgpt_setup_lifecycle", min_interval_sec=0)
             claude_log_event("claude_setup_lifecycle_message_sent", run_id=claude_run_id, phase="placing", trade_symbols=trade_symbols)
@@ -6530,7 +6536,7 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             summary.append(f"✅ {r.get('symbol')} {r.get('side')} {r.get('order_type')} — {r.get('entry')}")
         for r in skipped[:5]:
             summary.append(f"❌ {r.get('symbol')} {r.get('side')} — {str(r.get('reason') or r.get('error') or '')[:120]}")
-        final_text = "🤖 Claude Autopilot LIVE\n\n" + _claude_progress_bar(100) + "\nЭтап: завершено\n\n" + "\n".join(summary)
+        final_text = "🤖 Claude Autopilot LIVE\n\n" + _claude_progress_bar(100) + "\nЭтап: setup получен от ИИ / исполнение завершено\n\n" + "\n".join(summary)
         await _safe_edit_message_text(status_message, final_text) if status_message is not None else await _safe_send_bot_message(app, chat_id, final_text, reply_markup=MAIN_MENU)
         chatgpt_log_event("claude_autopilot_done", pack=pack_path, setup=setup_path, model=model, meta=meta, result=result)
         claude_log_event("claude_autopilot_run_done", run_id=claude_run_id, pack=pack_path, setup=setup_path, model=model, result=result)
@@ -9174,9 +9180,9 @@ async def on_startup(app):
     try:
         if monitor_cleanup_task is None or monitor_cleanup_task.done():
             monitor_cleanup_task = app.create_task(monitor_duplicate_cleanup_loop(app))
-            log_event("monitor_duplicate_cleanup_started_v0428", ok=True, interval_sec=MONITOR_DUPLICATE_CLEANUP_SEC)
+            log_event("monitor_duplicate_cleanup_started_v0429", ok=True, interval_sec=MONITOR_DUPLICATE_CLEANUP_SEC)
     except Exception as e:
-        log_event("monitor_duplicate_cleanup_start_failed_v0428", ok=False, error=str(e)[:500])
+        log_event("monitor_duplicate_cleanup_start_failed_v0429", ok=False, error=str(e)[:500])
 
 def _wrap_command(fn, name: str):
     async def _inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
