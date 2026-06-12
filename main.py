@@ -152,11 +152,12 @@ async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", 
 
         payload = str(text)[:3900]
 
-        # ChatGPT monitor must stay at the *bottom* of the chat. Editing a
-        # Telegram message keeps it in its old position, so for this card we
-        # intentionally delete the previous card and send a fresh one. The
-        # per-key lock above prevents duplicates when two refreshes overlap.
-        force_bottom_resend = key == "chatgpt_mode_monitor"
+        # ChatGPT/Claude monitor and ChatGPT setup lifecycle notices must stay
+        # at the *bottom* of the chat. Editing a Telegram message keeps it in
+        # its old position, so for these cards we intentionally delete the
+        # previous card and send a fresh one. The per-key lock above prevents
+        # duplicates when two refreshes overlap.
+        force_bottom_resend = key in {"chatgpt_mode_monitor", "chatgpt_limit_timeout_event", "chatgpt_position_event"}
 
         if old_msg_id and not force_bottom_resend:
             try:
@@ -7385,7 +7386,12 @@ async def emit_position_events(app, events: list[dict]) -> None:
     PositionManager.manage() must be free to return quickly; Telegram delivery is
     deliberately scheduled as background work so Telegram latency/rate limits do
     not delay TP/SL checks or reduce-only market closes.
+
+    ChatGPT/Claude setup LIMIT timeout events are aggregated into one replaceable
+    bottom card. This prevents repeated "Position event / limit timeout" spam
+    while still showing the actionable result.
     """
+    chatgpt_limit_timeout: list[dict] = []
     for ev in events or []:
         ev_type = str(ev.get("type") or "")
         # v0223: keep Telegram clean. These are not actionable errors; they mean
@@ -7398,6 +7404,13 @@ async def emit_position_events(app, events: list[dict]) -> None:
             "boost_tp_wait_exchange_profit",
             "boost_fast_profit_wait_exchange_profit",
         }:
+            continue
+        if ev_type == "limit_timeout":
+            result = ev.get("result") if isinstance(ev.get("result"), dict) else {}
+            strategy = str(ev.get("strategy") or result.get("strategy") or "").lower()
+            # Most ChatGPT pending rows do not carry strategy in the returned
+            # event, so treat LIMIT timeout as a replaceable lifecycle notice.
+            chatgpt_limit_timeout.append(ev)
             continue
         text = format_position_event(ev)
         if ev_type == "protection_watchdog":
@@ -7413,7 +7426,21 @@ async def emit_position_events(app, events: list[dict]) -> None:
         else:
             app.create_task(notify_admin(app, text, key="position_event"))
 
+    if chatgpt_limit_timeout:
+        symbols = []
+        for ev in chatgpt_limit_timeout:
+            sym = str(ev.get("symbol") or "-")
+            if sym not in symbols:
+                symbols.append(sym)
+        text = "\n".join([
+            "📌 Лимитки отменены по TTL",
+            "Reason: limit_timeout",
+            "• " + ", ".join(symbols[:12]),
+        ])
+        app.create_task(notify_admin_bottom_replace(app, text, key="chatgpt_limit_timeout_event", min_interval_sec=0))
 
+
+# one live master status message only
 async def update_chatgpt_monitor_message(app, ex=None, setup_result: dict | None = None) -> None:
     """Refresh one live ChatGPT monitor message from exchange state."""
     try:

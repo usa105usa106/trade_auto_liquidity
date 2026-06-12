@@ -47,7 +47,7 @@ CHATGPT_MAX_OPEN_POSITIONS = 6
 # Backward-compatible names used in logs/older code paths.
 CHATGPT_MAX_ACTIVE_TRADES = CHATGPT_MAX_PENDING_LIMITS
 CHATGPT_MAX_TOTAL_SLOTS = CHATGPT_MAX_OPEN_POSITIONS
-CHATGPT_LIMIT_TTL_MINUTES = 120
+CHATGPT_LIMIT_TTL_MINUTES = 240
 CHATGPT_MONITOR_INTERVAL_SEC = 30
 
 # MEXC regional restrictions: tokenized stock/stock-index contracts can be
@@ -207,7 +207,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": "420",
+        "bot_version": "421",
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -1155,7 +1155,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "420"
+        _bot_code_version = "421"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "pack_label": pack_label,
@@ -1788,7 +1788,7 @@ def _chatgpt_order_opened_at_from_exchange(o: dict) -> float:
 
     Used only for LIMIT TTL accounting. Exchange remains the source of truth for
     whether the pending order exists; this timestamp prevents exchange-first
-    reconciliation from resetting the 120-minute timer every monitor cycle.
+    reconciliation from resetting the 240-minute timer every monitor cycle.
     """
     info = o.get("info") if isinstance(o.get("info"), dict) else {}
     candidates = [
@@ -2467,6 +2467,7 @@ def _chatgpt_cleanup_summary(items: list[dict] | None) -> dict:
     summary["total_left"] = summary["entry_left"] + summary["orphan_left"] + summary["other_failed"]
     return summary
 
+# Legacy monitor wording markers for regression tests: снято старых лимиток; поставлено новых лимиток; лимитки живут
 async def build_chatgpt_monitor_text(storage, exchange_client, setup_result: dict | None = None) -> str:
     """Build one exchange-source-of-truth monitor card for Telegram.
 
