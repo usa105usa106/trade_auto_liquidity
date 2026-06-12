@@ -6209,11 +6209,26 @@ async def _claude_prepare_progress_message(app, chat_id: int, message=None):
 
 
 async def _claude_status(app, message, lines: list[str], line: str, *, pct: int | None = None, stage: str | None = None):
+    """Best-effort Claude progress update; never breaks scan/Claude/executor."""
     lines.append(line)
-    return await _claude_progress_render(app, message, lines, pct=pct, stage=stage or line)
+    try:
+        return await _claude_progress_render(app, message, lines, pct=pct, stage=stage or line)
+    except Exception as e:
+        try:
+            claude_log_event("claude_progress_update_error", ok=False, pct=pct, stage=str(stage or line)[:300], error=repr(e)[:500])
+        except Exception:
+            pass
+        return message
 
 
 async def _claude_progress_render(app, message, lines: list[str], *, pct: int | None = None, stage: str | None = None, note: str | None = None):
+    """Render Claude progress by replacing the card, not editing it.
+
+    Telegram edit updates were observed to leave the card stuck at 0% on some
+    scheduled runs. Replacing the previous progress card is more reliable and is
+    still low-volume because this runs only at real milestones. All failures are
+    logged and ignored so progress can never stop scanning/trading.
+    """
     header = "🤖 Claude Autopilot LIVE"
     parts = [header, ""]
     if pct is not None:
@@ -6224,10 +6239,61 @@ async def _claude_progress_render(app, message, lines: list[str], *, pct: int | 
         parts.append("")
     # Keep the card compact. Older details remain in /log_claude.
     parts.extend(lines[-10:])
-    text = "\n".join(parts)
+    text = "\n".join(parts)[:3900]
+
+    chat_id = None
     if message is not None:
-        await _safe_edit_message_text(message, text)
-    return text
+        chat_id = getattr(message, "chat_id", None)
+        if chat_id is None:
+            chat = getattr(message, "chat", None)
+            chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        try:
+            chat_id = int(await storage.get("admin_chat_id", 0) or 0)
+        except Exception:
+            chat_id = None
+
+    old_id = None
+    try:
+        old_id = app.bot_data.get("claude_progress_message_id")
+    except Exception:
+        old_id = None
+    if not old_id and message is not None:
+        old_id = getattr(message, "message_id", None)
+
+    new_message = None
+    delete_ok = None
+    send_ok = False
+    if chat_id:
+        if old_id:
+            try:
+                await _safe_delete_bot_message(app, int(chat_id), int(old_id))
+                delete_ok = True
+            except Exception:
+                delete_ok = False
+        try:
+            new_message = await _safe_send_bot_message(app, int(chat_id), text, reply_markup=MAIN_MENU)
+            new_id = getattr(new_message, "message_id", None) if new_message is not None else None
+            if new_id:
+                send_ok = True
+                app.bot_data["claude_progress_message_id"] = int(new_id)
+                try:
+                    await storage.set("claude_progress_message_id", int(new_id), bump_revision=False)
+                except Exception:
+                    pass
+                claude_log_event("claude_progress_update", ok=True, method="replace", pct=pct, stage=str(stage or "")[:300], old_message_id=old_id, new_message_id=int(new_id), delete_ok=delete_ok)
+                return new_message
+        except Exception as e:
+            claude_log_event("claude_progress_update_error", ok=False, method="replace", pct=pct, stage=str(stage or "")[:300], old_message_id=old_id, delete_ok=delete_ok, error=repr(e)[:500])
+
+    # Last-resort fallback: try edit if replace could not send.
+    if message is not None:
+        try:
+            edited = await _safe_edit_message_text(message, text)
+            claude_log_event("claude_progress_update", ok=bool(edited), method="edit_fallback", pct=pct, stage=str(stage or "")[:300], old_message_id=old_id, send_ok=send_ok)
+        except Exception as e:
+            claude_log_event("claude_progress_update_error", ok=False, method="edit_fallback", pct=pct, stage=str(stage or "")[:300], error=repr(e)[:500])
+    return message
 
 
 async def _claude_progress_ticker(app, message, lines: list[str], stop_event: asyncio.Event, *, start_pct: int = 5, end_pct: int = 72, stage: str = "формирую scan-pack", interval_sec: float = 30.0, estimate_sec: float = 210.0):
@@ -9180,9 +9246,9 @@ async def on_startup(app):
     try:
         if monitor_cleanup_task is None or monitor_cleanup_task.done():
             monitor_cleanup_task = app.create_task(monitor_duplicate_cleanup_loop(app))
-            log_event("monitor_duplicate_cleanup_started_v0429", ok=True, interval_sec=MONITOR_DUPLICATE_CLEANUP_SEC)
+            log_event("monitor_duplicate_cleanup_started_v0430", ok=True, interval_sec=MONITOR_DUPLICATE_CLEANUP_SEC)
     except Exception as e:
-        log_event("monitor_duplicate_cleanup_start_failed_v0429", ok=False, error=str(e)[:500])
+        log_event("monitor_duplicate_cleanup_start_failed_v0430", ok=False, error=str(e)[:500])
 
 def _wrap_command(fn, name: str):
     async def _inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
