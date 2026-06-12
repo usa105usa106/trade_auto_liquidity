@@ -62,6 +62,7 @@ position_task = None
 bottom_replace_locks = {}
 btc_ai_task = None
 claude_scheduler_task = None
+monitor_cleanup_task = None
 
 def admin_id_list() -> list[str]:
     return [x.strip() for x in str(ADMIN_IDS or os.getenv("ADMIN_IDS", "")).split(",") if x.strip()]
@@ -119,6 +120,147 @@ async def notify_admin(app, text: str, min_interval_sec: int = 0, key: str = "no
         log.warning("telegram notification failed/timeout: %s", e)
 
 
+
+
+# Technical Telegram monitor dedupe: this is NOT trading state/cache.  It only
+# remembers ids of monitor cards the bot itself sent, so a small sanitary worker
+# can delete duplicate monitor cards if Telegram/client reconnects create visual
+# duplicates.  It never touches progress cards, setup lifecycle cards, files or
+# trade/exchange state.
+MONITOR_DUPLICATE_CLEANUP_KEYS = {"chatgpt_mode_monitor"}
+MONITOR_DUPLICATE_KEEP_SEC = 3600
+MONITOR_DUPLICATE_CLEANUP_SEC = 300
+
+
+def _normalize_monitor_recent_records(raw, now: float | None = None) -> list[dict]:
+    now = float(now or time.time())
+    out = []
+    items = raw if isinstance(raw, list) else ([] if raw is None else [raw])
+    for item in items:
+        mid = None
+        ts = now
+        if isinstance(item, dict):
+            mid = item.get("id") or item.get("message_id")
+            try:
+                ts = float(item.get("ts") or item.get("time") or now)
+            except Exception:
+                ts = now
+        else:
+            mid = item
+        try:
+            mid = int(mid)
+        except Exception:
+            continue
+        if mid <= 0:
+            continue
+        if now - ts > MONITOR_DUPLICATE_KEEP_SEC:
+            continue
+        if not any(int(x.get("id")) == mid for x in out):
+            out.append({"id": mid, "ts": ts})
+    out.sort(key=lambda x: float(x.get("ts") or 0))
+    return out[-240:]
+
+
+async def _load_monitor_recent_records(app, key: str) -> list[dict]:
+    recent_key = f"bottom_recent_monitor_ids_{key}"
+    raw = app.bot_data.get(recent_key)
+    if raw is None:
+        try:
+            raw = await storage.get(recent_key, [])
+        except Exception:
+            raw = []
+    records = _normalize_monitor_recent_records(raw)
+    app.bot_data[recent_key] = records
+    return records
+
+
+async def _save_monitor_recent_records(app, key: str, records: list[dict]) -> None:
+    recent_key = f"bottom_recent_monitor_ids_{key}"
+    records = _normalize_monitor_recent_records(records)
+    app.bot_data[recent_key] = records
+    try:
+        await storage.set(recent_key, records, bump_revision=False)
+    except Exception:
+        pass
+
+
+async def _record_monitor_message_for_cleanup(app, key: str, message_id) -> None:
+    if key not in MONITOR_DUPLICATE_CLEANUP_KEYS:
+        return
+    try:
+        mid = int(message_id)
+    except Exception:
+        return
+    now = time.time()
+    records = await _load_monitor_recent_records(app, key)
+    records = [r for r in records if int(r.get("id")) != mid]
+    records.append({"id": mid, "ts": now})
+    await _save_monitor_recent_records(app, key, records)
+
+
+async def cleanup_monitor_duplicates_once(app, key: str = "chatgpt_mode_monitor") -> dict:
+    """Delete duplicate monitor cards known from the last hour, keep newest.
+
+    Telegram Bot API cannot search chat history by text, so this sanitary cleanup
+    uses only message_id values returned by Telegram when this bot sent monitor
+    cards.  It is intentionally limited to the main monitor key.
+    """
+    chat_id = first_admin_id()
+    if not chat_id or key not in MONITOR_DUPLICATE_CLEANUP_KEYS:
+        return {"checked": 0, "deleted": 0, "kept": 0, "failed": 0}
+    lock = bottom_replace_locks.get(f"cleanup_{key}")
+    if lock is None:
+        lock = asyncio.Lock()
+        bottom_replace_locks[f"cleanup_{key}"] = lock
+    async with lock:
+        records = await _load_monitor_recent_records(app, key)
+        if len(records) <= 1:
+            await _save_monitor_recent_records(app, key, records)
+            return {"checked": len(records), "deleted": 0, "kept": len(records), "failed": 0}
+        newest = max(records, key=lambda r: float(r.get("ts") or 0))
+        newest_id = int(newest.get("id"))
+        kept = [newest]
+        deleted = 0
+        failed = 0
+        for rec in records:
+            mid = int(rec.get("id"))
+            if mid == newest_id:
+                continue
+            try:
+                await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=mid), timeout=4)
+                deleted += 1
+            except Exception as e:
+                # If Telegram says it is already gone, drop it from the technical
+                # list.  Network/timeouts stay in the list so the next 5-minute
+                # cleanup can retry.
+                msg = str(e).lower()
+                if "message to delete not found" in msg or "message can't be deleted" in msg or "message identifier is not specified" in msg:
+                    deleted += 0
+                else:
+                    failed += 1
+                    kept.append(rec)
+                log.debug("telegram monitor duplicate cleanup delete skipped: %s", e)
+        await _save_monitor_recent_records(app, key, kept)
+        try:
+            chatgpt_log_event("monitor_duplicate_cleanup", key=key, checked=len(records), deleted=deleted, failed=failed, kept=len(kept))
+        except Exception:
+            pass
+        return {"checked": len(records), "deleted": deleted, "kept": len(kept), "failed": failed}
+
+
+async def monitor_duplicate_cleanup_loop(app):
+    try:
+        await asyncio.sleep(60)
+        while True:
+            try:
+                for key in MONITOR_DUPLICATE_CLEANUP_KEYS:
+                    await cleanup_monitor_duplicates_once(app, key=key)
+            except Exception as e:
+                log.debug("monitor duplicate cleanup loop error: %s", e)
+            await asyncio.sleep(MONITOR_DUPLICATE_CLEANUP_SEC)
+    except asyncio.CancelledError:
+        raise
+
 async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", min_interval_sec: int = 0) -> None:
     """Keep one live Telegram status message without duplicating cards.
 
@@ -143,12 +285,39 @@ async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", 
             app.bot_data[last_key] = now
 
         msg_key = f"bottom_msg_id_{key}"
+        ids_key = f"bottom_msg_ids_{key}"
         old_msg_id = app.bot_data.get(msg_key)
         if not old_msg_id:
             try:
                 old_msg_id = await storage.get(msg_key, None)
             except Exception:
                 old_msg_id = None
+
+        # Keep a small per-key history of monitor/status cards. This allows the
+        # replace mode to delete all known old monitor duplicates, not only the
+        # last active_id. It is intentionally scoped by key so progress cards,
+        # setup files, limit-filled cards, etc. are never touched.
+        raw_ids = app.bot_data.get(ids_key)
+        if raw_ids is None:
+            try:
+                raw_ids = await storage.get(ids_key, [])
+            except Exception:
+                raw_ids = []
+        known_ids = []
+        for x in (raw_ids if isinstance(raw_ids, list) else [raw_ids]):
+            try:
+                xi = int(x)
+                if xi not in known_ids:
+                    known_ids.append(xi)
+            except Exception:
+                pass
+        try:
+            if old_msg_id:
+                oi = int(old_msg_id)
+                if oi not in known_ids:
+                    known_ids.append(oi)
+        except Exception:
+            pass
 
         payload = str(text)[:3900]
 
@@ -168,8 +337,10 @@ async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", 
             try:
                 await asyncio.wait_for(app.bot.edit_message_text(chat_id=chat_id, message_id=int(old_msg_id), text=payload), timeout=6)
                 app.bot_data[msg_key] = int(old_msg_id)
+                app.bot_data[ids_key] = [int(old_msg_id)]
                 try:
                     await storage.set(msg_key, int(old_msg_id), bump_revision=False)
+                    await storage.set(ids_key, [int(old_msg_id)], bump_revision=False)
                 except Exception:
                     pass
                 return
@@ -177,25 +348,33 @@ async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", 
                 msg = str(e).lower()
                 if "message is not modified" in msg:
                     app.bot_data[msg_key] = int(old_msg_id)
+                    app.bot_data[ids_key] = [int(old_msg_id)]
                     return
                 log.debug("telegram bottom status edit skipped: %s", e)
 
-        if old_msg_id:
-            try:
-                await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id)), timeout=4)
-            except Exception as de:
-                log.debug("telegram bottom status delete skipped before resend: %s", de)
+        if known_ids:
+            for mid in list(known_ids):
+                try:
+                    await asyncio.wait_for(app.bot.delete_message(chat_id=chat_id, message_id=int(mid)), timeout=4)
+                except Exception as de:
+                    log.debug("telegram bottom status cleanup delete skipped before resend: %s", de)
             try:
                 await storage.set(msg_key, None, bump_revision=False)
+                await storage.set(ids_key, [], bump_revision=False)
             except Exception:
                 pass
+            app.bot_data[msg_key] = None
+            app.bot_data[ids_key] = []
 
         try:
             msg = await asyncio.wait_for(app.bot.send_message(chat_id=chat_id, text=payload), timeout=6)
             new_id = getattr(msg, "message_id", None)
             app.bot_data[msg_key] = new_id
+            app.bot_data[ids_key] = [int(new_id)] if new_id else []
+            await _record_monitor_message_for_cleanup(app, key, new_id)
             try:
                 await storage.set(msg_key, new_id, bump_revision=False)
+                await storage.set(ids_key, [int(new_id)] if new_id else [], bump_revision=False)
             except Exception:
                 pass
         except Exception as e:
@@ -6020,6 +6199,12 @@ async def _claude_prepare_progress_message(app, chat_id: int, message=None):
             await storage.set("claude_progress_message_id", int(msg_id), bump_revision=False)
         except Exception:
             pass
+    try:
+        # Make sure scheduled/manual runs immediately show the actual progress
+        # card, not the old plain "schedule triggered" text.
+        await _claude_progress_render(app, message, [], pct=0, stage="старт Claude Autopilot")
+    except Exception:
+        pass
     return message
 
 
@@ -6439,8 +6624,7 @@ async def _claude_scheduler_loop(app):
                     else:
                         chat_id = first_admin_id()
                         if chat_id:
-                            msg = await _safe_send_bot_message(app, int(chat_id), f"🤖 Claude Autopilot LIVE\n\n⏳ Сработало расписание: {schedule_label(sched)}", reply_markup=MAIN_MENU)
-                            app.create_task(_claude_run_cycle(app, int(chat_id), trigger=f"schedule:{sched}", status_message=msg))
+                            app.create_task(_claude_run_cycle(app, int(chat_id), trigger=f"schedule:{sched}", status_message=None))
             await asyncio.sleep(20)
         except asyncio.CancelledError:
             raise
@@ -8980,13 +9164,19 @@ async def on_startup(app):
         "mode": "disabled_v52_exchange_source_of_truth",
         "local_cache_cleared": app.bot_data.get("startup_local_position_cache_cleared", 0),
     }
-    global claude_scheduler_task
+    global claude_scheduler_task, monitor_cleanup_task
     try:
         if claude_scheduler_task is None or claude_scheduler_task.done():
             claude_scheduler_task = app.create_task(_claude_scheduler_loop(app))
             log_event("claude_autopilot_scheduler_started_v0402", ok=True)
     except Exception as e:
         log_event("claude_autopilot_scheduler_start_failed_v0402", ok=False, error=str(e)[:500])
+    try:
+        if monitor_cleanup_task is None or monitor_cleanup_task.done():
+            monitor_cleanup_task = app.create_task(monitor_duplicate_cleanup_loop(app))
+            log_event("monitor_duplicate_cleanup_started_v0428", ok=True, interval_sec=MONITOR_DUPLICATE_CLEANUP_SEC)
+    except Exception as e:
+        log_event("monitor_duplicate_cleanup_start_failed_v0428", ok=False, error=str(e)[:500])
 
 def _wrap_command(fn, name: str):
     async def _inner(update: Update, context: ContextTypes.DEFAULT_TYPE):

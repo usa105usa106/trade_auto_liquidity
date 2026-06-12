@@ -275,7 +275,7 @@ class ExchangeClient:
     def sanitize_protection_values(self, symbol: str, qty: float, stop_price: float | None = None, take_price: float | None = None) -> dict:
         """Sanitize qty/TP/SL before storage and native MEXC requests.
 
-        This removes Python float tails like 0.38182571428571427 and prevents
+        This removes Python float tails like 0.38182571428571428 and prevents
         MEXC 2015 precision errors when placing protection orders.
         """
         q_prec = self._mexc_amount_to_precision(symbol, qty)
