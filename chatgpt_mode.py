@@ -207,7 +207,7 @@ async def build_chatgpt_runtime_manifest_from_mexc(storage, exchange_client, sou
         "pack_type": "CHATGPT_RUNTIME_SYMBOL_MANIFEST",
         "source": source,
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "bot_version": "430",
+        "bot_version": "432",
         "symbol_guard_mode": "runtime_mexc_symbols",
         "selected_count": len(selected_symbols),
         "selected_symbols": selected_symbols,
@@ -1045,7 +1045,7 @@ def _trim_chatgpt_scan_log_to_top_blocks(log_text: str, top: int = 20) -> str:
     return before + marker + "\n" + trimmed_note + new_body + task_part
 
 
-async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None, chart_resolution: str | None = None, pack_timeframes_override: list[str] | tuple[str, ...] | None = None, pack_label: str | None = None, progress_cb=None) -> str:
+async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, storage=None, chart_resolution: str | None = None, pack_timeframes_override: list[str] | tuple[str, ...] | None = None, pack_label: str | None = None, progress_cb=None, force_rest_universe: bool = False, min_symbols: int | None = None) -> str:
     """Build a full ChatGPT Scan Mode ZIP: log.txt + task.txt + manifest + charts."""
     started = time.time()
     _phase_t0 = started
@@ -1062,7 +1062,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
         except Exception as e:
             chatgpt_log_event("scan_pack_progress_callback_error", pct=pct, stage=stage, error=repr(e))
 
-    log_path = await build_chatgpt_log(exchange_client, scanner, settings, ws_supervisor=ws_supervisor, limit=limit)
+    log_path = await build_chatgpt_log(exchange_client, scanner, settings, ws_supervisor=ws_supervisor, limit=limit, force_rest_universe=force_rest_universe, min_symbols=min_symbols)
     _timing_build_log_sec = round(time.time() - _phase_t0, 2)
     await _progress(30, "scan top-200 завершён")
     _phase_t0 = time.time()
@@ -1175,7 +1175,7 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     try:
         from config import VERSION as _bot_code_version
     except Exception:
-        _bot_code_version = "430"
+        _bot_code_version = "432"
     manifest = {
         "pack_type": "CHATGPT_SCAN_MODE",
         "pack_label": pack_label,
@@ -1245,11 +1245,11 @@ async def build_chatgpt_scan_pack(exchange_client, scanner, settings: dict, ws_s
     await _progress(85, "архив scan-pack готов")
     return str(zip_path)
 
-async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200) -> str:
+async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervisor=None, limit: int = 200, force_rest_universe: bool = False, min_symbols: int | None = None) -> str:
     """Run one top-N scan and write a ChatGPT-ready log.txt."""
     scan_started_at = time.time()
     workers = int(os.getenv("CHATGPT_SCAN_CONCURRENCY", "3") or 3)
-    chatgpt_log_event("scan_start", limit=limit, workers=workers, retries=os.getenv("CHATGPT_SCAN_RETRIES", "2"))
+    chatgpt_log_event("scan_start", limit=limit, workers=workers, retries=os.getenv("CHATGPT_SCAN_RETRIES", "2"), force_rest_universe=bool(force_rest_universe), min_symbols=min_symbols or os.getenv("CLAUDE_SCAN_MIN_SYMBOLS", "160"))
     work = Path(os.getenv("CHATGPT_LOG_DIR", "/tmp"))
     work.mkdir(parents=True, exist_ok=True)
     path = work / f"chatgpt_market_log_{int(time.time())}.txt"
@@ -1260,12 +1260,98 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
     # the final scan can still contain up to the requested top-N tradable coins.
     scan_settings["max_symbols"] = int(os.getenv("CHATGPT_SCAN_PREFILTER_LIMIT", str(max(int(limit) * 2, int(limit)))))
     _phase_t0 = time.time()
-    await scanner.refresh_symbols(exchange_client, scan_settings, ws_supervisor)
+    min_required = 0
+    if force_rest_universe:
+        try:
+            min_required = int(min_symbols if min_symbols is not None else os.getenv("CLAUDE_SCAN_MIN_SYMBOLS", "160"))
+        except Exception:
+            min_required = 160
+        min_required = max(1, min(int(limit), min_required))
+    universe_attempts = 1
+    if force_rest_universe:
+        try:
+            universe_attempts = 1 + max(0, int(os.getenv("CLAUDE_SCAN_UNIVERSE_RETRIES", "2") or 2))
+        except Exception:
+            universe_attempts = 3
+    raw_symbols: list[str] = []
+    filtered_symbols: list[str] = []
+    blocked_symbols: list[str] = []
+    symbols: list[str] = []
+    last_universe_error = ""
+    universe_source = "default"
+    for attempt in range(1, max(1, universe_attempts) + 1):
+        attempt_settings = dict(scan_settings)
+        attempt_ws = ws_supervisor
+        if force_rest_universe:
+            # Claude Autopilot must never use a partial WS/cache universe.  A
+            # fresh REST universe is slower but prevents trading from 50-70
+            # cached symbols when top-200 was requested.
+            attempt_settings["scan_market_source"] = "mexc_mexc"
+            attempt_ws = None
+            try:
+                scanner.hot_symbols = []
+            except Exception:
+                pass
+            try:
+                ex_obj = getattr(exchange_client, "exchange", None)
+                if ex_obj is not None and hasattr(ex_obj, "load_markets"):
+                    await asyncio.wait_for(ex_obj.load_markets(True), timeout=float(os.getenv("CLAUDE_SCAN_LOAD_MARKETS_TIMEOUT", "20") or 20))
+                    chatgpt_log_event(
+                        "scan_universe_load_markets_done",
+                        attempt=attempt,
+                        source="rest_only",
+                        markets=len(getattr(ex_obj, "markets", {}) or {}),
+                    )
+            except Exception as e:
+                chatgpt_log_event("scan_universe_load_markets_error", attempt=attempt, source="rest_only", error=repr(e))
+        await scanner.refresh_symbols(exchange_client, attempt_settings, attempt_ws)
+        raw_symbols = list(dict.fromkeys(getattr(scanner, "hot_symbols", []) or []))
+        filtered_symbols, blocked_symbols = filter_chatgpt_symbols(raw_symbols)
+        symbols = mexc_native_symbols(filtered_symbols)[:int(limit)]
+        universe_source = str(getattr(scanner, "last_scan_source", "-") or "-")
+        last_universe_error = str(getattr(scanner, "last_refresh_error", "") or "")
+        chatgpt_log_event(
+            "scan_universe_attempt",
+            attempt=attempt,
+            attempts=universe_attempts,
+            force_rest_universe=bool(force_rest_universe),
+            source=universe_source,
+            raw_count=len(raw_symbols),
+            blocked_count=len(blocked_symbols),
+            count=len(symbols),
+            min_required=min_required,
+            available_markets=getattr(scanner, "last_available_markets", 0),
+            total_markets=getattr(scanner, "last_total_markets", 0),
+            filtered_markets=getattr(scanner, "last_filtered_markets", 0),
+            refresh_error=last_universe_error,
+        )
+        if not force_rest_universe or len(symbols) >= min_required:
+            break
+        if attempt < universe_attempts:
+            await asyncio.sleep(min(5.0, 1.5 * attempt))
     _timing_refresh_symbols_sec = round(time.time() - _phase_t0, 2)
+    if force_rest_universe and len(symbols) < min_required:
+        chatgpt_log_event(
+            "scan_universe_guard_failed",
+            source=universe_source,
+            raw_count=len(raw_symbols),
+            blocked_count=len(blocked_symbols),
+            count=len(symbols),
+            min_required=min_required,
+            scan_limit=limit,
+            refresh_error=last_universe_error,
+        )
+        raise RuntimeError(f"Claude scan universe incomplete: {len(symbols)} symbols < {min_required}; source={universe_source}; trades skipped")
+    chatgpt_log_event(
+        "scan_universe_guard_ok" if force_rest_universe else "scan_universe_guard_off",
+        source=universe_source,
+        raw_count=len(raw_symbols),
+        blocked_count=len(blocked_symbols),
+        count=len(symbols),
+        min_required=min_required,
+        scan_limit=limit,
+    )
     _phase_t0 = time.time()
-    raw_symbols = list(dict.fromkeys(getattr(scanner, "hot_symbols", []) or []))
-    filtered_symbols, blocked_symbols = filter_chatgpt_symbols(raw_symbols)
-    symbols = mexc_native_symbols(filtered_symbols)[:int(limit)]
     _timing_symbol_filter_sec = round(time.time() - _phase_t0, 2)
     chatgpt_log_event(
         "scan_symbols_loaded",
@@ -1274,6 +1360,12 @@ async def build_chatgpt_log(exchange_client, scanner, settings: dict, ws_supervi
         blocked_sample=",".join(blocked_symbols[:30]),
         count=len(symbols),
         sample=",".join(symbols[:10]),
+        universe_source=universe_source,
+        universe_guard=("rest_only_ok" if force_rest_universe else "default"),
+        min_required=min_required,
+        available_markets=getattr(scanner, "last_available_markets", 0),
+        total_markets=getattr(scanner, "last_total_markets", 0),
+        filtered_markets=getattr(scanner, "last_filtered_markets", 0),
     )
 
     async def one_symbol(sym: str) -> str:

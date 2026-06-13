@@ -6234,12 +6234,14 @@ async def _claude_progress_render(app, message, lines: list[str], *, pct: int | 
     if pct is not None:
         parts.append(_claude_progress_bar(pct))
         parts.append(f"Этап: {stage or '-'}")
+        # v432: progress-card is intentionally compact. Do not print the
+        # accumulated step history here; /log_claude has the detailed trail
+        # and setup lifecycle messages show execution details separately.
         if note:
-            parts.append(str(note)[:400])
-        parts.append("")
-    # Keep the card compact. Older details remain in /log_claude.
-    parts.extend(lines[-10:])
-    text = "\n".join(parts)[:3900]
+            parts.append(str(note)[:220])
+    else:
+        parts.append(f"Этап: {stage or '-'}")
+    text = "\n".join(parts)[:1200]
 
     chat_id = None
     if message is not None:
@@ -6403,6 +6405,8 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             pack_timeframes_override=claude_pack_timeframes,
             pack_label=f"claude_{analysis_mode}",
             progress_cb=_pack_progress,
+            force_rest_universe=True,
+            min_symbols=int(os.getenv("CLAUDE_SCAN_MIN_SYMBOLS", "160") or 160),
         )
         try:
             pack_size = os.path.getsize(pack_path)
@@ -6602,7 +6606,7 @@ async def _claude_run_cycle(app, chat_id: int, *, trigger: str = "manual", statu
             summary.append(f"✅ {r.get('symbol')} {r.get('side')} {r.get('order_type')} — {r.get('entry')}")
         for r in skipped[:5]:
             summary.append(f"❌ {r.get('symbol')} {r.get('side')} — {str(r.get('reason') or r.get('error') or '')[:120]}")
-        final_text = "🤖 Claude Autopilot LIVE\n\n" + _claude_progress_bar(100) + "\nЭтап: setup получен от ИИ / исполнение завершено\n\n" + "\n".join(summary)
+        final_text = "🤖 Claude Autopilot LIVE\n\n" + _claude_progress_bar(100) + "\nЭтап: setup получен от ИИ"
         await _safe_edit_message_text(status_message, final_text) if status_message is not None else await _safe_send_bot_message(app, chat_id, final_text, reply_markup=MAIN_MENU)
         chatgpt_log_event("claude_autopilot_done", pack=pack_path, setup=setup_path, model=model, meta=meta, result=result)
         claude_log_event("claude_autopilot_run_done", run_id=claude_run_id, pack=pack_path, setup=setup_path, model=model, result=result)
@@ -9246,9 +9250,9 @@ async def on_startup(app):
     try:
         if monitor_cleanup_task is None or monitor_cleanup_task.done():
             monitor_cleanup_task = app.create_task(monitor_duplicate_cleanup_loop(app))
-            log_event("monitor_duplicate_cleanup_started_v0430", ok=True, interval_sec=MONITOR_DUPLICATE_CLEANUP_SEC)
+            log_event("monitor_duplicate_cleanup_started_v0431", ok=True, interval_sec=MONITOR_DUPLICATE_CLEANUP_SEC)
     except Exception as e:
-        log_event("monitor_duplicate_cleanup_start_failed_v0430", ok=False, error=str(e)[:500])
+        log_event("monitor_duplicate_cleanup_start_failed_v0431", ok=False, error=str(e)[:500])
 
 def _wrap_command(fn, name: str):
     async def _inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
