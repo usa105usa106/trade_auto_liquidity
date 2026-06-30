@@ -622,6 +622,12 @@ class ExecutionEngine:
             order_type = plan.order_type.lower()
             price = plan.entry_price if order_type == "limit" else None
             params = {"clientOrderId": self._new_client_order_id("bot_entry", plan.symbol, side), "leverage": getattr(plan, "leverage", None)}
+            try:
+                open_type = (getattr(plan, "signal_details", {}) or {}).get("open_type")
+                if open_type not in (None, ""):
+                    params["openType"] = int(float(open_type))
+            except Exception:
+                pass
             # v0146: for normal MEXC scalping attach TP/SL already to the entry order.
             # MEXC /order/create supports takeProfitPrice/stopLossPrice on opening
             # orders; this is more reliable than opening first and trying to attach

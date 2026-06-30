@@ -38,9 +38,17 @@ def _write(path: Path, record: dict) -> None:
 def log_event(kind: str, **fields: Any) -> None:
     record = {"kind": kind, **fields}
     _write(LOG_DIR / "trade.log", record)
-    if str(kind).lower().startswith("btc_ai"):
+    low_kind = str(kind).lower()
+    strategy = str(fields.get("strategy") or "").lower()
+    if low_kind.startswith("btc_ai"):
         _write(LOG_DIR / "btc_ai.log", record)
-    if kind.lower().startswith("error") or "error" in kind.lower() or fields.get("ok") is False:
+    # v433_full Ratio Pressure: keep a dedicated full forensic log for /log_full.
+    # It captures scan decisions, skips, order placement, SL/TP confirmation,
+    # position sync/live-card updates and time-stop/TP/SL close events without
+    # changing behaviour of any other mode.
+    if low_kind.startswith("ratio_pressure") or strategy == "ratio_pressure_1h" or low_kind == "ratio_position_closed":
+        _write(LOG_DIR / "ratio_pressure.log", record)
+    if low_kind.startswith("error") or "error" in low_kind or fields.get("ok") is False:
         _write(LOG_DIR / "errors.log", record)
 
 

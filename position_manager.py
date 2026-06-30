@@ -369,9 +369,42 @@ class PositionManager:
                     exit_price=float(price or 0),
                     result=res,
                 )
+            if strategy_name == "ratio_pressure_1h":
+                log_event(
+                    "ratio_pressure_close_attempt",
+                    strategy="ratio_pressure_1h",
+                    stage="exit",
+                    ok=bool(isinstance(res, dict) and res.get("ok")),
+                    symbol=str(symbol),
+                    side=str(pos.get("side", "")),
+                    reason=str(reason),
+                    event_type=str(event_type),
+                    exit_price=float(price or 0),
+                    entry_price=pos.get("entry_price"),
+                    stop_price=pos.get("stop_price"),
+                    take_price=pos.get("take_price"),
+                    result=res,
+                )
         except Exception:
             pass
+        cancel_result = None
+        strategy_name = str(pos.get("strategy", "")).lower()
         if isinstance(res, dict) and res.get("ok"):
+            # Ratio Pressure time-stop closes by MARKET; after that cancel any stale
+            # same-symbol TP/SL plan orders so no orphan protection remains.
+            if strategy_name == "ratio_pressure_1h":
+                try:
+                    cancel_result = await self.execution_engine.cancel_same_symbol_stale_orders(symbol, reason="ratio_pressure_time_stop_cleanup")
+                except Exception as ce:
+                    cancel_result = {"ok": False, "error": str(ce)[:300]}
+                log_event(
+                    "ratio_pressure_time_stop_order_cleanup",
+                    strategy="ratio_pressure_1h",
+                    ok=bool(isinstance(cancel_result, dict) and cancel_result.get("ok")),
+                    symbol=str(symbol),
+                    reason="ratio_pressure_time_stop_cleanup",
+                    cancel_result=cancel_result,
+                )
             # Close is terminal locally. Remove any stale local row again and rely
             # on /positions or sync to restore it only if exchange still has a
             # real position after settlement.
@@ -379,7 +412,32 @@ class PositionManager:
                 await self.storage.remove_position(symbol)
             except Exception:
                 pass
-        return {"type": event_type, "symbol": symbol, "result": res}
+        ev = {
+            "type": event_type,
+            "symbol": symbol,
+            "side": pos.get("side"),
+            "reason": reason,
+            "result": res,
+            "entry_price": pos.get("entry_price"),
+            "planned_entry_price": pos.get("planned_entry_price") or (pos.get("signal_details") or {}).get("price_signal") if isinstance(pos.get("signal_details"), dict) else pos.get("planned_entry_price"),
+            "stop_price": pos.get("stop_price"),
+            "take_price": pos.get("take_price"),
+            "close_price": price,
+            "opened_at": pos.get("opened_at"),
+            "closed_at": time.time(),
+            "strategy": strategy_name,
+            "cancel_result": cancel_result,
+        }
+        try:
+            entry = float(pos.get("entry_price") or 0)
+            if entry > 0:
+                if str(pos.get("side", "")).upper() == "LONG":
+                    ev["pnl_pct"] = (float(price or entry) - entry) / entry * 100.0
+                else:
+                    ev["pnl_pct"] = (entry - float(price or entry)) / entry * 100.0
+        except Exception:
+            pass
+        return ev
 
 
     async def _protection_watchdog(self, pos: dict, live: bool) -> dict | None:
@@ -943,6 +1001,48 @@ class PositionManager:
             is_cascade_hunter = strategy == "cascade_hunter"
             is_strongest_coin = strategy == "strongest_coin"
             is_knife_reversal = strategy == "knife_reversal"
+            is_ratio_pressure = strategy == "ratio_pressure_1h"
+            if is_ratio_pressure and live and (now - opened) > 5:
+                # Ratio uses exchange-side SL/TP. If MEXC already closed the
+                # position by TP/SL, remove stale local state and emit one final
+                # clear event instead of keeping a fake open card alive.
+                try:
+                    ex_row = await self._find_exchange_position_row(symbol)
+                except Exception:
+                    ex_row = None
+                if not ex_row:
+                    close_reason = "UNKNOWN_EXCHANGE_CLOSED"
+                    try:
+                        if side == "LONG" and take and price >= take:
+                            close_reason = "take_profit"
+                        elif side == "LONG" and stop and price <= stop:
+                            close_reason = "stop_loss"
+                        elif side == "SHORT" and take and price <= take:
+                            close_reason = "take_profit"
+                        elif side == "SHORT" and stop and price >= stop:
+                            close_reason = "stop_loss"
+                    except Exception:
+                        pass
+                    try:
+                        await self.storage.remove_position(symbol)
+                    except Exception:
+                        pass
+                    events.append({
+                        "type": "ratio_position_closed",
+                        "symbol": symbol,
+                        "side": side,
+                        "reason": close_reason,
+                        "entry_price": entry,
+                        "planned_entry_price": pos.get("planned_entry_price") or ((pos.get("signal_details") or {}).get("price_signal") if isinstance(pos.get("signal_details"), dict) else None),
+                        "stop_price": stop,
+                        "take_price": take,
+                        "close_price": price,
+                        "opened_at": opened,
+                        "closed_at": now,
+                        "pnl_pct": pnl,
+                        "strategy": strategy,
+                    })
+                    continue
             liquidation_stop_mode = bool(pos.get("liquidation_stop_mode")) and is_ai_scalping
             ai_manage_only_tpsl = str(await self._setting("ai_scalping_manage_only_tpsl", os.getenv("AI_SCALPING_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
             boost_manage_only_tpsl = str(await self._setting("boost_manage_only_tpsl", os.getenv("BOOST_MANAGE_ONLY_TPSL", "1"))).lower() in {"1", "true", "yes", "on"}
@@ -956,7 +1056,7 @@ class PositionManager:
             # ChatGPT setup mode is managed ONLY by explicit SL and TP orders
             # from setup.txt.  Do not apply generic scalp breakeven, trailing,
             # smart time-stop, or local fake-profit exits.
-            manage_only_tpsl = (is_ai_scalping and ai_manage_only_tpsl) or (is_boost_scalping and boost_manage_only_tpsl) or (is_impulse_dump and impulse_manage_only_tpsl) or ((is_orderflow_impulse or is_cascade_hunter or is_strongest_coin) and orderflow_manage_only_tpsl) or is_knife_reversal or is_chatgpt_setup
+            manage_only_tpsl = (is_ai_scalping and ai_manage_only_tpsl) or (is_boost_scalping and boost_manage_only_tpsl) or (is_impulse_dump and impulse_manage_only_tpsl) or ((is_orderflow_impulse or is_cascade_hunter or is_strongest_coin) and orderflow_manage_only_tpsl) or is_knife_reversal or is_chatgpt_setup or is_ratio_pressure
             policy = await self._refresh_scalp_policy()
             if not is_chatgpt_setup:
                 policy.update_best_pnl(pos, pnl)
@@ -1143,6 +1243,22 @@ class PositionManager:
                         ev = await self._close_and_event(pos, "sl", "stop_loss", live, price)
                         if ev: events.append(ev)
                         continue
+            if strategy == "ratio_pressure_1h":
+                rp_time_stop = int(await self._setting("ratio_pressure_time_stop_sec", os.getenv("RATIO_PRESSURE_TIME_STOP_SEC", "28800")) or 28800)
+                if rp_time_stop > 0 and now - opened >= rp_time_stop:
+                    log_event(
+                        "ratio_pressure_time_stop_trigger",
+                        strategy="ratio_pressure_1h",
+                        ok=True,
+                        symbol=str(symbol),
+                        side=str(pos.get("side", "")),
+                        opened_at=opened,
+                        time_stop_sec=rp_time_stop,
+                        current_price=float(price or 0),
+                    )
+                    ev = await self._close_and_event(pos, "time_stop", "ratio_pressure_8h_time_stop", live, price)
+                    if ev: events.append(ev)
+                    continue
             if strategy == "quick_bounce":
                 qb_time_stop = int(await self._setting("quick_bounce_time_stop_sec", os.getenv("QUICK_BOUNCE_TIME_STOP_SEC", "43200")) or 43200)
                 if qb_time_stop > 0 and now - opened >= qb_time_stop:

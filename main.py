@@ -36,6 +36,7 @@ from ai_btc_autopilot import BTCVisionAutopilot
 from chatgpt_mode import build_chatgpt_log, build_chatgpt_scan_pack, build_chatgpt_runtime_manifest_from_mexc, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log, build_chatgpt_monitor_text, CHATGPT_MONITOR_INTERVAL_SEC, CHATGPT_SETUP_VERSION
 from claude_autopilot import call_claude_for_setup, save_claude_setup_text, normalize_claude_model, claude_model_label, schedule_label, next_schedule_run, schedule_due, CLAUDE_SONNET_46, CLAUDE_OPUS_48, MSK
 from claude_runtime_logger import claude_log_event, claude_runtime_log_path, tail_claude_runtime_log
+from ratio_pressure_autopilot import RatioPressureAutopilot, RATIO_ENABLED_KEY, RATIO_LAST_RUN_KEY, RATIO_STATUS_MSG_KEY
 from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
 from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env, set_runtime_secret_cache, clear_runtime_secret_cache, runtime_secret_cache, ensure_runtime_secrets_loaded, merge_secrets_into_settings, secret_source_report
@@ -62,6 +63,7 @@ position_task = None
 bottom_replace_locks = {}
 btc_ai_task = None
 claude_scheduler_task = None
+ratio_pressure_task = None
 monitor_cleanup_task = None
 
 def admin_id_list() -> list[str]:
@@ -331,6 +333,7 @@ async def notify_admin_bottom_replace(app, text: str, key: str = "live_status", 
             "chatgpt_limit_timeout_event",
             "chatgpt_position_event",
             "chatgpt_setup_lifecycle",
+            RATIO_STATUS_MSG_KEY,
         }
 
         if old_msg_id and not force_bottom_resend:
@@ -1943,32 +1946,40 @@ async def log_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 n = max(20, min(400, int(context.args[0])))
             except Exception:
                 n = 120
-        text = tail_text(files=["btc_ai.log", "errors.log", "mexc_raw.log", "trade.log"], lines=n, max_chars=3600)
+        text = tail_text(files=["ratio_pressure.log", "btc_ai.log", "errors.log", "mexc_raw.log", "trade.log"], lines=n, max_chars=5200)
         try:
             settings = await storage.all_settings()
             settings_view = {
                 "version": VERSION,
-                "btc_ai_autopilot_enabled": settings.get("btc_ai_autopilot_enabled"),
-                "btc_ai_live_test_enabled": settings.get("btc_ai_live_test_enabled"),
-                "btc_ai_symbol": settings.get("btc_ai_symbol"),
-                "btc_ai_min_trade_probability": settings.get("btc_ai_min_trade_probability"),
-                "btc_ai_a_plus_probability": settings.get("btc_ai_a_plus_probability"),
-                "btc_ai_balance_share": settings.get("btc_ai_balance_share"),
-                "btc_ai_leverage": settings.get("btc_ai_leverage"),
-                "scan_market_source": settings.get("scan_market_source"),
                 "live_trading": settings.get("live_trading"),
+                "ratio_pressure_enabled": settings.get("ratio_pressure_autopilot_enabled"),
+                "ratio_pressure_last_run_ts": settings.get("ratio_pressure_last_run_ts"),
+                "ratio_pressure_sl_pct": settings.get("ratio_pressure_sl_pct", 1.0),
+                "ratio_pressure_tp_r": settings.get("ratio_pressure_tp_r", 6.0),
+                "ratio_pressure_time_stop_sec": settings.get("ratio_pressure_time_stop_sec", 28800),
+                "ratio_pressure_cooldown_sec": settings.get("ratio_pressure_cooldown_sec", 86400),
+                "ratio_pressure_eth_margin_pct": settings.get("ratio_pressure_eth_margin_pct", 10.0),
+                "ratio_pressure_btc_margin_pct": settings.get("ratio_pressure_btc_margin_pct", 5.0),
+                "ratio_pressure_max_active_positions": settings.get("ratio_pressure_max_active_positions", 2),
+                "btc_ai_autopilot_enabled": settings.get("btc_ai_autopilot_enabled"),
+                "scan_market_source": settings.get("scan_market_source"),
             }
             positions = await storage.positions()
+            ratio_positions = [p for p in positions if str(p.get("strategy") or "").lower() == "ratio_pressure_1h"]
             btc_positions = [p for p in positions if str(p.get("strategy") or "") == "btc_ai_4h" or str(p.get("symbol") or "").upper() in {"BTC_USDT", "BTCUSDT", "BTC/USDT"}]
-            pos_text = json.dumps(btc_positions[-8:], ensure_ascii=False, default=str)[:1200]
+            pos_blob = {
+                "ratio_positions": ratio_positions[-10:],
+                "btc_ai_positions": btc_positions[-6:],
+            }
+            pos_text = json.dumps(pos_blob, ensure_ascii=False, default=str)[:1900]
             set_text = json.dumps(settings_view, ensure_ascii=False, default=str)
         except Exception as e:
             pos_text = f"positions/settings read error: {e}"
             set_text = "{}"
-        header = "🧾 BTC AI FULL / MEXC / OpenAI logs\nSETTINGS=" + set_text + "\nACTIVE_POSITIONS=" + pos_text + "\n"
-        msg = header + "```\n" + text[-3000:] + "\n```"
+        header = "🧾 FULL LOGS / Ratio_pressure / BTC AI / MEXC\nSETTINGS=" + set_text + "\nACTIVE_POSITIONS=" + pos_text + "\n"
+        msg = header + "```\n" + text[-3300:] + "\n```"
         if len(msg) > 4050:
-            msg = msg[:900] + "\n...TRUNCATED...\n```\n" + text[-2700:] + "\n```"
+            msg = msg[:950] + "\n...TRUNCATED...\n```\n" + text[-2650:] + "\n```"
         await reply(update, msg, reply_markup=MAIN_MENU)
     except Exception as e:
         await reply(update, f"/log_full error: {e}", reply_markup=MAIN_MENU)
@@ -2350,6 +2361,9 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("btc_ai_autopilot_enabled", False, bump_revision=False)
+    await storage.set(RATIO_ENABLED_KEY, False, bump_revision=False)
+    ratio_obj = context.application.bot_data.get("ratio_pressure_autopilot")
+    if ratio_obj: ratio_obj.stop()
     obj = context.application.bot_data.get("btc_ai_autopilot")
     if obj: obj.stop()
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
@@ -2372,6 +2386,9 @@ async def panic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("btc_ai_autopilot_enabled", False, bump_revision=False)
+    await storage.set(RATIO_ENABLED_KEY, False, bump_revision=False)
+    ratio_obj = context.application.bot_data.get("ratio_pressure_autopilot")
+    if ratio_obj: ratio_obj.stop()
     obj = context.application.bot_data.get("btc_ai_autopilot")
     if obj: obj.stop()
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
@@ -5046,6 +5063,9 @@ async def cancel_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _boost_disarm_runtime(context.application)
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("btc_ai_autopilot_enabled", False, bump_revision=False)
+    await storage.set(RATIO_ENABLED_KEY, False, bump_revision=False)
+    ratio_obj = context.application.bot_data.get("ratio_pressure_autopilot")
+    if ratio_obj: ratio_obj.stop()
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
     await reply(update, "⏳ Cancel all orders: command received. New entries are OFF. Cancelling MEXC orders now...", reply_markup=MAIN_MENU)
     s = await storage.all_settings()
@@ -5077,6 +5097,9 @@ async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await storage.set("boost_autopilot_active", False, bump_revision=False)
     await storage.set("btc_ai_autopilot_enabled", False, bump_revision=False)
     await storage.set("btc_ai_live_test_enabled", False, bump_revision=False)
+    await storage.set(RATIO_ENABLED_KEY, False, bump_revision=False)
+    ratio_obj = context.application.bot_data.get("ratio_pressure_autopilot")
+    if ratio_obj: ratio_obj.stop()
     await storage.set("strategy_mode", "hybrid", bump_revision=False)
     await reply(update, "⏳ Close all positions: command received. New entries are OFF. HARD closing MEXC positions now...", reply_markup=MAIN_MENU)
     failures = []
@@ -6639,6 +6662,9 @@ async def _claude_emergency_close_all(app, chat_id: int, status_message=None):
         await storage.set("chatgpt_setup_mode", False, bump_revision=False)
         await storage.set("boost_autopilot_active", False, bump_revision=False)
         await storage.set("btc_ai_autopilot_enabled", False, bump_revision=False)
+        await storage.set(RATIO_ENABLED_KEY, False, bump_revision=False)
+        ratio_obj = app.bot_data.get("ratio_pressure_autopilot")
+        if ratio_obj: ratio_obj.stop()
         _boost_disarm_runtime(app)
         lines.append("✅ Автопилот выключен, расписание остановлено")
         if status_message is not None:
@@ -6707,6 +6733,277 @@ async def _claude_scheduler_loop(app):
         except Exception as e:
             log.exception("claude scheduler loop error: %s", e)
             await asyncio.sleep(30)
+
+
+
+def _ratio_bool(settings: dict | None, key: str, default: bool = False) -> bool:
+    return _boolish((settings or {}).get(key), default)
+
+
+def ratio_pressure_keyboard(settings: dict | None = None) -> InlineKeyboardMarkup:
+    enabled = _ratio_bool(settings or {}, RATIO_ENABLED_KEY, False)
+    toggle_label = "🔴 Ratio_pressure: ВЫКЛЮЧИТЬ" if enabled else "🟢 Ratio_pressure: ВКЛЮЧИТЬ"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data="ratio:toggle")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="noop:ratio")],
+    ])
+
+
+async def _ratio_notify(app, chat_id: int, text: str):
+    try:
+        await _safe_send_bot_message(app, int(chat_id), str(text)[:3900], reply_markup=MAIN_MENU)
+    except Exception as e:
+        log_event("ratio_pressure_notify_send_failed", ok=False, error=str(e)[:300])
+
+
+async def _ratio_status_notify(app, chat_id: int, text: str):
+    try:
+        await notify_admin_bottom_replace(app, str(text)[:3900], key=RATIO_STATUS_MSG_KEY, min_interval_sec=0)
+    except Exception as e:
+        log_event("ratio_pressure_status_send_failed", ok=False, error=str(e)[:300])
+
+
+async def _get_ratio_autopilot(app, chat_id: int | None = None):
+    s = await storage.all_settings()
+    ex = await get_exchange(s)
+    executor = ExecutionEngine(storage, ex)
+    cid = int(chat_id or first_admin_id() or 0)
+    obj = app.bot_data.get("ratio_pressure_autopilot")
+    if obj is None or getattr(obj, "exchange_client", None) is not ex:
+        async def _notify(text: str):
+            if cid:
+                await _ratio_notify(app, cid, text)
+        async def _status_notify(text: str):
+            if cid:
+                await _ratio_status_notify(app, cid, text)
+        obj = RatioPressureAutopilot(storage, ex, executor, notify=_notify, status_notify=_status_notify)
+        app.bot_data["ratio_pressure_autopilot"] = obj
+    return obj
+
+
+async def _ensure_ratio_task(app, chat_id: int | None = None):
+    global ratio_pressure_task, position_task
+    try:
+        await storage.set("execution_loop_interval_sec", 1.0, bump_revision=False)
+    except Exception:
+        pass
+    obj = await _get_ratio_autopilot(app, chat_id)
+    if ratio_pressure_task is None or ratio_pressure_task.done():
+        ratio_pressure_task = app.create_task(obj.run_loop(app))
+        log_event("ratio_pressure_task_started", ok=True)
+    if position_task is None or position_task.done():
+        position_task = app.create_task(position_management_loop(app))
+        log_event("ratio_pressure_position_manager_started", ok=True)
+    return obj
+
+
+def ratio_pressure_menu_text(settings: dict | None = None) -> str:
+    # Build a lightweight object only to reuse the status formatter; no exchange needed.
+    enabled = _ratio_bool(settings or {}, RATIO_ENABLED_KEY, False)
+    last_ts = 0.0
+    try:
+        last_ts = float((settings or {}).get(RATIO_LAST_RUN_KEY) or 0)
+    except Exception:
+        last_ts = 0.0
+    nxt = RatioPressureAutopilot.next_1h_close_ts()
+    last_s = RatioPressureAutopilot._fmt_utc(last_ts) if last_ts else "-"
+    next_s = RatioPressureAutopilot._fmt_utc(nxt)
+    return (
+        "🧬 ETH/BTC 1h/1h Ratio Pressure\n\n"
+        "FINAL_LIVE_CANDIDATE!!!\n"
+        f"Статус: {'ВКЛ' if enabled else 'ВЫКЛ'}\n"
+        f"Последний scan: {last_s}\n"
+        f"Следующий scan: {next_s}\n\n"
+        "ETH: 10% баланса x10\n"
+        "BTC: 5% баланса x10\n"
+        "SL 1% | TP 6R = 6% движения цены\n"
+        "Max 2 позиции, max 1 позиция на символ\n"
+        "Синхронизация позиций: ~1 сек, без сообщений при обычном sync\n"
+        "Кнопка: тумблер ВКЛ/ВЫКЛ, ручного scan сейчас нет\n"
+        "ИИ не используется. Ордер-исполнение через существующий ExecutionEngine."
+    )
+
+
+def _ratio_seconds_hhmmss(seconds: float | int) -> str:
+    try:
+        sec = max(0, int(float(seconds)))
+    except Exception:
+        sec = 0
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s2 = sec % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{s2:02d}"
+    return f"{m:02d}:{s2:02d}"
+
+
+def _ratio_utc_hms(ts: float | int | None) -> str:
+    try:
+        if not ts:
+            return "-"
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%H:%M:%S UTC")
+    except Exception:
+        return "-"
+
+
+def _ratio_price_signal(pos: dict) -> float:
+    details = pos.get("signal_details") if isinstance(pos.get("signal_details"), dict) else {}
+    for v in (pos.get("planned_entry_price"), details.get("price_signal"), pos.get("entry_reference"), pos.get("entry_price")):
+        try:
+            fv = float(v or 0)
+            if fv > 0:
+                return fv
+        except Exception:
+            pass
+    return 0.0
+
+
+def _ratio_pnl_pct(pos: dict, price: float) -> float:
+    try:
+        entry = float(pos.get("entry_price") or 0)
+        if entry <= 0:
+            return 0.0
+        side = str(pos.get("side") or "").upper()
+        if side == "SHORT":
+            return (entry - float(price)) / entry * 100.0
+        return (float(price) - entry) / entry * 100.0
+    except Exception:
+        return 0.0
+
+
+def _ratio_live_position_card(pos: dict, price: float, settings: dict | None = None) -> str:
+    settings = settings or {}
+    symbol = str(pos.get("symbol") or "-")
+    side = str(pos.get("side") or "-").upper()
+    entry = float(pos.get("entry_price") or 0)
+    price_signal = _ratio_price_signal(pos)
+    stop = float(pos.get("stop_price") or 0)
+    take = float(pos.get("take_price") or 0)
+    opened = float(pos.get("opened_at") or time.time())
+    time_stop = int(float(settings.get("ratio_pressure_time_stop_sec", os.getenv("RATIO_PRESSURE_TIME_STOP_SEC", "28800")) or 28800))
+    left = max(0, opened + time_stop - time.time())
+    pnl = _ratio_pnl_pct(pos, price)
+    protection = str(pos.get("protection_status") or "CHECK REQUIRED")
+    protected = protection.upper() in {"EXCHANGE PROTECTED", "TP + LIQUIDATION STOP", "SL + TP", "TP + SL"}
+    return "\n".join([
+        "🧬 Ratio_pressure 1H",
+        "",
+        f"✅ {symbol} {side}",
+        "",
+        "✅ MARKET entry accepted",
+        f"✅ Open position: {_fmt_price(entry)}",
+        f"✅ SL на бирже: {_fmt_price(stop)}" if protected else f"🚨 SL проверить: {_fmt_price(stop)}",
+        f"✅ TP на бирже: {_fmt_price(take)}" if protected else f"🚨 TP проверить: {_fmt_price(take)}",
+        "",
+        f"Price signal: {_fmt_price(price_signal)}",
+        f"Protection: {'✅ ' if protected else '🚨 '}{protection}",
+        "",
+        f"Время открытия позиции: {_ratio_utc_hms(opened)}",
+        f"Таймер на закрытие: {_ratio_seconds_hhmmss(left)}",
+        f"Actual price {symbol.split('_')[0]}: {_fmt_price(float(price or 0))}",
+        f"P/L: {pnl:+.2f}%",
+        "",
+        "Сообщение обновляется раз в минуту без переноса вниз чата.",
+    ])
+
+
+def _ratio_closed_card(ev: dict) -> str:
+    symbol = str(ev.get("symbol") or "-")
+    side = str(ev.get("side") or "-").upper()
+    reason = str(ev.get("reason") or ev.get("type") or "closed")
+    title_reason = "TIME-STOP 8H" if reason == "ratio_pressure_8h_time_stop" or str(ev.get("type")) == "time_stop" else reason.upper()
+    entry = ev.get("entry_price")
+    price_signal = ev.get("planned_entry_price") or entry
+    close_price = ev.get("close_price") or ev.get("price")
+    opened = ev.get("opened_at")
+    closed = ev.get("closed_at") or time.time()
+    try:
+        duration = float(closed) - float(opened or closed)
+    except Exception:
+        duration = 0
+    pnl = ev.get("pnl_pct")
+    try:
+        pnl_s = f"{float(pnl):+.2f}%"
+    except Exception:
+        pnl_s = "-"
+    cancel_res = ev.get("cancel_result") if isinstance(ev.get("cancel_result"), dict) else {}
+    cancel_ok = cancel_res.get("ok")
+    cancel_line = "✅ Остаточные SL/TP ордера отменены" if cancel_ok is True else ("⚠️ Остаточные SL/TP ордера: проверить" if cancel_res else "✅ Остаточные SL/TP ордера: не обнаружены/не требуются")
+    if str(ev.get("type")) == "time_stop":
+        header = f"⏱ {symbol} {side} закрыта по TIME-STOP 8H"
+        reason_lines = ["Причина закрытия:", "TP/SL не сработали за 8 часов"]
+    else:
+        header = f"✅ {symbol} {side} закрыта"
+        reason_lines = ["Причина закрытия:", title_reason]
+    return "\n".join([
+        "🧬 Ratio_pressure 1H",
+        "",
+        header,
+        "",
+        "✅ Позиция закрыта MARKET" if str(ev.get("type")) == "time_stop" else "✅ Позиция закрыта на бирже",
+        cancel_line,
+        "✅ Position sync подтверждён",
+        "",
+        f"Price signal: {_fmt_price(float(price_signal or 0))}",
+        f"Open position: {_fmt_price(float(entry or 0))}",
+        f"Close position: {_fmt_price(float(close_price or 0))}",
+        "",
+        f"Result: {pnl_s}",
+        "",
+        f"Время открытия: {_ratio_utc_hms(opened)}",
+        f"Время закрытия: {_ratio_utc_hms(closed)}",
+        f"Длительность: {_ratio_seconds_hhmmss(duration)}",
+        "",
+        *reason_lines,
+    ])
+
+
+async def update_ratio_pressure_live_cards(app, ex=None, force: bool = False) -> None:
+    try:
+        settings = await storage.all_settings()
+        now = time.time()
+        positions = await storage.positions()
+        if ex is None:
+            ex = await get_exchange(settings)
+        for pos in positions:
+            if str(pos.get("strategy") or "").lower() != "ratio_pressure_1h" or str(pos.get("status") or "").lower() != "open":
+                continue
+            symbol = str(pos.get("symbol") or "")
+            if not symbol:
+                continue
+            last_key = f"ratio_live_last_update_{symbol}"
+            last = float(app.bot_data.get(last_key, 0) or 0)
+            if not force and now - last < 60:
+                continue
+            price = await get_last_price(ex, symbol)
+            if not price:
+                continue
+            text = _ratio_live_position_card(pos, float(price), settings)
+            app.bot_data[last_key] = now
+            log_event(
+                "ratio_pressure_live_card_update",
+                ok=True,
+                strategy="ratio_pressure_1h",
+                symbol=symbol,
+                side=str(pos.get("side") or ""),
+                actual_price=float(price or 0),
+                open_position=pos.get("entry_price"),
+                price_signal=_ratio_price_signal(pos),
+                stop_price=pos.get("stop_price"),
+                take_price=pos.get("take_price"),
+                protection_status=pos.get("protection_status"),
+            )
+            await notify_admin_bottom_replace(app, text, key=f"ratio_live_{symbol}", min_interval_sec=0)
+    except Exception as e:
+        log_event("ratio_pressure_live_card_update_failed", ok=False, error=str(e)[:500])
+
+
+async def ratio_pressure_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    s = await storage.all_settings()
+    await reply(update, ratio_pressure_menu_text(s), reply_markup=ratio_pressure_keyboard(s))
+
 
 
 
@@ -7286,7 +7583,7 @@ def _button_mapping():
         ("🚀 BOOST MODE", boost_start_cmd), ("BOOST MODE", boost_start_cmd),
         ("🛑 STOP BOOST", boost_stop_cmd), ("STOP BOOST", boost_stop_cmd),
         ("🤖 ChatGPT Scan Mode", chatgpt_scan_mode_cmd), ("ChatGPT Scan Mode", chatgpt_scan_mode_cmd),
-        ("🤖 Claude Autopilot", claude_autopilot_cmd), ("Claude Autopilot", claude_autopilot_cmd),
+        ("🤖 Claude Autopilot", claude_autopilot_cmd), ("🧬 Ratio_pressure", ratio_pressure_cmd), ("🧬 Ratio 1H Autopilot", ratio_pressure_cmd), ("Ratio_pressure", ratio_pressure_cmd), ("Ratio 1H Autopilot", ratio_pressure_cmd), ("Claude Autopilot", claude_autopilot_cmd),
         ("📥 Принять setup", chatgpt_accept_setup_cmd), ("Принять setup", chatgpt_accept_setup_cmd), ("Accept setup", chatgpt_accept_setup_cmd), ("/import_setup", chatgpt_accept_setup_cmd),
         ("📄 Log ChatGPT", log_chatgpt_cmd), ("Log ChatGPT", log_chatgpt_cmd), ("📄 Log Claude", log_claude_cmd), ("Log Claude", log_claude_cmd),
         ("❌ Exit ChatGPT Mode", chatgpt_exit_mode_cmd), ("Exit ChatGPT Mode", chatgpt_exit_mode_cmd),
@@ -7336,7 +7633,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     raw_data = str(q.data or "")
     data = raw_data.split(":")
-    allowed_prefixes = {"boost", "toggle", "set", "menu", "api", "aistats", "openai", "claude", "noop"}
+    allowed_prefixes = {"boost", "toggle", "set", "menu", "api", "aistats", "openai", "claude", "ratio", "noop"}
     if not data or data[0] not in allowed_prefixes:
         log.warning("ignored unknown callback_data: %s", raw_data[:120])
         return
@@ -7348,6 +7645,49 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rev = current_rev
     if rev != current_rev and data[0] != "menu":
         await _safe_edit_message_text(q.message, "⚠️ Старое меню. Открой Settings заново.")
+        return
+
+
+    if data[0] == "ratio":
+        action = data[1] if len(data) > 1 else "menu"
+        chat_id = q.message.chat_id if q.message else int(first_admin_id() or 0)
+        if action == "toggle":
+            ns0 = await storage.all_settings()
+            cur = _boolish(ns0.get(RATIO_ENABLED_KEY), False)
+            new_enabled = not cur
+            await storage.set(RATIO_ENABLED_KEY, new_enabled)
+            if new_enabled:
+                await storage.set("execution_loop_interval_sec", 1.0, bump_revision=False)
+                await _ensure_ratio_task(context.application, int(chat_id))
+            else:
+                obj = context.application.bot_data.get("ratio_pressure_autopilot")
+                if obj:
+                    obj.stop()
+            ns = await storage.all_settings()
+            await _safe_edit_message_text(q.message, ratio_pressure_menu_text(ns), reply_markup=ratio_pressure_keyboard(ns))
+            return
+        # Backward compatibility for old inline buttons; not shown in UI now.
+        if action == "enable":
+            await storage.set(RATIO_ENABLED_KEY, True)
+            await storage.set("execution_loop_interval_sec", 1.0, bump_revision=False)
+            await _ensure_ratio_task(context.application, int(chat_id))
+            ns = await storage.all_settings()
+            await _safe_edit_message_text(q.message, ratio_pressure_menu_text(ns), reply_markup=ratio_pressure_keyboard(ns))
+            return
+        if action == "disable":
+            await storage.set(RATIO_ENABLED_KEY, False)
+            obj = context.application.bot_data.get("ratio_pressure_autopilot")
+            if obj:
+                obj.stop()
+            ns = await storage.all_settings()
+            await _safe_edit_message_text(q.message, ratio_pressure_menu_text(ns), reply_markup=ratio_pressure_keyboard(ns))
+            return
+        if action == "run":
+            ns = await storage.all_settings()
+            await _safe_edit_message_text(q.message, "ℹ️ Ручной scan сейчас убран, чтобы не было путаницы. Ratio_pressure сканирует сам каждый час после закрытия 1H свечи.", reply_markup=ratio_pressure_keyboard(ns))
+            return
+        ns = await storage.all_settings()
+        await _safe_edit_message_text(q.message, ratio_pressure_menu_text(ns), reply_markup=ratio_pressure_keyboard(ns))
         return
 
 
@@ -7819,6 +8159,27 @@ async def emit_position_events(app, events: list[dict]) -> None:
     chatgpt_limit_timeout: list[dict] = []
     for ev in events or []:
         ev_type = str(ev.get("type") or "")
+        if (str(ev.get("strategy") or "").lower() == "ratio_pressure_1h" and ev_type in {"time_stop", "tp", "sl"}) or ev_type == "ratio_position_closed":
+            log_event(
+                "ratio_pressure_position_closed_event",
+                ok=True,
+                strategy="ratio_pressure_1h",
+                event_type=ev_type,
+                symbol=ev.get("symbol"),
+                side=ev.get("side"),
+                reason=ev.get("reason"),
+                entry_price=ev.get("entry_price"),
+                planned_entry_price=ev.get("planned_entry_price"),
+                stop_price=ev.get("stop_price"),
+                take_price=ev.get("take_price"),
+                close_price=ev.get("close_price") or ev.get("price"),
+                pnl_pct=ev.get("pnl_pct"),
+                result=ev.get("result"),
+                cancel_result=ev.get("cancel_result"),
+            )
+            symbol_key = str(ev.get("symbol") or "position").replace("/", "_").replace(":", "_")
+            app.create_task(notify_admin_bottom_replace(app, _ratio_closed_card(ev), key=f"ratio_live_{symbol_key}", min_interval_sec=0))
+            continue
         # v0223: keep Telegram clean. These are not actionable errors; they mean
         # local TP/fast-profit was touched but MEXC real profit was not confirmed
         # yet. Re-sending them every manage tick floods the chat and delays useful
@@ -7888,7 +8249,7 @@ async def position_management_loop(app):
     trading_loop / handlers.
     """
     global running, position_task
-    interval_default = os.getenv("EXECUTION_LOOP_INTERVAL_SEC", "0.25")
+    interval_default = os.getenv("EXECUTION_LOOP_INTERVAL_SEC", "1.0")
     try:
         while running:
             try:
@@ -7899,6 +8260,7 @@ async def position_management_loop(app):
                 pos_manager = PositionManager(storage, exec_engine)
                 events = await pos_manager.manage(lambda symbol: get_last_price(ex, symbol), live)
                 await emit_position_events(app, events)
+                await update_ratio_pressure_live_cards(app, ex=ex)
                 try:
                     last_mon = float(app.bot_data.get("chatgpt_monitor_last_update", 0) or 0)
                     if time.time() - last_mon >= float(CHATGPT_MONITOR_INTERVAL_SEC):
@@ -8074,6 +8436,7 @@ async def trading_loop(app):
                 if not _boolish(settings.get("separate_execution_loop_enabled", os.getenv("SEPARATE_EXECUTION_LOOP_ENABLED", "true")), True):
                     events = await pos_manager.manage(lambda symbol: get_last_price(ex, symbol), live)
                     await emit_position_events(app, events)
+                    await update_ratio_pressure_live_cards(app, ex=ex)
 
                 # 2) Refresh symbol universe for legacy scanner modes only.
                 # v0114: AI BTC/ETH scalping must not run the adaptive universe
@@ -9240,13 +9603,36 @@ async def on_startup(app):
         "mode": "disabled_v52_exchange_source_of_truth",
         "local_cache_cleared": app.bot_data.get("startup_local_position_cache_cleared", 0),
     }
-    global claude_scheduler_task, monitor_cleanup_task
+    global claude_scheduler_task, ratio_pressure_task, monitor_cleanup_task
     try:
         if claude_scheduler_task is None or claude_scheduler_task.done():
             claude_scheduler_task = app.create_task(_claude_scheduler_loop(app))
             log_event("claude_autopilot_scheduler_started_v0402", ok=True)
     except Exception as e:
         log_event("claude_autopilot_scheduler_start_failed_v0402", ok=False, error=str(e)[:500])
+    try:
+        if _boolish(settings.get(RATIO_ENABLED_KEY), False):
+            try:
+                await storage.set("execution_loop_interval_sec", 1.0, bump_revision=False)
+            except Exception:
+                pass
+            ex = await get_exchange(settings)
+            executor = ExecutionEngine(storage, ex)
+            chat_id = int(first_admin_id() or 0)
+            async def _ratio_startup_notify(text: str):
+                if chat_id:
+                    await _ratio_notify(app, chat_id, text)
+            async def _ratio_startup_status_notify(text: str):
+                if chat_id:
+                    await _ratio_status_notify(app, chat_id, text)
+            obj = RatioPressureAutopilot(storage, ex, executor, notify=_ratio_startup_notify, status_notify=_ratio_startup_status_notify)
+            app.bot_data["ratio_pressure_autopilot"] = obj
+            if ratio_pressure_task is None or ratio_pressure_task.done():
+                ratio_pressure_task = app.create_task(obj.run_loop(app))
+                log_event("ratio_pressure_startup_task_started", ok=True)
+    except Exception as e:
+        log_event("ratio_pressure_startup_task_failed", ok=False, error=str(e)[:500])
+
     try:
         if monitor_cleanup_task is None or monitor_cleanup_task.done():
             monitor_cleanup_task = app.create_task(monitor_duplicate_cleanup_loop(app))
@@ -9285,6 +9671,7 @@ def build_app():
     app.add_handler(CommandHandler("chatgpt_scan", _wrap_command(chatgpt_scan_mode_cmd, "/chatgpt_scan")))
     app.add_handler(CommandHandler("scan_potok", _wrap_command(scan_potok_cmd, "/scan_potok")))
     app.add_handler(CommandHandler("claude_autopilot", _wrap_command(claude_autopilot_cmd, "/claude_autopilot")))
+    app.add_handler(CommandHandler("ratio_pressure", _wrap_command(ratio_pressure_cmd, "/ratio_pressure")))
     app.add_handler(CommandHandler("claude_api", _wrap_command(claude_api_cmd, "/claude_api")))
     app.add_handler(CommandHandler("import_setup", _wrap_command(chatgpt_accept_setup_cmd, "/import_setup")))
     app.add_handler(CommandHandler("chatgpt_exit", _wrap_command(chatgpt_exit_mode_cmd, "/chatgpt_exit")))
