@@ -98,9 +98,14 @@ class RatioPressureAutopilot:
 
     @staticmethod
     def _fmt_utc(ts: float | int | None) -> str:
+        """Telegram display time for Ratio mode: MSK (UTC+3).
+
+        Important: scheduler/calculations remain UTC timestamps; only user-visible
+        formatting is shifted to Moscow time to avoid changing trading logic.
+        """
         if not ts:
             return "-"
-        return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return datetime.fromtimestamp(float(ts), tz=timezone(timedelta(hours=3))).strftime("%Y-%m-%d %H:%M МСК")
 
     def status_text(self, settings: dict | None = None) -> str:
         s = settings or {}
@@ -136,7 +141,7 @@ class RatioPressureAutopilot:
                     # One sparse heartbeat per hour, not Telegram spam.
                     if now - self._last_heartbeat_ts > 3500:
                         self._last_heartbeat_ts = now
-                        log_event("ratio_pressure_loop_wait", ok=True, next_scan_utc=self._fmt_utc(target))
+                        log_event("ratio_pressure_loop_wait", ok=True, next_scan_msk=self._fmt_utc(target))
                     await asyncio.sleep(min(30.0, max(1.0, target - now)))
                     continue
                 await self.cycle(app=app, trigger="schedule")
@@ -466,7 +471,7 @@ class RatioPressureAutopilot:
                 open_price = pos.get("entry_price") or x.get("entry")
                 price_signal = pos.get("planned_entry_price") or ((pos.get("signal_details") or {}).get("price_signal") if isinstance(pos.get("signal_details"), dict) else None) or x.get("entry")
                 opened_ts = float(pos.get("opened_at") or 0)
-                opened_s = datetime.fromtimestamp(opened_ts, tz=timezone.utc).strftime("%H:%M:%S UTC") if opened_ts else "-"
+                opened_s = datetime.fromtimestamp(opened_ts, tz=timezone(timedelta(hours=3))).strftime("%H:%M:%S МСК") if opened_ts else "-"
                 lines.extend([
                     "",
                     f"✅ {symbol} {side}",
@@ -493,7 +498,7 @@ class RatioPressureAutopilot:
             ok=True,
             trigger=trigger,
             live_trading=live,
-            next_scan_utc=self._fmt_utc(self.next_1h_close_ts(delay_sec=int(float(settings.get("ratio_pressure_delay_after_hour_sec", 65) or 65)))),
+            next_scan_msk=self._fmt_utc(self.next_1h_close_ts(delay_sec=int(float(settings.get("ratio_pressure_delay_after_hour_sec", 65) or 65)))),
             symbols=",".join(self.symbols),
             tf="1h",
             sl_pct=settings.get("ratio_pressure_sl_pct", 1.0),

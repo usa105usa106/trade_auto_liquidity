@@ -6838,10 +6838,15 @@ def _ratio_seconds_hhmmss(seconds: float | int) -> str:
 
 
 def _ratio_utc_hms(ts: float | int | None) -> str:
+    """User-visible Ratio mode time in MSK (UTC+3).
+
+    Keep the old function name for compatibility; only formatting changes.
+    Trading timestamps/scheduler are not shifted.
+    """
     try:
         if not ts:
             return "-"
-        return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%H:%M:%S UTC")
+        return datetime.fromtimestamp(float(ts), tz=timezone(timedelta(hours=3))).strftime("%H:%M:%S МСК")
     except Exception:
         return "-"
 
