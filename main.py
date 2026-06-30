@@ -36,7 +36,7 @@ from ai_btc_autopilot import BTCVisionAutopilot
 from chatgpt_mode import build_chatgpt_log, build_chatgpt_scan_pack, build_chatgpt_runtime_manifest_from_mexc, disable_other_modes, extract_setup_json, execute_setup, chatgpt_log_event, chatgpt_runtime_log_path, tail_chatgpt_runtime_log, build_chatgpt_monitor_text, CHATGPT_MONITOR_INTERVAL_SEC, CHATGPT_SETUP_VERSION
 from claude_autopilot import call_claude_for_setup, save_claude_setup_text, normalize_claude_model, claude_model_label, schedule_label, next_schedule_run, schedule_due, CLAUDE_SONNET_46, CLAUDE_OPUS_48, MSK
 from claude_runtime_logger import claude_log_event, claude_runtime_log_path, tail_claude_runtime_log
-from ratio_pressure_autopilot import RatioPressureAutopilot, RATIO_ENABLED_KEY, RATIO_LAST_RUN_KEY, RATIO_STATUS_MSG_KEY
+from ratio_pressure_autopilot import RatioPressureAutopilot, RATIO_ENABLED_KEY, RATIO_LAST_RUN_KEY, RATIO_STATUS_MSG_KEY, RATIO_ENABLED_SINCE_KEY, RATIO_NEXT_SCAN_KEY
 from btc_pattern_backtest import run_btc_pattern_backtest, run_btc_pattern_backtest_1h, run_round_level_backtest, run_strategy_lab_backtest, run_strategy_detail_backtest
 from debug_log import tail_text, tail_important, log_event
 from runtime_secrets import secret_value, save_secret_backup, clear_secret_backup, apply_secret_backup_to_env, set_runtime_secret_cache, clear_runtime_secret_cache, runtime_secret_cache, ensure_runtime_secrets_loaded, merge_secrets_into_settings, secret_source_report
@@ -1940,13 +1940,16 @@ async def log_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     try:
-        n = 120
+        n = 1200
         if context.args:
             try:
-                n = max(20, min(400, int(context.args[0])))
+                n = max(50, min(5000, int(context.args[0])))
             except Exception:
-                n = 120
-        text = tail_text(files=["ratio_pressure.log", "btc_ai.log", "errors.log", "mexc_raw.log", "trade.log"], lines=n, max_chars=5200)
+                n = 1200
+
+        # v433_full fix: /log_full must send a complete .txt document, not a
+        # broken Telegram text chunk. This keeps chat clean and avoids losing
+        # the beginning/end of JSON lines.
         try:
             settings = await storage.all_settings()
             settings_view = {
@@ -1954,6 +1957,8 @@ async def log_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "live_trading": settings.get("live_trading"),
                 "ratio_pressure_enabled": settings.get("ratio_pressure_autopilot_enabled"),
                 "ratio_pressure_last_run_ts": settings.get("ratio_pressure_last_run_ts"),
+                "ratio_pressure_next_scan_ts": settings.get("ratio_pressure_next_scan_ts"),
+                "ratio_pressure_enabled_since_ts": settings.get("ratio_pressure_enabled_since_ts"),
                 "ratio_pressure_sl_pct": settings.get("ratio_pressure_sl_pct", 1.0),
                 "ratio_pressure_tp_r": settings.get("ratio_pressure_tp_r", 6.0),
                 "ratio_pressure_time_stop_sec": settings.get("ratio_pressure_time_stop_sec", 28800),
@@ -1968,19 +1973,52 @@ async def log_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ratio_positions = [p for p in positions if str(p.get("strategy") or "").lower() == "ratio_pressure_1h"]
             btc_positions = [p for p in positions if str(p.get("strategy") or "") == "btc_ai_4h" or str(p.get("symbol") or "").upper() in {"BTC_USDT", "BTCUSDT", "BTC/USDT"}]
             pos_blob = {
-                "ratio_positions": ratio_positions[-10:],
-                "btc_ai_positions": btc_positions[-6:],
+                "ratio_positions": ratio_positions[-20:],
+                "btc_ai_positions": btc_positions[-10:],
             }
-            pos_text = json.dumps(pos_blob, ensure_ascii=False, default=str)[:1900]
-            set_text = json.dumps(settings_view, ensure_ascii=False, default=str)
+            set_text = json.dumps(settings_view, ensure_ascii=False, default=str, indent=2)
+            pos_text = json.dumps(pos_blob, ensure_ascii=False, default=str, indent=2)
         except Exception as e:
-            pos_text = f"positions/settings read error: {e}"
             set_text = "{}"
-        header = "🧾 FULL LOGS / Ratio_pressure / BTC AI / MEXC\nSETTINGS=" + set_text + "\nACTIVE_POSITIONS=" + pos_text + "\n"
-        msg = header + "```\n" + text[-3300:] + "\n```"
-        if len(msg) > 4050:
-            msg = msg[:950] + "\n...TRUNCATED...\n```\n" + text[-2650:] + "\n```"
-        await reply(update, msg, reply_markup=MAIN_MENU)
+            pos_text = f"positions/settings read error: {e}"
+
+        text = tail_text(
+            files=["ratio_pressure.log", "btc_ai.log", "errors.log", "mexc_raw.log", "trade.log"],
+            lines=n,
+            max_chars=2_000_000,
+        )
+        now_msk = datetime.now(timezone.utc) + timedelta(hours=3)
+        filename = now_msk.strftime("log_%Y-%m-%d_%H-%M-%S_MSK.txt")
+        tmp_path = f"/tmp/{filename}"
+        body = (
+            "🧾 FULL LOGS / Ratio_pressure / BTC AI / MEXC\n"
+            f"created_msk={now_msk.strftime('%Y-%m-%d %H:%M:%S МСК')}\n"
+            f"lines_per_file={n}\n"
+            "\n================ SETTINGS ================\n"
+            + set_text
+            + "\n\n================ ACTIVE_POSITIONS ================\n"
+            + pos_text
+            + "\n\n================ LOGS ================\n"
+            + text
+        )
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(body)
+        size_kb = os.path.getsize(tmp_path) / 1024.0
+        caption = f"🧾 /log_full готов: {filename} ({size_kb:.1f} KB)"
+        try:
+            with open(tmp_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=f,
+                    filename=filename,
+                    caption=caption,
+                    reply_markup=MAIN_MENU,
+                )
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
     except Exception as e:
         await reply(update, f"/log_full error: {e}", reply_markup=MAIN_MENU)
 
@@ -2165,7 +2203,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /start - меню
 /help - помощь
 /log - краткий BTC AI лог
-/log_full [lines] - полный сырой BTC AI/MEXC/OpenAI JSON, токены, prompt, ордера, позиции
+/log_full [lines] - отправить полный сырой Ratio/BTC AI/MEXC JSON файлом log_дата_время.txt
 /run - запустить торговлю
 /boost_start или кнопка 🚀 BOOST MODE - запустить BOOST autopilot: 10% депозита → x20 цель
 /boost_stop или кнопка 🛑 STOP BOOST - остановить BOOST и новые входы
@@ -6781,6 +6819,30 @@ async def _get_ratio_autopilot(app, chat_id: int | None = None):
     return obj
 
 
+
+async def _ratio_prepare_enable_schedule(settings: dict | None = None) -> float:
+    """Turn Ratio ON as a real live mode and set the first future scan slot.
+
+    Critical behavior:
+    - ON before HH:01:05 => first scan this hour at HH:01:05.
+    - ON after HH:01:05 => first scan next hour at HH+1:01:05.
+    No stale catch-up is created when enabling after the scan slot.
+    """
+    s = settings or await storage.all_settings()
+    try:
+        delay = int(float(s.get("ratio_pressure_delay_after_hour_sec", 65) or 65))
+    except Exception:
+        delay = 65
+    now = time.time()
+    next_ts = RatioPressureAutopilot.first_scan_after_enable_ts(now, delay_sec=delay)
+    await storage.set(RATIO_ENABLED_KEY, True)
+    # User explicitly wants Ratio to trade real balance when enabled.
+    await storage.set("live_trading", True, bump_revision=False)
+    await storage.set(RATIO_ENABLED_SINCE_KEY, now, bump_revision=False)
+    await storage.set(RATIO_NEXT_SCAN_KEY, next_ts, bump_revision=False)
+    log_event("ratio_pressure_enabled_live", ok=True, enabled_since_msk=RatioPressureAutopilot._fmt_utc(now), next_scan_msk=RatioPressureAutopilot._fmt_utc(next_ts), live_trading=True)
+    return next_ts
+
 async def _ensure_ratio_task(app, chat_id: int | None = None):
     global ratio_pressure_task, position_task
     try:
@@ -6805,7 +6867,16 @@ def ratio_pressure_menu_text(settings: dict | None = None) -> str:
         last_ts = float((settings or {}).get(RATIO_LAST_RUN_KEY) or 0)
     except Exception:
         last_ts = 0.0
-    nxt = RatioPressureAutopilot.next_1h_close_ts()
+    try:
+        delay = int(float((settings or {}).get("ratio_pressure_delay_after_hour_sec", 65) or 65))
+    except Exception:
+        delay = 65
+    try:
+        nxt = float((settings or {}).get(RATIO_NEXT_SCAN_KEY) or 0)
+    except Exception:
+        nxt = 0.0
+    if not nxt:
+        nxt = RatioPressureAutopilot.next_scan_after_ts(delay_sec=delay)
     last_s = RatioPressureAutopilot._fmt_utc(last_ts) if last_ts else "-"
     next_s = RatioPressureAutopilot._fmt_utc(nxt)
     return (
@@ -7660,20 +7731,22 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ns0 = await storage.all_settings()
             cur = _boolish(ns0.get(RATIO_ENABLED_KEY), False)
             new_enabled = not cur
-            await storage.set(RATIO_ENABLED_KEY, new_enabled)
             if new_enabled:
+                await _ratio_prepare_enable_schedule(ns0)
                 await storage.set("execution_loop_interval_sec", 1.0, bump_revision=False)
                 await _ensure_ratio_task(context.application, int(chat_id))
             else:
+                await storage.set(RATIO_ENABLED_KEY, False)
                 obj = context.application.bot_data.get("ratio_pressure_autopilot")
                 if obj:
                     obj.stop()
+                log_event("ratio_pressure_disabled", ok=True)
             ns = await storage.all_settings()
             await _safe_edit_message_text(q.message, ratio_pressure_menu_text(ns), reply_markup=ratio_pressure_keyboard(ns))
             return
         # Backward compatibility for old inline buttons; not shown in UI now.
         if action == "enable":
-            await storage.set(RATIO_ENABLED_KEY, True)
+            await _ratio_prepare_enable_schedule(await storage.all_settings())
             await storage.set("execution_loop_interval_sec", 1.0, bump_revision=False)
             await _ensure_ratio_task(context.application, int(chat_id))
             ns = await storage.all_settings()

@@ -1002,6 +1002,14 @@ class PositionManager:
             is_strongest_coin = strategy == "strongest_coin"
             is_knife_reversal = strategy == "knife_reversal"
             is_ratio_pressure = strategy == "ratio_pressure_1h"
+            ratio_exchange_protected = False
+            if is_ratio_pressure:
+                try:
+                    rp_mode_txt = str(pos.get("protection_mode") or "").lower()
+                    rp_status_txt = str(pos.get("protection_status") or "").upper()
+                    ratio_exchange_protected = rp_mode_txt == "exchange" or rp_status_txt in {"EXCHANGE PROTECTED", "SL + TP", "TP + SL", "TP + LIQUIDATION STOP"}
+                except Exception:
+                    ratio_exchange_protected = False
             if is_ratio_pressure and live and (now - opened) > 5:
                 # Ratio uses exchange-side SL/TP. If MEXC already closed the
                 # position by TP/SL, remove stale local state and emit one final
@@ -1182,7 +1190,7 @@ class PositionManager:
                     events.append({"type":"boost_fast_profit_error", "symbol": symbol, "error": str(e)[:160]})
 
             if side=="LONG":
-                if take and price>=take and not (is_chatgpt_setup and (chatgpt_exchange_protected or chatgpt_protection_pending)):
+                if take and price>=take and not (is_chatgpt_setup and (chatgpt_exchange_protected or chatgpt_protection_pending)) and not (is_ratio_pressure and live and ratio_exchange_protected):
                     if live and strategy == "boost_scalping":
                         min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.09) or 0.09)
                         ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, min_profit)
@@ -1202,7 +1210,7 @@ class PositionManager:
                     ev = await self._close_and_event(pos, "tp", "take_profit", live, price)
                     if ev: events.append(ev)
                     continue
-                if stop and price<=stop and not liquidation_stop_mode and not (is_chatgpt_setup and (chatgpt_exchange_protected or chatgpt_protection_pending)):
+                if stop and price<=stop and not liquidation_stop_mode and not (is_chatgpt_setup and (chatgpt_exchange_protected or chatgpt_protection_pending)) and not (is_ratio_pressure and live and ratio_exchange_protected):
                     if boost_monitor_only_no_exchange:
                         pos["boost_monitor_only_skip_sl"] = f"exchange TP/SL missing; local SL close skipped at pnl {pnl:+.3f}%"
                         pos["updated_at"] = now
@@ -1213,7 +1221,7 @@ class PositionManager:
                         if ev: events.append(ev)
                         continue
             else:
-                if take and price<=take and not (is_chatgpt_setup and (chatgpt_exchange_protected or chatgpt_protection_pending)):
+                if take and price<=take and not (is_chatgpt_setup and (chatgpt_exchange_protected or chatgpt_protection_pending)) and not (is_ratio_pressure and live and ratio_exchange_protected):
                     if live and strategy == "boost_scalping":
                         min_profit = float(await self._setting("boost_live_min_exchange_profit_pct", 0.09) or 0.09)
                         ok_profit, why_profit = await self._live_boost_profit_confirmed(pos, pnl, min_profit)
@@ -1233,7 +1241,7 @@ class PositionManager:
                     ev = await self._close_and_event(pos, "tp", "take_profit", live, price)
                     if ev: events.append(ev)
                     continue
-                if stop and price>=stop and not liquidation_stop_mode and not (is_chatgpt_setup and (chatgpt_exchange_protected or chatgpt_protection_pending)):
+                if stop and price>=stop and not liquidation_stop_mode and not (is_chatgpt_setup and (chatgpt_exchange_protected or chatgpt_protection_pending)) and not (is_ratio_pressure and live and ratio_exchange_protected):
                     if boost_monitor_only_no_exchange:
                         pos["boost_monitor_only_skip_sl"] = f"exchange TP/SL missing; local SL close skipped at pnl {pnl:+.3f}%"
                         pos["updated_at"] = now

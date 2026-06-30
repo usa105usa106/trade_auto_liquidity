@@ -15,6 +15,8 @@ RATIO_STRATEGY = "ratio_pressure_1h"
 RATIO_ENABLED_KEY = "ratio_pressure_autopilot_enabled"
 RATIO_LAST_RUN_KEY = "ratio_pressure_last_run_ts"
 RATIO_STATUS_MSG_KEY = "ratio_pressure_status"
+RATIO_ENABLED_SINCE_KEY = "ratio_pressure_enabled_since_ts"
+RATIO_NEXT_SCAN_KEY = "ratio_pressure_next_scan_ts"
 
 
 @dataclass
@@ -96,6 +98,51 @@ class RatioPressureAutopilot:
         nxt = (now_dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
         return nxt.timestamp() + float(delay_sec)
 
+
+    @staticmethod
+    def current_1h_scan_ts(now: float | None = None, delay_sec: int = 65) -> float:
+        """Scheduled scan timestamp for the current UTC hour.
+
+        Kept for diagnostics/tests only.  Live scheduling uses an explicit
+        stored next scan timestamp created at the moment the mode is enabled.
+        This is critical: if the user enables Ratio at 06:55 MSK, next scan is
+        07:01 MSK; if enabled at 07:03 MSK, next scan is 08:01 MSK.
+        """
+        now_dt = datetime.fromtimestamp(now or time.time(), tz=timezone.utc)
+        cur = now_dt.replace(minute=0, second=0, microsecond=0)
+        return cur.timestamp() + float(delay_sec)
+
+    @classmethod
+    def first_scan_after_enable_ts(cls, enabled_at: float | None = None, delay_sec: int = 65) -> float:
+        """First future scan after the user turns the mode ON.
+
+        No catch-up is allowed on enable.
+        - enabled before HH:01:05 => scan at HH:01:05;
+        - enabled after HH:01:05 => scan at next hour HH+1:01:05.
+        """
+        n = float(enabled_at or time.time())
+        cur_scan = cls.current_1h_scan_ts(n, delay_sec=delay_sec)
+        if n < cur_scan:
+            return cur_scan
+        return cur_scan + 3600.0
+
+    @classmethod
+    def next_scan_after_ts(cls, after_ts: float | None = None, delay_sec: int = 65) -> float:
+        n = float(after_ts or time.time())
+        cur_scan = cls.current_1h_scan_ts(n, delay_sec=delay_sec)
+        if n < cur_scan:
+            return cur_scan
+        return cur_scan + 3600.0
+
+    @classmethod
+    def upcoming_or_due_1h_scan_ts(cls, now: float | None = None, delay_sec: int = 65, last_run_ts: float | int | None = None) -> float:
+        """Backward-compatible display helper: always show the next future scan.
+
+        Older builds used this as catch-up logic; Ratio live now stores
+        `ratio_pressure_next_scan_ts` explicitly on enable.
+        """
+        return cls.next_1h_close_ts(now=now or time.time(), delay_sec=delay_sec)
+
     @staticmethod
     def _fmt_utc(ts: float | int | None) -> str:
         """Telegram display time for Ratio mode: MSK (UTC+3).
@@ -110,7 +157,8 @@ class RatioPressureAutopilot:
     def status_text(self, settings: dict | None = None) -> str:
         s = settings or {}
         enabled = self._truthy(s.get(RATIO_ENABLED_KEY), False)
-        next_ts = self.next_1h_close_ts()
+        delay = int(float(s.get("ratio_pressure_delay_after_hour_sec", 65) or 65))
+        next_ts = float(s.get(RATIO_NEXT_SCAN_KEY) or self.next_scan_after_ts(delay_sec=delay))
         return (
             "🧬 ETH/BTC 1h/1h Ratio Pressure\n\n"
             f"Статус: {'ВКЛ' if enabled else 'ВЫКЛ'}\n"
@@ -135,18 +183,49 @@ class RatioPressureAutopilot:
                 if not self._truthy(settings.get(RATIO_ENABLED_KEY), False):
                     await asyncio.sleep(10)
                     continue
-                target = self.next_1h_close_ts(delay_sec=int(float(settings.get("ratio_pressure_delay_after_hour_sec", 65) or 65)))
+
+                delay = int(float(settings.get("ratio_pressure_delay_after_hour_sec", 65) or 65))
                 now = time.time()
-                if now < target:
-                    # One sparse heartbeat per hour, not Telegram spam.
-                    if now - self._last_heartbeat_ts > 3500:
-                        self._last_heartbeat_ts = now
-                        log_event("ratio_pressure_loop_wait", ok=True, next_scan_msk=self._fmt_utc(target))
-                    await asyncio.sleep(min(30.0, max(1.0, target - now)))
+                try:
+                    last_run = float(settings.get(RATIO_LAST_RUN_KEY) or 0.0)
+                except Exception:
+                    last_run = 0.0
+                try:
+                    target = float(settings.get(RATIO_NEXT_SCAN_KEY) or 0.0)
+                except Exception:
+                    target = 0.0
+                if target <= 0:
+                    target = self.first_scan_after_enable_ts(now, delay_sec=delay)
+                    await self.storage.set(RATIO_NEXT_SCAN_KEY, target, bump_revision=False)
+                    log_event("ratio_pressure_next_scan_initialized", ok=True, next_scan_msk=self._fmt_utc(target))
+
+                # The scan slot is fixed when the mode is enabled.
+                # Enabled before 07:01 -> target 07:01 and it runs then.
+                # Enabled after 07:01 -> target 08:01. No stale catch-up from 07:01.
+                if now >= target and last_run < target - 5:
+                    max_lag = int(float(settings.get("ratio_pressure_max_scan_lag_sec", 15 * 60) or (15 * 60)))
+                    if now - target > max_lag:
+                        skipped = target
+                        target = self.next_scan_after_ts(now, delay_sec=delay)
+                        await self.storage.set(RATIO_NEXT_SCAN_KEY, target, bump_revision=False)
+                        log_event("ratio_pressure_stale_scan_skipped", ok=False, skipped_scan_msk=self._fmt_utc(skipped), next_scan_msk=self._fmt_utc(target), lag_sec=round(now-skipped, 1))
+                        await asyncio.sleep(min(30.0, max(1.0, target - now)))
+                        continue
+                    log_event("ratio_pressure_scan_due", ok=True, due_scan_msk=self._fmt_utc(target), last_run_msk=self._fmt_utc(last_run) if last_run else "-")
+                    await self.cycle(app=app, trigger="schedule")
+                    await self.storage.set(RATIO_LAST_RUN_KEY, target, bump_revision=False)
+                    next_target = target + 3600.0
+                    while next_target <= time.time():
+                        next_target += 3600.0
+                    await self.storage.set(RATIO_NEXT_SCAN_KEY, next_target, bump_revision=False)
+                    log_event("ratio_pressure_next_scan_scheduled", ok=True, next_scan_msk=self._fmt_utc(next_target))
+                    await asyncio.sleep(60)
                     continue
-                await self.cycle(app=app, trigger="schedule")
-                await self.storage.set(RATIO_LAST_RUN_KEY, time.time(), bump_revision=False)
-                await asyncio.sleep(60)
+
+                if now - self._last_heartbeat_ts > 3500:
+                    self._last_heartbeat_ts = now
+                    log_event("ratio_pressure_loop_wait", ok=True, next_scan_msk=self._fmt_utc(target), last_run_msk=self._fmt_utc(last_run) if last_run else "-")
+                await asyncio.sleep(min(30.0, max(1.0, target - now)))
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -183,11 +262,19 @@ class RatioPressureAutopilot:
 
     @staticmethod
     def _rank(value: float, history: list[float]) -> float:
+        """Tie-safe percentile rank in [0, 1].
+
+        Important for live: if the current value equals most of the history
+        (flat volume/range/ret3), it must be neutral (~0.5), not 1.0.
+        A plain <= rank would create false HIGH signals on flat data.
+        """
         hist = [float(x) for x in history if math.isfinite(float(x))]
         if not hist or not math.isfinite(value):
             return 0.5
-        le = sum(1 for x in hist if x <= value)
-        return max(0.0, min(1.0, le / len(hist)))
+        less = sum(1 for x in hist if x < value)
+        equal = sum(1 for x in hist if x == value)
+        rank = (less + 0.5 * equal) / len(hist)
+        return max(0.0, min(1.0, rank))
 
     def _feature_rows(self, rows: list[list[float]]) -> list[dict]:
         out = []
